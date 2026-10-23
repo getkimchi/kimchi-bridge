@@ -8,14 +8,15 @@ This is a release candidate. Direct reporting requires the companion ai-optimize
 
 Requires access to this private repository, authenticated `gh`, and the official client(s) on PATH. macOS and Linux arm64/amd64 builds are provided; native compatibility is verified on macOS with Claude Code 2.1.309 and Codex CLI 0.164.0. Linux binaries must be treated as compiled support until native checks run there. Windows, IDE and cloud sessions are outside this release.
 
-Download `install.sh` from the selected private GitHub release, then run:
+The main entry point is Kimchi's installer, which installs Kimchi and pulls the selected adapter release. The adapter option is in [Kimchi PR #1524](https://github.com/getkimchi/kimchi/pull/1524). Until that installer ships in a stable Kimchi release, use this pinned preview of the same script:
 
 ```sh
-bash install.sh install claude v0.1.0-rc.5 # or codex, or both
-kimchi-adapters status
+curl -fsSL https://raw.githubusercontent.com/getkimchi/kimchi/7fbbb81b7876d4734ad7d423fad8fc373aa47417/scripts/install.sh | bash -s -- --adapters both
 ```
 
-The script downloads the matching release with `gh`, verifies SHA256 and archive paths, and uses the client's native plugin manager. No Go or Node installation is needed. Start a new client session and accept its ordinary plugin trust prompt. Add `~/.local/bin` to PATH if needed. Finish active coding sessions before updating or removing a plugin.
+Use `--adapters claude` or `--adapters codex` for one client; omitting the option installs Kimchi only. `KIMCHI_VERSION` and `KIMCHI_ADAPTERS_VERSION` pin the two release streams independently. Rerun the same command to update Kimchi and the selected adapters. Once the shared installer is released, the same options work with Kimchi's usual `releases/latest/download/install.sh` URL.
+
+Kimchi's script downloads the private adapter bootstrap through authenticated `gh`; that bootstrap verifies archive SHA256 and paths and uses each client's native plugin manager. No Go or Node installation is needed. Start a new client session and accept its ordinary plugin trust prompt. Add `~/.local/bin` to PATH if needed, then run `kimchi-adapters status`. Finish active coding sessions before updating or removing a plugin. The adapter release's `install.sh` remains the internal provisioning helper and supports existing installations.
 
 Configure reporting once, with JSON on stdin. Use a private file or a password manager's stdin output; keep credentials out of shell history and Git:
 
