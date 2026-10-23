@@ -51,7 +51,9 @@ func toolCategory(name string) string {
 	}
 }
 
-func filePaths(root string, e Object) ([]string, bool) {
+func filePaths(s scope, e Object) ([]string, bool) {
+	root := s.root()
+	base := s.CWD
 	input := toolInput(e)
 	var paths []string
 	for _, k := range []string{"file_path", "path", "filePath"} {
@@ -70,6 +72,7 @@ func filePaths(root string, e Object) ([]string, bool) {
 	}
 	native := len(paths) > 0
 	if !native {
+		base = root
 		out, err := git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
 		if err == nil {
 			paths = strings.Split(out, "\x00")
@@ -82,9 +85,16 @@ func filePaths(root string, e Object) ([]string, bool) {
 			continue
 		}
 		if !filepath.IsAbs(p) {
-			p = filepath.Join(root, p)
+			p = filepath.Join(base, p)
 		}
 		p = filepath.Clean(p)
+		if native {
+			if canonical, err := filepath.EvalSymlinks(p); err == nil {
+				p = canonical
+			} else if parent, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+				p = filepath.Join(parent, filepath.Base(p))
+			}
+		}
 		rel, err := filepath.Rel(root, p)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || strings.Contains(rel, ".git"+string(os.PathSeparator)) {
 			continue
@@ -184,7 +194,7 @@ func (r *Recorder) before(s scope, e Object, work string) error {
 		r.Store.Diagnostic("tool_identity_missing")
 		return nil
 	}
-	paths, native := filePaths(s.CWD, e)
+	paths, native := filePaths(s, e)
 	category := toolCategory(str(e, "tool_name", "tool"))
 	state := toolState{Files: map[string]fileState{}, Expected: map[string]string{}, Work: work, Turn: s.Turn, Agent: s.Agent, Started: time.Now().UTC(), Category: category, Native: native}
 	if category != "read" {
@@ -200,7 +210,7 @@ func (r *Recorder) before(s scope, e Object, work string) error {
 		if within(r.Store.Dir, p) {
 			continue
 		}
-		state.Files[p] = r.snapshot(s.CWD, p)
+		state.Files[p] = r.snapshot(s.root(), p)
 		if info, e := os.Lstat(p); e == nil {
 			bytes += info.Size()
 		}
@@ -249,7 +259,7 @@ func (r *Recorder) after(s scope, e, result Object, work string, failed bool) er
 	if err = r.Store.Observe(ev); err != nil {
 		return err
 	}
-	paths, _ := filePaths(s.CWD, e)
+	paths, _ := filePaths(s, e)
 	for _, p := range paths {
 		if _, ok := state.Files[p]; !ok {
 			state.Files[p] = fileState{}
@@ -263,7 +273,7 @@ func (r *Recorder) after(s scope, e, result Object, work string, failed bool) er
 			r.Store.Diagnostic("file_snapshot_incomplete")
 			continue
 		}
-		after := r.snapshot(s.CWD, p)
+		after := r.snapshot(s.root(), p)
 		if !before.Complete || !after.Complete {
 			r.Store.Diagnostic("file_snapshot_incomplete")
 			continue
@@ -317,7 +327,7 @@ func (r *Recorder) after(s scope, e, result Object, work string, failed bool) er
 				return err
 			}
 		}
-		rel, _ := filepath.Rel(s.CWD, p)
+		rel, _ := filepath.Rel(s.root(), p)
 		if state.Category != "read" && quality == "tool_observed" && after.Exists && strings.HasSuffix(p, ".md") && (strings.HasPrefix(rel, "plans/") || strings.HasPrefix(rel, ".plans/")) {
 			if err = r.RegisterPlan(s.CWD, p, work, s); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err

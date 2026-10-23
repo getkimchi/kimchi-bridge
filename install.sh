@@ -36,21 +36,33 @@ temp=
 cleanup() { [[ -z "$temp" ]] || rm -rf -- "$temp"; rmdir "$prefix/install.lock"; }
 trap cleanup EXIT
 market_name() { printf 'kimchi-work-%s' "${1//./-}"; }
+remove_version() {
+  local cli=$1 version=$2 market selector output
+  valid_version "$version" || fail 'Invalid installed-version receipt.'
+  market=$(market_name "$version");selector="kimchi-work@$market"
+  if [[ "$cli" == claude ]]; then
+    if output=$(claude plugin uninstall "$selector" --scope user 2>&1); then printf '%s\n' "$output"; else
+      case "$output" in *"Plugin \"$selector\" not found in installed plugins"*) ;; *) printf '%s\n' "$output" >&2;return 1 ;; esac
+    fi
+    if output=$(claude plugin marketplace remove "$market" 2>&1); then printf '%s\n' "$output"; else
+      case "$output" in *"Marketplace '$market' not found"*) ;; *) printf '%s\n' "$output" >&2;return 1 ;; esac
+    fi
+  else
+    codex plugin remove "$selector" --json
+    if output=$(codex plugin marketplace remove "$market" --json 2>&1); then printf '%s\n' "$output"; else
+      case "$output" in *"marketplace \`$market\` is not configured or installed"*) ;; *) printf '%s\n' "$output" >&2;return 1 ;; esac
+    fi
+  fi
+}
 
 if [[ "$action" == uninstall ]]; then
   for cli in "${clients[@]}"; do
     receipt="$prefix/installed/$cli"
-    [[ -f "$receipt" ]] || continue
-    old=$(cat "$receipt"); valid_version "$old" || fail 'Invalid installed-version receipt.'
-    market=$(market_name "$old")
-    if [[ "$cli" == claude ]]; then
-      claude plugin uninstall "kimchi-work@$market" --scope user
-      claude plugin marketplace remove "$market"
-    else
-      codex plugin remove "kimchi-work@$market" --json
-      codex plugin marketplace remove "$market" --json
-    fi
-    rm -- "$receipt"
+    for state in "$receipt.cleanup" "$receipt"; do
+      [[ -f "$state" ]] || continue
+      remove_version "$cli" "$(cat "$state")"
+      rm -- "$state"
+    done
   done
   if [[ ! -f "$prefix/installed/claude" && ! -f "$prefix/installed/codex" && -x "$bin_dir/kimchi-adapters" ]]; then "$bin_dir/kimchi-adapters" disable; fi
   printf '%s\n' 'Selected plugins removed. Reporting credentials, ledger and release files are retained.'
@@ -101,26 +113,25 @@ for cli in "${clients[@]}"; do
   receipt="$prefix/installed/$cli"
   old=
   if [[ -f "$receipt" ]]; then old=$(cat "$receipt");valid_version "$old" || fail 'Invalid installed-version receipt.';fi
-  if [[ "$old" == "$version" ]]; then printf '%s already at %s\n' "$cli" "$version";continue;fi
-  if [[ "$cli" == claude ]]; then
-    claude plugin marketplace add "$target" --scope user
-    claude plugin install "kimchi-work@$market" --scope user
+  if [[ "$old" == "$version" ]]; then
+    printf '%s already at %s\n' "$cli" "$version"
   else
-    codex plugin marketplace add "$target" --json
-    codex plugin add "kimchi-work@$market" --json
-  fi
-  # Record a successful new install before removing only our preceding version.
-  printf '%s\n' "$version" > "$receipt.new"
-  mv -- "$receipt.new" "$receipt"
-  if [[ -n "$old" ]]; then
-    previous=$(market_name "$old")
+    # Finish an interrupted cleanup before accepting a third installed version.
+    if [[ -f "$receipt.cleanup" ]]; then remove_version "$cli" "$(cat "$receipt.cleanup")";rm -- "$receipt.cleanup";fi
     if [[ "$cli" == claude ]]; then
-      claude plugin uninstall "kimchi-work@$previous" --scope user
-      claude plugin marketplace remove "$previous"
+      claude plugin marketplace add "$target" --scope user
+      claude plugin install "kimchi-work@$market" --scope user
     else
-      codex plugin remove "kimchi-work@$previous" --json
-      codex plugin marketplace remove "$previous" --json
+      codex plugin marketplace add "$target" --json
+      codex plugin add "kimchi-work@$market" --json
     fi
+    if [[ -n "$old" ]]; then printf '%s\n' "$old" > "$receipt.cleanup.new";mv -- "$receipt.cleanup.new" "$receipt.cleanup";fi
+    printf '%s\n' "$version" > "$receipt.new"
+    mv -- "$receipt.new" "$receipt"
+  fi
+  if [[ -f "$receipt.cleanup" ]]; then
+    remove_version "$cli" "$(cat "$receipt.cleanup")"
+    rm -- "$receipt.cleanup"
   fi
 done
 ln -s "$target/bin/kimchi-adapters" "$bin_dir/.kimchi-adapters.new.$$"

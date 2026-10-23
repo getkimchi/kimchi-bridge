@@ -39,9 +39,10 @@ func main() {
 	driver := flag.Bool("driver", false, "use isolated Driver/TMUX interactive sessions")
 	telemetry := flag.Bool("native-telemetry", true, "enable disposable native exporters; false tests quiet defaults")
 	installPackage := flag.String("installer-package", "", "locally built release archive; run native installer checks instead of inference")
+	upgradePackage := flag.String("installer-upgrade-package", "", "optional second local archive for a native version upgrade")
 	flag.Parse()
 	if *installPackage != "" {
-		if err := probe.RunInstaller(*root, *installPackage); err != nil {
+		if err := probe.RunInstaller(*root, *installPackage, *upgradePackage); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

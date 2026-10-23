@@ -156,6 +156,25 @@ func run() error {
 			s.Diagnostic("hook_invalid_json")
 			return nil
 		}
+		session := n.SessionID
+		if session == "" {
+			session, _ = n.Event["session_id"].(string)
+		}
+		dir, e := settings.SessionStateDir(c, args[1], session)
+		if e != nil {
+			s.Diagnostic("session_account_binding_failed")
+			return nil
+		}
+		if dir != s.Dir {
+			if e = s.Close(); e != nil {
+				return e
+			}
+			s, e = ledger.Open(dir)
+			if e != nil {
+				return e
+			}
+			defer s.Close()
+		}
 		id, e := s.DeviceID()
 		if e != nil {
 			return e

@@ -19,7 +19,11 @@ func copyProductBinary(product, plugin string) error {
 	if err = os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "kimchi-adapters"), b, 0700)
+	path := filepath.Join(dir, "kimchi-adapters")
+	if err = os.WriteFile(path, b, 0700); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0700)
 }
 func productEvidence(dir string) (int, bool, error) {
 	s, err := ledger.Open(dir)

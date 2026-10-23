@@ -91,6 +91,10 @@ func (r *Recorder) ReconcileGit(ctx context.Context) error {
 	}
 	deadline := time.Now().Add(8 * time.Second)
 	var failures error
+	if len(items) == 0 {
+		_, err = r.Store.DB.Exec(`DELETE FROM meta WHERE key='git-pass-after'`)
+		return err
+	}
 	for _, v := range items {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -126,12 +130,6 @@ func (r *Recorder) ReconcileGit(ctx context.Context) error {
 				failures = errors.Join(failures, err)
 			}
 			continue
-		}
-		if len(items) == 0 {
-			_, err = r.Store.DB.Exec(`DELETE FROM meta WHERE key='git-pass-after'`)
-			if err != nil {
-				return err
-			}
 		}
 		var change gitChange
 		if err = json.Unmarshal([]byte(v.body), &change); err != nil {
@@ -187,7 +185,7 @@ func treeObject(root, commit, path string) (string, error) {
 	return fields[2], nil
 }
 func (r *Recorder) matchCommits(c gitChange, deadline time.Time) error {
-	root := c.Scope.CWD
+	root := c.Scope.root()
 	format, err := git(root, "rev-parse", "--show-object-format")
 	if err != nil {
 		return err

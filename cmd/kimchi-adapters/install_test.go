@@ -95,3 +95,88 @@ cp "$FIXTURE_SUMS" "$dest/SHA256SUMS"
 		})
 	}
 }
+
+func TestUpdateRetriesPreviousVersionCleanup(t *testing.T) {
+	script, err := os.ReadFile("../../install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cli := range []string{"claude", "codex"} {
+		t.Run(cli, func(t *testing.T) {
+			root := t.TempDir()
+			prefix := filepath.Join(root, "install")
+			bin := filepath.Join(root, "bin")
+			fakeBin := filepath.Join(root, "fake-bin")
+			pkg := filepath.Join(root, "package")
+			for _, p := range []string{prefix + "/installed", prefix + "/releases/v0.1.0/bin", bin, fakeBin, pkg + "/bin"} {
+				if err = os.MkdirAll(p, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stub := []byte("#!/bin/sh\nexit 0\n")
+			for _, p := range []string{prefix + "/releases/v0.1.0/bin/kimchi-adapters", pkg + "/bin/kimchi-adapters"} {
+				if err = os.WriteFile(p, stub, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = os.Symlink(prefix+"/releases/v0.1.0/bin/kimchi-adapters", bin+"/kimchi-adapters"); err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(pkg+"/VERSION", []byte("v0.2.0\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range []string{pkg + "/install.sh", pkg + "/bootstrap.sh"} {
+				if err = os.WriteFile(p, script, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			receipt := prefix + "/installed/" + cli
+			if err = os.WriteFile(receipt, []byte("v0.1.0\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			shim := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_CALLS"
+case "$1/$2/$3" in
+  plugin/uninstall/kimchi-work@kimchi-work-v0-1-0|plugin/remove/kimchi-work@kimchi-work-v0-1-0)
+    if [ ! -e "$FAKE_FAILED" ]; then : > "$FAKE_FAILED";echo 'temporary native removal failure' >&2;exit 1;fi
+    ;;
+esac
+exit 0
+`
+			if err = os.WriteFile(fakeBin+"/"+cli, []byte(shim), 0700); err != nil {
+				t.Fatal(err)
+			}
+			run := func() ([]byte, error) {
+				cmd := exec.Command("bash", pkg+"/install.sh", "update", cli)
+				cmd.Env = []string{"HOME=" + root, "PATH=" + fakeBin + ":/usr/bin:/bin", "KIMCHI_ADAPTERS_PREFIX=" + prefix, "KIMCHI_ADAPTERS_BIN_DIR=" + bin, "FAKE_CALLS=" + root + "/calls", "FAKE_FAILED=" + root + "/failed"}
+				return cmd.CombinedOutput()
+			}
+			if out, err := run(); err == nil {
+				t.Fatal("expected interrupted cleanup", string(out))
+			}
+			pending, err := os.ReadFile(receipt + ".cleanup")
+			if err != nil || string(pending) != "v0.1.0\n" {
+				t.Fatal("previous hooks lost their cleanup receipt", string(pending), err)
+			}
+			if out, err := run(); err != nil {
+				t.Fatal("retry did not finish cleanup", err, string(out))
+			}
+			if _, err = os.Stat(receipt + ".cleanup"); !os.IsNotExist(err) {
+				t.Fatal("cleanup not finished", err)
+			}
+			calls, err := os.ReadFile(root + "/calls")
+			if err != nil {
+				t.Fatal(err)
+			}
+			install := "plugin install kimchi-work@kimchi-work-v0-2-0"
+			remove := "plugin uninstall kimchi-work@kimchi-work-v0-1-0"
+			if cli == "codex" {
+				install = "plugin add kimchi-work@kimchi-work-v0-2-0"
+				remove = "plugin remove kimchi-work@kimchi-work-v0-1-0"
+			}
+			if strings.Count(string(calls), install) != 1 || strings.Count(string(calls), remove) != 2 {
+				t.Fatal("retry skipped cleanup or installed twice", string(calls))
+			}
+		})
+	}
+}

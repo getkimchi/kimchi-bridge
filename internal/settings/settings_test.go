@@ -25,6 +25,10 @@ func TestAccountsAndUnverifiedHistoryStaySeparate(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := c.StateDir()
+	oldSession, err := SessionStateDir(c, "codex", "old-session")
+	if err != nil || oldSession != first {
+		t.Fatal(oldSession, err)
+	}
 	if first == local {
 		t.Fatal("unknown local records assigned to login")
 	}
@@ -37,5 +41,13 @@ func TestAccountsAndUnverifiedHistoryStaySeparate(t *testing.T) {
 	c.Config, err = delivery.Authenticate(t.Context(), c.Config)
 	if err != nil || c.StateDir() == first || c.StateDir() == local {
 		t.Fatal("actor switch reused another account", err)
+	}
+	stillOld, err := SessionStateDir(c, "codex", "old-session")
+	if err != nil || stillOld != first {
+		t.Fatal("ongoing session relabeled after login", stillOld, err)
+	}
+	newSession, err := SessionStateDir(c, "codex", "new-session")
+	if err != nil || newSession != c.StateDir() {
+		t.Fatal(newSession, err)
 	}
 }

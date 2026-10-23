@@ -47,6 +47,8 @@ Default state is `~/.local/state/kimchi-adapters`; installed releases are under 
 
 ## What is recorded
 
+Native sessions stay pinned to the reporting account selected at first capture. Changing the global login does not relabel an older open session or upload its queue with the new user's credentials. The running collector continues processing older sessions and pre-login transcripts into their original local queues. Start a new session to record under the new account; select the original verified account to upload its pending records.
+
 | Evidence | Capture and limits |
 | --- | --- |
 | Work and plans | Persisted session/turn/agent bindings; existing plan path plus content revision; quoted file references and shared Git worktrees. Ambiguous plan ownership is preserved. Ordinary session continuation is inferred. |
@@ -70,6 +72,8 @@ The API uses the existing generated gateway, pricing catalog and PR/Jira bill un
 Prompts, source text, plan text, paths, file hashes, tool arguments/results and credentials are excluded from upload. Local before/after file contents are private evidence: seven days, at most 256 MiB, with 4 MiB per file and bounded capture work. Tool/preimage detail expires after seven days. Normalized records have a 1 GiB hard capacity; pending accounting is not age-deleted. At capacity capture fails open and status shows a gap; export and investigate before removing state. Compact plan/identity metadata remains local. Server detailed logs expire after 90 days from first receipt; financial quotes and replay guards follow accounting retention and organization deletion policy.
 
 ## Run the isolated probe
+
+Retention is enforced while the collector runs and at its next start, including expired detail from previous accounts and pre-login state. Disabling or uninstalling retains local files until collection resumes or the user removes them. The normalized capacity is 1 GiB **per account**. Financial server history has no automatic time expiry in this release; organization cleanup must include the adapter's org-scoped tables alongside existing PR accounting.
 
 Requirements: macOS with `sandbox-exec`, Go 1.26.2, and the official `claude` and `codex` executables on PATH. Tested native versions: Claude Code 2.1.309 and Codex CLI 0.164.0. Linux execution deliberately fails closed until an equivalent isolation boundary is implemented.
 

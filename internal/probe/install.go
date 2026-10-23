@@ -16,7 +16,7 @@ import (
 
 // RunInstaller uses real native management commands, an owned HOME and the same
 // OS gate as capture probes. It makes no model requests or reporting login.
-func RunInstaller(root, archive string) error {
+func RunInstaller(root, archive, upgradeArchive string) error {
 	if runtime.GOOS != "darwin" {
 		return errors.New("installer native probe requires macOS OS gate")
 	}
@@ -77,6 +77,16 @@ func RunInstaller(root, archive string) error {
 	if out, err := exec.Command("tar", "-xzf", archive, "-C", packageDir).CombinedOutput(); err != nil {
 		return fmt.Errorf("extract own package: %w %s", err, out)
 	}
+	upgradeDir := ""
+	if upgradeArchive != "" {
+		upgradeDir = filepath.Join(root, "upgrade")
+		if err = os.Mkdir(upgradeDir, 0700); err != nil {
+			return err
+		}
+		if out, err := exec.Command("tar", "-xzf", upgradeArchive, "-C", upgradeDir).CombinedOutput(); err != nil {
+			return fmt.Errorf("extract own upgrade package: %w %s", err, out)
+		}
+	}
 	bin := filepath.Join(root, "native-bin")
 	if err = os.Mkdir(bin, 0700); err != nil {
 		return err
@@ -109,9 +119,19 @@ func RunInstaller(root, archive string) error {
 			}
 		}
 		env = append(env, "KIMCHI_ADAPTERS_PREFIX="+state+"/install", "KIMCHI_ADAPTERS_BIN_DIR="+state+"/bin", "KIMCHI_ADAPTERS_HOME="+state+"/ledger")
-		for _, action := range []string{"install", "status", "update", "uninstall"} {
+		actions := []struct{ action, dir string }{{"install", packageDir}, {"status", packageDir}, {"update", packageDir}}
+		if upgradeDir != "" {
+			actions = append(actions, struct{ action, dir string }{"update", upgradeDir})
+		}
+		uninstallDir := packageDir
+		if upgradeDir != "" {
+			uninstallDir = upgradeDir
+		}
+		actions = append(actions, struct{ action, dir string }{"uninstall", uninstallDir})
+		for _, step := range actions {
+			action := step.action
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			out, stderr, err := command(ctx, profile, state, env, "/bin/bash", filepath.Join(packageDir, "install.sh"), action, selection)
+			out, stderr, err := command(ctx, profile, state, env, "/bin/bash", filepath.Join(step.dir, "install.sh"), action, selection)
 			cancel()
 			_ = Save(filepath.Join(state, "results"), map[string]any{"action": action, "success": err == nil, "stdout": string(out), "stderr": string(stderr)})
 			if err != nil {
@@ -142,5 +162,9 @@ func RunInstaller(root, archive string) error {
 			}
 		}
 	}
-	return writePrivate(filepath.Join(root, "result.json"), []byte(`{"passed":true,"clients":["claude","codex","both"],"actions":["install","status","same-version-update","uninstall"],"osGuard":true,"inferencePreserved":true,"enterpriseTelemetryPreserved":true}`))
+	result, err := json.Marshal(map[string]any{"passed": true, "clients": []string{"claude", "codex", "both"}, "actions": []string{"install", "status", "same-version-update", "uninstall"}, "crossVersionUpgrade": upgradeDir != "", "osGuard": true, "inferencePreserved": true, "enterpriseTelemetryPreserved": true})
+	if err != nil {
+		return err
+	}
+	return writePrivate(filepath.Join(root, "result.json"), result)
 }

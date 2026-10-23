@@ -97,6 +97,7 @@ func Run(ctx context.Context, c settings.Config) error {
 	backoff := time.Second
 	var otlpRetryAt time.Time
 	otlpBackoff := time.Second
+	var pruneAt time.Time
 	for {
 		latest, loadErr := settings.Load()
 		if loadErr != nil {
@@ -109,14 +110,20 @@ func Run(ctx context.Context, c settings.Config) error {
 		} else {
 			c = latest
 		}
+		if !time.Now().Before(pruneAt) {
+			if err = capture.PruneAccounts(settings.Root(), time.Now()); err != nil {
+				s.Diagnostic("retention_failed")
+			}
+			pruneAt = time.Now().Add(time.Hour)
+		}
 		for _, source := range []string{"claude-code", "codex"} {
 			r := capture.Recorder{Store: s, Source: source, Device: device}
 			if err = r.Recover(); err != nil {
 				s.Diagnostic("recovery_failed")
 			}
-			if err = r.PruneEvidence(time.Now()); err != nil {
-				s.Diagnostic("retention_failed")
-			}
+		}
+		if err = recoverInactiveAccounts(ctx, settings.Root(), s.Dir); err != nil {
+			s.Diagnostic("inactive_account_recovery_failed")
 		}
 		gitRecorder := capture.Recorder{Store: s, Source: "collector", Device: device}
 		if err = gitRecorder.ReconcileGit(ctx); err != nil {

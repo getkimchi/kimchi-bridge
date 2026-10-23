@@ -19,6 +19,116 @@ func gitOK(t *testing.T, root string, args ...string) string {
 	return out
 }
 
+func TestGitCursorRevisitsEditCommittedAfterFirstPass(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	r, root := newRecorder(t, "codex")
+	gitOK(t, root, "init", "--initial-branch=main")
+	gitOK(t, root, "config", "user.email", "fixture@example.invalid")
+	gitOK(t, root, "config", "user.name", "Fixture")
+	gitOK(t, root, "config", "core.hooksPath", "/dev/null")
+	path := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(path, []byte("before"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitOK(t, root, "add", ".")
+	gitOK(t, root, "commit", "-m", "baseline")
+	prompt(t, r, root, "session", "turn", "edit")
+	e := Object{"session_id": "session", "turn_id": "turn", "cwd": root, "tool_use_id": "late-commit", "tool_name": "Edit", "tool_input": Object{"file_path": path, "old_string": "before", "new_string": "after"}}
+	if err := r.Record(Native{Stage: "PreToolUse", Event: e}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("after"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Record(Native{Stage: "PostToolUse", Event: e}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReconcileGit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	gitOK(t, root, "add", ".")
+	gitOK(t, root, "commit", "-m", "later commit")
+	for i := 0; i < 2; i++ {
+		if _, err := r.Store.DB.Exec(`DELETE FROM meta WHERE key='git-last-pass'`); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.ReconcileGit(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := r.Store.DB.QueryRow(`SELECT count(*) FROM events WHERE kind='commit'`).Scan(&count); err != nil || count != 1 {
+		t.Fatal("cursor never revisited pending edit", count, err)
+	}
+}
+
+func TestSubdirectoryPlanAndRelativePatchUseNativeCWD(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	r, root := newRecorder(t, "claude-code")
+	gitOK(t, root, "init", "--initial-branch=main")
+	gitOK(t, root, "config", "user.email", "fixture@example.invalid")
+	gitOK(t, root, "config", "user.name", "Fixture")
+	gitOK(t, root, "config", "core.hooksPath", "/dev/null")
+	sub := filepath.Join(root, "sub")
+	if err := os.Mkdir(sub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{filepath.Join(root, "plan.md"), filepath.Join(sub, "plan.md")} {
+		if err := os.WriteFile(p, []byte("same bytes, different plans"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "edit.txt"), []byte("root sentinel"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sub, "edit.txt")
+	if err := os.WriteFile(path, []byte("before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitOK(t, root, "add", ".")
+	gitOK(t, root, "commit", "-m", "baseline")
+	canonicalRoot, repo, _ := repository(root)
+	for _, item := range []struct{ dir, session string }{{root, "root-session"}, {sub, "sub-session"}} {
+		prompt(t, r, item.dir, item.session, "plan-turn", "plan")
+		s := scope{Session: item.session, Turn: "plan-turn", CWD: item.dir, Root: canonicalRoot, Repo: repo}
+		if err := r.RegisterPlan(item.dir, "plan.md", r.work(s), s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expected := r.work(scope{Session: "sub-session", Turn: "plan-turn", Repo: repo})
+	r.Source = "codex"
+	prompt(t, r, sub, "implementation", "turn", "implement plan.md")
+	if got := r.work(scope{Session: "implementation", Turn: "turn", Repo: repo}); got != expected {
+		t.Fatal("resolved root plan instead of subdirectory plan", got, expected)
+	}
+	patch := "*** Begin Patch\n*** Update File: edit.txt\n@@\n-before\n+after\n*** End Patch"
+	e := Object{"session_id": "implementation", "turn_id": "turn", "cwd": sub, "tool_use_id": "patch", "tool_name": "exec_command", "tool_input": Object{"cmd": "apply_patch '" + patch + "'"}}
+	if err := r.Record(Native{Stage: "PreToolUse", Event: e}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("after\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Record(Native{Stage: "PostToolUse", Event: e}); err != nil {
+		t.Fatal(err)
+	}
+	var quality string
+	if err := r.Store.DB.QueryRow(`SELECT quality FROM file_changes WHERE before_hash=? AND after_hash=?`, digest([]byte("before\n")), digest([]byte("after\n"))).Scan(&quality); err != nil || quality != "tool_observed" {
+		t.Fatal("relative patch preimage lost", quality, err)
+	}
+	gitOK(t, root, "add", ".")
+	gitOK(t, root, "commit", "-m", "relative patch")
+	if err := r.ReconcileGit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := r.Store.DB.QueryRow(`SELECT count(*) FROM events WHERE kind='commit'`).Scan(&count); err != nil || count != 1 {
+		t.Fatal("subdirectory blob transition not matched", count, err)
+	}
+}
+
 func TestQuotedPlanHandoffAcrossWorktrees(t *testing.T) {
 	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")

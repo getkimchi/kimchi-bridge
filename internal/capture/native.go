@@ -66,8 +66,15 @@ type Recorder struct {
 	Source, Device string
 }
 type scope struct {
-	Session, Turn, Agent, CWD, Repo string
-	Repository                      *protocol.Repository
+	Session, Turn, Agent, CWD, Root, Repo string
+	Repository                            *protocol.Repository
+}
+
+func (s scope) root() string {
+	if s.Root != "" {
+		return s.Root
+	}
+	return s.CWD
 }
 
 func git(cwd string, args ...string) (string, error) {
@@ -87,6 +94,9 @@ func git(cwd string, args ...string) (string, error) {
 	return strings.TrimSuffix(strings.TrimSuffix(out.String(), "\n"), "\r"), e
 }
 func repository(cwd string) (string, string, *protocol.Repository) {
+	if canonical, err := filepath.EvalSymlinks(cwd); err == nil {
+		cwd = canonical
+	}
 	root, e := git(cwd, "rev-parse", "--show-toplevel")
 	if e != nil {
 		return cwd, "local:" + digest([]byte(cwd)), nil
@@ -157,7 +167,10 @@ func (r *Recorder) Record(n Native) error {
 	if s.Session == "" || !filepath.IsAbs(s.CWD) {
 		return errors.New("missing native session or working directory")
 	}
-	s.CWD, s.Repo, s.Repository = repository(s.CWD)
+	if cwd, err := filepath.EvalSymlinks(s.CWD); err == nil {
+		s.CWD = cwd
+	}
+	s.Root, s.Repo, s.Repository = repository(s.CWD)
 	if n.Version != "" {
 		if err := r.version(s.Session, n.Version); err != nil {
 			return err
@@ -307,7 +320,7 @@ func (r *Recorder) bind(s scope, prompt string) error {
 		if e != nil || len(b) > 4<<20 {
 			continue
 		}
-		rows, e := r.Store.DB.Query(`SELECT DISTINCT work_id FROM plans WHERE repository=? AND path=? AND hash=?`, s.Repo, planKey(s.CWD, path), digest(b))
+		rows, e := r.Store.DB.Query(`SELECT DISTINCT work_id FROM plans WHERE repository=? AND path=? AND hash=?`, s.Repo, planKey(s.root(), path), digest(b))
 		if e != nil {
 			return e
 		}
@@ -415,7 +428,7 @@ func (r *Recorder) RegisterPlan(cwd, path, work string, s scope) error {
 		return err
 	}
 	hash := digest(b)
-	path = planKey(cwd, path)
+	path = planKey(s.root(), path)
 	planID := protocol.StableID(s.Repo, path, work)
 	rev := protocol.StableID(planID, hash)
 	_, err = r.Store.DB.Exec(`INSERT OR IGNORE INTO plans(repository,path,hash,work_id,plan_id,revision_id) VALUES(?,?,?,?,?,?)`, s.Repo, path, hash, work, planID, rev)
