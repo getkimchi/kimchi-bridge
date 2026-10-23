@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Private release bootstrap and native plugin management. No inference settings.
+umask 077
+repo=getkimchi/kimchi-adapters
+prefix=${KIMCHI_ADAPTERS_PREFIX:-"$HOME/.local/share/kimchi-adapters"}
+bin_dir=${KIMCHI_ADAPTERS_BIN_DIR:-"$HOME/.local/bin"}
+action=${1:-install}
+client=${2:-both}
+requested=${3:-}
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+case "$action" in install|update|uninstall|status) ;; *) fail 'Usage: install.sh install|update|uninstall|status claude|codex|both [vVERSION]' ;; esac
+case "$client" in claude|codex|both) ;; *) fail 'Choose claude, codex or both.' ;; esac
+case "$prefix:$bin_dir" in /*:/*) ;; *) fail 'Install and binary directories must be absolute.' ;; esac
+valid_version() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; }
+clients=()
+[[ "$client" == codex ]] || clients+=(claude)
+[[ "$client" == claude ]] || clients+=(codex)
+
+if [[ "$action" == status ]]; then
+  for cli in "${clients[@]}"; do
+    if [[ -f "$prefix/installed/$cli" ]]; then printf '%s: %s\n' "$cli" "$(cat "$prefix/installed/$cli")"; else printf '%s: not installed\n' "$cli"; fi
+  done
+  [[ ! -x "$bin_dir/kimchi-adapters" ]] || "$bin_dir/kimchi-adapters" status
+  exit 0
+fi
+for cli in "${clients[@]}"; do command -v "$cli" >/dev/null || fail "Install official $cli first."; done
+mkdir -p "$prefix/installed" "$bin_dir"
+if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-adapters" || -L "$bin_dir/kimchi-adapters" ) ]]; then
+  existing=$(readlink "$bin_dir/kimchi-adapters") || fail 'Refusing to replace an unmanaged kimchi-adapters binary.'
+  case "$existing" in "$prefix/releases/"*/bin/kimchi-adapters) ;; *) fail 'Refusing to replace an unmanaged kimchi-adapters link.' ;; esac
+fi
+mkdir "$prefix/install.lock" 2>/dev/null || fail "Another installer is running ($prefix/install.lock)."
+temp=
+cleanup() { [[ -z "$temp" ]] || rm -rf -- "$temp"; rmdir "$prefix/install.lock"; }
+trap cleanup EXIT
+market_name() { printf 'kimchi-work-%s' "${1//./-}"; }
+
+if [[ "$action" == uninstall ]]; then
+  for cli in "${clients[@]}"; do
+    receipt="$prefix/installed/$cli"
+    [[ -f "$receipt" ]] || continue
+    old=$(cat "$receipt"); valid_version "$old" || fail 'Invalid installed-version receipt.'
+    market=$(market_name "$old")
+    if [[ "$cli" == claude ]]; then
+      claude plugin uninstall "kimchi-work@$market" --scope user
+      claude plugin marketplace remove "$market"
+    else
+      codex plugin remove "kimchi-work@$market" --json
+      codex plugin marketplace remove "$market" --json
+    fi
+    rm -- "$receipt"
+  done
+  if [[ ! -f "$prefix/installed/claude" && ! -f "$prefix/installed/codex" && -x "$bin_dir/kimchi-adapters" ]]; then "$bin_dir/kimchi-adapters" disable; fi
+  printf '%s\n' 'Selected plugins removed. Reporting credentials, ledger and release files are retained.'
+  exit 0
+fi
+
+for cli in "${clients[@]}"; do "$cli" plugin --help >/dev/null || fail "$cli does not support native plugins. Update the official CLI."; done
+script_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [[ -f "$script_root/VERSION" && -x "$script_root/bin/kimchi-adapters" ]]; then
+  version=$(cat "$script_root/VERSION")
+  [[ -z "$requested" || "$requested" == "$version" ]] || fail 'Requested version differs from this package.'
+  valid_version "$version" || fail 'Invalid package version.'
+  package=$script_root
+else
+  command -v gh >/dev/null || fail 'Private releases require GitHub CLI. Install gh and run gh auth login.'
+  version=$requested
+  [[ -n "$version" ]] || version=$(gh release view --repo "$repo" --json tagName --jq .tagName)
+  valid_version "$version" || fail 'Specify a release such as v0.1.0-rc.1.'
+  case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) fail 'Supported platforms: macOS and Linux.' ;; esac
+  case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=amd64 ;; *) fail 'Supported CPUs: arm64 and amd64.' ;; esac
+  asset="kimchi-adapters_${os}_${arch}.tar.gz"
+  temp=$(mktemp -d "$prefix/.download.XXXXXXXX")
+  gh release download "$version" --repo "$repo" --dir "$temp" --pattern "$asset" --pattern SHA256SUMS
+  expected=$(awk -v asset="$asset" '$2 == asset { print $1 }' "$temp/SHA256SUMS")
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || fail 'Missing release checksum.'
+  if command -v sha256sum >/dev/null; then actual=$(sha256sum "$temp/$asset" | awk '{print $1}'); else actual=$(shasum -a 256 "$temp/$asset" | awk '{print $1}'); fi
+  [[ "$expected" == "$actual" ]] || fail 'Release checksum mismatch.'
+  tar -tzf "$temp/$asset" > "$temp/entries" || fail 'Unsafe release archive listing.'
+  while IFS= read -r entry; do
+    case "$entry" in /*|..|../*|*/../*|*/..) fail 'Unsafe release archive path.' ;; esac
+  done < "$temp/entries"
+  tar -tvzf "$temp/$asset" | awk 'substr($1,1,1)!="-" && substr($1,1,1)!="d" {bad=1} END {exit bad}' || fail 'Release archive contains links or special files.'
+  mkdir "$temp/package"
+  tar -xzf "$temp/$asset" -C "$temp/package"
+  [[ "$(cat "$temp/package/VERSION")" == "$version" ]] || fail 'Release version mismatch.'
+  package="$temp/package"
+fi
+
+target="$prefix/releases/$version"
+mkdir -p "$prefix/releases"
+if [[ ! -d "$target" ]]; then
+  staged=$(mktemp -d "$prefix/releases/.install.XXXXXXXX")
+  cp -R "$package/." "$staged/"
+  mv -- "$staged" "$target"
+fi
+market=$(market_name "$version")
+for cli in "${clients[@]}"; do
+  receipt="$prefix/installed/$cli"
+  old=
+  if [[ -f "$receipt" ]]; then old=$(cat "$receipt");valid_version "$old" || fail 'Invalid installed-version receipt.';fi
+  if [[ "$old" == "$version" ]]; then printf '%s already at %s\n' "$cli" "$version";continue;fi
+  if [[ "$cli" == claude ]]; then
+    claude plugin marketplace add "$target" --scope user
+    claude plugin install "kimchi-work@$market" --scope user
+  else
+    codex plugin marketplace add "$target" --json
+    codex plugin add "kimchi-work@$market" --json
+  fi
+  # Record a successful new install before removing only our preceding version.
+  printf '%s\n' "$version" > "$receipt.new"
+  mv -- "$receipt.new" "$receipt"
+  if [[ -n "$old" ]]; then
+    previous=$(market_name "$old")
+    if [[ "$cli" == claude ]]; then
+      claude plugin uninstall "kimchi-work@$previous" --scope user
+      claude plugin marketplace remove "$previous"
+    else
+      codex plugin remove "kimchi-work@$previous" --json
+      codex plugin marketplace remove "$previous" --json
+    fi
+  fi
+done
+ln -s "$target/bin/kimchi-adapters" "$bin_dir/.kimchi-adapters.new.$$"
+mv -f -- "$bin_dir/.kimchi-adapters.new.$$" "$bin_dir/kimchi-adapters"
+# Keep the bootstrap, rather than a package-bound script, for future updates.
+cp "$target/bootstrap.sh" "$prefix/install.sh"
+chmod 700 "$prefix/install.sh"
+"$bin_dir/kimchi-adapters" activate
+printf '%s\n' "Installed $client $version. Start a new client session and accept its plugin trust prompt." "Control: $bin_dir/kimchi-adapters status" 'Configure reporting once with kimchi-adapters configure (JSON on stdin). Existing inference and enterprise telemetry settings are unchanged.'
