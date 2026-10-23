@@ -11,7 +11,7 @@ Requires access to this private repository, authenticated `gh`, and the official
 Download `install.sh` from the selected private GitHub release, then run:
 
 ```sh
-bash install.sh install claude v0.1.0-rc.1 # or codex, or both
+bash install.sh install claude v0.1.0-rc.5 # or codex, or both
 kimchi-adapters status
 ```
 

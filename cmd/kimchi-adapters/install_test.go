@@ -67,6 +67,7 @@ func TestBootstrapRejectsCorruptAndUnsafeArchives(t *testing.T) {
 				t.Fatal(err)
 			}
 			gh := `#!/bin/sh
+if [ "$1" = release ] && [ "$2" = list ]; then printf '%s\n' v0.1.0-rc.5;exit 0;fi
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --dir ]; then dest=$2;shift 2;else shift;fi
 done
@@ -79,7 +80,7 @@ cp "$FIXTURE_SUMS" "$dest/SHA256SUMS"
 			if err = os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			cmd := exec.Command("bash", installer, "install", "claude", "v0.1.0-rc.1")
+			cmd := exec.Command("bash", installer, "install", "claude")
 			cmd.Env = []string{"HOME=" + root, "PATH=" + bin + ":/usr/bin:/bin", "KIMCHI_ADAPTERS_PREFIX=" + root + "/install", "KIMCHI_ADAPTERS_BIN_DIR=" + root + "/bin", "FIXTURE_ASSET=" + asset, "FIXTURE_SUMS=" + sums, "FIXTURE_NAME=" + name}
 			out, err := cmd.CombinedOutput()
 			if err == nil {

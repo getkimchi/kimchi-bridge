@@ -79,7 +79,7 @@ if [[ -f "$script_root/VERSION" && -x "$script_root/bin/kimchi-adapters" ]]; the
 else
   command -v gh >/dev/null || fail 'Private releases require GitHub CLI. Install gh and run gh auth login.'
   version=$requested
-  [[ -n "$version" ]] || version=$(gh release view --repo "$repo" --json tagName --jq .tagName)
+  [[ -n "$version" ]] || version=$(gh release list --repo "$repo" --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')
   valid_version "$version" || fail 'Specify a release such as v0.1.0-rc.1.'
   case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) fail 'Supported platforms: macOS and Linux.' ;; esac
   case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=amd64 ;; *) fail 'Supported CPUs: arm64 and amd64.' ;; esac
