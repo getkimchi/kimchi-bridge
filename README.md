@@ -1,110 +1,104 @@
-# Kimchi work adapters
+# Kimchi PR-cost plugins
 
-Two independent plugins for the official Claude Code and Codex CLIs. Each bundles a recorder, durable SQLite outbox and background uploader. Both share the same local work registry. Inference goes to the user's existing provider or gateway; normalized work records go directly to the Cast API.
+Two plugins for the official Claude Code and Codex CLIs. Both use one shared TypeScript recorder and SQLite outbox. Native hooks and Claude mod timers run short commands; no daemon or inference proxy is required. Inference uses the client’s existing provider. Normalized work records go directly to the Cast API.
 
-This is a release candidate. Direct reporting requires the companion ai-optimizer API and console changes to be deployed with their generated RBAC policy. An older server leaves uploads pending. No production rollout is performed by the installer.
+This is an unpublished release candidate. Reporting needs the companion PR-cost API, console and generated RBAC changes. An older server leaves records queued locally.
 
-## Install
+## Install and authenticate
 
-Requires access to this private repository, authenticated `gh`, and the official client(s) on PATH. macOS and Linux arm64/amd64 builds are provided; native compatibility is verified on macOS with Claude Code 2.1.309 and Codex CLI 0.164.0. Linux binaries must be treated as compiled support until native checks run there. Windows, IDE and cloud sessions are outside this release.
+Requires the official selected clients, authenticated `gh` access to this private repository, and macOS or glibc Linux on arm64/x64. Downloaded plugins contain one self-contained executable; users do not install Node, Bun, pnpm or Go. Native plugin trust remains the client’s ordinary setup step.
 
-The main entry point is Kimchi's installer, which installs Kimchi and pulls the selected adapter release. The adapter option is in [Kimchi PR #1524](https://github.com/getkimchi/kimchi/pull/1524). Until that installer ships in a stable Kimchi release, use this pinned preview of the same script:
+The shared entry point is [Kimchi’s installer change](https://github.com/getkimchi/kimchi/pull/1524), with `--adapters claude`, `--adapters codex` or `--adapters both`. Until that change ships, use its pinned preview:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getkimchi/kimchi/7fbbb81b7876d4734ad7d423fad8fc373aa47417/scripts/install.sh | bash -s -- --adapters both
 ```
 
-Use `--adapters claude` or `--adapters codex` for one client; omitting the option installs Kimchi only. `KIMCHI_VERSION` and `KIMCHI_ADAPTERS_VERSION` pin the two release streams independently. Rerun the same command to update Kimchi and the selected adapters. Once the shared installer is released, the same options work with Kimchi's usual `releases/latest/download/install.sh` URL.
+`KIMCHI_VERSION` and `KIMCHI_ADAPTERS_VERSION` select independent releases. The preview currently downloads published adapter releases; it does not install this uncommitted TypeScript candidate. The release bootstrap verifies checksums, rejects unsafe archive entries, and uses each client’s native plugin manager. Finish active coding sessions before an update or uninstall.
 
-Kimchi's script downloads the private adapter bootstrap through authenticated `gh`; that bootstrap verifies archive SHA256 and paths and uses each client's native plugin manager. No Go or Node installation is needed. Start a new client session and accept its ordinary plugin trust prompt. Add `~/.local/bin` to PATH if needed, then run `kimchi-adapters status`. Finish active coding sessions before updating or removing a plugin. The adapter release's `install.sh` remains the internal provisioning helper and supports existing installations.
+For a standalone installation, run `bash install.sh install both` from the release package. Choose `claude` or `codex` instead of `both` when needed. This does not require the Kimchi harness.
 
-Configure reporting once, with JSON on stdin. Use a private file or a password manager's stdin output; keep credentials out of shell history and Git:
+Install and update keep an already verified reporting account. Otherwise, the installer imports `KIMCHI_API_KEY` or the key in `~/.config/kimchi/config.json`. If no key exists, an interactive install opens browser login; a noninteractive install prints the login command. A key that fails verification leaves the existing configuration intact and reports an error.
+
+```sh
+kimchi-adapters login
+kimchi-adapters status
+```
+
+Browser login opens Kimchi’s existing console flow, where you choose the organization and create a user-owned API key. The key is verified and saved only for reporting. This does not sign the Kimchi harness in or change its inference settings. The installer does not run `kimchi login`, which can reset a custom Kimchi inference endpoint.
+
+Use `kimchi-adapters login --from-kimchi` to explicitly select your current saved Kimchi account. `--region eu` selects Europe for browser login; `login https://your-console.example` uses the existing self-hosted discovery flow. `--no-browser` prints the browser URL for manual opening. Project config and Claude/Codex inference credentials are never imported.
+
+JSON configuration remains available as a backup. Supply a user-owned Kimchi key through a private file or password manager:
 
 ```json
 {
   "apiUrl": "https://api.cast.ai",
-  "organizationId": "YOUR-ORGANIZATION-UUID",
-  "apiKey": "YOUR-USER-REPORTING-KEY"
+  "apiKey": "YOUR-KIMCHI-API-KEY"
 }
 ```
 
-Run `kimchi-adapters configure < /path/to/private/reporting.json`. A user SSO bearer token may be supplied as `accessToken` instead of `apiKey`. The existing `/v1/me` endpoint verifies the user. State is separated by reporting endpoint, organization and actor; a key rotation is verified again. Unassigned records captured before login stay local and are never silently uploaded as the new user. Service-account keys are rejected. The reporting user needs the new ingestion permission; Jira's one-use connection key is not a reporting credential.
+```sh
+kimchi-adapters configure < /path/to/private/reporting.json
+kimchi-adapters status
+```
 
-## Controls and outputs
+`KIMCHI_API_KEY` takes precedence for `configure` and explicit `--from-kimchi` imports. The existing key-verification endpoint discovers the organization; `/v1/me` confirms a matching user. An optional supplied `organizationId` must match. Select the regional/self-hosted reporting API origin when configuring JSON. Existing saved bearer configurations remain readable during upgrades.
+
+Service-account keys are rejected. A normal Kimchi user key needs reporting permission; a restricted reporting-only key may fail the broader existing verification endpoint. Jira’s one-use connection key is not this credential. Account state is separated by verified endpoint, organization and user. Pre-login history stays local; changing login never relabels an existing native session.
+
+## Quiet collection and outputs
+
+Capture saves locally before returning, including file contents before edits. Claude’s mod schedules sync at startup, turn completion and every 30 seconds while open. Codex uses background lifecycle hooks. Sync makes one pass with an eight-second cooperative budget and a ten-second native timeout. Pending work waits for the next trigger when clients are closed. SQLite can finish an already-blocked operation after the cooperative deadline; the native timeout remains the final process bound.
 
 ```sh
-kimchi-adapters status                   # counts, gaps and pending uploads; no credentials
-kimchi-adapters disable                  # stop capture and delivery; retain data
+kimchi-adapters status
+kimchi-adapters disable
 kimchi-adapters enable
-kimchi-adapters flush                    # recover and deliver pending records
-kimchi-adapters export jsonl > work.jsonl # or export csv
-kimchi-adapters update both v0.1.0-rc.1   # independently: claude or codex
-kimchi-adapters uninstall claude
+kimchi-adapters flush
+kimchi-adapters export jsonl > work.jsonl  # or export csv
+kimchi-adapters update both v0.1.0-rc.9
+kimchi-adapters uninstall codex
 ```
 
-Local JSONL/CSV contains normalized revisions, not calculated invoice amounts. CSV protects spreadsheet formula cells. Cast calculates API reference estimates using its existing model catalog and keeps the selected rates with each valuation. Optional `otlpUrl` (the full `/v1/logs` endpoint) and `otlpHeaders` in reporting configuration export normalized OTLP/HTTP JSON logs to a customer collector. Cast and OTLP have separate receipts and credentials. OTLP is at least once; consumers deduplicate by event ID and use the highest entity revision. Native enterprise exporters are never changed.
+Hooks fail open without chat output, context injection or extra model calls. Status exposes gaps and queued uploads. Export contains normalized revisions; CSV protects formula cells. Optional `otlpUrl` and `otlpHeaders` send normalized OTLP/HTTP logs with independent credentials and receipts. A login to another endpoint, organization or user clears these exporter settings; key rotation within the same account preserves them. Existing enterprise exporters remain unchanged.
 
-Default state is `~/.local/state/kimchi-adapters`; installed releases are under `~/.local/share/kimchi-adapters`. Both can be redirected for testing with `KIMCHI_ADAPTERS_HOME` and `KIMCHI_ADAPTERS_PREFIX`. Uninstall retains reporting credentials, ledger and release files, and disables collection after the last plugin is removed. It does not delete customer data.
+## Evidence and pricing
 
-## What is recorded
+| Evidence           | Behavior                                                                                                                                                                                                                                                 |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Work and plans     | Bind each session/turn/agent. Verified saved plan revisions can continue across clients and Git worktrees. Ambiguous matches stay separate. Start explicit new work with `New work: title` on the prompt’s first line. Only that title becomes metadata. |
+| Requests and cache | Read registered native transcripts and exposed Claude telemetry. Preserve token buckets, IDs, model/route and missing fields. Duplicate streams revise one request; mod counters without request IDs stay supplementary.                                 |
+| Tools and files    | Persist native IDs, outcomes, synchronous before-state and observed after-state. Confirm expected edit bytes conservatively. Shell activity, concurrent human changes, fuzzy patches and renames retain weaker evidence.                                 |
+| Git, PR and Jira   | Match exact parent/child blobs only against newly observed commits. Host-bound read-only `gh`/`glab` discovery retains target repository and PR IDs, lifecycle and observed Jira keys.                                                                   |
+| Cost and coverage  | Cast applies its existing rate catalog and PR/Jira accounting. API reference estimates remain separate from verified proxy charges; only exact owned aliases suppress duplicate estimates. Missing usage/prices stay unknown.                            |
 
-Native sessions stay pinned to the reporting account selected at first capture. Changing the global login does not relabel an older open session or upload its queue with the new user's credentials. The running collector continues processing older sessions and pre-login transcripts into their original local queues. Start a new session to record under the new account; select the original verified account to upload its pending records.
+Put portable plans in `plans/` or `.plans/`; native writes register actual revisions. Claude’s exposed plan-mode path is also registered. Refer to the registered file in the other client to continue the same work. A displayed plan alone is not a saved file.
 
-| Evidence | Capture and limits |
-| --- | --- |
-| Work and plans | Persisted session/turn/agent bindings; existing plan path plus content revision; quoted file references and shared Git worktrees. Ambiguous plan ownership is preserved. Ordinary session continuation is inferred. |
-| Requests and cache | Native transcript IDs/counters, Claude request telemetry when exposed, and supplementary mod step counters. Missing buckets stay unknown. Duplicate streams revise the same request. |
-| Tools and files | Native tool IDs, names, outcomes and durations; synchronous preimages and verified native edit results; opaque file/revision IDs on upload. Concurrent or shell changes retain weaker attribution. |
-| Git and PRs | Exact parent-to-child blob matches to newly observed commits, then authenticated read-only `gh`/`glab` commit-to-PR discovery. PR lifecycle and observed title/branch Jira keys feed existing reporting. Automatic whole-work attribution is inferred. |
-| Coverage | Source versions, missing identities/counters, unknown pricing, capture bounds and delivery errors. Status exposes diagnostics; totals must be assessed with coverage. |
+Codex transcript usage supplies the financial records. `PostModelRequest` adds main-loop status and counter coverage, without another charge because it has no stable request ID. Its counters can include synthesized zeroes. Internal thread-title generation is outside this callback; its usage and cost remain unknown. Hidden gateway retries/routing, provider tool charges, subscription invoices and an exact request-to-tool join also remain limited by what the client exposes.
 
-Put portable plans in `plans/` or `.plans/` so verified native writes register them. Claude's exposed `ExitPlanMode` file path is also observed. Referencing the actual registered revision from another client retains its work ID. A displayed plan without a real file is not a saved plan. New prompts retain the session's work by default. Start a separate item in the same session with an ordinary prompt beginning `New work: title` on its first line; that explicit title and its Jira keys become metadata. Remaining prompt text stays local. Task switching without a recognizable boundary remains inferred.
+## Storage, delivery and privacy
 
-Native plugins cannot see hidden gateway retries, model routing or negotiated invoices. Codex does not expose a reliable proxy response-header identity in the tested surfaces, and auxiliary requests can be absent from its transcript. Claude mod steps expose counters without a cross-source response ID, so those counters are supplementary rather than another charge. Subscription dollars and consumed credits remain unknown unless independently exposed. A request's known subtotal is not a complete work cost. Provider tools can incur charges absent from token counters.
+Default state: `~/.local/state/kimchi-adapters`. Releases: `~/.local/share/kimchi-adapters`. Testing can override `KIMCHI_ADAPTERS_HOME` and `KIMCHI_ADAPTERS_PREFIX`. New observations and raw file bytes add SQLite rows, not one file per event/revision. Session pins share one SQLite registry. WAL/SHM files can exist while databases are open. Legacy JSON pins/blobs remain readable.
 
-## Delivery, accounting and retention
+Uploads are immutable record deltas, normally at most 100 events/about 1 MiB. Exact durable batches survive lost acknowledgements. HTTP 413 splits retain event IDs, revisions and order. Server quotes, replay guards and PR/Jira projections use the existing PR-cost domain; PostgreSQL commits before ClickHouse insertion and the ACK. Replay repairs missing detail without a second charge.
 
-Only explicit work titles and PR metadata can contain human text on upload. The rest of a prompt stays local.
+Prompts, source/plan text, paths, file hashes, tool arguments/results and credentials are excluded from upload. Explicit work titles and provider PR metadata can contain human text. Raw local evidence shares a 256 MiB account cap across old/new storage and has a 4 MiB file limit. When sync runs, its hourly sweep removes raw evidence older than seven days across active and inactive accounts. Normalized records have a 1 GiB account cap; pending financial records are not age-deleted. Disabled/uninstalled collection retains state until resumed or explicitly removed.
 
-Uploads are record deltas, normally at most 100 events and about 1 MiB. A 413 response splits durable batches into smaller parts, retaining event IDs, revisions and order. A lost ACK replays the same part; unchanged observations produce no new upload. One record that cannot fit remains pending with a diagnostic. No work item must fit in one request, and records are never sent as partial legacy inventories.
+## Development and regression checks
 
-The API uses the existing generated gateway, pricing catalog and PR/Jira bill union. Detailed normalized events are batch-inserted directly into ClickHouse without Pub/Sub. PostgreSQL retains financial quotes, effective attribution and compact revision/receipt guards. The server ACK follows both writes; a failed ClickHouse write is repaired by durable client replay. This is not a cross-database atomic transaction. Exact owned proxy aliases use verified billing and suppress an additional estimate. API estimates and verified charges remain separate; unmatched identities do not imply zero or prove that two observations are different bills.
-
-Prompts, source text, plan text, paths, file hashes, tool arguments/results and credentials are excluded from upload. Local before/after file contents are private evidence: seven days, at most 256 MiB, with 4 MiB per file and bounded capture work. Tool/preimage detail expires after seven days. Normalized records have a 1 GiB hard capacity; pending accounting is not age-deleted. At capacity capture fails open and status shows a gap; export and investigate before removing state. Compact plan/identity metadata remains local. Server detailed logs expire after 90 days from first receipt; financial quotes and replay guards follow accounting retention and organization deletion policy.
-
-## Run the isolated probe
-
-Retention is enforced while the collector runs and at its next start, including expired detail from previous accounts and pre-login state. Disabling or uninstalling retains local files until collection resumes or the user removes them. The normalized capacity is 1 GiB **per account**. Financial server history has no automatic time expiry in this release; organization cleanup must include the adapter's org-scoped tables alongside existing PR accounting.
-
-Requirements: macOS with `sandbox-exec`, Go 1.26.2, and the official `claude` and `codex` executables on PATH. Tested native versions: Claude Code 2.1.309 and Codex CLI 0.164.0. Linux execution deliberately fails closed until an equivalent isolation boundary is implemented.
-
-From the repository root:
+Development requires pnpm 10 and Bun 1.4. The shipped helper includes that runtime. SQLite, Temporal, URL, JSON and filesystem APIs are native; Markdown references use mdast, shell syntax uses shell-quote, and V4A edit application uses the official OpenAI Agents SDK. Conservative attribution checks remain around its fuzzy matching. Runtime/build source has an AST regression check prohibiting local regular expressions.
 
 ```sh
-go test -race ./...
-go vet ./...
-go build -o "$HOME/.local/state/kimchi-adapters/probe-bin/capture-probe" ./cmd/capture-probe
-"$HOME/.local/state/kimchi-adapters/probe-bin/capture-probe" \
-  --root "$HOME/.local/state/kimchi-adapters/probes/run-$(date +%s)" \
-  --fixtures "$PWD/probes" --harness both --paired
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm test
+pnpm build
+bash scripts/package.sh v0.1.0-rc.9 dist
 ```
 
-The scratch directory must be new, absolute, and outside the repository. Choose `--harness claude` or `--harness codex` to run one pair. Every selected harness runs once without capture and once with capture. The synthetic provider asks the official CLI to change `probe.txt` from `before` to `after`, then reply `done`.
+The Go implementation is frozen separately as a regression oracle. Checked-in Go-generated wire/hash fixtures and a populated legacy SQLite fixture test byte-compatible identities, hash chains and restart delivery without Go installed. Tests also cover account isolation, retries/splits, raw caps, plan handoff, symlink races, deadlines and installer refusal/cleanup.
 
-## What the probe verifies
+The private native lab drives official clients through Driver/TMUX under an OS network/file gate and a fake loopback provider. It compares model payloads/replies, usage and durable file evidence. It never uses production inference, real credentials or normal-HOME plugin settings. Its frozen checker and failed/passing receipts stay outside this product repository. Linux CLI hooks, IDE/cloud sessions, concurrent native sessions, compaction and WebSockets need separate surface-specific evidence before broader support claims.
 
-- An OS gate permits the loopback fixture endpoint and requires explicit denial of external networking and a private-file canary before native processes start. Disposable HOME/config paths and an environment allowlist prevent inheriting account credentials. No real provider inference is used.
-- Claude loads a scratch plugin with native mod events. Codex installs a scratch local-marketplace plugin with command hooks. Native OTLP can be enabled only in the disposable fixture; `--native-telemetry=false` checks the defaults. Registration and activation evidence is retained.
-- The fixture recorder fsyncs synthetic pre/post edit state before returning. Pass `--product /absolute/path/to/kimchi-adapters --fixtures "$PWD/plugins"` to test the bundled product instead. Assertions require matching tool identities, state and pre-before-post ordering.
-- Provider request counts, normalized request payloads, and final replies are compared. Normalization removes scratch paths, known generated identity metadata and native chunk IDs—not prompts, tools, models, or actual tool output. Full native stdout and stderr remain available separately; final-reply equality does not mean byte-identical lifecycle output.
-- Raw synthetic records stay in the private scratch directory. The probe does not upload to Cast or a remote collector. `.kimchi/docs/` is local-only and ignored by Git.
-
-## Evidence and limits
-
-Each run saves `report.json`, setup receipts, private native stdout/stderr, provider `wire/` records, `events/`, `otlp/`, and native scratch transcripts. Files are bounded and private. `retention.json` records a seven-day expiry target; automated deletion is **not** implemented. Keep these synthetic captures out of Git and remove expired run directories after review.
-
-A passing basic probe covers SSE, one turn, serial tools, a synthetic API key and a fake model catalog. It does not establish full coverage under concurrency, cancellation, compaction or WebSockets. Codex traces and logs have been inspected: their usage and turn identities cannot reliably be joined at request level; transcript recovery remains the accounting source. Fake-provider wire identifiers are test ground truth, not an identity the direct-upload plugin may invent.
-
-Native telemetry can contain tool arguments/output even with prompt logging disabled. The uploader exports only the typed allowlist, never native bodies. Usage from step, turn, transcript and telemetry overlaps; do not sum these streams. Subscription costs and rate-card estimates are not invoice evidence.
-
-The probe never activates a plugin in the normal HOME or calls production inference. Use `--driver` for the real interactive clients controlled through Driver/TMUX. `--installer-package /absolute/path/to/archive.tar.gz` checks native install/status/reinstall/uninstall under the same OS gate.
+Use `pnpm exec bun scripts/benchmark.ts --baseline /absolute/path/to/frozen-go --candidate "$PWD/bin/kimchi-adapters" --out /absolute/path/to/new-results` for the executable comparison. Report medians/p95, sample counts, memory and archive bytes independently; TypeScript alone does not imply smaller or faster. Native syscall bridging uses Bun FFI for rooted openat and the existing flock; Bun documents FFI as experimental, so platform smoke tests and pinned-runtime upgrades are required.

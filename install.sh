@@ -110,6 +110,10 @@ if [[ ! -d "$target" ]]; then
 fi
 market=$(market_name "$version")
 for cli in "${clients[@]}"; do
+  mkdir -p "$target/plugins/$cli/bin"
+  if [[ ! -e "$target/plugins/$cli/bin/kimchi-adapters" ]]; then
+    ln "$target/bin/kimchi-adapters" "$target/plugins/$cli/bin/kimchi-adapters"
+  fi
   receipt="$prefix/installed/$cli"
   old=
   if [[ -f "$receipt" ]]; then old=$(cat "$receipt");valid_version "$old" || fail 'Invalid installed-version receipt.';fi
@@ -140,4 +144,15 @@ mv -f -- "$bin_dir/.kimchi-adapters.new.$$" "$bin_dir/kimchi-adapters"
 cp "$target/bootstrap.sh" "$prefix/install.sh"
 chmod 700 "$prefix/install.sh"
 "$bin_dir/kimchi-adapters" activate
-printf '%s\n' "Installed $client $version. Start a new client session and accept its plugin trust prompt." "Control: $bin_dir/kimchi-adapters status" 'Configure reporting once with kimchi-adapters configure (JSON on stdin). Existing inference and enterprise telemetry settings are unchanged.'
+if configured=$("$bin_dir/kimchi-adapters" login --from-kimchi --if-present); then
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+  elif [[ -t 1 ]]; then
+    "$bin_dir/kimchi-adapters" login || fail "Plugins installed; reporting login was not completed. Run $bin_dir/kimchi-adapters login to retry."
+  else
+    printf '%s\n' "Sign in once: $bin_dir/kimchi-adapters login (opens the same key-creation flow as Kimchi)."
+  fi
+else
+  fail "Plugins installed; the saved Kimchi login could not be verified. Run $bin_dir/kimchi-adapters login to create a reporting key."
+fi
+printf '%s\n' "Installed $client $version. Start a new client session and accept its plugin trust prompt." "Control: $bin_dir/kimchi-adapters status" 'Existing inference and enterprise telemetry settings are unchanged.'

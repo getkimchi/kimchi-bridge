@@ -12,21 +12,34 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
         with:
-          go-version-file: go.mod
-          cache: true
-      - run: go test -race ./...
-      - run: go vet ./...
+          node-version: 22
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm format:check
+      - run: pnpm test
+      - run: pnpm build
       - run: bash -n install.sh scripts/package.sh
-      - run: test -z "$(gofmt -l cmd internal protocol)"
+      - run: git diff --check
   package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
         with:
-          go-version-file: go.mod
+          node-version: 22
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: pnpm install --frozen-lockfile
       - run: bash scripts/package.sh v0.1.0-rc.1 dist
       - uses: actions/upload-artifact@v4
         with:
