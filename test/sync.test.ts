@@ -84,27 +84,33 @@ test("wallclock deadlines survive a blocked event loop and nested operation budg
   expect(() => RemainingTime(nested, 2000)).toThrow();
 });
 
-test("sync stops after a blocking recovery exceeds its inherited deadline and releases the lock", async () => {
+test("sync stops when recovery exhausts its inherited deadline and releases the lock", async () => {
   Save({});
   const s = Open(StateDir({}));
   s.DB.query("INSERT INTO meta(key,value) VALUES('pruned-at',?)").run(
     Math.floor(Date.now() / 1000),
   );
   s.Close();
-  const recovery = spyOn(Recorder.prototype, "RecoverContext").mockImplementation(() => {
-    const until = Date.now() + 30;
-    while (Date.now() < until) {
-      /* stand in for a blocking native read */
-    }
+  const initialNow = Date.now();
+  let now = initialNow;
+  const clock = spyOn(Date, "now").mockImplementation(() => now);
+  const recovery = spyOn(Recorder.prototype, "RecoverContext").mockImplementation((signal) => {
+    CheckSignal(signal);
+    now += 30;
   });
   try {
-    await expect(Run({}, WithDeadline(20))).rejects.toThrow();
+    await expect(Run({}, WithDeadline(20))).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(now).toBe(initialNow + 30);
     expect(recovery).toHaveBeenCalledTimes(1);
     const guard = lockSync(StateDir({}));
     expect(guard).not.toBeNull();
     guard!.close();
+    recovery.mockImplementation((signal) => CheckSignal(signal));
+    await Run({});
+    expect(recovery).toHaveBeenCalledTimes(3);
   } finally {
     recovery.mockRestore();
+    clock.mockRestore();
   }
 });
 
