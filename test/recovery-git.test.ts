@@ -194,6 +194,75 @@ test("Claude telemetry and transcript revise one request and attach its exact to
   expect(() => RecoverContext(r)).toThrow("transcript recovery incomplete");
 });
 
+test.each(["flat", "nested", "mixed", "zero-flat", "invalid-flat"])(
+  "Claude %s iteration counters survive transcript recovery",
+  (shape) => {
+    const { root, store, r, scope } = fixture("claude-code");
+    const path = join(root, "claude.jsonl");
+    registerTranscript(r, scope, path, "customer-gateway", "unknown");
+    const raw = {
+      input_tokens: 101,
+      output_tokens: 11,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 7,
+      cache_creation: { ephemeral_5m_input_tokens: 3, ephemeral_1h_input_tokens: 4 },
+    };
+    const iteration = shape === "nested" ? { usage: raw } : { ...raw };
+    if (shape === "mixed")
+      Object.assign(iteration, { usage: { input_tokens: 999, output_tokens: 999 } });
+    const first =
+      shape === "zero-flat" || shape === "invalid-flat"
+        ? { input_tokens: shape === "zero-flat" ? 0 : "invalid", usage: raw }
+        : iteration;
+    writeFileSync(
+      path,
+      JSON.stringify({
+        type: "assistant",
+        timestamp: at,
+        message: {
+          id: "flat-iterations",
+          model: "returned",
+          usage: {
+            input_tokens: 202,
+            output_tokens: 22,
+            iterations: [
+              { type: "message", model: "primary", ...first },
+              { type: "fallback_message", model: "returned", input_tokens: 202, output_tokens: 22 },
+            ],
+          },
+        },
+      }) + "\n",
+    );
+    RecoverContext(r);
+    const event = latest(store, "usage");
+    expect(event.usage.raw).toEqual({ inputTokens: "202", outputTokens: "22" });
+    expect(event.usage.iterations.map((item: any) => [item.model, item.raw])).toEqual([
+      [
+        "primary",
+        shape === "zero-flat"
+          ? { inputTokens: "0" }
+          : shape === "invalid-flat"
+            ? {}
+            : {
+                inputTokens: "101",
+                outputTokens: "11",
+                cacheReadTokens: "0",
+                cacheWriteTokens: "7",
+                cacheWrites: [
+                  { ttlSeconds: 300, tokens: "3" },
+                  { ttlSeconds: 3600, tokens: "4" },
+                ],
+              },
+      ],
+      ["returned", { inputTokens: "202", outputTokens: "22" }],
+    ]);
+    RecoverContext(r);
+    expect(
+      (store.DB.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
+    ).toBe(1);
+  },
+);
+
 test("SCM IDs remain exact, target repository owns fork PRs and credentials stay host-bound", () => {
   const source = { provider: "github", host: "github.com", name: "fork/repo", id: "name:fixture" };
   const raw = Parse(

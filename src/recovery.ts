@@ -258,11 +258,18 @@ function consume(r: Recorder, t: Transcript, v: Object, _offset: number) {
   if (Array.isArray(raw.iterations) && raw.iterations.length)
     u.iterations = raw.iterations.map((item: unknown, i: number) => {
       const it = obj(item);
+      const flat = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation",
+      ].some((key) => Object.hasOwn(it, key));
       return {
         id: str(it, "id") || StableID(response, Hash(i)),
         model: str(it, "model"),
         schema: u.schema,
-        raw: claudeUsage(obj(it.usage)),
+        raw: claudeUsage(flat ? it : obj(it.usage)),
         stopReason: str(it, "stop_reason"),
         billingStatus: str(it, "billing_status"),
       };
