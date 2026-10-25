@@ -14,7 +14,7 @@ The shared entry point is [Kimchi’s installer change](https://github.com/getki
 curl -fsSL https://raw.githubusercontent.com/getkimchi/kimchi/7fbbb81b7876d4734ad7d423fad8fc373aa47417/scripts/install.sh | bash -s -- --adapters both
 ```
 
-`KIMCHI_VERSION` and `KIMCHI_ADAPTERS_VERSION` select independent releases. The preview currently downloads published adapter releases; it does not install this uncommitted TypeScript candidate. The release bootstrap verifies checksums, rejects unsafe archive entries, and uses each client’s native plugin manager. Finish active coding sessions before an update or uninstall.
+`KIMCHI_VERSION` and `KIMCHI_ADAPTERS_VERSION` select independent releases. The preview currently downloads published adapter releases; it installs this TypeScript build only once it is released. The release bootstrap verifies checksums, rejects unsafe archive entries, and uses each client’s native plugin manager. Finish active coding sessions before an update or uninstall.
 
 For a standalone installation, run `bash install.sh install both` from the release package. Choose `claude` or `codex` instead of `both` when needed. This does not require the Kimchi harness.
 
@@ -81,7 +81,7 @@ Codex transcript usage supplies the financial records. `PostModelRequest` adds m
 
 Default state: `~/.local/state/kimchi-adapters`. Releases: `~/.local/share/kimchi-adapters`. Testing can override `KIMCHI_ADAPTERS_HOME` and `KIMCHI_ADAPTERS_PREFIX`. New observations and raw file bytes add SQLite rows, not one file per event/revision. Session pins share one SQLite registry. WAL/SHM files can exist while databases are open. Legacy JSON pins/blobs remain readable.
 
-Uploads are immutable record deltas, normally at most 100 events/about 1 MiB. Exact durable batches survive lost acknowledgements. HTTP 413 splits retain event IDs, revisions and order. Server quotes, replay guards and PR/Jira projections use the existing PR-cost domain; PostgreSQL commits before ClickHouse insertion and the ACK. Replay repairs missing detail without a second charge.
+Uploads are immutable record deltas, normally at most 100 events/about 1 MiB. Exact durable batches survive lost acknowledgements. HTTP 413 splits retain event IDs, revisions and order. Server quotes, replay guards and PR/Jira projections use the existing PR-cost domain; PostgreSQL commits, then the server publishes the detailed logs for ClickHouse before the ACK. Replay republishes missing detail without a second charge.
 
 Prompts, source/plan text, paths, file hashes, tool arguments/results and credentials are excluded from upload. Explicit work titles and provider PR metadata can contain human text. Raw local evidence shares a 256 MiB account cap across old/new storage and has a 4 MiB file limit. When sync runs, its hourly sweep removes raw evidence older than seven days across active and inactive accounts. Normalized records have a 1 GiB account cap; pending financial records are not age-deleted. Disabled/uninstalled collection retains state until resumed or explicitly removed.
 
