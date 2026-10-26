@@ -99,7 +99,7 @@ export async function Run(c: Config, signal?: AbortSignal): Promise<void> {
       const now = Math.floor(Date.now() / 1000);
       if (now - (row?.value ?? 0) >= 3600) {
         try {
-          await PruneAccounts(Root(), new Date(), signal);
+          PruneAccounts(Root(), new Date(), signal);
           s.SetMeta("pruned-at", String(now));
         } catch {
           s.Diagnostic("retention_failed");
@@ -108,19 +108,19 @@ export async function Run(c: Config, signal?: AbortSignal): Promise<void> {
       for (const source of ["claude-code", "codex"]) {
         CheckSignal(signal);
         try {
-          await new Recorder(s, source, device).RecoverContext(signal);
+          new Recorder(s, source, device).RecoverContext(signal);
         } catch {
           s.Diagnostic("recovery_failed");
         }
       }
       try {
-        await recoverInactiveAccounts(Root(), s.Dir, signal);
+        recoverInactiveAccounts(Root(), s.Dir, signal);
       } catch {
         s.Diagnostic("inactive_account_recovery_failed");
       }
       CheckSignal(signal);
       try {
-        await new Recorder(s, "collector", device).ReconcileGit(signal);
+        new Recorder(s, "collector", device).ReconcileGit(signal);
       } catch {
         s.Diagnostic("git_reconciliation_incomplete");
       }

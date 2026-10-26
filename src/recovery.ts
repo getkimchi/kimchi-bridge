@@ -146,7 +146,7 @@ function recoverFile(r: Recorder, t: Transcript, signal?: AbortSignal) {
               CheckSignal(signal);
               if (end + 1 > 4 * 1024 * 1024) throw new Error("transcript record exceeds bound");
               const line = pending.subarray(0, end + 1);
-              consume(r, t, obj(Parse(line.toString())), offset);
+              consume(r, t, obj(Parse(line.toString())));
               offset += line.length;
               consumed += line.length;
               pending = pending.subarray(end + 1);
@@ -175,7 +175,7 @@ function timestamp(value: string): string {
   return CanonicalTime(value);
 }
 
-function consume(r: Recorder, t: Transcript, v: Object, _offset: number) {
+function consume(r: Recorder, t: Transcript, v: Object) {
   const s = { ...t.scope };
   if (r.Source === "codex" && str(v, "type") === "session_meta") {
     const value = str(obj(v.payload), "cli_version");
