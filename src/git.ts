@@ -75,12 +75,8 @@ const fields = (s: string) =>
     .filter(Boolean);
 const seconds = () => Math.floor(Date.now() / 1000);
 const rootOf = (s: Scope) => s.Root || s.CWD;
-const value = (r: Recorder, key: string) =>
-  (r.Store.DB.query("SELECT value FROM meta WHERE key=?").get(key) as any)?.value ?? "";
 export function saveMeta(r: Recorder, key: string, data: unknown) {
-  r.Store.DB.query(
-    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-  ).run(key, Stringify(data));
+  r.Store.SetMeta(key, Stringify(data));
 }
 export function refTips(root: string): string[] | null {
   try {
@@ -100,13 +96,11 @@ export function refTips(root: string): string[] | null {
 export function ReconcileGit(r: Recorder, signal?: AbortSignal) {
   signal = WithDeadline(8000, signal);
   CheckSignal(signal);
-  if (seconds() - Number(value(r, "git-last-pass")) < 60) return;
-  r.Store.DB.query(
-    "INSERT INTO meta(key,value) VALUES('git-last-pass',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-  ).run(seconds());
+  if (seconds() - Number(r.Store.Meta("git-last-pass")) < 60) return;
+  r.Store.SetMeta("git-last-pass", String(seconds()));
   const items = r.Store.DB.query(
     "SELECT key,value FROM meta WHERE (key LIKE 'git-change:%' OR key LIKE 'tracked-commit:%') AND key>? ORDER BY key LIMIT 32",
-  ).all(value(r, "git-pass-after")) as { key: string; value: string }[];
+  ).all(r.Store.Meta("git-pass-after")) as { key: string; value: string }[];
   if (!items.length) {
     r.Store.DB.query("DELETE FROM meta WHERE key='git-pass-after'").run();
     return;
@@ -119,9 +113,7 @@ export function ReconcileGit(r: Recorder, signal?: AbortSignal) {
       r.Store.Diagnostic("git_reconciliation_budget_exceeded");
       break;
     }
-    r.Store.DB.query(
-      "INSERT INTO meta(key,value) VALUES('git-pass-after',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-    ).run(item.key);
+    r.Store.SetMeta("git-pass-after", item.key);
     if (item.key.startsWith("tracked-commit:")) {
       const c: TrackedCommit = JSON.parse(item.value);
       if (Date.now() - Date.parse(c.CreatedAt) > 90 * 86400_000) {
@@ -214,7 +206,7 @@ function matchCommits(r: Recorder, c: GitChange, deadline: number, signal?: Abor
       r.Store.Observe(link);
     }
     const key = `tracked-commit:${StableID(c.Scope.Repo, sha)}`;
-    if (!value(r, key))
+    if (!r.Store.Meta(key))
       saveMeta(r, key, {
         Scope: c.Scope,
         Source: c.Source,

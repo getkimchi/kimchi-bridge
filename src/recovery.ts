@@ -24,12 +24,6 @@ interface Transcript {
   route: string;
   basis: string;
 }
-const rowValue = (r: Recorder, key: string): string =>
-  (r.Store.DB.query("SELECT value FROM meta WHERE key=?").get(key) as any)?.value ?? "";
-const setValue = (r: Recorder, key: string, value: string) =>
-  r.Store.DB.query(
-    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-  ).run(key, value);
 const textBody = (v: unknown) =>
   typeof v === "string" ? v : Buffer.from(v as Uint8Array).toString();
 const wireInteger = (v: unknown) => {
@@ -80,8 +74,7 @@ export function registerTranscript(
   basis: string,
 ) {
   if (!isAbsolute(path) || !path.endsWith(".jsonl")) throw new Error("invalid transcript path");
-  setValue(
-    r,
+  r.Store.SetMeta(
     `transcript:${r.Source}:${path}`,
     Stringify({ path, scope: s, route: observedRoute || "unknown", basis: basis || "unknown" }),
   );
@@ -123,7 +116,7 @@ function recoverFile(r: Recorder, t: Transcript, signal?: AbortSignal) {
       r.Store.Diagnostic("transcript_truncated");
       throw new Error("transcript was truncated");
     }
-    const context = rowValue(r, `cursor-context:${t.path}`);
+    const context = r.Store.Meta(`cursor-context:${t.path}`);
     if (context) {
       try {
         t = JSON.parse(context);
@@ -169,7 +162,7 @@ function recoverFile(r: Recorder, t: Transcript, signal?: AbortSignal) {
           r.Store.DB.query(
             "INSERT INTO cursors(path,offset) VALUES(?,?) ON CONFLICT(path) DO UPDATE SET offset=excluded.offset",
           ).run(t.path, offset);
-          setValue(r, `cursor-context:${t.path}`, Stringify(t));
+          r.Store.SetMeta(`cursor-context:${t.path}`, Stringify(t));
         }).immediate();
         if (failed) throw failure;
       }
@@ -204,7 +197,7 @@ function consume(r: Recorder, t: Transcript, v: Object, _offset: number) {
     const p = obj(v.payload);
     if (str(v, "type") === "turn_context") {
       t.scope.Turn = str(p, "turn_id");
-      setValue(r, `model:${t.path}`, str(p, "model"));
+      r.Store.SetMeta(`model:${t.path}`, str(p, "model"));
       return;
     }
     const info = obj(p.info);
@@ -219,7 +212,7 @@ function consume(r: Recorder, t: Transcript, v: Object, _offset: number) {
       provider: "openai",
       raw: openAIUsage(info.last_token_usage),
       attemptsComplete: false,
-      reportedModel: rowValue(r, `model:${t.path}`),
+      reportedModel: r.Store.Meta(`model:${t.path}`),
     };
     const e = r.event(s, `token-count:${Hash(info.total_token_usage)}`, r.workExact(s));
     e.observeTime = observed;
@@ -230,7 +223,7 @@ function consume(r: Recorder, t: Transcript, v: Object, _offset: number) {
   }
   if (str(v, "type") === "user") {
     const prompt = str(v, "promptId");
-    if (prompt) t.scope.Turn = rowValue(r, `prompt-turn:${s.Session}:${prompt}`);
+    if (prompt) t.scope.Turn = r.Store.Meta(`prompt-turn:${s.Session}:${prompt}`);
     return;
   }
   const m = obj(v.message),
@@ -279,7 +272,7 @@ function consume(r: Recorder, t: Transcript, v: Object, _offset: number) {
     work = r.work(s);
     if (work) u.correlation = "inherited_agent_work";
   }
-  const turn = rowValue(r, `response-turn:${s.Session}:${response}`);
+  const turn = r.Store.Meta(`response-turn:${s.Session}:${response}`);
   if (turn) s.Turn = turn;
   if (s.Turn) {
     work = r.workExact(s);
@@ -305,7 +298,7 @@ function attachToolRequest(r: Recorder, s: Scope, call: string, request: string)
     request = "";
     r.Store.Diagnostic("tool_request_identity_conflict");
   }
-  setValue(r, key, request);
+  r.Store.SetMeta(key, request);
   const entity = r.event(s, `tool:${call}`, "").entityId;
   const row = r.Store.DB.query(
     "SELECT body FROM events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1",
@@ -387,7 +380,7 @@ export function telemetry(r: Recorder, s: Scope, e: Object, observedRoute: strin
   }
   s = { ...s, Turn: "" };
   const prompt = str(a, "prompt.id");
-  if (prompt) s.Turn = rowValue(r, `prompt-turn:${s.Session}:${prompt}`);
+  if (prompt) s.Turn = r.Store.Meta(`prompt-turn:${s.Session}:${prompt}`);
   const event = r.event(s, requestEntity("", request), s.Turn ? r.workExact(s) : r.work(s));
   const existing = r.Store.DB.query(
     "SELECT body FROM events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1",

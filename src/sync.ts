@@ -107,9 +107,7 @@ export async function Run(c: Config, signal?: AbortSignal): Promise<void> {
       if (now - (row?.value ?? 0) >= 3600) {
         try {
           await PruneAccounts(Root(), new Date(), signal);
-          s.DB.query(
-            "INSERT INTO meta(key,value) VALUES('pruned-at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-          ).run(now);
+          s.SetMeta("pruned-at", String(now));
         } catch {
           s.Diagnostic("retention_failed");
         }

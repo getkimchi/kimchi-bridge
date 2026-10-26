@@ -70,13 +70,6 @@ export const integer = Integer;
 export const digest = (bytes: Uint8Array | string): string =>
   createHash("sha256").update(bytes).digest("hex");
 const rootOf = (s: Scope) => s.Root || s.CWD;
-const value = (r: Recorder, key: string): string =>
-  (r.Store.DB.query("SELECT value FROM meta WHERE key=?").get(key) as { value: string } | null)
-    ?.value ?? "";
-const setValue = (r: Recorder, key: string, body: string) =>
-  r.Store.DB.query(
-    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-  ).run(key, body);
 
 export function repository(cwd: string): [string, string, Repository | undefined] {
   try {
@@ -322,7 +315,7 @@ export class Recorder {
     return {
       entityId: StableID(source, s.Session, entity),
       source,
-      sourceVersion: value(this, `source-version:${source}:${s.Session}`) || "unknown",
+      sourceVersion: this.Store.Meta(`source-version:${source}:${s.Session}`) || "unknown",
       deviceId: this.Device,
       observeTime: new Date().toISOString(),
       repository: s.Repository,
@@ -345,8 +338,7 @@ export class Recorder {
     const exact = this.workExact(s);
     return (
       exact ||
-      value(
-        this,
+      this.Store.Meta(
         s.Agent
           ? `agent-work:${this.Source}:${s.Session}:${s.Agent}`
           : `${this.Source}:${s.Session}:work`,
@@ -408,8 +400,8 @@ export class Recorder {
         "INSERT INTO bindings(source,session_id,turn_id,agent_id,work_id,repository) VALUES(?,?,?,?,?,?)",
       ).run(this.Source, s.Session, s.Turn, s.Agent, work, s.Repo);
       if (!s.Agent) {
-        setValue(this, `${this.Source}:${s.Session}:turn`, s.Turn);
-        setValue(this, `${this.Source}:${s.Session}:work`, work);
+        this.Store.SetMeta(`${this.Source}:${s.Session}:turn`, s.Turn);
+        this.Store.SetMeta(`${this.Source}:${s.Session}:work`, work);
       }
       const e = this.event(s, `binding:${s.Turn}`, work);
       e.work = { reason, quality, title, issueKeys: keys };
@@ -459,9 +451,9 @@ export class Recorder {
     if (n.version) version(this, s.Session, n.version);
     if (str(e, "transcript_path") && this.Source === "codex")
       transcriptVersion(this, s.Session, str(e, "transcript_path"));
-    if (!modelRequest) s.Turn ||= value(this, `${this.Source}:${s.Session}:turn`);
+    if (!modelRequest) s.Turn ||= this.Store.Meta(`${this.Source}:${s.Session}:turn`);
     if (stage === "classic.UserPromptSubmit" && str(e, "prompt_id"))
-      setValue(this, `pending-prompt:${s.Session}`, str(e, "prompt_id"));
+      this.Store.SetMeta(`pending-prompt:${s.Session}`, str(e, "prompt_id"));
     if (stage === "turn.start" || stage === "UserPromptSubmit") {
       if (!s.Turn) throw new Error("prompt has no turn identity");
       this.bind(s, str(e, "text", "prompt"));
@@ -469,7 +461,7 @@ export class Recorder {
     if (s.Turn) {
       const prompt =
         str(e, "prompt_id") ||
-        (stage === "turn.start" ? value(this, `pending-prompt:${s.Session}`) : "");
+        (stage === "turn.start" ? this.Store.Meta(`pending-prompt:${s.Session}`) : "");
       if (prompt)
         this.Store.DB.query("INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)").run(
           `prompt-turn:${s.Session}:${prompt}`,
@@ -502,7 +494,7 @@ export class Recorder {
     if (modelRequest) {
       const boundWork =
         (s.Turn ? this.workExact(s) : "") ||
-        (s.Agent ? value(this, `agent-work:${this.Source}:${s.Session}:${s.Agent}`) : "");
+        (s.Agent ? this.Store.Meta(`agent-work:${this.Source}:${s.Session}:${s.Agent}`) : "");
       const status = ["completed", "failed", "cancelled"].includes(str(e, "status"))
         ? str(e, "status")
         : "unknown";
@@ -638,12 +630,12 @@ export class Recorder {
     s = { ...s, Turn: state.turn, Agent: state.agent };
     work = state.work;
     const done = `${this.Source}:${s.Session}:${call}:done`;
-    if (value(this, done)) return;
+    if (this.Store.Meta(done)) return;
     const ev = this.event(s, `tool:${call}`, work);
     ev.tool = {
       callId: call,
       name: str(e, "tool", "tool_name"),
-      requestEntityId: value(this, `tool-request:${this.Source}:${s.Session}:${call}`),
+      requestEntityId: this.Store.Meta(`tool-request:${this.Source}:${s.Session}:${call}`),
       category: state.category,
       outcome: failed ? "failed" : "completed",
       durationMs: String(Date.now() - new Date(state.started).getTime()),

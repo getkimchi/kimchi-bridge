@@ -170,6 +170,14 @@ export class Store {
     this.DB.query("INSERT OR IGNORE INTO meta(key,value) VALUES('device',?)").run(NewID());
     return (this.DB.query("SELECT value FROM meta WHERE key='device'").get() as any).value;
   }
+  Meta(key: string): string {
+    return (this.DB.query("SELECT value FROM meta WHERE key=?").get(key) as any)?.value ?? "";
+  }
+  SetMeta(key: string, value: string): void {
+    this.DB.query(
+      "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    ).run(key, value);
+  }
   private insert(e: Event): void {
     const body = Buffer.from(EncodeEvent(e));
     const size = (this.DB.query("SELECT total_bytes FROM ledger_totals WHERE id=1").get() as any)
