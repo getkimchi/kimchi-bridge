@@ -317,21 +317,6 @@ export class Recorder {
   ReconcileGit(signal?: AbortSignal) {
     return ReconcileGit(this, signal);
   }
-  version(session: string, v: string) {
-    return version(this, session, v);
-  }
-  transcriptVersion(session: string, path: string) {
-    return transcriptVersion(this, session, path);
-  }
-  registerTranscript(s: Scope, path: string, observedRoute: string, basis: string) {
-    return registerTranscript(this, s, path, observedRoute, basis);
-  }
-  telemetry(s: Scope, e: Object, observedRoute: string, basis: string) {
-    return telemetry(this, s, e, observedRoute, basis);
-  }
-  saveMeta(key: string, body: unknown) {
-    return saveMeta(this, key, body);
-  }
 
   event(s: Scope, entity: string, work: string, source = this.Source): Event {
     return {
@@ -471,9 +456,9 @@ export class Recorder {
       /* Preserve native cwd. */
     }
     [s.Root, s.Repo, s.Repository] = repository(s.CWD);
-    if (n.version) this.version(s.Session, n.version);
+    if (n.version) version(this, s.Session, n.version);
     if (str(e, "transcript_path") && this.Source === "codex")
-      this.transcriptVersion(s.Session, str(e, "transcript_path"));
+      transcriptVersion(this, s.Session, str(e, "transcript_path"));
     if (!modelRequest) s.Turn ||= value(this, `${this.Source}:${s.Session}:turn`);
     if (stage === "classic.UserPromptSubmit" && str(e, "prompt_id"))
       setValue(this, `pending-prompt:${s.Session}`, str(e, "prompt_id"));
@@ -498,7 +483,7 @@ export class Recorder {
       this.Store.Observe(coverage);
       this.Store.Diagnostic("native_auxiliary_usage_coverage_unknown");
     }
-    if (stage === "telemetry.log") return this.telemetry(s, e, observedRoute, basis);
+    if (stage === "telemetry.log") return telemetry(this, s, e, observedRoute, basis);
     if (stage === "step.after") {
       const usage = obj(result.usage),
         index = integer(e.index);
@@ -557,9 +542,16 @@ export class Recorder {
       }
     }
     if (str(e, "transcript_path"))
-      this.registerTranscript({ ...s, Agent: "" }, str(e, "transcript_path"), observedRoute, basis);
+      registerTranscript(
+        this,
+        { ...s, Agent: "" },
+        str(e, "transcript_path"),
+        observedRoute,
+        basis,
+      );
     if (str(e, "agent_transcript_path") && s.Agent)
-      this.registerTranscript(
+      registerTranscript(
+        this,
         { ...s, Turn: "" },
         str(e, "agent_transcript_path"),
         observedRoute,
@@ -736,7 +728,7 @@ export class Recorder {
         state.refsKnown &&
         quality === "tool_observed"
       ) {
-        this.saveMeta(`git-change:${change}`, {
+        saveMeta(this, `git-change:${change}`, {
           Scope: s,
           Source: this.Source,
           Work: work,

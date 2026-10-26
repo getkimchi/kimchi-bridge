@@ -12,6 +12,7 @@ import {
   registerTranscript,
   telemetry,
   route,
+  version,
 } from "../src/recovery.ts";
 import {
   issueKeys,
@@ -404,9 +405,9 @@ test("collector Git reconciliation preserves the originating source, version and
   writeFileSync(path, "before\n");
   git(root, "add", "file.txt");
   git(root, "commit", "-m", "baseline");
-  r.version(scope.Session, "native-test-version");
+  version(r, scope.Session, "native-test-version");
   const collector = new Recorder(store, "collector", r.Device);
-  collector.version(scope.Session, "collector-test-version");
+  version(collector, scope.Session, "collector-test-version");
   expect(r.event(scope, "native-default", "")).toMatchObject({
     source: r.Source,
     sourceVersion: "native-test-version",
@@ -477,9 +478,9 @@ test("PR refresh revises lifecycle while retaining one exact commit membership l
   const sha = "a".repeat(40),
     key = `tracked-commit:${StableID(scope.Repo, sha)}`;
   const tracked = { Scope: scope, Source: "codex", SHA: sha, CreatedAt: new Date().toISOString() };
-  r.version(scope.Session, "native-test-version");
+  version(r, scope.Session, "native-test-version");
   const collector = new Recorder(store, "collector", r.Device);
-  collector.version(scope.Session, "collector-test-version");
+  version(collector, scope.Session, "collector-test-version");
   const raw = {
     id: 42,
     number: 7,
