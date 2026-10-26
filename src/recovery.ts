@@ -10,7 +10,6 @@ import {
   ZeroTime,
   obj,
   str,
-  type Event,
   type RawUsage,
   type Usage,
 } from "./protocol.ts";
@@ -24,8 +23,6 @@ interface Transcript {
   route: string;
   basis: string;
 }
-const textBody = (v: unknown) =>
-  typeof v === "string" ? v : Buffer.from(v as Uint8Array).toString();
 const wireInteger = (v: unknown) => {
   const text = NumberText(v);
   if (text === undefined) return;
@@ -299,13 +296,8 @@ function attachToolRequest(r: Recorder, s: Scope, call: string, request: string)
     r.Store.Diagnostic("tool_request_identity_conflict");
   }
   r.Store.SetMeta(key, request);
-  const entity = r.event(s, `tool:${call}`, "").entityId;
-  const row = r.Store.DB.query(
-    "SELECT body FROM events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1",
-  ).get(entity) as any;
-  if (!row) return;
-  const event: Event = JSON.parse(textBody(row.body));
-  if (event.tool) {
+  const event = r.Store.Latest(r.event(s, `tool:${call}`, "").entityId);
+  if (event?.tool) {
     event.tool.requestEntityId = request;
     r.Store.Observe(event);
   }
@@ -382,10 +374,7 @@ export function telemetry(r: Recorder, s: Scope, e: Object, observedRoute: strin
   const prompt = str(a, "prompt.id");
   if (prompt) s.Turn = r.Store.Meta(`prompt-turn:${s.Session}:${prompt}`);
   const event = r.event(s, requestEntity("", request), s.Turn ? r.workExact(s) : r.work(s));
-  const existing = r.Store.DB.query(
-    "SELECT body FROM events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1",
-  ).get(event.entityId) as any;
-  if (existing && JSON.parse(textBody(existing.body)).usage?.channel === "transcript") return;
+  if (r.Store.Latest(event.entityId)?.usage?.channel === "transcript") return;
   event.observeTime = timestamp(str(a, "event.timestamp"));
   const cacheWrites = writes(a, [
     ["cache_creation_5m_tokens", 300],

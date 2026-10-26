@@ -200,14 +200,17 @@ export class Store {
       this.insert(e);
     });
   }
+  Latest(entityId: string): Event | null {
+    const row = this.DB.query(
+      "SELECT body FROM events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1",
+    ).get(entityId) as any;
+    return row && JSON.parse(text(row.body));
+  }
   Observe(input: Event): void {
     this.tx(() => {
       const e = { ...input, revision: "1", baseRevision: "0", baseHash: "" };
-      const row = this.DB.query(
-        "SELECT body FROM events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1",
-      ).get(e.entityId) as any;
-      if (row) {
-        const old = JSON.parse(text(row.body)) as Event;
+      const old = this.Latest(e.entityId);
+      if (old) {
         const neutral = (v: Event): Event => ({
           ...v,
           id: "",
