@@ -9,6 +9,7 @@ import {
   Parse,
   StableID,
   Stringify,
+  gitID,
   obj,
   str,
   type IssueKey,
@@ -66,8 +67,6 @@ interface TrackedCommit {
   CheckedAt?: string;
   CreatedAt: string;
 }
-const gitHash = (s: string) =>
-  [40, 64].includes(s.length) && Buffer.from(s, "hex").toString("hex") === s;
 const fields = (s: string) =>
   s
     .split("\n")
@@ -157,7 +156,7 @@ function treeObject(
   const out = gitContext(signal, root, "ls-tree", "-z", commit, "--", path);
   if (!out) return "";
   const parts = fields(out.split("\t", 1)[0]!);
-  if (parts.length !== 3 || parts[1] !== "blob" || !gitHash(parts[2]!))
+  if (parts.length !== 3 || parts[1] !== "blob" || !gitID(parts[2]!))
     throw new Error("not an ordinary file blob");
   return parts[2]!;
 }
@@ -177,7 +176,7 @@ function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
   }
   for (const sha of commits) {
     CheckSignal(signal);
-    if (!gitHash(sha)) throw new Error("invalid commit identity");
+    if (!gitID(sha)) throw new Error("invalid commit identity");
     if (treeObject(signal, root, sha, path) !== after) continue;
     const parents = fields(gitContext(signal, root, "show", "--format=%P", "--no-patch", sha));
     let matched = parents.length === 0 && before === "";

@@ -66,7 +66,6 @@ interface ToolState {
   refsKnown: boolean;
 }
 const emptyFile = (): FileState => ({ hash: "", exists: false, complete: false });
-export const integer = Integer;
 export const digest = (bytes: Uint8Array | string): string =>
   createHash("sha256").update(bytes).digest("hex");
 const rootOf = (s: Scope) => s.Root || s.CWD;
@@ -478,7 +477,7 @@ export class Recorder {
     if (stage === "telemetry.log") return telemetry(this, s, e, observedRoute, basis);
     if (stage === "step.after") {
       const usage = obj(result.usage),
-        index = integer(e.index);
+        index = Integer(e.index);
       if (index !== undefined && s.Turn) {
         const step = this.event(s, `step:${s.Turn}:${s.Agent}:${Hash(index)}`, work);
         step.coverage = {
