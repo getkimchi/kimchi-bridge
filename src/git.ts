@@ -105,14 +105,9 @@ export function ReconcileGit(r: Recorder, signal?: AbortSignal) {
     r.Store.DB.query("DELETE FROM meta WHERE key='git-pass-after'").run();
     return;
   }
-  const deadline = Date.now() + 8000,
-    failures: unknown[] = [];
+  const failures: unknown[] = [];
   for (const item of items) {
     CheckSignal(signal);
-    if (Date.now() > deadline) {
-      r.Store.Diagnostic("git_reconciliation_budget_exceeded");
-      break;
-    }
     r.Store.SetMeta("git-pass-after", item.key);
     if (item.key.startsWith("tracked-commit:")) {
       const c: TrackedCommit = JSON.parse(item.value);
@@ -137,7 +132,7 @@ export function ReconcileGit(r: Recorder, signal?: AbortSignal) {
         continue;
       }
       try {
-        matchCommits(r, c, deadline, signal);
+        matchCommits(r, c, signal);
       } catch (e) {
         r.Store.Diagnostic("git_match_incomplete");
         failures.push(e);
@@ -166,7 +161,7 @@ function treeObject(
     throw new Error("not an ordinary file blob");
   return parts[2]!;
 }
-function matchCommits(r: Recorder, c: GitChange, deadline: number, signal?: AbortSignal) {
+function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
   const root = rootOf(c.Scope),
     format = gitContext(signal, root, "rev-parse", "--show-object-format");
   const before = fileObject(r, c.Before, format),
@@ -182,7 +177,6 @@ function matchCommits(r: Recorder, c: GitChange, deadline: number, signal?: Abor
   }
   for (const sha of commits) {
     CheckSignal(signal);
-    if (Date.now() > deadline) throw new Error("git matching budget exceeded");
     if (!gitHash(sha)) throw new Error("invalid commit identity");
     if (treeObject(signal, root, sha, path) !== after) continue;
     const parents = fields(gitContext(signal, root, "show", "--format=%P", "--no-patch", sha));
