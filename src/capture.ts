@@ -749,7 +749,8 @@ export class Recorder {
   }
   expected(before: FileState, e: Object, root: string, path: string): string | undefined {
     if (!before.complete) return;
-    if (patchInput(e)) return this.patchExpected(before, e, root, path);
+    const patch = patchInput(e);
+    if (patch) return this.patchExpected(before, patch, root, path);
     const input = toolInput(e);
     switch (str(e, "tool", "tool_name").toLowerCase()) {
       case "read":
@@ -779,9 +780,7 @@ export class Recorder {
       }
     }
   }
-  patchExpected(before: FileState, e: Object, root: string, path: string): string | undefined {
-    const patch = patchInput(e);
-    if (!patch) return;
+  patchExpected(before: FileState, patch: string, root: string, path: string): string | undefined {
     let kind = "",
       active = false;
     const block: string[] = [];
