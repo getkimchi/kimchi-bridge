@@ -59,9 +59,6 @@ CREATE TABLE IF NOT EXISTS diagnostics(code TEXT PRIMARY KEY,count INTEGER NOT N
 const now = () => Math.floor(Date.now() / 1000);
 const text = (body: string | Uint8Array) =>
   typeof body === "string" ? body : Buffer.from(body).toString("utf8");
-function abort(signal?: AbortSignal): void {
-  signal?.throwIfAborted();
-}
 export function OpenDatabase(path: string): Database {
   mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
   const fd = openSync(path, "a", 0o600);
@@ -88,9 +85,6 @@ export class Store {
       this.DB.close();
       throw e;
     }
-  }
-  static Open(dir: string): Store {
-    return new Store(dir);
   }
   Close(): void {
     this.DB.close();
@@ -230,7 +224,7 @@ export class Store {
     });
   }
   PendingBatch(signal?: AbortSignal): Batch | null {
-    abort(signal);
+    signal?.throwIfAborted();
     return this.tx(() => {
       const existing = this.DB.query(
         "SELECT b.body FROM batches b LEFT JOIN batch_order o ON o.batch_id=b.id ORDER BY COALESCE(o.order_key,''),b.created_at,b.rowid LIMIT 1",
@@ -336,8 +330,7 @@ export class Store {
     );
     return { ...n, ...bytes, diagnostics };
   }
-  Events(signal?: AbortSignal): Event[] {
-    abort(signal);
+  Events(): Event[] {
     return (this.DB.query("SELECT body FROM events ORDER BY created_at,rowid").all() as any[]).map(
       (r) => JSON.parse(text(r.body)),
     );
