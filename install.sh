@@ -114,6 +114,11 @@ mkdir -p "$prefix/releases"
 if [[ ! -d "$target" ]]; then
   staged=$(mktemp -d "$prefix/releases/.install.XXXXXXXX")
   cp -R "$script_root/." "$staged/"
+  # A Kimchi update can replace the package while it is copied; never keep a mixed copy.
+  if [[ "$(cat "$staged/VERSION" 2>/dev/null)" != "$version" || ! -f "$staged/lib/kimchi-bridge.mjs" ]]; then
+    rm -rf -- "$staged"
+    fail 'The package changed while it was copied: run the installer again.'
+  fi
   mv -- "$staged" "$target"
 fi
 # Every registered plugin runs this code, so link it before registering. Each link changes with
