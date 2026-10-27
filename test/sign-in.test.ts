@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run as cli } from "../src/cli.ts";
-import { credentialHash, kimchiSignIn } from "../src/kimchi.ts";
+import { IdentityError, credentialHash, kimchiSignIn } from "../src/kimchi.ts";
 import {
   loadConfig,
   saveConfig,
@@ -314,4 +314,30 @@ test("verifying keeps settings changed while the request was in flight", async (
   const c = await verifySignIn({ apiUrl, token: "kimchi-key" });
   expect(c.disabled).toBe(true);
   expect(loadConfig().disabled).toBe(true);
+});
+
+test("a sign-in that failed to verify waits before the next check; a changed one is checked at once", async () => {
+  let status = 401,
+    calls = 0;
+  const apiUrl = server(() => {
+    calls++;
+    return status === 401
+      ? new Response(null, { status })
+      : Response.json({ organizationId: randomUUID(), userId: randomUUID() });
+  });
+  const rejected = { apiUrl, token: "rejected-key" };
+  await expect(verifySignIn(rejected)).rejects.toBeInstanceOf(IdentityError);
+  const retry = loadConfig().verifyRetry!;
+  expect(retry).toMatchObject({ failures: 1, rejected: true });
+  expect(retry.at - Date.now()).toBeGreaterThan(59 * 60_000);
+  await expect(verifySignIn(rejected)).rejects.toBeInstanceOf(IdentityError);
+  expect(calls).toBe(1);
+  saveConfig({ ...loadConfig(), verifyRetry: { ...retry, at: Date.now() - 1 } });
+  await expect(verifySignIn(rejected)).rejects.toBeInstanceOf(IdentityError);
+  expect(calls).toBe(2);
+  expect(loadConfig().verifyRetry!.at - Date.now()).toBeGreaterThan(119 * 60_000);
+  status = 200;
+  const c = await verifySignIn({ apiUrl, token: "new-key" });
+  expect(calls).toBe(3);
+  expect(c.verifyRetry).toBeUndefined();
 });

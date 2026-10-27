@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import {
+  IdentityError,
   authenticate,
   credentialHash,
   hasControl,
@@ -33,6 +34,8 @@ export interface Config {
   otlpUrl?: string;
   otlpHeaders?: Record<string, string>;
   disabled?: boolean;
+  /** A sign-in that failed to verify, and when it may be tried again (milliseconds since epoch). */
+  verifyRetry?: { credentialHash: string; at: number; failures: number; rejected: boolean };
 }
 export function stateRoot(): string {
   const path = process.env.KIMCHI_BRIDGE_HOME;
@@ -86,13 +89,39 @@ export function saveConfig(config: Config): void {
 }
 
 /** Verify Kimchi's sign-in when it changed. A different account drops the old account's exporter. */
+const MINUTE = 60_000,
+  HOUR = 60 * MINUTE;
 export async function verifySignIn(k: SignIn, signal?: AbortSignal): Promise<Config> {
   const before = loadConfig();
-  if (!k.token || before.credentialHash === credentialHash(k)) return before;
-  const identity = await authenticate(k, signal);
+  const hash = credentialHash(k);
+  if (!k.token || before.credentialHash === hash) return before;
+  // A sign-in that failed waits before it is checked again, as Kimchi's uploader waits: 1 h
+  // doubling to 6 h after the API rejected it, 30 s doubling to 30 min while it is unreachable.
+  // A changed sign-in is checked at once.
+  const retry = before.verifyRetry?.credentialHash === hash ? before.verifyRetry : undefined;
+  if (retry && Date.now() < retry.at) {
+    if (retry.rejected) throw new IdentityError("Kimchi sign-in was rejected; retrying later");
+    throw new Error("Kimchi API unreachable; retrying later");
+  }
+  let identity: Awaited<ReturnType<typeof authenticate>>;
+  try {
+    identity = await authenticate(k, signal);
+  } catch (error) {
+    const rejected = error instanceof IdentityError,
+      failures = (retry?.failures ?? 0) + 1;
+    const wait = rejected
+      ? Math.min(6 * HOUR, HOUR * 2 ** (failures - 1))
+      : Math.min(30 * MINUTE, 30_000 * 2 ** (failures - 1));
+    saveConfig({
+      ...loadConfig(),
+      verifyRetry: { credentialHash: hash, at: Date.now() + wait, failures, rejected },
+    });
+    throw error;
+  }
   // Read again, keeping what changed during the request, such as disable or configure.
   const latest = loadConfig();
   const next: Config = { ...latest, ...identity };
+  delete next.verifyRetry;
   if (latest.actorId && stateDir(next) !== stateDir(latest)) {
     delete next.otlpUrl;
     delete next.otlpHeaders;
