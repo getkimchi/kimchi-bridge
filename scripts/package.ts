@@ -28,10 +28,11 @@ export function ReleaseVersion(value: string): string {
 }
 
 // Every plugin's bin/kimchi-adapters, and the user's command. Kimchi's runtime runs the code
-// the installer made current, without loading the project's .env or bunfig.toml.
+// the installer made current, without loading the project's .env or bunfig.toml. Without Kimchi
+// only a terminal gets the hint: Codex shows every hook's output in the session.
 export const SHIM = `#!/bin/sh
 prefix=\${KIMCHI_ADAPTERS_PREFIX:-$HOME/.local/share/kimchi-adapters}
-[ -x "$prefix/runtime" ] || { echo 'kimchi-adapters: run the Kimchi installer.' >&2; exit 0; }
+[ -x "$prefix/runtime" ] || { [ ! -t 2 ] || echo 'kimchi-adapters: run the Kimchi installer.' >&2; exit 0; }
 exec env BUN_BE_BUN=1 "$prefix/runtime" --no-env-file --config=/dev/null "$prefix/current.mjs" "$@"
 `;
 

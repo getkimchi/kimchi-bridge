@@ -79,12 +79,13 @@ test("the shim runs the code on Kimchi's runtime without the project's .env or b
     });
     expect(existsSync(redirect)).toBe(false);
     expect(existsSync(canary)).toBe(false);
-    // Without Kimchi, hooks stay quiet and succeed rather than fail the client's session.
+    // Without Kimchi, hooks succeed silently: Codex shows hook output in the session, and a
+    // real Codex run showed the hint after every hook. Hooks have no terminal.
     rmSync(join(prefix, "runtime"));
     const missing = run(["hook", "codex"]);
     expect(missing.exitCode).toBe(0);
     expect(missing.stdout.toString()).toBe("");
-    expect(missing.stderr.toString()).toContain("run the Kimchi installer");
+    expect(missing.stderr.toString()).toBe("");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
