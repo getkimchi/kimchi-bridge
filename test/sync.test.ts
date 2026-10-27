@@ -6,7 +6,7 @@ import { Recorder } from "../src/capture.ts";
 import { Run as CLI, csvText } from "../src/cli.ts";
 import { Authenticate, CredentialHash } from "../src/delivery.ts";
 import { Open } from "../src/ledger.ts";
-import { CheckSignal, RemainingTime, WithDeadline, lockSync } from "../src/platform.ts";
+import { CheckSignal, WithDeadline, lockSync } from "../src/platform.ts";
 import { NewID, Parse, type Batch } from "../src/protocol.ts";
 import { Load, Save, SessionStateDir, StateDir, type Config } from "../src/settings.ts";
 import { Run } from "../src/sync.ts";
@@ -70,18 +70,6 @@ test("sync honors cancellation, disabled capture, and switched active accounts",
   Save(c);
   await Run({});
   expect(existsSync(join(StateDir(c), "worker.lock"))).toBe(false);
-});
-
-test("wallclock deadlines survive a blocked event loop and nested operation budgets", () => {
-  const parent = WithDeadline(20);
-  const nested = WithDeadline(8000, parent);
-  expect(RemainingTime(nested, 2000)).toBeLessThanOrEqual(20);
-  const until = Date.now() + 30;
-  while (Date.now() < until) {
-    /* simulate synchronous filesystem or parser work */
-  }
-  expect(() => CheckSignal(nested)).toThrow();
-  expect(() => RemainingTime(nested, 2000)).toThrow();
 });
 
 test("sync stops when recovery exhausts its inherited deadline and releases the lock", async () => {

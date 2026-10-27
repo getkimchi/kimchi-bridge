@@ -508,7 +508,7 @@ const bounded = (s: any, max: number) =>
 const opaque = (s: any) => bounded(s, 128) && !containsAny(s ?? "", "/\\@?#|");
 const quality = (s: any) =>
   ["observed", "inferred", "confirmed", "tool_observed", "ambiguous", "unknown"].includes(s);
-const gitID = (s: any) =>
+export const gitID = (s: any) =>
   typeof s === "string" &&
   (s.length === 40 || s.length === 64) &&
   Buffer.from(s, "hex").toString("hex") === s;

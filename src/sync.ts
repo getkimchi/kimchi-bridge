@@ -7,25 +7,31 @@ import { Open } from "./ledger.ts";
 import { CheckSignal, WithDeadline, lockSync } from "./platform.ts";
 import { Load, Root, StateDir, type Config } from "./settings.ts";
 
-function PruneAccounts(stateRoot: string, now: Date, signal?: AbortSignal) {
+function accountLedgers(stateRoot: string): string[] {
   const root = join(stateRoot, "accounts");
   let entries;
   try {
     entries = readdirSync(root, { withFileTypes: true });
   } catch (e: any) {
-    if (e.code === "ENOENT") return;
+    if (e.code === "ENOENT") return [];
     throw e;
   }
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(root, entry.name))
+    .filter((dir) => {
+      try {
+        return lstatSync(join(dir, "ledger.sqlite")).isFile();
+      } catch {
+        return false;
+      }
+    });
+}
+
+function PruneAccounts(stateRoot: string, now: Date, signal?: AbortSignal) {
   const errors: unknown[] = [];
-  for (const entry of entries) {
+  for (const dir of accountLedgers(stateRoot)) {
     CheckSignal(signal);
-    if (!entry.isDirectory()) continue;
-    const dir = join(root, entry.name);
-    try {
-      if (!lstatSync(join(dir, "ledger.sqlite")).isFile()) continue;
-    } catch {
-      continue;
-    }
     let store;
     try {
       store = Open(dir);
@@ -40,23 +46,10 @@ function PruneAccounts(stateRoot: string, now: Date, signal?: AbortSignal) {
 }
 
 function recoverInactiveAccounts(stateRoot: string, activeDir: string, signal?: AbortSignal) {
-  let entries;
-  try {
-    entries = readdirSync(join(stateRoot, "accounts"), { withFileTypes: true });
-  } catch (e: any) {
-    if (e.code === "ENOENT") return;
-    throw e;
-  }
   const errors: unknown[] = [];
-  for (const entry of entries) {
+  for (const dir of accountLedgers(stateRoot)) {
     CheckSignal(signal);
-    const dir = join(stateRoot, "accounts", entry.name);
-    if (!entry.isDirectory() || dir === activeDir) continue;
-    try {
-      if (!lstatSync(join(dir, "ledger.sqlite")).isFile()) continue;
-    } catch {
-      continue;
-    }
+    if (dir === activeDir) continue;
     let store;
     try {
       store = Open(dir);
@@ -106,10 +99,8 @@ export async function Run(c: Config, signal?: AbortSignal): Promise<void> {
       const now = Math.floor(Date.now() / 1000);
       if (now - (row?.value ?? 0) >= 3600) {
         try {
-          await PruneAccounts(Root(), new Date(), signal);
-          s.DB.query(
-            "INSERT INTO meta(key,value) VALUES('pruned-at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-          ).run(now);
+          PruneAccounts(Root(), new Date(), signal);
+          s.SetMeta("pruned-at", String(now));
         } catch {
           s.Diagnostic("retention_failed");
         }
@@ -117,19 +108,19 @@ export async function Run(c: Config, signal?: AbortSignal): Promise<void> {
       for (const source of ["claude-code", "codex"]) {
         CheckSignal(signal);
         try {
-          await new Recorder(s, source, device).RecoverContext(signal);
+          new Recorder(s, source, device).RecoverContext(signal);
         } catch {
           s.Diagnostic("recovery_failed");
         }
       }
       try {
-        await recoverInactiveAccounts(Root(), s.Dir, signal);
+        recoverInactiveAccounts(Root(), s.Dir, signal);
       } catch {
         s.Diagnostic("inactive_account_recovery_failed");
       }
       CheckSignal(signal);
       try {
-        await new Recorder(s, "collector", device).ReconcileGit(signal);
+        new Recorder(s, "collector", device).ReconcileGit(signal);
       } catch {
         s.Diagnostic("git_reconciliation_incomplete");
       }

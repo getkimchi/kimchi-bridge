@@ -13,7 +13,14 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 case "$action" in install|update|uninstall|status) ;; *) fail 'Usage: install.sh install|update|uninstall|status claude|codex|both [vVERSION]' ;; esac
 case "$client" in claude|codex|both) ;; *) fail 'Choose claude, codex or both.' ;; esac
 case "$prefix:$bin_dir" in /*:/*) ;; *) fail 'Install and binary directories must be absolute.' ;; esac
-valid_version() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; }
+# Releases are vMAJOR.MINOR.PATCH with an optional -rc.N suffix.
+valid_version() {
+  local core="${1#v}" rc=0
+  [[ "v$core" == "$1" ]] || return 1
+  case "$core" in *-rc.*) rc="${core#*-rc.}"; core="${core%%-rc.*}" ;; esac
+  case "$core" in .*|*.|*..*|*.*.*.*|*[!0123456789.]*) return 1 ;; *.*.*) ;; *) return 1 ;; esac
+  case "$rc" in ""|*[!0123456789]*) return 1 ;; esac
+}
 clients=()
 [[ "$client" == codex ]] || clients+=(claude)
 [[ "$client" == claude ]] || clients+=(codex)
@@ -87,7 +94,8 @@ else
   temp=$(mktemp -d "$prefix/.download.XXXXXXXX")
   gh release download "$version" --repo "$repo" --dir "$temp" --pattern "$asset" --pattern SHA256SUMS
   expected=$(awk -v asset="$asset" '$2 == asset { print $1 }' "$temp/SHA256SUMS")
-  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || fail 'Missing release checksum.'
+  case "$expected" in *[!0123456789abcdef]*) fail 'Missing release checksum.' ;; esac
+  [[ ${#expected} -eq 64 ]] || fail 'Missing release checksum.'
   if command -v sha256sum >/dev/null; then actual=$(sha256sum "$temp/$asset" | awk '{print $1}'); else actual=$(shasum -a 256 "$temp/$asset" | awk '{print $1}'); fi
   [[ "$expected" == "$actual" ]] || fail 'Release checksum mismatch.'
   tar -tzf "$temp/$asset" > "$temp/entries" || fail 'Unsafe release archive listing.'

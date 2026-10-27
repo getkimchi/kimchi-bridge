@@ -59,9 +59,6 @@ CREATE TABLE IF NOT EXISTS diagnostics(code TEXT PRIMARY KEY,count INTEGER NOT N
 const now = () => Math.floor(Date.now() / 1000);
 const text = (body: string | Uint8Array) =>
   typeof body === "string" ? body : Buffer.from(body).toString("utf8");
-function abort(signal?: AbortSignal): void {
-  signal?.throwIfAborted();
-}
 export function OpenDatabase(path: string): Database {
   mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
   const fd = openSync(path, "a", 0o600);
@@ -88,9 +85,6 @@ export class Store {
       this.DB.close();
       throw e;
     }
-  }
-  static Open(dir: string): Store {
-    return new Store(dir);
   }
   Close(): void {
     this.DB.close();
@@ -170,6 +164,14 @@ export class Store {
     this.DB.query("INSERT OR IGNORE INTO meta(key,value) VALUES('device',?)").run(NewID());
     return (this.DB.query("SELECT value FROM meta WHERE key='device'").get() as any).value;
   }
+  Meta(key: string): string {
+    return (this.DB.query("SELECT value FROM meta WHERE key=?").get(key) as any)?.value ?? "";
+  }
+  SetMeta(key: string, value: string): void {
+    this.DB.query(
+      "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    ).run(key, value);
+  }
   private insert(e: Event): void {
     const body = Buffer.from(EncodeEvent(e));
     const size = (this.DB.query("SELECT total_bytes FROM ledger_totals WHERE id=1").get() as any)
@@ -192,14 +194,17 @@ export class Store {
       this.insert(e);
     });
   }
+  Latest(entityId: string): Event | null {
+    const row = this.DB.query(
+      "SELECT body FROM events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1",
+    ).get(entityId) as any;
+    return row && JSON.parse(text(row.body));
+  }
   Observe(input: Event): void {
     this.tx(() => {
       const e = { ...input, revision: "1", baseRevision: "0", baseHash: "" };
-      const row = this.DB.query(
-        "SELECT body FROM events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1",
-      ).get(e.entityId) as any;
-      if (row) {
-        const old = JSON.parse(text(row.body)) as Event;
+      const old = this.Latest(e.entityId);
+      if (old) {
         const neutral = (v: Event): Event => ({
           ...v,
           id: "",
@@ -219,7 +224,7 @@ export class Store {
     });
   }
   PendingBatch(signal?: AbortSignal): Batch | null {
-    abort(signal);
+    signal?.throwIfAborted();
     return this.tx(() => {
       const existing = this.DB.query(
         "SELECT b.body FROM batches b LEFT JOIN batch_order o ON o.batch_id=b.id ORDER BY COALESCE(o.order_key,''),b.created_at,b.rowid LIMIT 1",
@@ -325,8 +330,7 @@ export class Store {
     );
     return { ...n, ...bytes, diagnostics };
   }
-  Events(signal?: AbortSignal): Event[] {
-    abort(signal);
+  Events(): Event[] {
     return (this.DB.query("SELECT body FROM events ORDER BY created_at,rowid").all() as any[]).map(
       (r) => JSON.parse(text(r.body)),
     );

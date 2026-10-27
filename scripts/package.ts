@@ -1,8 +1,7 @@
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import { parse, valid } from "semver";
 
 export function ReleaseVersion(value: string): string {
@@ -50,7 +49,7 @@ async function main() {
   const [version, output] = process.argv.slice(2);
   if (!version || !output) throw new Error("Usage: scripts/package.sh vVERSION OUTPUT_DIRECTORY");
   ReleaseVersion(version);
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), ".."),
+  const root = resolve(import.meta.dir, ".."),
     out = resolve(output);
   mkdirSync(out, { recursive: true });
   const temp = mkdtempSync(join(tmpdir(), "pr-cost-package-"));

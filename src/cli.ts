@@ -187,7 +187,7 @@ export async function Run(
           s = Open(dir);
         }
         try {
-          await new Recorder(s, args[1], s.DeviceID()).Record(native);
+          new Recorder(s, args[1], s.DeviceID()).Record(native);
         } catch {
           s.Diagnostic("hook_capture_failed");
         }
@@ -208,7 +208,7 @@ export async function Run(
       case "recover":
       case "flush": {
         for (const source of ["claude-code", "codex"])
-          await new Recorder(s, source, s.DeviceID()).RecoverContext();
+          new Recorder(s, source, s.DeviceID()).RecoverContext();
         if (command === "recover") return;
         if (!c.enabled) throw new Error("reporting login required; local records retained");
         while (await Flush(s, c)) {
