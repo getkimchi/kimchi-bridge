@@ -302,7 +302,8 @@ test("a session whose sign-in cannot be verified reports to the old account only
     await start(name);
     expect([name, sessionStateDir(loadConfig(), "codex", name)]).toEqual([name, expected]);
   }
-});
+  // Three cases wait out the one-second verification budget; slow CI runners need the margin.
+}, 15000);
 
 test("verifying keeps settings changed while the request was in flight", async () => {
   const apiUrl = server(async () => {
