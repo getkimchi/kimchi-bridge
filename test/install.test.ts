@@ -46,15 +46,18 @@ function fixture(version: string, market: string) {
   const root = temp(),
     pkg = join(root, "package"),
     fake = join(root, "fake-bin");
-  for (const path of [join(pkg, "bin"), join(pkg, "lib"), fake])
+  for (const path of [join(pkg, "bin"), join(pkg, "lib"), join(pkg, "markets"), fake])
     mkdirSync(path, { recursive: true });
   const script = readFileSync(installer, "utf8");
   executable(join(pkg, "install.sh"), script);
   executable(join(pkg, "bootstrap.sh"), script);
-  executable(join(pkg, "bin/kimchi-adapters"), "#!/bin/sh\nexit 0\n");
+  executable(
+    join(pkg, "bin/kimchi-adapters"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> "${join(root, "helper-calls")}"\n`,
+  );
   writeFileSync(join(pkg, "lib/kimchi-adapters.mjs"), "");
   writeFileSync(join(pkg, "VERSION"), version + "\n");
-  writeFileSync(join(pkg, "MARKETPLACE"), market + "\n");
+  for (const cli of ["claude", "codex"]) writeFileSync(join(pkg, "markets", cli), market + "\n");
   executable(join(root, "kimchi"), "#!/bin/sh\nexit 0\n");
   for (const cli of ["claude", "codex"])
     executable(
@@ -66,6 +69,7 @@ case "$1/$2/$3" in
     if [ ! -e "$FAKE_FAILED" ]; then : > "$FAKE_FAILED";echo 'temporary native removal failure' >&2;exit 1;fi
     ;;
 esac
+[ "\${FAKE_FAIL_ADD:-}/$1/$2" != "${cli}/plugin/add" ] || { echo 'native add failure' >&2; exit 1; }
 exit 0
 `,
     );
@@ -79,7 +83,8 @@ exit 0
   mkdirSync(join(prefix, "installed"), { recursive: true });
   const calls = () =>
     existsSync(env.FAKE_CALLS!) ? readFileSync(env.FAKE_CALLS!, "utf8").split("\n") : [];
-  return { root, pkg, env, prefix, calls };
+  const helper = () => readFileSync(join(root, "helper-calls"), "utf8");
+  return { root, pkg, env, prefix, calls, helper };
 }
 
 describe("a new wiring registers once and retries removing the old registration", () => {
@@ -154,6 +159,36 @@ test("the installer needs Kimchi and leaves updates to Kimchi's release", () => 
   expect(update.output).toContain("run the Kimchi installer");
   const uninstall = run(join(prefix, "install.sh"), ["uninstall", "claude"], env);
   expect(uninstall.status).toBe(0);
+  expect(calls()).toContain("plugin uninstall kimchi-work@kimchi-work-0123456789ab --scope user");
+  expect(existsSync(join(prefix, "installed/claude"))).toBe(false);
+});
+
+test("a client whose registration failed keeps the code receipt old, so Kimchi retries it", () => {
+  const { pkg, env, prefix, helper } = fixture("v0.2.0", "kimchi-work-0123456789ab");
+  for (const cli of ["claude", "codex"])
+    writeFileSync(join(prefix, "installed", cli), "kimchi-work-000000000000\n");
+  writeFileSync(join(prefix, "installed/code"), "v0.1.0\n");
+  const failing = { ...env, FAKE_FAIL_ADD: "codex" };
+  // Kimchi runs the installer once per client, so Claude's success comes first.
+  expect(run(join(pkg, "install.sh"), ["update", "claude"], failing).status).toBe(0);
+  expect(run(join(pkg, "install.sh"), ["update", "codex"], failing).status).not.toBe(0);
+  expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.1.0\n");
+  expect(run(join(pkg, "install.sh"), ["update", "codex"], env).status).toBe(0);
+  expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.2.0\n");
+  // Each finished run saves the settings once, dropping an earlier release's stored key.
+  expect(
+    helper()
+      .split("\n")
+      .filter((line) => line === "activate").length,
+  ).toBe(2);
+});
+
+test("uninstalling both needs only the client the plugins were added to", () => {
+  const { pkg, env, prefix, calls } = fixture("v0.2.0", "kimchi-work-0123456789ab");
+  expect(run(join(pkg, "install.sh"), ["install", "claude"], env).status).toBe(0);
+  rmSync(join(env.PATH!.split(delimiter)[0]!, "codex"));
+  const result = run(join(prefix, "install.sh"), ["uninstall", "both"], env);
+  expect(result.status).toBe(0);
   expect(calls()).toContain("plugin uninstall kimchi-work@kimchi-work-0123456789ab --scope user");
   expect(existsSync(join(prefix, "installed/claude"))).toBe(false);
 });

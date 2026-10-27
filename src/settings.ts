@@ -14,6 +14,7 @@ import { NewID, StableID } from "./protocol";
 import { OpenDatabase } from "./ledger";
 import {
   Authenticate,
+  BaseUrl,
   CredentialHash,
   ValidateConfig,
   ValidateOTLP,
@@ -83,7 +84,12 @@ export function KimchiSignIn(
   dir = join(process.env.HOME || homedir(), ".config", "kimchi"),
   env: Record<string, string | undefined> = process.env,
 ): SignIn {
-  const config = kimchiFile(join(dir, "config.json"));
+  let config: Record<string, unknown> = {};
+  try {
+    config = kimchiFile(join(dir, "config.json"));
+  } catch {
+    // Kimchi reads a malformed config as empty too, and still uses its saved login.
+  }
   const apiUrl = kimchiApiUrl(config, env);
   const key = environmentKey || text(config.apiKey) || text(config.api_key);
   if (key) return { apiUrl, token: key };
@@ -108,27 +114,37 @@ function kimchiFile(path: string): Record<string, unknown> {
     throw new Error("Kimchi settings could not be read");
   }
 }
-// Kimchi's resolveEndpoints: KIMCHI_REMOTE_ENDPOINT, else the region's or self-hosted API.
+// Where Kimchi's own PR-cost uploads go (resolveEndpoints().platformApiUrl): KIMCHI_REMOTE_ENDPOINT,
+// else the region's console with /api. Self-hosted needs all three stored endpoints, as in Kimchi.
 function kimchiApiUrl(config: Record<string, unknown>, env: Record<string, string | undefined>) {
   if (env.KIMCHI_REMOTE_ENDPOINT) return env.KIMCHI_REMOTE_ENDPOINT;
   const region = [env.KIMCHI_REGION, config.region].find((r) =>
     ["us", "eu", "self-hosted"].includes(text(r)),
   );
-  if (region === "eu") return "https://api.eu.cast.ai";
-  if (region !== "self-hosted") return "https://api.cast.ai";
-  const stored = text(object(config.selfHostedEndpoints).api);
-  if (stored) return stored;
-  // Pre-discovery Kimchi stores one base; its API lives under /api.
-  let legacy = env.KIMCHI_SELF_HOSTED_URL || text(config.selfHostedUrl);
-  while (legacy.endsWith("/")) legacy = legacy.slice(0, -1);
-  return legacy && legacy + "/api";
+  if (region === "eu") return "https://app.eu.kimchi.dev/api";
+  if (region !== "self-hosted") return "https://app.kimchi.dev/api";
+  const stored = object(config.selfHostedEndpoints);
+  const [api, console, llm] = ["api", "console", "llm"].map((key) => origin(text(stored[key])));
+  return api && console && llm ? console + "/api" : "";
+}
+// Kimchi's normalizeSelfHostedBaseUrl: an absolute http(s) URL without trailing slashes.
+function origin(value: string): string {
+  value = BaseUrl(value.trim());
+  try {
+    return ["http:", "https:"].includes(new URL(value).protocol) ? value : "";
+  } catch {
+    return "";
+  }
 }
 
 /** Verify Kimchi's sign-in when it changed. A different account drops the old account's exporter. */
 export async function Verify(k: SignIn, signal?: AbortSignal): Promise<Config> {
+  const before = Load();
+  if (!k.token || before.credentialHash === CredentialHash(k)) return before;
+  const identity = await Authenticate(k, signal);
+  // Read again, keeping what changed during the request, such as disable or configure.
   const latest = Load();
-  if (!k.token || latest.credentialHash === CredentialHash(k)) return latest;
-  const next: Config = { ...latest, ...(await Authenticate(k, signal)) };
+  const next: Config = { ...latest, ...identity };
   if (latest.actorId && StateDir(next) !== StateDir(latest)) {
     delete next.otlpUrl;
     delete next.otlpHeaders;

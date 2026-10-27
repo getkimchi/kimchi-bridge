@@ -61,43 +61,44 @@ function event(): Event {
   };
 }
 
-test("reads Kimchi's API key, saved login and region in Kimchi's order", () => {
+test("reads Kimchi's API key, saved login and API in Kimchi's order", () => {
   const organization = NewID();
   const read = (env: Record<string, string> = {}, key = "") => KimchiSignIn(key, kimchi, env);
-  expect(read()).toEqual({ apiUrl: "https://api.cast.ai" });
-  kimchiFiles(undefined, {
-    "kimchi-dev": {
-      type: "oauth",
-      access: "sso-token",
-      refresh: "r",
-      expires: 1,
-      orgId: organization,
-    },
-  });
-  expect(read()).toEqual({
-    apiUrl: "https://api.cast.ai",
-    token: "sso-token",
-    organizationId: organization,
-  });
+  const us = "https://app.kimchi.dev/api",
+    eu = "https://app.eu.kimchi.dev/api";
+  expect(read()).toEqual({ apiUrl: us });
+  const sso = { "kimchi-dev": { type: "oauth", access: "sso-token", orgId: organization } };
+  kimchiFiles(undefined, sso);
+  expect(read()).toEqual({ apiUrl: us, token: "sso-token", organizationId: organization });
   kimchiFiles(undefined, { "kimchi-dev": { type: "api_key", key: "saved-key" } });
-  expect(read()).toEqual({ apiUrl: "https://api.cast.ai", token: "saved-key" });
+  expect(read()).toEqual({ apiUrl: us, token: "saved-key" });
   kimchiFiles({ api_key: "legacy-key", region: "eu" });
-  expect(read()).toEqual({ apiUrl: "https://api.eu.cast.ai", token: "legacy-key" });
-  kimchiFiles(
-    { apiKey: "config-key", region: "eu" },
-    { "kimchi-dev": { type: "oauth", access: "sso-token" } },
-  );
-  expect(read()).toEqual({ apiUrl: "https://api.eu.cast.ai", token: "config-key" });
+  expect(read()).toEqual({ apiUrl: eu, token: "legacy-key" });
+  kimchiFiles({ apiKey: "config-key", region: "eu" }, sso);
+  expect(read()).toEqual({ apiUrl: eu, token: "config-key" });
   expect(read({ KIMCHI_REGION: "us" }, "environment-key")).toEqual({
-    apiUrl: "https://api.cast.ai",
+    apiUrl: us,
     token: "environment-key",
   });
-  kimchiFiles({ region: "self-hosted", selfHostedEndpoints: { api: "https://api.example" } });
-  expect(read()).toEqual({ apiUrl: "https://api.example" });
-  kimchiFiles({ region: "self-hosted", selfHostedUrl: "https://kimchi.example/" });
-  expect(read().apiUrl).toBe("https://kimchi.example/api");
   expect(read({ KIMCHI_REMOTE_ENDPOINT: "http://127.0.0.1:9" }).apiUrl).toBe("http://127.0.0.1:9");
+  // Self-hosted needs all three endpoints, as Kimchi does; the old single base URL is ignored.
+  const endpoints = {
+    api: "https://api.example",
+    console: "https://console.example/",
+    llm: "https://llm.example",
+  };
+  kimchiFiles({ region: "self-hosted", selfHostedEndpoints: endpoints });
+  expect(read().apiUrl).toBe("https://console.example/api");
+  kimchiFiles({ region: "self-hosted", selfHostedEndpoints: { ...endpoints, llm: "not a url" } });
+  expect(read().apiUrl).toBe("");
+  kimchiFiles({ region: "self-hosted", selfHostedUrl: "https://kimchi.example/" });
+  expect(read({ KIMCHI_SELF_HOSTED_URL: "https://kimchi.example" }).apiUrl).toBe("");
+  // A malformed config reads as empty, as in Kimchi, so the saved login still counts.
+  kimchiFiles(undefined, sso);
   writeFileSync(join(kimchi, "config.json"), "{");
+  expect(read().token).toBe("sso-token");
+  // An unreadable login, as while Kimchi rewrites auth.json, is not a signed-out state.
+  writeFileSync(join(kimchi, "harness", "auth.json"), "{");
   expect(() => read()).toThrow("Kimchi settings could not be read");
 });
 
@@ -237,4 +238,67 @@ test("flush verifies first and uploads only the signed-in account's ledger, with
   }
   kimchiFiles();
   await expect(CLI(["flush"])).rejects.toThrow("sign in to Kimchi");
+});
+
+test("a session whose sign-in cannot be verified reports to the old account only for a refreshed SSO token", async () => {
+  const organization = NewID(),
+    actor = NewID();
+  type Answer = "401" | "slow" | "ok";
+  let answer = "ok" as Answer;
+  const apiUrl = server(async () => {
+    if (answer === "401") return new Response(null, { status: 401 });
+    if (answer === "slow") await Bun.sleep(1500);
+    return Response.json({ organizationId: organization, userId: actor });
+  });
+  process.env.KIMCHI_REMOTE_ENDPOINT = apiUrl;
+  const start = (session: string) =>
+    CLI(
+      ["hook", "codex"],
+      stdin({ hook_event_name: "SessionStart", session_id: session, cwd: root }),
+    );
+  const sso = (token: string, orgId = organization) =>
+    kimchiFiles(undefined, { "kimchi-dev": { type: "oauth", access: token, orgId } });
+  sso("first-token");
+  await start("verified");
+  const account = StateDir(Load());
+  expect(account).not.toBe(StateDir({}));
+  const cases: [string, () => void, Answer, string][] = [
+    ["rejected key", () => kimchiFiles({ apiKey: "rejected-key" }), "401", StateDir({})],
+    [
+      "unreachable with another key",
+      () => kimchiFiles({ apiKey: "other-key" }),
+      "slow",
+      StateDir({}),
+    ],
+    [
+      "unreachable with another SSO organization",
+      () => sso("other-org-token", NewID()),
+      "slow",
+      StateDir({}),
+    ],
+    ["unreachable with a refreshed SSO token", () => sso("refreshed-token"), "slow", account],
+    [
+      "unreadable login",
+      () => writeFileSync(join(kimchi, "harness", "auth.json"), "{"),
+      "ok",
+      account,
+    ],
+  ];
+  for (const [name, change, response, expected] of cases) {
+    change();
+    answer = response;
+    await start(name);
+    expect([name, SessionStateDir(Load(), "codex", name)]).toEqual([name, expected]);
+  }
+});
+
+test("verifying keeps settings changed while the request was in flight", async () => {
+  const apiUrl = server(async () => {
+    // The user pauses recording while the sign-in is being verified.
+    await CLI(["disable"], undefined, () => {});
+    return Response.json({ organizationId: NewID(), userId: NewID() });
+  });
+  const c = await Verify({ apiUrl, token: "kimchi-key" });
+  expect(c.disabled).toBe(true);
+  expect(Load().disabled).toBe(true);
 });

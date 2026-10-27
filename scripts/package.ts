@@ -60,14 +60,16 @@ async function main() {
   const root = resolve(import.meta.dir, ".."),
     out = resolve(output),
     stage = mkdtempSync(join(tmpdir(), "pr-cost-package-"));
-  // Clients key hook trust by marketplace, so it changes only when the plugin wiring does:
-  // a release that changes only code needs no new registration or trust review.
-  const wiring = createHash("sha256").update(SHIM);
-  for (const path of files(join(root, "plugins")))
-    wiring.update(relative(root, path)).update("\0").update(readFileSync(path));
-  const market = `kimchi-work-${wiring.digest("hex").slice(0, 12)}`;
+  // Clients key hook trust by marketplace, so each client's marketplace changes only when its
+  // own plugin wiring does: a release that changes only code needs no new registration or review.
+  const market = (client: string) => {
+    const wiring = createHash("sha256").update(SHIM);
+    for (const path of files(join(root, "plugins", client)))
+      wiring.update(relative(root, path)).update("\0").update(readFileSync(path));
+    return `kimchi-work-${wiring.digest("hex").slice(0, 12)}`;
+  };
   try {
-    for (const path of ["bin", "lib", ".claude-plugin", ".agents/plugins"])
+    for (const path of ["bin", "lib", "markets", ".claude-plugin", ".agents/plugins"])
       mkdirSync(join(stage, path), { recursive: true });
     await BuildBundle(version, join(stage, "lib/kimchi-adapters.mjs"));
     cpSync(join(root, "plugins"), join(stage, "plugins"), { recursive: true });
@@ -78,7 +80,7 @@ async function main() {
     writeFileSync(
       join(stage, ".claude-plugin/marketplace.json"),
       JSON.stringify({
-        name: market,
+        name: market("claude"),
         owner: { name: "Kimchi" },
         plugins: [
           {
@@ -92,7 +94,7 @@ async function main() {
     writeFileSync(
       join(stage, ".agents/plugins/marketplace.json"),
       JSON.stringify({
-        name: market,
+        name: market("codex"),
         plugins: [
           {
             name: "kimchi-work",
@@ -103,7 +105,8 @@ async function main() {
         ],
       }) + "\n",
     );
-    writeFileSync(join(stage, "MARKETPLACE"), market + "\n");
+    for (const client of ["claude", "codex"])
+      writeFileSync(join(stage, "markets", client), market(client) + "\n");
     writeFileSync(join(stage, "VERSION"), version + "\n");
     cpSync(join(root, "install.sh"), join(stage, "install.sh"));
     cpSync(join(root, "install.sh"), join(stage, "bootstrap.sh"));

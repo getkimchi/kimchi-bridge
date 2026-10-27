@@ -242,14 +242,13 @@ test("CSV export guards formulas and status never outputs reporting credentials"
     join(root, ".config", "kimchi", "config.json"),
     JSON.stringify({ apiKey: "synthetic-private-key" }),
   );
+  // Kimchi's default region uploads to its console's /api.
+  const apiUrl = "https://app.kimchi.dev/api";
   const c: Config = {
-    apiUrl: "https://api.cast.ai",
+    apiUrl,
     organizationId: NewID(),
     actorId: NewID(),
-    credentialHash: CredentialHash({
-      apiUrl: "https://api.cast.ai",
-      token: "synthetic-private-key",
-    }),
+    credentialHash: CredentialHash({ apiUrl, token: "synthetic-private-key" }),
   };
   Save(c);
   let output = "";

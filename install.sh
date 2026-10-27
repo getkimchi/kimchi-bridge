@@ -32,7 +32,11 @@ if [[ "$action" == status ]]; then
   [[ ! -x "$bin_dir/kimchi-adapters" ]] || "$bin_dir/kimchi-adapters" status
   exit 0
 fi
-for cli in "${clients[@]}"; do command -v "$cli" >/dev/null || fail "Install official $cli first."; done
+for cli in "${clients[@]}"; do
+  # Uninstalling skips a client the plugins were never added to.
+  [[ "$action" == uninstall && ! -f "$prefix/installed/$cli" && ! -f "$prefix/installed/$cli.cleanup" ]] && continue
+  command -v "$cli" >/dev/null || fail "Install official $cli first."
+done
 mkdir -p "$prefix/installed" "$bin_dir"
 if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-adapters" || -L "$bin_dir/kimchi-adapters" ) ]]; then
   existing=$(readlink "$bin_dir/kimchi-adapters") || fail 'Refusing to replace an unmanaged kimchi-adapters binary.'
@@ -86,8 +90,6 @@ script_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 version=$(cat "$script_root/VERSION")
 [[ -z "$requested" || "$requested" == "$version" ]] || fail 'Requested version differs from this package.'
 valid_version "$version" || fail 'Invalid package version.'
-market=$(cat "$script_root/MARKETPLACE")
-valid_market "$market" || fail 'Invalid package marketplace.'
 # The plugins run on Kimchi's runtime; Kimchi's installer and updater pass its path.
 runtime=${KIMCHI_BIN:-$(command -v kimchi || true)}
 [[ "$runtime" == /* && -x "$runtime" ]] || fail 'Kimchi runs the plugins: install Kimchi first.'
@@ -107,7 +109,10 @@ ln -s "$target/lib/kimchi-adapters.mjs" "$prefix/.current.$$"
 mv -f -- "$prefix/.current.$$" "$prefix/current.mjs"
 ln -s "$target/bin/kimchi-adapters" "$bin_dir/.kimchi-adapters.new.$$"
 mv -f -- "$bin_dir/.kimchi-adapters.new.$$" "$bin_dir/kimchi-adapters"
+registered=
 for cli in "${clients[@]}"; do
+  market=$(cat "$script_root/markets/$cli")
+  valid_market "$market" || fail 'Invalid package marketplace.'
   receipt="$prefix/installed/$cli"
   old=
   [[ ! -f "$receipt" ]] || old=$(market_of "$(cat "$receipt")")
@@ -128,16 +133,28 @@ for cli in "${clients[@]}"; do
     if [[ -n "$old" ]]; then printf '%s\n' "$old" > "$receipt.cleanup.new";mv -- "$receipt.cleanup.new" "$receipt.cleanup";fi
     printf '%s\n' "$market" > "$receipt.new"
     mv -- "$receipt.new" "$receipt"
+    registered=1
   fi
   if [[ -f "$receipt.cleanup" ]]; then
     remove_market "$cli" "$(cat "$receipt.cleanup")"
     rm -- "$receipt.cleanup"
   fi
 done
-# Written last: after a failed registration the old code receipt stays, so Kimchi's next update retries.
-printf '%s\n' "$version" > "$prefix/installed/code.new"
-mv -- "$prefix/installed/code.new" "$prefix/installed/code"
+# Saving the settings drops what earlier releases kept there (their reporting key), which also
+# stops an earlier release's resident daemon.
+"$bin_dir/kimchi-adapters" activate
+# Written last, and only once every added client has this package's registration, so Kimchi's
+# next update retries a client whose registration failed.
+current=1
+for cli in claude codex; do
+  [[ ! -f "$prefix/installed/$cli" ]] || [[ "$(market_of "$(cat "$prefix/installed/$cli")")" == "$(cat "$script_root/markets/$cli")" ]] || current=
+done
+if [[ -n "$current" ]]; then
+  printf '%s\n' "$version" > "$prefix/installed/code.new"
+  mv -- "$prefix/installed/code.new" "$prefix/installed/code"
+fi
 # Keep the bootstrap, rather than a package-bound script, for kimchi-adapters uninstall.
 cp "$target/bootstrap.sh" "$prefix/install.sh"
 chmod 700 "$prefix/install.sh"
-printf '%s\n' "Installed $client $version. Start a new client session; Codex asks you to trust the plugin's hooks." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-adapters status" 'Existing inference and enterprise telemetry settings are unchanged.'
+printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-adapters status" 'Existing inference and enterprise telemetry settings are unchanged.'
+[[ -z "$registered" ]] || printf '%s\n' 'Start a new Claude Code or Codex session; Codex asks you to trust the hooks.'

@@ -1,7 +1,15 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Recorder, type Native } from "./capture.ts";
-import { CredentialHash, Flush, FlushOTLP, type SignIn } from "./delivery.ts";
+import {
+  BaseUrl,
+  CredentialHash,
+  Flush,
+  FlushOTLP,
+  IdentityError,
+  type Config,
+  type SignIn,
+} from "./delivery.ts";
 import { Open } from "./ledger.ts";
 import { EncodeEvent, Kind, Parse, Stringify } from "./protocol.ts";
 import {
@@ -40,6 +48,30 @@ function csvCell(value: string): string {
     : text;
 }
 
+// A starting session reports to the account Kimchi's sign-in verifies as. A sign-in that cannot be
+// read (Kimchi rewriting auth.json) keeps the verified account, and so does an unreachable API for
+// an SSO token of that same organization, as after a token refresh. Otherwise the account is
+// unknown, and the session stays on this machine.
+async function sessionAccount(c: Config, environmentKey?: string): Promise<Config> {
+  let k: SignIn;
+  try {
+    k = KimchiSignIn(environmentKey);
+  } catch {
+    return c;
+  }
+  if (!k.token) return {};
+  try {
+    return await Verify(k, AbortSignal.timeout(1000));
+  } catch (error) {
+    const refreshed =
+      !(error instanceof IdentityError) &&
+      k.organizationId !== undefined &&
+      k.organizationId.toLowerCase() === c.organizationId &&
+      BaseUrl(k.apiUrl) === c.apiUrl;
+    return refreshed ? c : {};
+  }
+}
+
 export async function Run(
   args: string[],
   stdin = input,
@@ -49,6 +81,8 @@ export async function Run(
 ): Promise<void> {
   const environmentKey = process.env.KIMCHI_API_KEY;
   delete process.env.KIMCHI_API_KEY;
+  // Kimchi's runtime switch must not reach the git, gh and glab this starts.
+  delete process.env.BUN_BE_BUN;
   // Unreadable Kimchi settings mean no sign-in: local recording continues, uploads wait.
   const signIn = (): SignIn => {
     try {
@@ -85,6 +119,10 @@ export async function Run(
     return;
   }
   let c = Load();
+  if (command === "activate") {
+    Save(c);
+    return;
+  }
   if (command === "enable" || command === "disable") {
     c.disabled = command === "disable";
     Save(c);
@@ -134,15 +172,11 @@ export async function Run(
           return;
         }
         const session = native.sessionId || native.event?.session_id;
-        // A session reports to the account Kimchi was signed in to when it started.
-        let account = c;
         const stage = native.stage || native.event?.hook_event_name;
-        if (stage === "session.start" || stage === "SessionStart") {
-          const current = signIn();
-          account = {};
-          if (current.token)
-            account = await Verify(current, AbortSignal.timeout(1000)).catch(() => c);
-        }
+        const account =
+          stage === "session.start" || stage === "SessionStart"
+            ? await sessionAccount(c, environmentKey)
+            : c;
         let dir: string;
         try {
           dir = SessionStateDir(account, args[1], typeof session === "string" ? session : "");

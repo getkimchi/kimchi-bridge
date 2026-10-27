@@ -10,7 +10,8 @@ import {
 } from "./protocol.ts";
 
 declare const Temporal: { Instant: { from(value: string): { epochNanoseconds: bigint } } };
-class IdentityError extends Error {}
+/** The API answered, and the sign-in is not a verified account. */
+export class IdentityError extends Error {}
 
 /** Kimchi's sign-in, read for each upload and never saved. */
 export interface SignIn {
@@ -42,7 +43,7 @@ export function ValidID(id: unknown): id is string {
 }
 
 const hasControl = (text: string) => ["\r", "\n", "\0"].some((char) => text.includes(char));
-function baseUrl(value: string): string {
+export function BaseUrl(value: string): string {
   while (value.endsWith("/")) value = value.slice(0, -1);
   return value;
 }
@@ -147,7 +148,7 @@ export async function Authenticate(k: SignIn, signal?: AbortSignal): Promise<Con
   secureEndpoint(k.apiUrl);
   if (!k.token || hasControl(k.token + (k.organizationId ?? "")))
     throw new Error("invalid Kimchi sign-in");
-  const apiUrl = baseUrl(k.apiUrl);
+  const apiUrl = BaseUrl(k.apiUrl);
   let identity: { organizationId?: unknown; userId?: unknown };
   try {
     const verify = await request(
@@ -191,7 +192,7 @@ export async function Flush(
   let response: Response;
   try {
     response = await request(
-      `${baseUrl(c.apiUrl!)}/ai-optimizer/v1beta/organizations/${encodeURIComponent(c.organizationId!)}/pr-cost-events:batchIngest`,
+      `${BaseUrl(c.apiUrl!)}/ai-optimizer/v1beta/organizations/${encodeURIComponent(c.organizationId!)}/pr-cost-events:batchIngest`,
       {
         method: "POST",
         headers: { ...authorization(k), "Content-Type": "application/json" },
