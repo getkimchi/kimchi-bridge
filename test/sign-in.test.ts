@@ -244,6 +244,9 @@ test("follows Kimchi's PR-reporting switch: explicit choice, then telemetry with
   policy("FORCE_OFF");
   state(JSON.stringify({ version: 1, enabled: true }));
   expect(enabled()).toBe(true);
+  // A busy user's state holds megabytes of queued snapshots; Kimchi still reads it.
+  state(JSON.stringify({ version: 1, enabled: true, entries: ["x".repeat(3 << 20)] }));
+  expect(enabled()).toBe(true);
   state(JSON.stringify({ version: 1, enabled: true, followsTelemetry: true }));
   expect(enabled()).toBe(false);
   state("{");
