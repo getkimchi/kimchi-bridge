@@ -304,6 +304,36 @@ test("native int64 usage readers preserve decimal identity before bounded event 
   expect(claudeUsage(raw).outputTokens).toBeUndefined();
 });
 
+test("Codex usage carries the service tier its thread settings ask for", () => {
+  const { root, store, r, scope } = fixture();
+  const path = join(root, "tier.jsonl");
+  registerTranscript(r, scope, path, "unknown", "unknown");
+  const line = (payload: object) =>
+    JSON.stringify({ timestamp: at, type: "event_msg", payload }) + "\n";
+  const usage = (total: number) =>
+    line({
+      type: "token_count",
+      info: {
+        last_token_usage: { input_tokens: 1, output_tokens: 1 },
+        total_token_usage: { input_tokens: total, output_tokens: total },
+      },
+    });
+  const tier = () => latest(store, "usage").usage.serviceTier;
+  writeFileSync(path, usage(1));
+  recoverContext(r);
+  expect(tier()).toBeUndefined();
+  appendFileSync(path, line({ type: "thread_settings_applied", thread_settings: {} }) + usage(2));
+  recoverContext(r);
+  expect(tier()).toBe("default");
+  appendFileSync(
+    path,
+    line({ type: "thread_settings_applied", thread_settings: { service_tier: "priority" } }) +
+      usage(3),
+  );
+  recoverContext(r);
+  expect(tier()).toBe("priority");
+});
+
 test("batched recovery commits the valid prefix and resumes without another charge", () => {
   const { root, store, r, scope } = fixture();
   const path = join(root, "batch.jsonl");

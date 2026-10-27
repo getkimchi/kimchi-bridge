@@ -193,7 +193,10 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
   if (
     r.source === "codex" &&
     str(v, "type") !== "turn_context" &&
-    !(str(v, "type") === "event_msg" && str(obj(v.payload), "type") === "token_count")
+    !(
+      str(v, "type") === "event_msg" &&
+      ["token_count", "thread_settings_applied"].includes(str(obj(v.payload), "type"))
+    )
   )
     return;
   const observed = timestamp(str(v, "timestamp"));
@@ -202,6 +205,12 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     if (str(v, "type") === "turn_context") {
       t.scope.Turn = str(p, "turn_id");
       r.store.setMeta(`model:${t.path}`, str(p, "model"));
+      return;
+    }
+    // The backend prices only a known tier. Codex's thread settings name the tier it asks
+    // for, such as "priority" for Fast; without one, OpenAI serves its "default" tier.
+    if (str(p, "type") === "thread_settings_applied") {
+      r.store.setMeta(`tier:${t.path}`, str(obj(p.thread_settings), "service_tier") || "default");
       return;
     }
     const info = obj(p.info);
@@ -214,6 +223,7 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
       billingBasis: t.basis,
       correlation: s.Turn ? "native_transcript_turn" : "session_only",
       provider: "openai",
+      serviceTier: r.store.meta(`tier:${t.path}`),
       raw: openAiUsage(info.last_token_usage),
       attemptsComplete: false,
       reportedModel: r.store.meta(`model:${t.path}`),
