@@ -116,6 +116,23 @@ test("reads Kimchi's API key, saved login and API in Kimchi's order", () => {
   expect(() => read()).toThrow("Kimchi settings could not be read");
 });
 
+test("the session hint asks for a sign-in only when neither Kimchi nor the plugin has one", async () => {
+  const hint = async () => {
+    let text = "";
+    await cli(["hint"], undefined, (out) => {
+      text += out;
+    });
+    return text;
+  };
+  expect(await hint()).toContain("Kimchi is not signed in");
+  kimchiFiles({ apiKey: "config-key" });
+  expect(await hint()).toBe("");
+  kimchiFiles(undefined, {
+    "kimchi-dev": { type: "oauth", access: "sso-token", orgId: randomUUID() },
+  });
+  expect(await hint()).toBe("");
+});
+
 test("a new key for the same account keeps its exporter; another account drops it", async () => {
   const exported: string[] = [];
   const exporter = server(async (request) => {
