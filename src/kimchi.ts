@@ -80,7 +80,8 @@ const text = (v: unknown) => (typeof v === "string" ? v : "");
 function kimchiFile(path: string): Record<string, unknown> {
   try {
     const bytes = readFileSync(path);
-    if (bytes.length > 1 << 20) throw new Error();
+    // Kimchi's own bound for these files (MAX_STATE_BYTES); a busy user's PR-reporting state is several MiB.
+    if (bytes.length > 24 << 20) throw new Error();
     const value = JSON.parse(bytes.toString("utf8"));
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
     return value;
