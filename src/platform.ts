@@ -11,6 +11,7 @@ import { constants as osConstants } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type * as BunFFI from "bun:ffi";
 import type { Pointer } from "bun:ffi";
+import { Database } from "bun:sqlite";
 
 const darwin = process.platform === "darwin";
 if (!darwin && process.platform !== "linux") throw new Error("Only macOS and Linux are supported");
@@ -196,4 +197,15 @@ export function lockSync(dir: string): { close(): void } | null {
       }
     },
   };
+}
+
+export function OpenDatabase(path: string): Database {
+  mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+  const fd = openSync(path, "a", 0o600);
+  closeSync(fd);
+  const db = new Database(path, { create: true, strict: true });
+  db.exec(
+    "PRAGMA busy_timeout=2000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;",
+  );
+  return db;
 }

@@ -15,7 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { Open, type Store } from "../src/ledger";
+import { Open, type Store } from "../src/work/ledger";
 import {
   CanonicalTime,
   EncodeBatch,
@@ -32,7 +32,7 @@ import {
   type Acknowledgement,
   type Batch,
   type Event,
-} from "../src/protocol";
+} from "../src/work/protocol";
 import {
   DecodeOTLP,
   Load,

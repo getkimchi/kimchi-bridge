@@ -19,11 +19,11 @@ import {
   referencedPaths,
   repository,
   type Scope,
-} from "../src/capture.ts";
-import { Open } from "../src/ledger.ts";
-import { git } from "../src/git.ts";
+} from "../src/work/capture.ts";
+import { Open } from "../src/work/ledger.ts";
+import { git } from "../src/work/git.ts";
 import { CheckSignal, RemainingTime, WithDeadline, lockSync, safeRead } from "../src/platform.ts";
-import { NewID, StableID } from "../src/protocol.ts";
+import { NewID, StableID } from "../src/work/protocol.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -299,8 +299,8 @@ test("two native processes racing the same turn keep one work ID and session def
   const { base, root, state, store } = fixture(),
     start = join(base, "start"),
     s = scope(root, "race", "turn");
-  const captureModule = new URL("../src/capture.ts", import.meta.url).pathname;
-  const ledgerModule = new URL("../src/ledger.ts", import.meta.url).pathname;
+  const captureModule = new URL("../src/work/capture.ts", import.meta.url).pathname;
+  const ledgerModule = new URL("../src/work/ledger.ts", import.meta.url).pathname;
   const children = [0, 1].map((index) => {
     const ready = join(base, `ready-${index}`);
     const script = `const f=require('node:fs');const{Recorder}=await import(${JSON.stringify(captureModule)});const{Open}=await import(${JSON.stringify(ledgerModule)});const store=Open(${JSON.stringify(state)});const r=new Recorder(store,'codex',store.DeviceID());const original=r.workExact.bind(r);let first=true;r.workExact=(s)=>{const work=original(s);if(first){first=false;f.writeFileSync(${JSON.stringify(ready)},'ready');const until=Date.now()+3000;while(!f.existsSync(${JSON.stringify(start)})){if(Date.now()>until)throw Error('barrier expired');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,2)}}return work};try{r.bind(${JSON.stringify(s)},'New work: same turn')}finally{store.Close()}`;

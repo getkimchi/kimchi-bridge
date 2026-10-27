@@ -12,6 +12,9 @@ import { join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { parse, valid } from "semver";
 
+// The plugin each client's marketplace lists, from plugins/<plugin>/<client>.
+const plugin = "kimchi-work";
+
 export function ReleaseVersion(value: string): string {
   const text = value.startsWith("v") ? value.slice(1) : "",
     version = parse(text);
@@ -65,7 +68,7 @@ async function main() {
   // own plugin wiring does: a release that changes only code needs no new registration or review.
   const market = (client: string) => {
     const wiring = createHash("sha256").update(SHIM);
-    for (const path of files(join(root, "plugins", client)))
+    for (const path of files(join(root, "plugins", plugin, client)))
       wiring.update(relative(root, path)).update("\0").update(readFileSync(path));
     return `kimchi-bridge-${wiring.digest("hex").slice(0, 12)}`;
   };
@@ -74,7 +77,7 @@ async function main() {
       mkdirSync(join(stage, path), { recursive: true });
     await BuildBundle(version, join(stage, "lib/kimchi-bridge.mjs"));
     cpSync(join(root, "plugins"), join(stage, "plugins"), { recursive: true });
-    for (const bin of ["bin", "plugins/claude/bin", "plugins/codex/bin"]) {
+    for (const bin of ["bin", `plugins/${plugin}/claude/bin`, `plugins/${plugin}/codex/bin`]) {
       mkdirSync(join(stage, bin), { recursive: true });
       writeFileSync(join(stage, bin, "kimchi-bridge"), SHIM, { mode: 0o755 });
     }
@@ -85,8 +88,8 @@ async function main() {
         owner: { name: "Kimchi" },
         plugins: [
           {
-            name: "kimchi-work",
-            source: "./plugins/claude",
+            name: plugin,
+            source: `./plugins/${plugin}/claude`,
             description: "Quiet work accounting for official Claude Code",
           },
         ],
@@ -98,8 +101,8 @@ async function main() {
         name: market("codex"),
         plugins: [
           {
-            name: "kimchi-work",
-            source: { source: "local", path: "./plugins/codex" },
+            name: plugin,
+            source: { source: "local", path: `./plugins/${plugin}/codex` },
             policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
             category: "Productivity",
           },

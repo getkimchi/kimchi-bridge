@@ -2,9 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { appendFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Recorder, repository, type Scope } from "../src/capture.ts";
-import { Open } from "../src/ledger.ts";
-import { Parse, StableID } from "../src/protocol.ts";
+import { Recorder, repository, type Scope } from "../src/work/capture.ts";
+import { Open } from "../src/work/ledger.ts";
+import { Parse, StableID } from "../src/work/protocol.ts";
 import {
   claudeUsage,
   openAIUsage,
@@ -13,7 +13,7 @@ import {
   telemetry,
   route,
   version,
-} from "../src/recovery.ts";
+} from "../src/work/recovery.ts";
 import {
   issueKeys,
   git,
@@ -22,7 +22,7 @@ import {
   ReconcileGit,
   saveMeta,
   scmEnvironment,
-} from "../src/git.ts";
+} from "../src/work/git.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {

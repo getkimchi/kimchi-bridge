@@ -1,27 +1,20 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Recorder, type Native } from "./capture.ts";
-import {
-  BaseUrl,
-  CredentialHash,
-  Flush,
-  FlushOTLP,
-  IdentityError,
-  type Config,
-  type SignIn,
-} from "./delivery.ts";
-import { Open } from "./ledger.ts";
-import { EncodeEvent, Kind, Parse, Stringify } from "./protocol.ts";
+import { BaseUrl, CredentialHash, IdentityError, KimchiSignIn, type SignIn } from "./kimchi.ts";
 import {
   DecodeOTLP,
-  KimchiSignIn,
   Load,
   Save,
   SessionStateDir,
   StateDir,
   Verify,
+  type Config,
 } from "./settings.ts";
-import { Run as Sync } from "./sync.ts";
+import { Recorder, type Native } from "./work/capture.ts";
+import { Flush, FlushOTLP } from "./work/delivery.ts";
+import { Open } from "./work/ledger.ts";
+import { EncodeEvent, Kind, Parse, Stringify } from "./work/protocol.ts";
+import { Run as Sync } from "./work/sync.ts";
 
 declare const BUILD_VERSION: string | undefined;
 const version = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev";

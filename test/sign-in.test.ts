@@ -3,10 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Run as CLI } from "../src/cli.ts";
-import { CredentialHash, FlushOTLP } from "../src/delivery.ts";
-import { Open } from "../src/ledger.ts";
-import { NewID, Parse, type Batch, type Event } from "../src/protocol.ts";
-import { KimchiSignIn, Load, Save, SessionStateDir, StateDir, Verify } from "../src/settings.ts";
+import { CredentialHash, KimchiSignIn } from "../src/kimchi.ts";
+import { Load, Save, SessionStateDir, StateDir, Verify } from "../src/settings.ts";
+import { FlushOTLP } from "../src/work/delivery.ts";
+import { Open } from "../src/work/ledger.ts";
+import { NewID, Parse, type Batch, type Event } from "../src/work/protocol.ts";
 
 let root: string, kimchi: string;
 const variables = [

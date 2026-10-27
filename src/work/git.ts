@@ -16,7 +16,7 @@ import {
   type PullRequest,
   type Repository,
 } from "./protocol.ts";
-import { CheckSignal, RemainingTime, WithDeadline, within } from "./platform.ts";
+import { CheckSignal, RemainingTime, WithDeadline, within } from "../platform.ts";
 import type { Recorder, Scope } from "./capture.ts";
 
 type Object = Record<string, any>;

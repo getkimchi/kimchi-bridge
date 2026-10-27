@@ -2,18 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  Authenticate,
-  CredentialHash,
-  Flush,
-  FlushOTLP,
-  Ready,
-  ValidateConfig,
-  type Config,
-  type SignIn,
-} from "../src/delivery.ts";
-import { Open, type Store } from "../src/ledger.ts";
-import { Hash, NewID, Parse, type Batch, type Event } from "../src/protocol.ts";
+import { Authenticate, CredentialHash, type SignIn } from "../src/kimchi.ts";
+import { ValidateConfig, type Config } from "../src/settings.ts";
+import { Flush, FlushOTLP, Ready } from "../src/work/delivery.ts";
+import { Open, type Store } from "../src/work/ledger.ts";
+import { Hash, NewID, Parse, type Batch, type Event } from "../src/work/protocol.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {

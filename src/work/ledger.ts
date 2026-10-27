@@ -1,16 +1,16 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import {
   closeSync,
   constants,
   fstatSync,
   lstatSync,
-  mkdirSync,
   openSync,
   readSync,
   readdirSync,
 } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { OpenDatabase } from "../platform.ts";
 import {
   EncodeBatch,
   EncodeEvent,
@@ -24,7 +24,7 @@ import {
   type Acknowledgement,
   type Batch,
   type Event,
-} from "./protocol";
+} from "./protocol.ts";
 
 export const ErrConflict = new Error("event identity conflicts with persisted content");
 const schemaVersion = 0x4b570001;
@@ -59,16 +59,6 @@ CREATE TABLE IF NOT EXISTS diagnostics(code TEXT PRIMARY KEY,count INTEGER NOT N
 const now = () => Math.floor(Date.now() / 1000);
 const text = (body: string | Uint8Array) =>
   typeof body === "string" ? body : Buffer.from(body).toString("utf8");
-export function OpenDatabase(path: string): Database {
-  mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
-  const fd = openSync(path, "a", 0o600);
-  closeSync(fd);
-  const db = new Database(path, { create: true, strict: true });
-  db.exec(
-    "PRAGMA busy_timeout=2000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;",
-  );
-  return db;
-}
 export class Store {
   readonly DB: Database;
   constructor(readonly Dir: string) {

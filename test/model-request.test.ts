@@ -2,9 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Recorder } from "../src/capture.ts";
-import { Open, type Store } from "../src/ledger.ts";
-import { Hash, Parse, type Event } from "../src/protocol.ts";
+import { Recorder } from "../src/work/capture.ts";
+import { Open, type Store } from "../src/work/ledger.ts";
+import { Hash, Parse, type Event } from "../src/work/protocol.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -105,7 +105,7 @@ test("identical completed callbacks remain two supplementary observations and ne
   });
   expect(store.PendingBatch()).toBeNull();
   const config = JSON.parse(
-    readFileSync(new URL("../plugins/codex/hooks/hooks.json", import.meta.url), "utf8"),
+    readFileSync(new URL("../plugins/kimchi-work/codex/hooks/hooks.json", import.meta.url), "utf8"),
   );
   const handler = config.hooks.PostModelRequest[0].hooks[0];
   expect(handler.type).toBe("command");

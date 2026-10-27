@@ -6,7 +6,10 @@ import ts from "typescript";
 test("runtime and build scripts use native APIs and parsers without local regexes", () => {
   const found: string[] = [];
   for (const dir of ["src", "scripts"])
-    for (const file of readdirSync(join(import.meta.dir, "..", dir))) {
+    for (const file of readdirSync(join(import.meta.dir, "..", dir), {
+      recursive: true,
+      encoding: "utf8",
+    })) {
       if (!file.endsWith(".ts")) continue;
       const path = join(dir, file),
         source = ts.createSourceFile(

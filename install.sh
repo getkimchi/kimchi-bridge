@@ -3,6 +3,8 @@ set -euo pipefail
 
 # Native plugin management for the package in Kimchi's release. No inference settings.
 umask 077
+# The plugin the package registers with each client.
+plugin=kimchi-work
 prefix=${KIMCHI_BRIDGE_PREFIX:-"$HOME/.local/share/kimchi-bridge"}
 bin_dir=${KIMCHI_BRIDGE_BIN_DIR:-"$HOME/.local/bin"}
 action=${1:-install}
@@ -57,7 +59,7 @@ remove_market() {
   local cli=$1 market selector output
   market=$(market_of "$2")
   valid_market "$market" || fail 'Invalid registration receipt.'
-  selector="kimchi-work@$market"
+  selector="$plugin@$market"
   if [[ "$cli" == claude ]]; then
     if output=$(claude plugin uninstall "$selector" --scope user 2>&1); then printf '%s\n' "$output"; else
       case "$output" in *"Plugin \"$selector\" not found in installed plugins"*) ;; *) printf '%s\n' "$output" >&2;return 1 ;; esac
@@ -127,10 +129,10 @@ for cli in "${clients[@]}"; do
     if [[ -f "$receipt.cleanup" ]]; then remove_market "$cli" "$(cat "$receipt.cleanup")";rm -- "$receipt.cleanup";fi
     if [[ "$cli" == claude ]]; then
       claude plugin marketplace add "$target" --scope user
-      claude plugin install "kimchi-work@$market" --scope user
+      claude plugin install "$plugin@$market" --scope user
     else
       codex plugin marketplace add "$target" --json
-      codex plugin add "kimchi-work@$market" --json
+      codex plugin add "$plugin@$market" --json
     fi
     if [[ -n "$old" ]]; then printf '%s\n' "$old" > "$receipt.cleanup.new";mv -- "$receipt.cleanup.new" "$receipt.cleanup";fi
     printf '%s\n' "$market" > "$receipt.new"

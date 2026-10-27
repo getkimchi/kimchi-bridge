@@ -10,20 +10,26 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { NewID, StableID } from "./protocol";
-import { OpenDatabase } from "./ledger";
 import {
   Authenticate,
-  BaseUrl,
   CredentialHash,
-  ValidateConfig,
-  ValidateOTLP,
   ValidID,
-  type Config as DeliveryConfig,
+  hasControl,
+  object,
+  secureEndpoint,
   type SignIn,
-} from "./delivery";
+} from "./kimchi.ts";
+import { OpenDatabase } from "./platform.ts";
+import { NewID, StableID } from "./work/protocol.ts";
 
-export interface Config extends DeliveryConfig {
+/** The account Kimchi's sign-in was verified as, OTLP export, and whether capture is paused. */
+export interface Config {
+  apiUrl?: string;
+  organizationId?: string;
+  actorId?: string;
+  credentialHash?: string;
+  otlpUrl?: string;
+  otlpHeaders?: Record<string, string>;
   disabled?: boolean;
 }
 export function Root(): string {
@@ -76,66 +82,6 @@ export function Save(config: Config): void {
     }
   }
 }
-// Kimchi's sign-in, in the order of its resolveGatewayCredentials: an API key (KIMCHI_API_KEY,
-// then the global config), else its saved login, whose SSO token carries its organization.
-// Project .kimchi/config.json keys stay Kimchi's: the plugins can't see its project trust.
-export function KimchiSignIn(
-  environmentKey = "",
-  dir = join(process.env.HOME || homedir(), ".config", "kimchi"),
-  env: Record<string, string | undefined> = process.env,
-): SignIn {
-  let config: Record<string, unknown> = {};
-  try {
-    config = kimchiFile(join(dir, "config.json"));
-  } catch {
-    // Kimchi reads a malformed config as empty too, and still uses its saved login.
-  }
-  const apiUrl = kimchiApiUrl(config, env);
-  const key = environmentKey || text(config.apiKey) || text(config.api_key);
-  if (key) return { apiUrl, token: key };
-  const login = object(kimchiFile(join(dir, "harness", "auth.json"))["kimchi-dev"]);
-  if (login.type === "oauth" && text(login.access))
-    return { apiUrl, token: text(login.access), organizationId: text(login.orgId) || undefined };
-  if (login.type === "api_key" && text(login.key)) return { apiUrl, token: text(login.key) };
-  return { apiUrl };
-}
-const object = (v: unknown): Record<string, unknown> =>
-  v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
-const text = (v: unknown) => (typeof v === "string" ? v : "");
-function kimchiFile(path: string): Record<string, unknown> {
-  try {
-    const bytes = readFileSync(path);
-    if (bytes.length > 1 << 20) throw new Error();
-    const value = JSON.parse(bytes.toString("utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
-    return value;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw new Error("Kimchi settings could not be read");
-  }
-}
-// Where Kimchi's own PR-cost uploads go (resolveEndpoints().platformApiUrl): KIMCHI_REMOTE_ENDPOINT,
-// else the region's console with /api. Self-hosted needs all three stored endpoints, as in Kimchi.
-function kimchiApiUrl(config: Record<string, unknown>, env: Record<string, string | undefined>) {
-  if (env.KIMCHI_REMOTE_ENDPOINT) return env.KIMCHI_REMOTE_ENDPOINT;
-  const region = [env.KIMCHI_REGION, config.region].find((r) =>
-    ["us", "eu", "self-hosted"].includes(text(r)),
-  );
-  if (region === "eu") return "https://app.eu.kimchi.dev/api";
-  if (region !== "self-hosted") return "https://app.kimchi.dev/api";
-  const stored = object(config.selfHostedEndpoints);
-  const [api, console, llm] = ["api", "console", "llm"].map((key) => origin(text(stored[key])));
-  return api && console && llm ? console + "/api" : "";
-}
-// Kimchi's normalizeSelfHostedBaseUrl: an absolute http(s) URL without trailing slashes.
-function origin(value: string): string {
-  value = BaseUrl(value.trim());
-  try {
-    return ["http:", "https:"].includes(new URL(value).protocol) ? value : "";
-  } catch {
-    return "";
-  }
-}
 
 /** Verify Kimchi's sign-in when it changed. A different account drops the old account's exporter. */
 export async function Verify(k: SignIn, signal?: AbortSignal): Promise<Config> {
@@ -168,6 +114,32 @@ export function DecodeOTLP(data: string | Uint8Array): Pick<Config, "otlpUrl" | 
   ValidateOTLP(otlp);
   return otlp;
 }
+
+export function ValidateOTLP(c: Config): void {
+  if (c.otlpUrl) secureEndpoint(c.otlpUrl);
+  const headers = c.otlpHeaders ?? {};
+  if (typeof headers !== "object" || Array.isArray(headers) || Object.keys(headers).length > 16)
+    throw new Error("invalid OTLP headers");
+  for (const [key, value] of Object.entries(headers)) {
+    if (
+      !key ||
+      key.length > 64 ||
+      typeof value !== "string" ||
+      value.length > 2048 ||
+      hasControl(key + value)
+    )
+      throw new Error("invalid OTLP header");
+    if (["host", "content-length", "transfer-encoding"].includes(key.toLowerCase()))
+      throw new Error("reserved OTLP header");
+  }
+}
+
+export function ValidateConfig(c: Config): void {
+  secureEndpoint(c.apiUrl);
+  ValidateOTLP(c);
+  if (!ValidID(c.organizationId) || !ValidID(c.actorId)) throw new Error("invalid account");
+}
+
 const validAccount = (s: unknown) => s === "local" || ValidID(s);
 export function SessionStateDir(c: Config, source: string, session: string): string {
   if (
