@@ -10,11 +10,20 @@ import {
   verifySignIn,
   type Config,
 } from "./settings.ts";
+import {
+  loginStatus,
+  readLoginProgress,
+  signInFlow,
+  storedSignIn,
+  writeLoginProgress,
+  type RegionId,
+} from "./oauth.ts";
 import { Recorder, type Native } from "./work/capture.ts";
 import { flush, flushOtlp } from "./work/delivery.ts";
 import { Store } from "./work/ledger.ts";
 import { encodeEvent, eventKind, parseJson, stringifyJson } from "./work/protocol.ts";
 import { sync } from "./work/sync.ts";
+import { cliEntry } from "./platform.ts";
 
 declare const BUILD_VERSION: string | undefined;
 const version = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev";
@@ -41,6 +50,17 @@ function csvCell(value: string): string {
     : text;
 }
 
+/**
+ * The sign-in the plugins report with: an explicit key first, then this
+ * helper's own OAuth credential, then Kimchi's saved sign-in (key or SSO).
+ */
+function resolveSignIn(environmentKey: string | undefined): SignIn {
+  if (environmentKey) return kimchiSignIn(environmentKey);
+  const stored = storedSignIn();
+  if (stored) return stored;
+  return kimchiSignIn(environmentKey);
+}
+
 // A starting session reports to the account Kimchi's sign-in verifies as. A sign-in that cannot be
 // read (Kimchi rewriting auth.json) keeps the verified account, and so does an unreachable API for
 // an SSO token of that same organization, as after a token refresh. Otherwise the account is
@@ -48,7 +68,7 @@ function csvCell(value: string): string {
 async function sessionAccount(c: Config, environmentKey?: string): Promise<Config> {
   let k: SignIn;
   try {
-    k = kimchiSignIn(environmentKey);
+    k = resolveSignIn(environmentKey);
   } catch {
     return c;
   }
@@ -79,19 +99,168 @@ export async function run(
   // Unreadable Kimchi settings mean no sign-in: local recording continues, uploads wait.
   const signIn = (): SignIn => {
     try {
-      return kimchiSignIn(environmentKey);
+      return resolveSignIn(environmentKey);
     } catch {
       return { apiUrl: "" };
     }
   };
   if (!args.length)
     throw new Error(
-      "usage: kimchi-bridge status | enable | disable | flush | export jsonl|csv | version",
+      "usage: kimchi-bridge status | login | enable | disable | flush | export jsonl|csv | gateway start|run|ensure|stop|status|enable|disable | version",
     );
   const command = args[0];
   if (command === "version") {
     output(version + "\n");
     return;
+  }
+  if (command === "hint") {
+    // One line, and only when the plugin is not set up; silent otherwise.
+    const status = await loginStatus();
+    if (status.state === "signed-out")
+      output(
+        "Kimchi is not signed in. Sign in with the /kimchi-login command (or run `kimchi-bridge login` in a terminal) to record work and route model requests through the Kimchi gateway.\n",
+      );
+    return;
+  }
+  if (command === "login") {
+    const { parseArgs } = await import("node:util");
+    if (args[1] === "status") {
+      output(JSON.stringify(await loginStatus()) + "\n");
+      return;
+    }
+    const { values } = parseArgs({
+      args: args.slice(1),
+      allowPositionals: false,
+      options: {
+        "from-kimchi": { type: "boolean" },
+        "no-browser": { type: "boolean" },
+        "reporting-only": { type: "boolean" },
+        detached: { type: "boolean" },
+        foreground: { type: "boolean" },
+        region: { type: "string" },
+        org: { type: "string" },
+      },
+    });
+    if (values.detached && values.foreground)
+      throw new Error("choose --detached or --foreground, not both");
+    if (values.region && values.region !== "us" && values.region !== "eu")
+      throw new Error("choose region us or eu");
+    // The OAuth sign-in waits on a browser callback for up to five minutes;
+    // shells driven by agents may not wait that long, so run detached there.
+    const detached = values.detached || (!values.foreground && !process.stdout.isTTY);
+    if (detached) {
+      const child = Bun.spawn(
+        [
+          ...cliEntry(),
+          "login",
+          "--foreground",
+          ...args.slice(1).filter((arg) => arg !== "--detached"),
+        ],
+        { stdin: "ignore", stdout: "ignore", stderr: "ignore", detached: true },
+      );
+      child.unref();
+      // Give the detached sign-in a moment to record its URL for the message.
+      const deadline = Date.now() + 3000;
+      let progress;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        progress = readLoginProgress();
+        if (progress?.url) break;
+      }
+      output("CAST AI sign-in started in the background.\n");
+      if (progress?.url) output(`If the browser does not open, visit: ${progress.url}\n`);
+      output("Watch it finish with: kimchi-bridge login status\n");
+      return;
+    }
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    process.once("SIGTERM", cancel);
+    process.once("SIGINT", cancel);
+    try {
+      writeLoginProgress({ phase: "starting", startedAt: Date.now() });
+      const result = await signInFlow({
+        fromKimchi: values["from-kimchi"],
+        noBrowser: values["no-browser"],
+        region: values.region as RegionId | undefined,
+        org: values.org,
+        signal: controller.signal,
+        onMessage: (message) => output(message + "\n"),
+        onStarted: (url) => writeLoginProgress({ phase: "waiting", startedAt: Date.now(), url }),
+      });
+      // Bind the verified account the way every sign-in does, then report it.
+      const bound = await verifySignIn(storedSignIn() ?? { apiUrl: "", token: "" });
+      output(
+        `Reporting configured with your CAST AI sign-in for ${result.credential.orgName}` +
+          ` (organization ${bound.organizationId ?? result.credential.orgId}).\n`,
+      );
+      writeLoginProgress({ phase: "done", startedAt: Date.now(), finishedAt: Date.now() });
+      // A successful sign-in turns the gateway on in the matching mode; the
+      // opt-out keeps the plugins reporting-only.
+      if (!values["reporting-only"]) {
+        try {
+          const { enable } = await import("./gateway.ts");
+          await enable(storedSignIn() ?? { apiUrl: "", token: "" }, (message) =>
+            output(message + "\n"),
+          );
+        } catch (error) {
+          output(
+            `Gateway not enabled: ${error instanceof Error ? error.message : "unknown error"}\n`,
+          );
+        }
+      } else {
+        output("Reporting only; inference settings are unchanged.\n");
+      }
+    } catch (error) {
+      writeLoginProgress({
+        phase: "error",
+        startedAt: Date.now(),
+        error: error instanceof Error ? error.message : "login failed",
+        finishedAt: Date.now(),
+      });
+      throw error;
+    } finally {
+      process.off("SIGTERM", cancel);
+      process.off("SIGINT", cancel);
+    }
+    return;
+  }
+  if (command === "gateway") {
+    const gateway = await import("./gateway.ts");
+    const verb = args[1];
+    const message = (text: string) => output(text + "\n");
+    if (verb === "run") {
+      await gateway.runDaemon();
+      return;
+    }
+    if (verb === "start" || verb === "ensure") {
+      // --quick is the hook path: spawn and return immediately.
+      if (args.includes("--quick")) {
+        gateway.ensureQuick();
+        return;
+      }
+      const outcome = await gateway.ensure();
+      if (outcome === "unauthenticated") throw new Error("run kimchi-bridge login first");
+      output(outcome + "\n");
+      return;
+    }
+    if (verb === "stop") {
+      gateway.stop();
+      output("Gateway proxy stopped.\n");
+      return;
+    }
+    if (verb === "enable") {
+      await gateway.enable(signIn(), message);
+      return;
+    }
+    if (verb === "disable") {
+      await gateway.disable(message);
+      return;
+    }
+    if (verb === "status") {
+      output(JSON.stringify(await gateway.status()) + "\n");
+      return;
+    }
+    throw new Error("usage: kimchi-bridge gateway start|run|ensure|stop|status|enable|disable");
   }
   if (command === "uninstall") {
     if (!["claude", "codex", "both"].includes(args[1]))
@@ -129,6 +298,9 @@ export async function run(
     process.once("SIGTERM", cancel);
     process.once("SIGINT", cancel);
     try {
+      // An expired OAuth bearer is refreshed before its sign-in is read.
+      const { ensureFresh } = await import("./oauth.ts");
+      await ensureFresh(controller.signal).catch(() => {});
       await sync(signIn(), controller.signal);
     } finally {
       process.off("SIGTERM", cancel);
@@ -189,19 +361,29 @@ export async function run(
         }
         return;
       }
-      case "status":
+      case "status": {
+        const { status: gatewayStatus } = await import("./gateway.ts");
         output(
           JSON.stringify({
             version,
             disabled: c.disabled ?? false,
             kimchiSignedIn: Boolean(k.token),
             reportingVerified: Boolean(k.token) && c.credentialHash === credentialHash(k),
+            signInSource: environmentKey
+              ? "key"
+              : storedSignIn()
+                ? "oauth"
+                : k.token
+                  ? "kimchi"
+                  : "none",
             organizationId: c.organizationId ?? "",
+            gateway: await gatewayStatus(),
             ledger: stateDir(c),
             accounting: s.status(),
           }) + "\n",
         );
         return;
+      }
       case "recover":
       case "flush": {
         for (const source of ["claude-code", "codex"])

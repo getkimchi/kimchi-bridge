@@ -1,5 +1,6 @@
 import {
   constants,
+  existsSync,
   closeSync,
   fstatSync,
   mkdirSync,
@@ -12,6 +13,20 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type * as BunFFI from "bun:ffi";
 import type { Pointer } from "bun:ffi";
 import { Database } from "bun:sqlite";
+
+/**
+ * The command that re-invokes this CLI. The release shim runs
+ * `runtime current.mjs ...`, and bun runs an entry script, so argv[1] is a
+ * script path; a compiled binary re-invokes itself with only arguments.
+ */
+export function cliEntry(): string[] {
+  const entry = process.argv[1];
+  const isScript =
+    entry &&
+    (entry.endsWith(".mjs") || entry.endsWith(".ts") || entry.endsWith(".js")) &&
+    existsSync(entry);
+  return isScript ? [process.execPath, entry] : [process.execPath];
+}
 
 const darwin = process.platform === "darwin";
 if (!darwin && process.platform !== "linux") throw new Error("Only macOS and Linux are supported");

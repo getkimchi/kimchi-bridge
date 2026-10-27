@@ -160,5 +160,5 @@ fi
 # Keep the bootstrap, rather than a package-bound script, for kimchi-bridge uninstall.
 cp "$target/bootstrap.sh" "$prefix/install.sh"
 chmod 700 "$prefix/install.sh"
-printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-bridge status" 'Existing inference and enterprise telemetry settings are unchanged.'
+printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi, or kimchi-bridge login for the browser SSO.' "Control: $bin_dir/kimchi-bridge status" 'kimchi-bridge login routes model requests through the Kimchi gateway; revert with kimchi-bridge gateway disable.'
 [[ -z "$registered" ]] || printf '%s\n' 'Start a new Claude Code or Codex session; Codex asks you to trust the hooks.'
