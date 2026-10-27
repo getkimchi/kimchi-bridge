@@ -6,7 +6,7 @@ async function record($, stage, event, result) {
     const sessionId = await $.session.id();
     const cwd = await $.session.cwd();
     const version = sourceVersion ??= (await $.session.version()).version;
-    await $.process.run([root + '/bin/kimchi-adapters', 'hook', 'claude-code'], {
+    await $.process.run([root + '/bin/kimchi-bridge', 'hook', 'claude-code'], {
       stdin: JSON.stringify({stage, event, result, sessionId, cwd, version}),
       timeoutMs: 2000
     });
@@ -16,7 +16,7 @@ async function record($, stage, event, result) {
 }
 async function sync($) {
   try {
-    await $.process.run([$.plugin.root + '/bin/kimchi-adapters', 'sync'], {timeoutMs: 10000});
+    await $.process.run([$.plugin.root + '/bin/kimchi-bridge', 'sync'], {timeoutMs: 10000});
   } catch {
     // The durable queue is retried by the next timer or session.
   }

@@ -1,6 +1,6 @@
-# Kimchi PR-cost plugins
+# Kimchi bridge
 
-Plugins for the official Claude Code and Codex CLIs. They record the token usage of your coding sessions, link it to the pull requests that contain your changes and upload it to Cast AI with your Kimchi sign-in. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
+Kimchi plugins for other coding harnesses, run by the `kimchi-bridge` command. The `kimchi-work` plugin works with the official Claude Code and Codex CLIs. It records the token usage of your coding sessions, links it to the pull requests that contain your changes and uploads it to your Kimchi account. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
 
 ## Install
 
@@ -32,16 +32,16 @@ Kimchi's releases include the plugins, and Kimchi updates the plugins it added w
 2. Upload anything still queued:
 
    ```sh
-   kimchi-adapters flush
+   kimchi-bridge flush
    ```
 
 3. Remove the plugins. Choose `claude`, `codex` or `both`:
 
    ```sh
-   kimchi-adapters uninstall both
+   kimchi-bridge uninstall both
    ```
 
-Your local records and the plugin files stay in `~/.local/state/kimchi-adapters` and `~/.local/share/kimchi-adapters` until you delete them. Kimchi's updates leave removed plugins removed; running Kimchi's installer adds them again.
+Your local records and the plugin files stay in `~/.local/state/kimchi-bridge` and `~/.local/share/kimchi-bridge` until you delete them. Kimchi's updates leave removed plugins removed; running Kimchi's installer adds them again.
 
 ## Use
 
@@ -55,12 +55,12 @@ A session reports to the account Kimchi was signed in to when the session starte
 
 | Command | What it does |
 | --- | --- |
-| `kimchi-adapters status` | Shows whether Kimchi is signed in and verified, the local data folder, queued uploads and recording problems. |
-| `kimchi-adapters flush` | Uploads all queued records now. |
-| `kimchi-adapters disable` | Pauses recording and background uploads. Local records are kept. |
-| `kimchi-adapters enable` | Resumes recording and uploads. |
-| `kimchi-adapters export jsonl` | Prints all local records as JSON Lines. Use `export csv` for CSV. |
-| `kimchi-adapters version` | Prints the installed version. |
+| `kimchi-bridge status` | Shows whether Kimchi is signed in and verified, the local data folder, queued uploads and recording problems. |
+| `kimchi-bridge flush` | Uploads all queued records now. |
+| `kimchi-bridge disable` | Pauses recording and background uploads. Local records are kept. |
+| `kimchi-bridge enable` | Resumes recording and uploads. |
+| `kimchi-bridge export jsonl` | Prints all local records as JSON Lines. Use `export csv` for CSV. |
+| `kimchi-bridge version` | Prints the installed version. |
 
 ### Start new work
 
@@ -78,10 +78,14 @@ To continue the same work in another session, or in the other client, have the a
 
 Claude Code and Codex hooks run the plugins' code on Kimchi's own runtime (`BUN_BE_BUN=1 kimchi`), without loading the project's `.env` or `bunfig.toml`. The code records the token usage of each model request, read from the client's transcripts, and each tool call with its outcome. It also keeps copies of the files each tool works on, from before and after the call. It then matches file changes to your Git commits and asks `gh` or `glab` which pull requests contain those commits. It doesn't change prompts or replies, and if recording fails, your session carries on.
 
-Records are saved in SQLite databases under `~/.local/state/kimchi-adapters`, one for each account. The plugins keep no key: they read Kimchi's sign-in each time they upload. File copies never leave your machine. While recording is on, copies older than seven days are deleted.
+Records are saved in SQLite databases under `~/.local/state/kimchi-bridge`, one for each account. The plugins keep no key: they read Kimchi's sign-in each time they upload. File copies never leave your machine. While recording is on, copies older than seven days are deleted.
 
-A background sync uploads new records to the Cast AI API when a session starts, after each turn and every 30 seconds while Claude Code is open. Records that fail to upload stay queued for the next sync. Nothing runs while the clients are closed.
+A background sync uploads new records to the Kimchi API when a session starts, after each turn and every 30 seconds while Claude Code is open. Records that fail to upload stay queued for the next sync. Nothing runs while the clients are closed.
 
 Uploads contain IDs, timestamps, token counts, model names, tool names and outcomes, commit IDs, repository names, pull request numbers, titles and links, `New work:` titles, and issue keys found in titles and branch names. They don't contain prompts, replies, code, file contents, file paths, or tool inputs and outputs.
 
-Cast AI prices the usage and shows the cost of each pull request in the Kimchi console, under Reporting → PR costs.
+Kimchi prices the usage and shows the cost of each pull request in the Kimchi console, under Reporting → PR costs.
+
+## Repository layout
+
+Shared code lives at the top of `src/`: the `kimchi-bridge` command in `cli.ts`, Kimchi's sign-in in `kimchi.ts`, local settings and session binding in `settings.ts`, and platform helpers in `platform.ts`. A plugin's code lives in its own folder under `src/`, and its Claude Code and Codex files in `plugins/<plugin>/claude/` and `plugins/<plugin>/codex/`. The `kimchi-work` plugin uses `src/work/` and `plugins/kimchi-work/`.

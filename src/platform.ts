@@ -11,6 +11,7 @@ import { constants as osConstants } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type * as BunFFI from "bun:ffi";
 import type { Pointer } from "bun:ffi";
+import { Database } from "bun:sqlite";
 
 const darwin = process.platform === "darwin";
 if (!darwin && process.platform !== "linux") throw new Error("Only macOS and Linux are supported");
@@ -31,7 +32,7 @@ function native() {
 }
 
 const deadlines = new WeakMap<AbortSignal, number>();
-export function WithDeadline(ms: number, parent?: AbortSignal): AbortSignal {
+export function withDeadline(ms: number, parent?: AbortSignal): AbortSignal {
   if (!Number.isFinite(ms) || ms < 0) throw new Error("Invalid time budget");
   const deadline = Math.min(
     Date.now() + ms,
@@ -42,13 +43,13 @@ export function WithDeadline(ms: number, parent?: AbortSignal): AbortSignal {
   deadlines.set(signal, deadline);
   return signal;
 }
-export function CheckSignal(signal?: AbortSignal): void {
+export function checkSignal(signal?: AbortSignal): void {
   signal?.throwIfAborted();
   if (signal && Date.now() >= (deadlines.get(signal) ?? Infinity))
     throw new DOMException("operation timed out", "TimeoutError");
 }
-export function RemainingTime(signal: AbortSignal | undefined, maximum: number): number {
-  CheckSignal(signal);
+export function remainingTime(signal: AbortSignal | undefined, maximum: number): number {
+  checkSignal(signal);
   return Math.min(
     maximum,
     signal ? Math.max(1, (deadlines.get(signal) ?? Infinity) - Date.now()) : maximum,
@@ -196,4 +197,16 @@ export function lockSync(dir: string): { close(): void } | null {
       }
     },
   };
+}
+
+export function openDatabase(path: string): Database {
+  mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+  // Create the file private first; SQLite would create it with the process umask.
+  const fd = openSync(path, "a", 0o600);
+  closeSync(fd);
+  const db = new Database(path, { create: true, strict: true });
+  db.exec(
+    "PRAGMA busy_timeout=2000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;",
+  );
+  return db;
 }

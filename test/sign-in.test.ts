@@ -1,16 +1,24 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Run as CLI } from "../src/cli.ts";
-import { CredentialHash, FlushOTLP } from "../src/delivery.ts";
-import { Open } from "../src/ledger.ts";
-import { NewID, Parse, type Batch, type Event } from "../src/protocol.ts";
-import { KimchiSignIn, Load, Save, SessionStateDir, StateDir, Verify } from "../src/settings.ts";
+import { run as cli } from "../src/cli.ts";
+import { credentialHash, kimchiSignIn } from "../src/kimchi.ts";
+import {
+  loadConfig,
+  saveConfig,
+  sessionStateDir,
+  stateDir,
+  verifySignIn,
+} from "../src/settings.ts";
+import { flushOtlp } from "../src/work/delivery.ts";
+import { Store } from "../src/work/ledger.ts";
+import { parseJson, type Batch, type Event } from "../src/work/protocol.ts";
 
 let root: string, kimchi: string;
 const variables = [
-  "KIMCHI_ADAPTERS_HOME",
+  "KIMCHI_BRIDGE_HOME",
   "KIMCHI_API_KEY",
   "HOME",
   "KIMCHI_REMOTE_ENDPOINT",
@@ -24,7 +32,7 @@ beforeEach(() => {
   kimchi = join(root, ".config", "kimchi");
   mkdirSync(join(kimchi, "harness"), { recursive: true });
   process.env.HOME = root;
-  process.env.KIMCHI_ADAPTERS_HOME = join(root, "reporting");
+  process.env.KIMCHI_BRIDGE_HOME = join(root, "reporting");
   for (const name of variables.slice(3)) delete process.env[name];
   delete process.env.KIMCHI_API_KEY;
 });
@@ -50,20 +58,20 @@ function kimchiFiles(config?: object, auth?: object) {
 const stdin = (value: unknown) => async () => Buffer.from(JSON.stringify(value));
 function event(): Event {
   return {
-    id: NewID(),
-    entityId: NewID(),
+    id: randomUUID(),
+    entityId: randomUUID(),
     revision: "1",
     source: "codex",
     sourceVersion: "test",
-    deviceId: NewID(),
+    deviceId: randomUUID(),
     observeTime: new Date().toISOString(),
     coverage: { code: "fixture", count: "1" },
   };
 }
 
 test("reads Kimchi's API key, saved login and API in Kimchi's order", () => {
-  const organization = NewID();
-  const read = (env: Record<string, string> = {}, key = "") => KimchiSignIn(key, kimchi, env);
+  const organization = randomUUID();
+  const read = (env: Record<string, string> = {}, key = "") => kimchiSignIn(key, kimchi, env);
   const us = "https://app.kimchi.dev/api",
     eu = "https://app.eu.kimchi.dev/api";
   expect(read()).toEqual({ apiUrl: us });
@@ -109,8 +117,8 @@ test("a new key for the same account keeps its exporter; another account drops i
     return Response.json({});
   });
   for (const changed of ["actor", "organization", "endpoint"]) {
-    const actor = NewID(),
-      organization = NewID(),
+    const actor = randomUUID(),
+      organization = randomUUID(),
       calls: string[] = [];
     const identity = () =>
       server((request) => {
@@ -119,43 +127,47 @@ test("a new key for the same account keeps its exporter; another account drops i
       });
     const apiUrl = identity();
     const kept = { disabled: true };
-    Save({ ...kept, otlpUrl: exporter + "/v1/logs", otlpHeaders: { Authorization: "Bearer old" } });
+    saveConfig({
+      ...kept,
+      otlpUrl: exporter + "/v1/logs",
+      otlpHeaders: { Authorization: "Bearer old" },
+    });
     // The first verification keeps an exporter configured before it.
-    let c = await Verify({ apiUrl, token: "first-key" });
+    let c = await verifySignIn({ apiUrl, token: "first-key" });
     expect(c).toMatchObject({ ...kept, actorId: actor, otlpUrl: exporter + "/v1/logs" });
-    const account = StateDir(c);
-    c = await Verify({ apiUrl, token: "rotated-key" });
-    expect(StateDir(c)).toBe(account);
+    const account = stateDir(c);
+    c = await verifySignIn({ apiUrl, token: "rotated-key" });
+    expect(stateDir(c)).toBe(account);
     expect(c.otlpUrl).toBe(exporter + "/v1/logs");
-    expect(await Verify({ apiUrl, token: "rotated-key" })).toEqual(c);
+    expect(await verifySignIn({ apiUrl, token: "rotated-key" })).toEqual(c);
     expect(calls).toEqual(["Bearer first-key", "Bearer rotated-key"]);
 
     const other = changed === "endpoint" ? identity() : apiUrl;
     const switched = server(() =>
       Response.json({
-        organizationId: changed === "organization" ? NewID() : organization,
-        userId: changed === "actor" ? NewID() : actor,
+        organizationId: changed === "organization" ? randomUUID() : organization,
+        userId: changed === "actor" ? randomUUID() : actor,
       }),
     );
-    c = await Verify({ apiUrl: changed === "endpoint" ? other : switched, token: "new-key" });
-    expect(StateDir(c)).not.toBe(account);
+    c = await verifySignIn({ apiUrl: changed === "endpoint" ? other : switched, token: "new-key" });
+    expect(stateDir(c)).not.toBe(account);
     expect(c).toMatchObject(kept);
     expect(c.otlpUrl).toBeUndefined();
     expect(c.otlpHeaders).toBeUndefined();
-    const s = Open(StateDir(c));
+    const s = new Store(stateDir(c));
     try {
-      s.Put(event());
-      expect(await FlushOTLP(s, c)).toBe(false);
+      s.put(event());
+      expect(await flushOtlp(s, c)).toBe(false);
     } finally {
-      s.Close();
+      s.close();
     }
   }
   expect(exported).toEqual([]);
 });
 
 test("a session reports to the account Kimchi was signed in to when it started", async () => {
-  const actor = NewID(),
-    organization = NewID();
+  const actor = randomUUID(),
+    organization = randomUUID();
   let verifications = 0;
   process.env.KIMCHI_REMOTE_ENDPOINT = server((request) => {
     expect(request.headers.get("authorization")).toBe("Bearer kimchi-key");
@@ -164,22 +176,22 @@ test("a session reports to the account Kimchi was signed in to when it started",
   });
   const start = (session: string) =>
     stdin({ hook_event_name: "SessionStart", session_id: session, cwd: root, source: "startup" });
-  await CLI(["hook", "codex"], start("before-sign-in"));
+  await cli(["hook", "codex"], start("before-sign-in"));
   expect(verifications).toBe(0);
   kimchiFiles({ apiKey: "kimchi-key" });
-  await CLI(["hook", "codex"], start("after-sign-in"));
-  await CLI(["hook", "codex"], start("next"));
+  await cli(["hook", "codex"], start("after-sign-in"));
+  await cli(["hook", "codex"], start("next"));
   expect(verifications).toBe(1);
-  const c = Load();
+  const c = loadConfig();
   expect(c.actorId).toBe(actor);
-  expect(SessionStateDir(c, "codex", "before-sign-in")).toBe(StateDir({}));
-  expect(SessionStateDir(c, "codex", "after-sign-in")).toBe(StateDir(c));
-  expect(SessionStateDir(c, "codex", "next")).toBe(StateDir(c));
+  expect(sessionStateDir(c, "codex", "before-sign-in")).toBe(stateDir({}));
+  expect(sessionStateDir(c, "codex", "after-sign-in")).toBe(stateDir(c));
+  expect(sessionStateDir(c, "codex", "next")).toBe(stateDir(c));
 });
 
 test("flush verifies first and uploads only the signed-in account's ledger, with SSO's organization", async () => {
-  const organization = NewID(),
-    actor = NewID(),
+  const organization = randomUUID(),
+    actor = randomUUID(),
     requests: { path: string; organization: string | null; body: string }[] = [];
   const apiUrl = server(async (request) => {
     const path = new URL(request.url).pathname;
@@ -190,7 +202,7 @@ test("flush verifies first and uploads only the signed-in account's ledger, with
     });
     if (path.endsWith("api-keys:verify"))
       return Response.json({ organizationId: organization, userId: actor });
-    const batch = Parse(requests.at(-1)!.body).batch as Batch;
+    const batch = parseJson(requests.at(-1)!.body).batch as Batch;
     return Response.json({
       batchId: batch.id,
       receipts: batch.events.map((e) => ({ id: e.id, revision: e.revision, status: "accepted" })),
@@ -200,49 +212,49 @@ test("flush verifies first and uploads only the signed-in account's ledger, with
   // A record queued for the previously verified account stays with that account.
   const previousAccount = {
     apiUrl,
-    organizationId: NewID(),
-    actorId: NewID(),
-    credentialHash: CredentialHash({ apiUrl, token: "earlier-key" }),
+    organizationId: randomUUID(),
+    actorId: randomUUID(),
+    credentialHash: credentialHash({ apiUrl, token: "earlier-key" }),
   };
-  Save(previousAccount);
-  const earlier = Open(StateDir(previousAccount));
-  earlier.Put(event());
-  earlier.Close();
+  saveConfig(previousAccount);
+  const earlier = new Store(stateDir(previousAccount));
+  earlier.put(event());
+  earlier.close();
   kimchiFiles(undefined, {
     "kimchi-dev": { type: "oauth", access: "sso-token", orgId: organization },
   });
   let output = "";
-  await CLI(["flush"], undefined, (text) => {
+  await cli(["flush"], undefined, (text) => {
     output += text;
   });
   expect(output).toBe("All pending records acknowledged.\n");
   expect(requests).toEqual([
     { path: "/ai-optimizer/v1beta/api-keys:verify", organization, body: "" },
   ]);
-  const current = Open(StateDir(Load()));
+  const current = new Store(stateDir(loadConfig()));
   try {
-    current.Put(event());
+    current.put(event());
   } finally {
-    current.Close();
+    current.close();
   }
-  await CLI(["flush"], undefined, () => {});
+  await cli(["flush"], undefined, () => {});
   expect(requests.map((r) => [r.path, r.organization])).toEqual([
     ["/ai-optimizer/v1beta/api-keys:verify", organization],
     [`/ai-optimizer/v1beta/organizations/${organization}/pr-cost-events:batchIngest`, organization],
   ]);
-  const kept = Open(StateDir(previousAccount));
+  const kept = new Store(stateDir(previousAccount));
   try {
-    expect(kept.Status().pending).toBe(1);
+    expect(kept.status().pending).toBe(1);
   } finally {
-    kept.Close();
+    kept.close();
   }
   kimchiFiles();
-  await expect(CLI(["flush"])).rejects.toThrow("sign in to Kimchi");
+  await expect(cli(["flush"])).rejects.toThrow("sign in to Kimchi");
 });
 
 test("a session whose sign-in cannot be verified reports to the old account only for a refreshed SSO token", async () => {
-  const organization = NewID(),
-    actor = NewID();
+  const organization = randomUUID(),
+    actor = randomUUID();
   type Answer = "401" | "slow" | "ok";
   let answer = "ok" as Answer;
   const apiUrl = server(async () => {
@@ -252,7 +264,7 @@ test("a session whose sign-in cannot be verified reports to the old account only
   });
   process.env.KIMCHI_REMOTE_ENDPOINT = apiUrl;
   const start = (session: string) =>
-    CLI(
+    cli(
       ["hook", "codex"],
       stdin({ hook_event_name: "SessionStart", session_id: session, cwd: root }),
     );
@@ -260,21 +272,21 @@ test("a session whose sign-in cannot be verified reports to the old account only
     kimchiFiles(undefined, { "kimchi-dev": { type: "oauth", access: token, orgId } });
   sso("first-token");
   await start("verified");
-  const account = StateDir(Load());
-  expect(account).not.toBe(StateDir({}));
+  const account = stateDir(loadConfig());
+  expect(account).not.toBe(stateDir({}));
   const cases: [string, () => void, Answer, string][] = [
-    ["rejected key", () => kimchiFiles({ apiKey: "rejected-key" }), "401", StateDir({})],
+    ["rejected key", () => kimchiFiles({ apiKey: "rejected-key" }), "401", stateDir({})],
     [
       "unreachable with another key",
       () => kimchiFiles({ apiKey: "other-key" }),
       "slow",
-      StateDir({}),
+      stateDir({}),
     ],
     [
       "unreachable with another SSO organization",
-      () => sso("other-org-token", NewID()),
+      () => sso("other-org-token", randomUUID()),
       "slow",
-      StateDir({}),
+      stateDir({}),
     ],
     ["unreachable with a refreshed SSO token", () => sso("refreshed-token"), "slow", account],
     [
@@ -288,7 +300,7 @@ test("a session whose sign-in cannot be verified reports to the old account only
     change();
     answer = response;
     await start(name);
-    expect([name, SessionStateDir(Load(), "codex", name)]).toEqual([name, expected]);
+    expect([name, sessionStateDir(loadConfig(), "codex", name)]).toEqual([name, expected]);
   }
   // Three cases wait out the one-second verification budget; slow CI runners need the margin.
 }, 15000);
@@ -296,10 +308,10 @@ test("a session whose sign-in cannot be verified reports to the old account only
 test("verifying keeps settings changed while the request was in flight", async () => {
   const apiUrl = server(async () => {
     // The user pauses recording while the sign-in is being verified.
-    await CLI(["disable"], undefined, () => {});
-    return Response.json({ organizationId: NewID(), userId: NewID() });
+    await cli(["disable"], undefined, () => {});
+    return Response.json({ organizationId: randomUUID(), userId: randomUUID() });
   });
-  const c = await Verify({ apiUrl, token: "kimchi-key" });
+  const c = await verifySignIn({ apiUrl, token: "kimchi-key" });
   expect(c.disabled).toBe(true);
-  expect(Load().disabled).toBe(true);
+  expect(loadConfig().disabled).toBe(true);
 });

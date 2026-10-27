@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 test("native mod caches its version and avoids helper calls for irrelevant telemetry", async () => {
   const { register } = await import(
-    new URL("../plugins/claude/hooks/register.js", import.meta.url).href
+    new URL("../plugins/kimchi-work/claude/hooks/register.js", import.meta.url).href
   );
   const handlers = new Map<string, (...args: any[]) => any>();
   register((event: string, ...args: any[]) => handlers.set(event, args.at(-1)));
@@ -36,6 +36,6 @@ test("native mod caches its version and avoids helper calls for irrelevant telem
   expect(await handlers.get("classic.UserPromptSubmit")!(api, prompt, next)).toBe(prompt);
   expect(calls).toHaveLength(3);
   expect(versionReads).toBe(1);
-  expect(calls[0]!.args).toEqual(["/plugin/bin/kimchi-adapters", "hook", "claude-code"]);
+  expect(calls[0]!.args).toEqual(["/plugin/bin/kimchi-bridge", "hook", "claude-code"]);
   expect(calls.every((c) => c.input.version === "2.1.309")).toBe(true);
 });

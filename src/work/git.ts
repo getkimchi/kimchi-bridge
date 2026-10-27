@@ -3,32 +3,29 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { join, relative } from "node:path";
 import {
-  CanonicalTime,
-  Integer,
-  NumberText,
-  Parse,
-  StableID,
-  Stringify,
-  gitID,
+  canonicalTime,
+  gitId,
+  integer,
+  numberText,
   obj,
+  parseJson,
+  stableId,
   str,
+  stringifyJson,
+  zeroTime,
   type IssueKey,
+  type JsonObject,
   type PullRequest,
   type Repository,
 } from "./protocol.ts";
-import { CheckSignal, RemainingTime, WithDeadline, within } from "./platform.ts";
+import { checkSignal, remainingTime, withDeadline, within } from "../platform.ts";
 import type { Recorder, Scope } from "./capture.ts";
 
-type Object = Record<string, any>;
 export function git(cwd: string, ...args: string[]): string {
   return gitContext(undefined, cwd, ...args);
 }
-export function gitContext(
-  signal: AbortSignal | undefined,
-  cwd: string,
-  ...args: string[]
-): string {
-  CheckSignal(signal);
+function gitContext(signal: AbortSignal | undefined, cwd: string, ...args: string[]): string {
+  checkSignal(signal);
   const env = { ...process.env };
   for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"])
     delete env[key];
@@ -39,17 +36,18 @@ export function gitContext(
   });
   const out = execFileSync("git", ["-C", cwd, ...args], {
     env,
-    timeout: RemainingTime(signal, 2000),
+    timeout: remainingTime(signal, 2000),
     maxBuffer: 8 << 20,
     stdio: ["ignore", "pipe", "ignore"],
   });
-  CheckSignal(signal);
+  checkSignal(signal);
   let text = out.toString();
   if (text.endsWith("\n")) text = text.slice(0, -1);
   if (text.endsWith("\r")) text = text.slice(0, -1);
   return text;
 }
 
+// Stored in ledger metadata like Scope; keep the field names.
 interface GitChange {
   Scope: Scope;
   Source: string;
@@ -73,9 +71,9 @@ const fields = (s: string) =>
     .flatMap((line) => line.split(" "))
     .filter(Boolean);
 const seconds = () => Math.floor(Date.now() / 1000);
-const rootOf = (s: Scope) => s.Root || s.CWD;
+export const rootOf = (s: Scope) => s.Root || s.CWD;
 export function saveMeta(r: Recorder, key: string, data: unknown) {
-  r.Store.SetMeta(key, Stringify(data));
+  r.store.setMeta(key, stringifyJson(data));
 }
 export function refTips(root: string): string[] | null {
   try {
@@ -92,48 +90,50 @@ export function refTips(root: string): string[] | null {
   }
 }
 
-export function ReconcileGit(r: Recorder, signal?: AbortSignal) {
-  signal = WithDeadline(8000, signal);
-  CheckSignal(signal);
-  if (seconds() - Number(r.Store.Meta("git-last-pass")) < 60) return;
-  r.Store.SetMeta("git-last-pass", String(seconds()));
-  const items = r.Store.DB.query(
-    "SELECT key,value FROM meta WHERE (key LIKE 'git-change:%' OR key LIKE 'tracked-commit:%') AND key>? ORDER BY key LIMIT 32",
-  ).all(r.Store.Meta("git-pass-after")) as { key: string; value: string }[];
+export function reconcileGit(r: Recorder, signal?: AbortSignal) {
+  signal = withDeadline(8000, signal);
+  checkSignal(signal);
+  if (seconds() - Number(r.store.meta("git-last-pass")) < 60) return;
+  r.store.setMeta("git-last-pass", String(seconds()));
+  const items = r.store.db
+    .query(
+      "SELECT key,value FROM meta WHERE (key LIKE 'git-change:%' OR key LIKE 'tracked-commit:%') AND key>? ORDER BY key LIMIT 32",
+    )
+    .all(r.store.meta("git-pass-after")) as { key: string; value: string }[];
   if (!items.length) {
-    r.Store.DB.query("DELETE FROM meta WHERE key='git-pass-after'").run();
+    r.store.db.query("DELETE FROM meta WHERE key='git-pass-after'").run();
     return;
   }
   const failures: unknown[] = [];
   for (const item of items) {
-    CheckSignal(signal);
-    r.Store.SetMeta("git-pass-after", item.key);
+    checkSignal(signal);
+    r.store.setMeta("git-pass-after", item.key);
     if (item.key.startsWith("tracked-commit:")) {
       const c: TrackedCommit = JSON.parse(item.value);
       if (Date.now() - Date.parse(c.CreatedAt) > 90 * 86400_000) {
-        r.Store.DB.query("DELETE FROM meta WHERE key=?").run(item.key);
+        r.store.db.query("DELETE FROM meta WHERE key=?").run(item.key);
         continue;
       }
       if (c.CheckedAt && Date.now() - Date.parse(c.CheckedAt) < 300_000) continue;
       c.CheckedAt = new Date().toISOString();
       saveMeta(r, item.key, c);
       try {
-        discoverPRs(r, c, signal);
+        discoverPullRequests(r, c, signal);
       } catch (e) {
-        r.Store.Diagnostic("scm_lookup_incomplete");
+        r.store.diagnostic("scm_lookup_incomplete");
         failures.push(e);
       }
     } else {
       const c: GitChange = JSON.parse(item.value);
       if (Date.now() - Date.parse(c.CreatedAt) > 7 * 86400_000) {
-        r.Store.Diagnostic("git_evidence_expired");
-        r.Store.DB.query("DELETE FROM meta WHERE key=?").run(item.key);
+        r.store.diagnostic("git_evidence_expired");
+        r.store.db.query("DELETE FROM meta WHERE key=?").run(item.key);
         continue;
       }
       try {
         matchCommits(r, c, signal);
       } catch (e) {
-        r.Store.Diagnostic("git_match_incomplete");
+        r.store.diagnostic("git_match_incomplete");
         failures.push(e);
       }
     }
@@ -144,7 +144,7 @@ export function ReconcileGit(r: Recorder, signal?: AbortSignal) {
 function fileObject(r: Recorder, hash: string, format: string): string {
   if (!hash) return "";
   if (!["sha1", "sha256"].includes(format)) throw new Error("unsupported git object format");
-  const bytes = r.Store.Blob(hash);
+  const bytes = r.store.blob(hash);
   return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
 }
 function treeObject(
@@ -156,7 +156,7 @@ function treeObject(
   const out = gitContext(signal, root, "ls-tree", "-z", commit, "--", path);
   if (!out) return "";
   const parts = fields(out.split("\t", 1)[0]!);
-  if (parts.length !== 3 || parts[1] !== "blob" || !gitID(parts[2]!))
+  if (parts.length !== 3 || parts[1] !== "blob" || !gitId(parts[2]!))
     throw new Error("not an ordinary file blob");
   return parts[2]!;
 }
@@ -171,12 +171,12 @@ function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
     gitContext(signal, root, "rev-list", "--all", "--max-count=129", "--not", ...(c.Refs || [])),
   );
   if (commits.length > 128) {
-    r.Store.Diagnostic("git_history_bound");
+    r.store.diagnostic("git_history_bound");
     commits = commits.slice(0, 128);
   }
   for (const sha of commits) {
-    CheckSignal(signal);
-    if (!gitID(sha)) throw new Error("invalid commit identity");
+    checkSignal(signal);
+    if (!gitId(sha)) throw new Error("invalid commit identity");
     if (treeObject(signal, root, sha, path) !== after) continue;
     const parents = fields(gitContext(signal, root, "show", "--format=%P", "--no-patch", sha));
     let matched = parents.length === 0 && before === "";
@@ -185,7 +185,7 @@ function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
     if (!matched) continue;
     const event = r.event(c.Scope, `commit:${sha}`, c.Work, c.Source);
     event.commit = { id: sha, parents, quality: "inferred" };
-    r.Store.Observe(event);
+    r.store.observe(event);
     if (c.Work) {
       const link = r.event(c.Scope, `work-commit:${c.Work}:${sha}`, c.Work, c.Source);
       link.link = {
@@ -196,15 +196,15 @@ function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
         quality: "inferred",
         reason: "file_revision",
       };
-      r.Store.Observe(link);
+      r.store.observe(link);
     }
-    const key = `tracked-commit:${StableID(c.Scope.Repo, sha)}`;
-    if (!r.Store.Meta(key))
+    const key = `tracked-commit:${stableId(c.Scope.Repo, sha)}`;
+    if (!r.store.meta(key))
       saveMeta(r, key, {
         Scope: c.Scope,
         Source: c.Source,
         SHA: sha,
-        CheckedAt: "0001-01-01T00:00:00Z",
+        CheckedAt: zeroTime,
         CreatedAt: new Date().toISOString(),
       });
   }
@@ -265,8 +265,8 @@ export function scmEnvironment(repo: Repository): NodeJS.ProcessEnv {
     GLAB_SHOW_WHATS_NEW: "false",
   };
 }
-function scmAPI(root: string, repo: Repository, path: string, signal?: AbortSignal): any {
-  CheckSignal(signal);
+function scmApi(root: string, repo: Repository, path: string, signal?: AbortSignal): any {
+  checkSignal(signal);
   if (
     (repo.provider === "github" &&
       repo.host !== "github.com" &&
@@ -282,7 +282,7 @@ function scmAPI(root: string, repo: Repository, path: string, signal?: AbortSign
     {
       cwd: root,
       env: scmEnvironment(repo),
-      timeout: RemainingTime(signal, 5000),
+      timeout: remainingTime(signal, 5000),
       maxBuffer: 4 * 1024 * 1024,
       encoding: "utf8",
       signal,
@@ -291,13 +291,13 @@ function scmAPI(root: string, repo: Repository, path: string, signal?: AbortSign
   );
   if (result.error || result.status !== 0) throw new Error("host-bound SCM lookup unavailable");
   try {
-    return Parse(result.stdout);
+    return parseJson(result.stdout);
   } catch {
     throw new Error("invalid SCM response");
   }
 }
-export function providerID(v: unknown): string {
-  const n = NumberText(v);
+export function providerId(v: unknown): string {
+  const n = numberText(v);
   if (!n) return "";
   try {
     const id = BigInt(n);
@@ -338,7 +338,7 @@ export function issueKeys(text: string, source: string): IssueKey[] {
 function time(v: unknown): string | undefined {
   if (typeof v !== "string") return;
   try {
-    return CanonicalTime(v);
+    return canonicalTime(v);
   } catch {
     return;
   }
@@ -364,10 +364,10 @@ export function metadataTitle(title: string): string {
   }
   return out;
 }
-export function pullRequest(source: Repository, v: Object): [Repository, PullRequest] {
+export function pullRequest(source: Repository, v: JsonObject): [Repository, PullRequest] {
   const repo: Repository = { provider: source.provider, host: source.host, id: "" };
   const p: PullRequest = {
-    id: providerID(v.id),
+    id: providerId(v.id),
     title: str(v, "title"),
     createTime: time(v.created_at),
     closeTime: time(v.closed_at),
@@ -379,15 +379,15 @@ export function pullRequest(source: Repository, v: Object): [Repository, PullReq
   };
   let number: number | undefined;
   if (source.provider === "github") {
-    number = Integer(v.number);
+    number = integer(v.number);
     const base = obj(obj(v.base).repo);
-    repo.id = providerID(base.id);
+    repo.id = providerId(base.id);
     repo.name = str(base, "full_name");
     p.uri = str(v, "html_url");
     p.state = p.mergeTime ? "merged" : str(v, "state");
   } else if (source.provider === "gitlab") {
-    number = Integer(v.iid);
-    repo.id = providerID(v.target_project_id);
+    number = integer(v.iid);
+    repo.id = providerId(v.target_project_id);
     p.uri = str(v, "web_url");
     p.state = str(v, "state");
     if (["opened", "locked"].includes(p.state)) p.state = "open";
@@ -433,15 +433,15 @@ export function pullRequest(source: Repository, v: Object): [Repository, PullReq
   }
   return [repo, p];
 }
-function discoverPRs(r: Recorder, c: TrackedCommit, signal?: AbortSignal) {
+function discoverPullRequests(r: Recorder, c: TrackedCommit, signal?: AbortSignal) {
   const repo = c.Scope.Repository;
   if (!repo) throw new Error("SCM repository is unknown");
   const path =
     repo.provider === "gitlab"
       ? `projects/${encodeURIComponent(repo.name || "")}`
       : `repos/${repo.name}`;
-  const identity = scmAPI(c.Scope.CWD, repo, path, signal),
-    id = providerID(identity.id);
+  const identity = scmApi(c.Scope.CWD, repo, path, signal),
+    id = providerId(identity.id);
   if (!id) throw new Error("SCM repository identity is missing");
   const name = str(identity, repo.provider === "gitlab" ? "path_with_namespace" : "full_name");
   const urlText = str(identity, repo.provider === "gitlab" ? "web_url" : "html_url");
@@ -466,14 +466,14 @@ function discoverPRs(r: Recorder, c: TrackedCommit, signal?: AbortSignal) {
       ? `projects/${id}/repository/commits/${c.SHA}/merge_requests`
       : `${path}/commits/${c.SHA}/pulls`;
   for (let page = 1; page <= 5; page++) {
-    const prs = scmAPI(c.Scope.CWD, repo, `${endpoint}?per_page=100&page=${page}`, signal);
+    const prs = scmApi(c.Scope.CWD, repo, `${endpoint}?per_page=100&page=${page}`, signal);
     if (!Array.isArray(prs)) throw new Error("invalid SCM response");
     for (const raw of prs) {
       const [target, p] = pullRequest(repo, obj(raw)),
         s = { ...c.Scope, Repository: target };
       const event = r.event(s, `pull-request:${target.id}:${p.id}`, "", c.Source);
       event.pullRequest = p;
-      r.Store.Observe(event);
+      r.store.observe(event);
       const link = r.event(s, `commit-pr:${c.SHA}:${target.id}:${p.id}`, "", c.Source);
       link.link = {
         fromKind: "commit",
@@ -483,21 +483,21 @@ function discoverPRs(r: Recorder, c: TrackedCommit, signal?: AbortSignal) {
         quality: "observed",
         reason: "provider_commit_membership",
       };
-      r.Store.Observe(link);
+      r.store.observe(link);
     }
     if (prs.length < 100) return;
   }
   throw new Error("SCM pagination exceeds capture bound");
 }
 
-export function PruneEvidence(r: Recorder, now: Date) {
+export function pruneEvidence(r: Recorder, now: Date) {
   const cutoff = Math.floor(now.getTime() / 1000) - 7 * 86400;
-  r.Store.DB.query(
-    "DELETE FROM tool_state WHERE unixepoch(json_extract(body,'$.started')) < ?",
-  ).run(cutoff);
-  r.Store.DB.query("DELETE FROM file_changes WHERE created_at < ?").run(cutoff);
-  r.Store.DB.query("DELETE FROM blobs WHERE observed_at < ?").run(cutoff);
-  const dir = join(r.Store.Dir, "blobs");
+  r.store.db
+    .query("DELETE FROM tool_state WHERE unixepoch(json_extract(body,'$.started')) < ?")
+    .run(cutoff);
+  r.store.db.query("DELETE FROM file_changes WHERE created_at < ?").run(cutoff);
+  r.store.db.query("DELETE FROM blobs WHERE observed_at < ?").run(cutoff);
+  const dir = join(r.store.dir, "blobs");
   let entries;
   try {
     entries = readdirSync(dir);

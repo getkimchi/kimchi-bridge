@@ -1,44 +1,45 @@
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseShell } from "shell-quote";
 import type { fromMarkdown as parseMarkdown } from "mdast-util-from-markdown";
 import type { applyDiff as applyPatchDiff } from "@openai/agents-core/utils";
+import { safeRead, within } from "../platform.ts";
+import { git, issueKeys, metadataTitle, reconcileGit, refTips, rootOf, saveMeta } from "./git.ts";
+import { bodyText, type Store } from "./ledger.ts";
 import {
-  Hash,
-  Integer,
-  NewID,
-  StableID,
+  canonicalHash,
+  digest,
+  integer,
   obj,
+  stableId,
   str,
   type Event,
+  type JsonObject,
   type Repository,
 } from "./protocol.ts";
-import type { Store } from "./ledger.ts";
-import { safeRead, within } from "./platform.ts";
 import {
   claudeUsage,
-  openAIUsage,
-  RecoverContext,
+  openAiUsage,
+  recoverContext,
   registerTranscript,
   route,
+  saveSourceVersion,
+  saveTranscriptVersion,
   telemetry,
-  transcriptVersion,
-  version,
 } from "./recovery.ts";
-import { ReconcileGit, git, issueKeys, metadataTitle, refTips, saveMeta } from "./git.ts";
 
-export type Object = Record<string, any>;
 export interface Native {
   stage?: string;
-  event: Object;
-  result?: Object;
+  event: JsonObject;
+  result?: JsonObject;
   sessionId?: string;
   cwd?: string;
   version?: string;
   route?: string;
   billingBasis?: string;
 }
+// Scopes are stored in ledger metadata, as the Go helper wrote them; keep their field names.
 export interface Scope {
   Session: string;
   Turn: string;
@@ -66,9 +67,6 @@ interface ToolState {
   refsKnown: boolean;
 }
 const emptyFile = (): FileState => ({ hash: "", exists: false, complete: false });
-export const digest = (bytes: Uint8Array | string): string =>
-  createHash("sha256").update(bytes).digest("hex");
-const rootOf = (s: Scope) => s.Root || s.CWD;
 
 export function repository(cwd: string): [string, string, Repository | undefined] {
   try {
@@ -106,7 +104,7 @@ export function repository(cwd: string): [string, string, Repository | undefined
       return [root, `local:${digest(root)}`, undefined];
     }
   }
-  const local = StableID("git-common-dir", common);
+  const local = stableId("git-common-dir", common);
   let remote = "";
   try {
     remote = git(root, "remote", "get-url", "origin");
@@ -148,11 +146,11 @@ export function repository(cwd: string): [string, string, Repository | undefined
   ];
 }
 
-export function toolInput(e: Object): Object {
+function toolInput(e: JsonObject): JsonObject {
   const input = e.tool_input;
   return input && typeof input === "object" && !Array.isArray(input) ? input : e;
 }
-export function toolCategory(name: string): string {
+function toolCategory(name: string): string {
   switch (name.toLowerCase()) {
     case "read":
     case "read_file":
@@ -174,7 +172,7 @@ export function toolCategory(name: string): string {
       return "other";
   }
 }
-export function patchInput(e: Object): string {
+export function patchInput(e: JsonObject): string {
   const input = toolInput(e);
   let patch = str(input, "patch", "input");
   if (typeof e.tool_input === "string") patch = e.tool_input;
@@ -193,7 +191,7 @@ export function patchInput(e: Object): string {
   return patch.startsWith("*** Begin Patch\n") && patch.endsWith("\n*** End Patch") ? patch : "";
 }
 
-export function filePaths(s: Scope, e: Object): [string[], boolean] {
+export function filePaths(s: Scope, e: JsonObject): [string[], boolean] {
   const root = rootOf(s),
     input = toolInput(e),
     paths: string[] = [];
@@ -250,7 +248,7 @@ export function filePaths(s: Scope, e: Object): [string[], boolean] {
   return [[...found], native];
 }
 
-export function planKey(root: string, path: string): string {
+function planKey(root: string, path: string): string {
   try {
     root = realpathSync(root);
   } catch {
@@ -299,23 +297,23 @@ export function referencedPaths(prompt: string, cwd: string): string[] {
 
 export class Recorder {
   constructor(
-    public Store: Store,
-    public Source: string,
-    public Device: string,
+    public store: Store,
+    public source: string,
+    public device: string,
   ) {}
-  RecoverContext(signal?: AbortSignal) {
-    return RecoverContext(this, signal);
+  recoverContext(signal?: AbortSignal) {
+    return recoverContext(this, signal);
   }
-  ReconcileGit(signal?: AbortSignal) {
-    return ReconcileGit(this, signal);
+  reconcileGit(signal?: AbortSignal) {
+    return reconcileGit(this, signal);
   }
 
-  event(s: Scope, entity: string, work: string, source = this.Source): Event {
+  event(s: Scope, entity: string, work: string, source = this.source): Event {
     return {
-      entityId: StableID(source, s.Session, entity),
+      entityId: stableId(source, s.Session, entity),
       source,
-      sourceVersion: this.Store.Meta(`source-version:${source}:${s.Session}`) || "unknown",
-      deviceId: this.Device,
+      sourceVersion: this.store.meta(`source-version:${source}:${s.Session}`) || "unknown",
+      deviceId: this.device,
       observeTime: new Date().toISOString(),
       repository: s.Repository,
       workId: work,
@@ -327,9 +325,11 @@ export class Recorder {
   workExact(s: Scope): string {
     return (
       (
-        this.Store.DB.query(
-          "SELECT work_id FROM bindings WHERE source=? AND session_id=? AND turn_id=? AND agent_id=?",
-        ).get(this.Source, s.Session, s.Turn, s.Agent) as { work_id: string } | null
+        this.store.db
+          .query(
+            "SELECT work_id FROM bindings WHERE source=? AND session_id=? AND turn_id=? AND agent_id=?",
+          )
+          .get(this.source, s.Session, s.Turn, s.Agent) as { work_id: string } | null
       )?.work_id ?? ""
     );
   }
@@ -337,10 +337,10 @@ export class Recorder {
     const exact = this.workExact(s);
     return (
       exact ||
-      this.Store.Meta(
+      this.store.meta(
         s.Agent
-          ? `agent-work:${this.Source}:${s.Session}:${s.Agent}`
-          : `${this.Source}:${s.Session}:work`,
+          ? `agent-work:${this.source}:${s.Session}:${s.Agent}`
+          : `${this.source}:${s.Session}:work`,
       )
     );
   }
@@ -362,75 +362,79 @@ export class Recorder {
         } catch {
           continue;
         }
-        const rows = this.Store.DB.query(
-          "SELECT DISTINCT work_id FROM plans WHERE repository=? AND path=? AND hash=?",
-        ).all(s.Repo, planKey(rootOf(s), path), digest(bytes)) as { work_id: string }[];
+        const rows = this.store.db
+          .query("SELECT DISTINCT work_id FROM plans WHERE repository=? AND path=? AND hash=?")
+          .all(s.Repo, planKey(rootOf(s), path), digest(bytes)) as { work_id: string }[];
         for (const row of rows) owners.add(row.work_id);
       }
     const keys = issueKeys(title, "work");
     // Parsing, Git and file reads finish before taking the short writer lock.
-    this.Store.DB.transaction(() => {
-      if (this.workExact(s)) return;
-      let work = "",
-        reason = "new_prompt",
-        quality = "observed";
-      if (explicit) {
-        reason = "explicit_new_work";
-        quality = "confirmed";
-      } else if (owners.size === 1) {
-        work = [...owners][0]!;
-        reason = "verified_plan_revision";
-        quality = "confirmed";
-      } else if (owners.size > 1) {
-        reason = "ambiguous_plan_reference";
-        this.Store.Diagnostic(reason);
-      } else {
-        work = this.work(s);
-        reason = "session_continuation";
-        quality = "inferred";
-      }
-      work ||= NewID();
-      this.Store.DB.query("INSERT OR IGNORE INTO work(id,repository,created_at) VALUES(?,?,?)").run(
-        work,
-        s.Repo,
-        Math.floor(Date.now() / 1000),
-      );
-      this.Store.DB.query(
-        "INSERT INTO bindings(source,session_id,turn_id,agent_id,work_id,repository) VALUES(?,?,?,?,?,?)",
-      ).run(this.Source, s.Session, s.Turn, s.Agent, work, s.Repo);
-      if (!s.Agent) {
-        this.Store.SetMeta(`${this.Source}:${s.Session}:turn`, s.Turn);
-        this.Store.SetMeta(`${this.Source}:${s.Session}:work`, work);
-      }
-      const e = this.event(s, `binding:${s.Turn}`, work);
-      e.work = { reason, quality, title, issueKeys: keys };
-      this.Store.Observe(e);
-    }).immediate();
+    this.store.db
+      .transaction(() => {
+        if (this.workExact(s)) return;
+        let work = "",
+          reason = "new_prompt",
+          quality = "observed";
+        if (explicit) {
+          reason = "explicit_new_work";
+          quality = "confirmed";
+        } else if (owners.size === 1) {
+          work = [...owners][0]!;
+          reason = "verified_plan_revision";
+          quality = "confirmed";
+        } else if (owners.size > 1) {
+          reason = "ambiguous_plan_reference";
+          this.store.diagnostic(reason);
+        } else {
+          work = this.work(s);
+          reason = "session_continuation";
+          quality = "inferred";
+        }
+        work ||= randomUUID();
+        this.store.db
+          .query("INSERT OR IGNORE INTO work(id,repository,created_at) VALUES(?,?,?)")
+          .run(work, s.Repo, Math.floor(Date.now() / 1000));
+        this.store.db
+          .query(
+            "INSERT INTO bindings(source,session_id,turn_id,agent_id,work_id,repository) VALUES(?,?,?,?,?,?)",
+          )
+          .run(this.source, s.Session, s.Turn, s.Agent, work, s.Repo);
+        if (!s.Agent) {
+          this.store.setMeta(`${this.source}:${s.Session}:turn`, s.Turn);
+          this.store.setMeta(`${this.source}:${s.Session}:work`, work);
+        }
+        const e = this.event(s, `binding:${s.Turn}`, work);
+        e.work = { reason, quality, title, issueKeys: keys };
+        this.store.observe(e);
+      })
+      .immediate();
   }
-  RegisterPlan(cwd: string, path: string, work: string, s: Scope) {
+  registerPlan(cwd: string, path: string, work: string, s: Scope) {
     if (!work) throw new Error("plan has no work binding");
     path = realpathSync(resolve(cwd, path));
     const hash = digest(safeRead(dirname(path), path).bytes),
       key = planKey(rootOf(s), path);
-    const planId = StableID(s.Repo, key, work),
-      revision = StableID(planId, hash);
-    this.Store.DB.query(
-      "INSERT OR IGNORE INTO plans(repository,path,hash,work_id,plan_id,revision_id) VALUES(?,?,?,?,?,?)",
-    ).run(s.Repo, key, hash, work, planId, revision);
+    const planId = stableId(s.Repo, key, work),
+      revision = stableId(planId, hash);
+    this.store.db
+      .query(
+        "INSERT OR IGNORE INTO plans(repository,path,hash,work_id,plan_id,revision_id) VALUES(?,?,?,?,?,?)",
+      )
+      .run(s.Repo, key, hash, work, planId, revision);
     const e = this.event(s, `plan:${revision}`, work);
     e.work = { planId, planRevision: revision, reason: "saved_plan", quality: "confirmed" };
-    this.Store.Observe(e);
+    this.store.observe(e);
   }
-  Record(n: Native) {
-    if (this.Source !== "claude-code" && this.Source !== "codex")
+  record(n: Native) {
+    if (this.source !== "claude-code" && this.source !== "codex")
       throw new Error("unsupported source");
     if (!n.event || typeof n.event !== "object") throw new Error("missing native event");
     const e = n.event,
       result = n.result ?? {},
       stage = n.stage || str(e, "hook_event_name");
-    const observedRoute = n.route || route(this.Source),
+    const observedRoute = n.route || route(this.source),
       basis = n.billingBasis || "unknown";
-    const modelRequest = this.Source === "codex" && stage === "PostModelRequest";
+    const modelRequest = this.source === "codex" && stage === "PostModelRequest";
     const s: Scope = {
       Session: n.sessionId || str(e, "session_id"),
       Turn: str(e, "turn_id", "turnId"),
@@ -447,12 +451,12 @@ export class Recorder {
       /* Preserve native cwd. */
     }
     [s.Root, s.Repo, s.Repository] = repository(s.CWD);
-    if (n.version) version(this, s.Session, n.version);
-    if (str(e, "transcript_path") && this.Source === "codex")
-      transcriptVersion(this, s.Session, str(e, "transcript_path"));
-    if (!modelRequest) s.Turn ||= this.Store.Meta(`${this.Source}:${s.Session}:turn`);
+    if (n.version) saveSourceVersion(this, s.Session, n.version);
+    if (str(e, "transcript_path") && this.source === "codex")
+      saveTranscriptVersion(this, s.Session, str(e, "transcript_path"));
+    if (!modelRequest) s.Turn ||= this.store.meta(`${this.source}:${s.Session}:turn`);
     if (stage === "classic.UserPromptSubmit" && str(e, "prompt_id"))
-      this.Store.SetMeta(`pending-prompt:${s.Session}`, str(e, "prompt_id"));
+      this.store.setMeta(`pending-prompt:${s.Session}`, str(e, "prompt_id"));
     if (stage === "turn.start" || stage === "UserPromptSubmit") {
       if (!s.Turn) throw new Error("prompt has no turn identity");
       this.bind(s, str(e, "text", "prompt"));
@@ -460,56 +464,55 @@ export class Recorder {
     if (s.Turn) {
       const prompt =
         str(e, "prompt_id") ||
-        (stage === "turn.start" ? this.Store.Meta(`pending-prompt:${s.Session}`) : "");
+        (stage === "turn.start" ? this.store.meta(`pending-prompt:${s.Session}`) : "");
       if (prompt)
-        this.Store.DB.query("INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)").run(
-          `prompt-turn:${s.Session}:${prompt}`,
-          s.Turn,
-        );
+        this.store.db
+          .query("INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)")
+          .run(`prompt-turn:${s.Session}:${prompt}`, s.Turn);
     }
     let work = this.work(s);
-    if (stage === "SessionStart" && this.Source === "codex") {
+    if (stage === "SessionStart" && this.source === "codex") {
       const coverage = this.event(s, "coverage:native-request-surface", work);
       coverage.coverage = { code: "native_auxiliary_usage_coverage_unknown", count: "1" };
-      this.Store.Observe(coverage);
-      this.Store.Diagnostic("native_auxiliary_usage_coverage_unknown");
+      this.store.observe(coverage);
+      this.store.diagnostic("native_auxiliary_usage_coverage_unknown");
     }
     if (stage === "telemetry.log") return telemetry(this, s, e, observedRoute, basis);
     if (stage === "step.after") {
       const usage = obj(result.usage),
-        index = Integer(e.index);
+        index = integer(e.index);
       if (index !== undefined && s.Turn) {
-        const step = this.event(s, `step:${s.Turn}:${s.Agent}:${Hash(index)}`, work);
+        const step = this.event(s, `step:${s.Turn}:${s.Agent}:${canonicalHash(index)}`, work);
         step.coverage = {
           code: "mod_step_request_identity_missing",
           count: "1",
           observedUsage: claudeUsage(usage),
           model: str(usage, "model"),
         };
-        this.Store.Observe(step);
+        this.store.observe(step);
       }
       return;
     }
     if (modelRequest) {
       const boundWork =
         (s.Turn ? this.workExact(s) : "") ||
-        (s.Agent ? this.Store.Meta(`agent-work:${this.Source}:${s.Session}:${s.Agent}`) : "");
+        (s.Agent ? this.store.meta(`agent-work:${this.source}:${s.Session}:${s.Agent}`) : "");
       const status = ["completed", "failed", "cancelled"].includes(str(e, "status"))
         ? str(e, "status")
         : "unknown";
       // No native request ID exists: keep callbacks distinct, and never charge these harness
       // counters (which may contain defaulted zeroes) in addition to transcript usage.
-      const observation = this.event(s, `model-request-observation:${NewID()}`, boundWork);
+      const observation = this.event(s, `model-request-observation:${randomUUID()}`, boundWork);
       observation.coverage = {
         code: `native_model_request_${status}`,
         count: "1",
         model: str(e, "model"),
         ...(e.token_usage && Object.getPrototypeOf(e.token_usage) === Object.prototype
-          ? { observedUsage: openAIUsage(e.token_usage) }
+          ? { observedUsage: openAiUsage(e.token_usage) }
           : {}),
       };
-      this.Store.Observe(observation);
-      this.Store.Diagnostic("native_model_request_identity_missing");
+      this.store.observe(observation);
+      this.store.diagnostic("native_model_request_identity_missing");
     }
     if (stage === "tool.before" || stage === "PreToolUse") this.before(s, e, work);
     if (["tool.after", "PostToolUse", "PostToolUseFailure"].includes(stage))
@@ -523,13 +526,14 @@ export class Recorder {
       const agent = str(e, "agent_id");
       work = this.work({ ...s, Agent: "" });
       if (agent && work) {
-        this.Store.DB.query(
-          "INSERT OR IGNORE INTO bindings(source,session_id,turn_id,agent_id,work_id,repository) VALUES(?,?,?,?,?,?)",
-        ).run(this.Source, s.Session, s.Turn, agent, work, s.Repo);
-        this.Store.DB.query("INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)").run(
-          `agent-work:${this.Source}:${s.Session}:${agent}`,
-          work,
-        );
+        this.store.db
+          .query(
+            "INSERT OR IGNORE INTO bindings(source,session_id,turn_id,agent_id,work_id,repository) VALUES(?,?,?,?,?,?)",
+          )
+          .run(this.source, s.Session, s.Turn, agent, work, s.Repo);
+        this.store.db
+          .query("INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)")
+          .run(`agent-work:${this.source}:${s.Session}:${agent}`, work);
       }
     }
     if (str(e, "transcript_path"))
@@ -552,23 +556,23 @@ export class Recorder {
       const path =
         str(obj(result.result), "filePath", "planFilePath") ||
         str(result, "filePath", "planFilePath");
-      if (path) this.RegisterPlan(s.CWD, path, work, s);
+      if (path) this.registerPlan(s.CWD, path, work, s);
     }
   }
   snapshot(root: string, path: string): FileState {
     try {
       const { bytes } = safeRead(root, path);
-      return { hash: this.Store.PutBlob(bytes), exists: true, complete: true };
+      return { hash: this.store.putBlob(bytes), exists: true, complete: true };
     } catch (error: any) {
       if (error.code === "ENOENT") return { hash: "", exists: false, complete: true };
-      this.Store.Diagnostic("file_snapshot_incomplete");
+      this.store.diagnostic("file_snapshot_incomplete");
       return emptyFile();
     }
   }
-  before(s: Scope, e: Object, work: string) {
+  before(s: Scope, e: JsonObject, work: string) {
     const call = str(e, "tool_use_id", "call_id", "toolCallId");
     if (!call) {
-      this.Store.Diagnostic("tool_identity_missing");
+      this.store.diagnostic("tool_identity_missing");
       return;
     }
     const [paths, native] = filePaths(s, e),
@@ -590,10 +594,10 @@ export class Recorder {
     let bytes = 0;
     for (const path of paths) {
       if (Date.now() > deadline || bytes >= 8 << 20) {
-        this.Store.Diagnostic("file_snapshot_budget_exceeded");
+        this.store.diagnostic("file_snapshot_budget_exceeded");
         break;
       }
-      if (within(this.Store.Dir, path)) continue;
+      if (within(this.store.dir, path)) continue;
       const before = this.snapshot(rootOf(s), path);
       state.files[path] = before;
       try {
@@ -605,75 +609,74 @@ export class Recorder {
       if (expected !== undefined) state.expected[path] = expected;
     }
     // The FULL SQLite commit completes before the native tool is allowed to run.
-    this.Store.DB.query(
-      "INSERT OR IGNORE INTO tool_state(source,session_id,call_id,body) VALUES(?,?,?,?)",
-    ).run(this.Source, s.Session, call, JSON.stringify(state));
+    this.store.db
+      .query("INSERT OR IGNORE INTO tool_state(source,session_id,call_id,body) VALUES(?,?,?,?)")
+      .run(this.source, s.Session, call, JSON.stringify(state));
   }
-  after(s: Scope, e: Object, work: string, failed: boolean) {
+  after(s: Scope, e: JsonObject, work: string, failed: boolean) {
     const call = str(e, "tool_use_id", "call_id", "toolCallId");
     if (!call) {
-      this.Store.Diagnostic("tool_identity_missing");
+      this.store.diagnostic("tool_identity_missing");
       return;
     }
-    const row = this.Store.DB.query(
-      "SELECT body FROM tool_state WHERE source=? AND session_id=? AND call_id=?",
-    ).get(this.Source, s.Session, call) as { body: string | Uint8Array } | null;
+    const row = this.store.db
+      .query("SELECT body FROM tool_state WHERE source=? AND session_id=? AND call_id=?")
+      .get(this.source, s.Session, call) as { body: string | Uint8Array } | null;
     if (!row) {
-      this.Store.Diagnostic("tool_preimage_missing");
+      this.store.diagnostic("tool_preimage_missing");
       return;
     }
-    const state: ToolState = JSON.parse(
-      typeof row.body === "string" ? row.body : Buffer.from(row.body).toString(),
-    );
+    const state: ToolState = JSON.parse(bodyText(row.body));
     state.expected ||= {};
     s = { ...s, Turn: state.turn, Agent: state.agent };
     work = state.work;
-    const done = `${this.Source}:${s.Session}:${call}:done`;
-    if (this.Store.Meta(done)) return;
+    const done = `${this.source}:${s.Session}:${call}:done`;
+    if (this.store.meta(done)) return;
     const ev = this.event(s, `tool:${call}`, work);
     ev.tool = {
       callId: call,
       name: str(e, "tool", "tool_name"),
-      requestEntityId: this.Store.Meta(`tool-request:${this.Source}:${s.Session}:${call}`),
+      requestEntityId: this.store.meta(`tool-request:${this.source}:${s.Session}:${call}`),
       category: state.category,
       outcome: failed ? "failed" : "completed",
       durationMs: String(Date.now() - new Date(state.started).getTime()),
     };
-    this.Store.Observe(ev);
+    this.store.observe(ev);
     const [paths] = filePaths(s, e);
     for (const path of paths) state.files[path] ||= emptyFile();
     for (const [path, before] of Object.entries(state.files)) {
-      if (within(this.Store.Dir, path)) continue;
+      if (within(this.store.dir, path)) continue;
       if (!before.complete) {
-        this.Store.Diagnostic("file_snapshot_incomplete");
+        this.store.diagnostic("file_snapshot_incomplete");
         continue;
       }
       const after = this.snapshot(rootOf(s), path);
       if (!after.complete) {
-        this.Store.Diagnostic("file_snapshot_incomplete");
+        this.store.diagnostic("file_snapshot_incomplete");
         continue;
       }
       if (before.hash === after.hash && before.exists === after.exists && state.category !== "read")
         continue;
-      this.Store.DB.query(
-        "INSERT OR IGNORE INTO file_identity(repository,path,id) VALUES(?,?,?)",
-      ).run(s.Repo, path, NewID());
+      this.store.db
+        .query("INSERT OR IGNORE INTO file_identity(repository,path,id) VALUES(?,?,?)")
+        .run(s.Repo, path, randomUUID());
       const id = (
-        this.Store.DB.query("SELECT id FROM file_identity WHERE repository=? AND path=?").get(
-          s.Repo,
-          path,
-        ) as { id: string }
+        this.store.db
+          .query("SELECT id FROM file_identity WHERE repository=? AND path=?")
+          .get(s.Repo, path) as { id: string }
       ).id;
       const revisions = ["", ""];
       for (const [index, file] of [before, after].entries())
         if (file.exists) {
-          this.Store.DB.query(
-            "INSERT OR IGNORE INTO file_revisions(repository,file_id,hash,id) VALUES(?,?,?,?)",
-          ).run(s.Repo, id, file.hash, NewID());
+          this.store.db
+            .query(
+              "INSERT OR IGNORE INTO file_revisions(repository,file_id,hash,id) VALUES(?,?,?,?)",
+            )
+            .run(s.Repo, id, file.hash, randomUUID());
           revisions[index] = (
-            this.Store.DB.query(
-              "SELECT id FROM file_revisions WHERE repository=? AND file_id=? AND hash=?",
-            ).get(s.Repo, id, file.hash) as { id: string }
+            this.store.db
+              .query("SELECT id FROM file_revisions WHERE repository=? AND file_id=? AND hash=?")
+              .get(s.Repo, id, file.hash) as { id: string }
           ).id;
         }
       const operation = !before.exists
@@ -690,7 +693,7 @@ export class Recorder {
         state.expected[path] === after.hash
           ? "tool_observed"
           : "observed";
-      const change = StableID(this.Source, s.Session, call, id),
+      const change = stableId(this.source, s.Session, call, id),
         fe = this.event(s, `file:${change}`, work);
       fe.file = {
         fileId: id,
@@ -700,19 +703,21 @@ export class Recorder {
         operation,
         quality,
       };
-      this.Store.Observe(fe);
-      this.Store.DB.query(
-        "INSERT OR IGNORE INTO file_changes(id,repository,path,before_hash,after_hash,work_id,quality,created_at) VALUES(?,?,?,?,?,?,?,?)",
-      ).run(
-        change,
-        s.Repo,
-        path,
-        before.hash,
-        after.hash,
-        work,
-        quality,
-        Math.floor(Date.now() / 1000),
-      );
+      this.store.observe(fe);
+      this.store.db
+        .query(
+          "INSERT OR IGNORE INTO file_changes(id,repository,path,before_hash,after_hash,work_id,quality,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        )
+        .run(
+          change,
+          s.Repo,
+          path,
+          before.hash,
+          after.hash,
+          work,
+          quality,
+          Math.floor(Date.now() / 1000),
+        );
       if (
         state.category !== "read" &&
         before.hash !== after.hash &&
@@ -721,7 +726,7 @@ export class Recorder {
       ) {
         saveMeta(this, `git-change:${change}`, {
           Scope: s,
-          Source: this.Source,
+          Source: this.source,
           Work: work,
           Path: path,
           Before: before.hash,
@@ -739,15 +744,15 @@ export class Recorder {
         (rel.startsWith("plans/") || rel.startsWith(".plans/"))
       ) {
         try {
-          this.RegisterPlan(s.CWD, path, work, s);
+          this.registerPlan(s.CWD, path, work, s);
         } catch (error: any) {
           if (error.code !== "ENOENT") throw error;
         }
       }
     }
-    this.Store.DB.query("INSERT OR IGNORE INTO meta(key,value) VALUES(?,'1')").run(done);
+    this.store.db.query("INSERT OR IGNORE INTO meta(key,value) VALUES(?,'1')").run(done);
   }
-  expected(before: FileState, e: Object, root: string, path: string): string | undefined {
+  expected(before: FileState, e: JsonObject, root: string, path: string): string | undefined {
     if (!before.complete) return;
     const patch = patchInput(e);
     if (patch) return this.patchExpected(before, patch, root, path);
@@ -767,7 +772,7 @@ export class Recorder {
           return;
         let text: string;
         try {
-          text = this.Store.Blob(before.hash).toString();
+          text = this.store.blob(before.hash).toString();
         } catch {
           return;
         }
@@ -813,7 +818,7 @@ export class Recorder {
     if (!before.exists) return;
     let content: string;
     try {
-      content = this.Store.Blob(before.hash).toString();
+      content = this.store.blob(before.hash).toString();
     } catch {
       return;
     }
