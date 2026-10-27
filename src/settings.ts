@@ -24,8 +24,6 @@ import {
 
 export interface Config extends DeliveryConfig {
   disabled?: boolean;
-  runtimeExecutable?: string;
-  runtimeRevision?: string;
 }
 export function Root(): string {
   const path = process.env.KIMCHI_ADAPTERS_HOME;
@@ -48,8 +46,9 @@ export function StateDir(c: Config): string {
   return join(Root(), "accounts", account);
 }
 export function Save(config: Config): void {
-  // Earlier releases kept their own reporting key here; Kimchi's sign-in replaces it.
-  const { apiKey, accessToken, enabled, ...c } = config as Config & Record<string, unknown>;
+  // Earlier releases kept their own reporting key and runtime here; Kimchi provides both.
+  const { apiKey, accessToken, enabled, runtimeExecutable, runtimeRevision, ...c } =
+    config as Config & Record<string, unknown>;
   ValidateOTLP(c);
   mkdirSync(Root(), { recursive: true, mode: 0o700 });
   const tmp = join(Root(), ".config-" + NewID());

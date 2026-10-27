@@ -290,10 +290,16 @@ describe("durable evidence and account pins", () => {
     expect(basename(SessionStateDir(c, "codex", "legacy"))).toBe(old);
     expect(basename(SessionStateDir(c, "claude-code", "legacy"))).toBe(basename(before));
   });
-  test("private atomic config saves preserve activation, drop an old stored key and decode only OTLP", () => {
+  test("private atomic config saves drop an earlier release's key and runtime and decode only OTLP", () => {
     process.env.KIMCHI_ADAPTERS_HOME = temp();
-    const c = { ...account(), runtimeExecutable: "/managed/runtime", runtimeRevision: NewID() };
-    Save({ ...c, apiKey: "earlier-release-key", enabled: true } as Config);
+    const c = { ...account(), disabled: true };
+    Save({
+      ...c,
+      apiKey: "earlier-release-key",
+      enabled: true,
+      runtimeExecutable: "/managed/runtime",
+      runtimeRevision: NewID(),
+    } as Config);
     expect(Load()).toEqual(c);
     expect(readFileSync(join(Root(), "config.json"), "utf8")).not.toContain("earlier-release-key");
     expect(statSync(join(Root(), "config.json")).mode & 0o777).toBe(0o600);

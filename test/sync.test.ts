@@ -164,21 +164,20 @@ test("next sync retries the original offline batch and recovers late usage exact
   }
 });
 
-test("configure sets only OTLP export, keeps activation and disable state, and refuses keys", async () => {
-  Save({ disabled: true, runtimeExecutable: "/owned/helper", runtimeRevision: NewID() });
+test("configure sets only OTLP export, keeps the disable state, and refuses keys", async () => {
+  Save({ disabled: true });
   let output = "";
   const exporter = {
     otlpUrl: "https://collector.example/v1/logs",
     otlpHeaders: { Authorization: "Bearer collector-only" },
   };
-  await CLI(["configure"], stdin({ ...exporter, runtimeExecutable: "/untrusted" }), (text) => {
+  await CLI(["configure"], stdin({ ...exporter, disabled: false }), (text) => {
     output += text;
   });
   const c = Load();
   expect(c.otlpUrl).toBe(exporter.otlpUrl);
   expect(c.otlpHeaders).toEqual(exporter.otlpHeaders);
   expect(c.disabled).toBe(true);
-  expect(c.runtimeExecutable).toBe("/owned/helper");
   expect(output).toBe("OTLP export configured.\n");
   await expect(
     CLI(["configure"], stdin({ apiUrl: "https://api.cast.ai", apiKey: "synthetic-key" })),
@@ -195,7 +194,7 @@ test("hook stores synchronously without spawning a worker and session stays in i
     cwd: root,
     prompt: "New work: fixture",
   };
-  Save({ runtimeExecutable: "/does/not/run" });
+  Save({});
   await CLI(["hook", "codex"], stdin(payload), (text) => {
     output += text;
   });

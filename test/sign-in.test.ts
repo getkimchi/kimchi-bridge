@@ -117,11 +117,7 @@ test("a new key for the same account keeps its exporter; another account drops i
         return Response.json({ organizationId: organization, userId: actor });
       });
     const apiUrl = identity();
-    const kept = {
-      disabled: true,
-      runtimeExecutable: "/owned/helper",
-      runtimeRevision: NewID(),
-    };
+    const kept = { disabled: true };
     Save({ ...kept, otlpUrl: exporter + "/v1/logs", otlpHeaders: { Authorization: "Bearer old" } });
     // The first verification keeps an exporter configured before it.
     let c = await Verify({ apiUrl, token: "first-key" });

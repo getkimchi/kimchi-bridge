@@ -1,10 +1,9 @@
-import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Recorder, type Native } from "./capture.ts";
 import { CredentialHash, Flush, FlushOTLP, type SignIn } from "./delivery.ts";
 import { Open } from "./ledger.ts";
-import { EncodeEvent, Kind, NewID, Parse, Stringify } from "./protocol.ts";
+import { EncodeEvent, Kind, Parse, Stringify } from "./protocol.ts";
 import {
   DecodeOTLP,
   KimchiSignIn,
@@ -86,12 +85,6 @@ export async function Run(
     return;
   }
   let c = Load();
-  if (command === "activate") {
-    c.runtimeExecutable = realpathSync(process.execPath);
-    c.runtimeRevision = NewID();
-    Save(c);
-    return;
-  }
   if (command === "enable" || command === "disable") {
     c.disabled = command === "disable";
     Save(c);

@@ -28,6 +28,7 @@ if [[ "$action" == status ]]; then
   for cli in "${clients[@]}"; do
     if [[ -f "$prefix/installed/$cli" ]]; then printf '%s: %s\n' "$cli" "$(cat "$prefix/installed/$cli")"; else printf '%s: not installed\n' "$cli"; fi
   done
+  [[ ! -f "$prefix/installed/code" ]] || printf 'code: %s\n' "$(cat "$prefix/installed/code")"
   [[ ! -x "$bin_dir/kimchi-adapters" ]] || "$bin_dir/kimchi-adapters" status
   exit 0
 fi
@@ -39,11 +40,18 @@ if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-adapters" || -L "$bin_dir/
 fi
 mkdir "$prefix/install.lock" 2>/dev/null || fail "Another installer is running ($prefix/install.lock)."
 trap 'rmdir "$prefix/install.lock"' EXIT
-market_name() { printf 'kimchi-work-%s' "${1//./-}"; }
-remove_version() {
-  local cli=$1 version=$2 market selector output
-  valid_version "$version" || fail 'Invalid installed-version receipt.'
-  market=$(market_name "$version");selector="kimchi-work@$market"
+# A client's receipt names its registered marketplace, which changes only with the plugin
+# wiring. Receipts from earlier releases name the version their marketplace was named after.
+market_of() { if valid_version "$1"; then printf 'kimchi-work-%s' "${1//./-}"; else printf '%s' "$1"; fi; }
+valid_market() {
+  case "$1" in kimchi-work-*) ;; *) return 1 ;; esac
+  case "${1#kimchi-work-}" in ""|*[!0123456789abcdefghijklmnopqrstuvwxyz-]*) return 1 ;; esac
+}
+remove_market() {
+  local cli=$1 market selector output
+  market=$(market_of "$2")
+  valid_market "$market" || fail 'Invalid registration receipt.'
+  selector="kimchi-work@$market"
   if [[ "$cli" == claude ]]; then
     if output=$(claude plugin uninstall "$selector" --scope user 2>&1); then printf '%s\n' "$output"; else
       case "$output" in *"Plugin \"$selector\" not found in installed plugins"*) ;; *) printf '%s\n' "$output" >&2;return 1 ;; esac
@@ -64,7 +72,7 @@ if [[ "$action" == uninstall ]]; then
     receipt="$prefix/installed/$cli"
     for state in "$receipt.cleanup" "$receipt"; do
       [[ -f "$state" ]] || continue
-      remove_version "$cli" "$(cat "$state")"
+      remove_market "$cli" "$(cat "$state")"
       rm -- "$state"
     done
   done
@@ -73,35 +81,43 @@ if [[ "$action" == uninstall ]]; then
   exit 0
 fi
 
-for cli in "${clients[@]}"; do "$cli" plugin --help >/dev/null || fail "$cli does not support native plugins. Update the official CLI."; done
 script_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-[[ -f "$script_root/VERSION" && -x "$script_root/bin/kimchi-adapters" ]] || fail 'Kimchi installs and updates the plugins: run the Kimchi installer.'
+[[ -f "$script_root/VERSION" && -f "$script_root/lib/kimchi-adapters.mjs" ]] || fail 'Kimchi installs and updates the plugins: run the Kimchi installer.'
 version=$(cat "$script_root/VERSION")
 [[ -z "$requested" || "$requested" == "$version" ]] || fail 'Requested version differs from this package.'
 valid_version "$version" || fail 'Invalid package version.'
-package=$script_root
+market=$(cat "$script_root/MARKETPLACE")
+valid_market "$market" || fail 'Invalid package marketplace.'
+# The plugins run on Kimchi's runtime; Kimchi's installer and updater pass its path.
+runtime=${KIMCHI_BIN:-$(command -v kimchi || true)}
+[[ "$runtime" == /* && -x "$runtime" ]] || fail 'Kimchi runs the plugins: install Kimchi first.'
 
 target="$prefix/releases/$version"
 mkdir -p "$prefix/releases"
 if [[ ! -d "$target" ]]; then
   staged=$(mktemp -d "$prefix/releases/.install.XXXXXXXX")
-  cp -R "$package/." "$staged/"
+  cp -R "$script_root/." "$staged/"
   mv -- "$staged" "$target"
 fi
-market=$(market_name "$version")
+# Every registered plugin runs this code, so link it before registering. Each link changes with
+# one rename: a running hook sees the old or the new target.
+ln -s "$runtime" "$prefix/.runtime.$$"
+mv -f -- "$prefix/.runtime.$$" "$prefix/runtime"
+ln -s "$target/lib/kimchi-adapters.mjs" "$prefix/.current.$$"
+mv -f -- "$prefix/.current.$$" "$prefix/current.mjs"
+ln -s "$target/bin/kimchi-adapters" "$bin_dir/.kimchi-adapters.new.$$"
+mv -f -- "$bin_dir/.kimchi-adapters.new.$$" "$bin_dir/kimchi-adapters"
 for cli in "${clients[@]}"; do
-  mkdir -p "$target/plugins/$cli/bin"
-  if [[ ! -e "$target/plugins/$cli/bin/kimchi-adapters" ]]; then
-    ln "$target/bin/kimchi-adapters" "$target/plugins/$cli/bin/kimchi-adapters"
-  fi
   receipt="$prefix/installed/$cli"
   old=
-  if [[ -f "$receipt" ]]; then old=$(cat "$receipt");valid_version "$old" || fail 'Invalid installed-version receipt.';fi
-  if [[ "$old" == "$version" ]]; then
-    printf '%s already at %s\n' "$cli" "$version"
+  [[ ! -f "$receipt" ]] || old=$(market_of "$(cat "$receipt")")
+  # The same wiring needs no new registration: the plugin already runs the current code.
+  if [[ "$old" == "$market" ]]; then
+    printf '%s plugin already registered\n' "$cli"
   else
-    # Finish an interrupted cleanup before accepting a third installed version.
-    if [[ -f "$receipt.cleanup" ]]; then remove_version "$cli" "$(cat "$receipt.cleanup")";rm -- "$receipt.cleanup";fi
+    "$cli" plugin --help >/dev/null || fail "$cli does not support native plugins. Update the official CLI."
+    # Finish an interrupted cleanup before accepting a third registration.
+    if [[ -f "$receipt.cleanup" ]]; then remove_market "$cli" "$(cat "$receipt.cleanup")";rm -- "$receipt.cleanup";fi
     if [[ "$cli" == claude ]]; then
       claude plugin marketplace add "$target" --scope user
       claude plugin install "kimchi-work@$market" --scope user
@@ -110,18 +126,18 @@ for cli in "${clients[@]}"; do
       codex plugin add "kimchi-work@$market" --json
     fi
     if [[ -n "$old" ]]; then printf '%s\n' "$old" > "$receipt.cleanup.new";mv -- "$receipt.cleanup.new" "$receipt.cleanup";fi
-    printf '%s\n' "$version" > "$receipt.new"
+    printf '%s\n' "$market" > "$receipt.new"
     mv -- "$receipt.new" "$receipt"
   fi
   if [[ -f "$receipt.cleanup" ]]; then
-    remove_version "$cli" "$(cat "$receipt.cleanup")"
+    remove_market "$cli" "$(cat "$receipt.cleanup")"
     rm -- "$receipt.cleanup"
   fi
 done
-ln -s "$target/bin/kimchi-adapters" "$bin_dir/.kimchi-adapters.new.$$"
-mv -f -- "$bin_dir/.kimchi-adapters.new.$$" "$bin_dir/kimchi-adapters"
+# Written last: after a failed registration the old code receipt stays, so Kimchi's next update retries.
+printf '%s\n' "$version" > "$prefix/installed/code.new"
+mv -- "$prefix/installed/code.new" "$prefix/installed/code"
 # Keep the bootstrap, rather than a package-bound script, for kimchi-adapters uninstall.
 cp "$target/bootstrap.sh" "$prefix/install.sh"
 chmod 700 "$prefix/install.sh"
-"$bin_dir/kimchi-adapters" activate
-printf '%s\n' "Installed $client $version. Start a new client session and accept its plugin trust prompt." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-adapters status" 'Existing inference and enterprise telemetry settings are unchanged.'
+printf '%s\n' "Installed $client $version. Start a new client session; Codex asks you to trust the plugin's hooks." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-adapters status" 'Existing inference and enterprise telemetry settings are unchanged.'

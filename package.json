@@ -8,7 +8,6 @@
     "bun": ">=1.4.0"
   },
   "scripts": {
-    "build": "bun run scripts/package.ts --helper bin/kimchi-adapters",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "format": "biome format --write --indent-style=space --indent-width=2 --line-width=100 src test scripts package.json tsconfig.json",

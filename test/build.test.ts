@@ -1,8 +1,29 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BuildHelper, ReleaseVersion } from "../scripts/package.ts";
+import { BuildBundle, ReleaseVersion, SHIM } from "../scripts/package.ts";
+
+// What the installer leaves: the shim, the current code and a runtime link. Bun stands in
+// for Kimchi's binary, which runs the code as Bun does when BUN_BE_BUN=1 is set.
+async function installed(root: string, version: string) {
+  const prefix = join(root, "prefix"),
+    helper = join(root, "bin", "kimchi-adapters");
+  mkdirSync(prefix, { recursive: true });
+  mkdirSync(join(root, "bin"));
+  await BuildBundle(version, join(prefix, "current.mjs"));
+  symlinkSync(process.execPath, join(prefix, "runtime"));
+  writeFileSync(helper, SHIM, { mode: 0o755 });
+  return { prefix, helper };
+}
 
 test("packager only accepts the installer release formats", () => {
   for (const version of ["v0.1.0", "v0.1.0-rc.9"]) expect(ReleaseVersion(version)).toBe(version);
@@ -16,17 +37,16 @@ test("packager only accepts the installer release formats", () => {
     expect(() => ReleaseVersion(version)).toThrow();
 });
 
-test("compiled helper ignores project dotenv and bunfig configuration", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pr-cost-compiled-"));
+test("the shim runs the code on Kimchi's runtime without the project's .env or bunfig.toml", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pr-cost-shim-"));
   try {
     const project = join(root, "project"),
       home = join(root, "home"),
       state = join(root, "state"),
-      redirect = join(root, "redirect");
+      redirect = join(root, "redirect"),
+      canary = join(root, "preload-executed");
     mkdirSync(project);
     mkdirSync(home);
-    const helper = join(root, "helper"),
-      canary = join(root, "preload-executed");
     writeFileSync(
       join(project, ".env"),
       `KIMCHI_ADAPTERS_HOME=${redirect}\nKIMCHI_API_KEY=untrusted-project-key\n`,
@@ -36,13 +56,21 @@ test("compiled helper ignores project dotenv and bunfig configuration", async ()
       `require('node:fs').writeFileSync(${JSON.stringify(canary)},'executed');\n`,
     );
     writeFileSync(join(project, "bunfig.toml"), 'preload = ["./preload.js"]\n');
-    await BuildHelper("compiled-test", helper);
-    const result = Bun.spawnSync([helper, "status"], {
-      cwd: project,
-      env: { HOME: home, PATH: process.env.PATH!, KIMCHI_ADAPTERS_HOME: state },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const { prefix, helper } = await installed(root, "bundle-test");
+    const run = (args: string[]) =>
+      Bun.spawnSync([helper, ...args], {
+        cwd: project,
+        env: {
+          HOME: home,
+          PATH: process.env.PATH!,
+          KIMCHI_ADAPTERS_PREFIX: prefix,
+          KIMCHI_ADAPTERS_HOME: state,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    expect(run(["version"]).stdout.toString()).toBe("bundle-test\n");
+    const result = run(["status"]);
     expect(result.exitCode).toBe(0);
     expect(result.stderr.toString()).toBe("");
     expect(JSON.parse(result.stdout.toString())).toMatchObject({
@@ -51,25 +79,19 @@ test("compiled helper ignores project dotenv and bunfig configuration", async ()
     });
     expect(existsSync(redirect)).toBe(false);
     expect(existsSync(canary)).toBe(false);
-    const withoutOverride = Bun.spawnSync([helper, "status"], {
-      cwd: project,
-      env: { HOME: home, PATH: process.env.PATH! },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    expect(withoutOverride.exitCode).toBe(0);
-    expect(JSON.parse(withoutOverride.stdout.toString()).ledger).toBe(
-      join(home, ".local/state/kimchi-adapters/accounts/local"),
-    );
-    expect(existsSync(redirect)).toBe(false);
-    expect(existsSync(canary)).toBe(false);
+    // Without Kimchi, hooks stay quiet and succeed rather than fail the client's session.
+    rmSync(join(prefix, "runtime"));
+    const missing = run(["hook", "codex"]);
+    expect(missing.exitCode).toBe(0);
+    expect(missing.stdout.toString()).toBe("");
+    expect(missing.stderr.toString()).toContain("run the Kimchi installer");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }, 15000);
 
-test("compiled helper reports with Kimchi's sign-in and leaves Kimchi's settings unchanged", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pr-cost-sign-in-compiled-"));
+test("the shipped helper reports with Kimchi's sign-in and leaves Kimchi's settings unchanged", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pr-cost-sign-in-"));
   const key = "synthetic-key-not-a-credential";
   const user = "11111111-1111-4111-8111-111111111111";
   const org = "22222222-2222-4222-8222-222222222222";
@@ -103,11 +125,11 @@ test("compiled helper reports with Kimchi's sign-in and leaves Kimchi's settings
     const settings = join(home, ".config", "kimchi", "config.json"),
       original = JSON.stringify({ apiKey: key, llmEndpoint: "https://inference.invalid/keep" });
     writeFileSync(settings, original);
-    const helper = join(root, "helper");
-    await BuildHelper("sign-in-test", helper);
+    const { prefix, helper } = await installed(root, "sign-in-test");
     const env = {
       HOME: home,
       PATH: process.env.PATH!,
+      KIMCHI_ADAPTERS_PREFIX: prefix,
       KIMCHI_ADAPTERS_HOME: state,
       KIMCHI_REMOTE_ENDPOINT: api.url.origin,
     };

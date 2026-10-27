@@ -6,6 +6,7 @@ Plugins for the official Claude Code and Codex CLIs. They record the token usage
 
 ### Requirements
 
+- Kimchi, installed with its install script. The plugins run on Kimchi's runtime.
 - Claude Code (`claude`), Codex (`codex`) or both, in a version that supports plugins.
 - GitHub CLI (`gh`) signed in for repositories on GitHub, GitLab CLI (`glab`) signed in for repositories on GitLab.
 - For a self-hosted GitHub or GitLab, `GH_HOST` or `GITLAB_HOST` set to its host name.
@@ -23,7 +24,7 @@ Start a new Claude Code or Codex session. Codex first shows "Hooks need review";
 
 ### Update
 
-Kimchi's releases include the plugins. When a Kimchi update brings a new plugin version, Kimchi updates the plugins it added. Claude Code sessions that are already open finish on the previous version. Open Codex sessions stop recording until you start a new one, and Codex asks you to trust the updated hooks again.
+Kimchi's releases include the plugins, and Kimchi updates the plugins it added when it updates itself. Open sessions switch to the new code with their next hook. Only an update that changes the plugins' hooks registers them again: open Codex sessions then stop recording until you start a new one, and Codex asks you to trust the new hooks.
 
 ### Uninstall
 
@@ -75,7 +76,7 @@ To continue the same work in another session, or in the other client, have the a
 
 ## How it works
 
-The plugins run the bundled `kimchi-adapters` program from Claude Code and Codex hooks. It records the token usage of each model request, read from the client's transcripts, and each tool call with its outcome. It also keeps copies of the files each tool works on, from before and after the call. It then matches file changes to your Git commits and asks `gh` or `glab` which pull requests contain those commits. It doesn't change prompts or replies, and if recording fails, your session carries on.
+Claude Code and Codex hooks run the plugins' code on Kimchi's own runtime (`BUN_BE_BUN=1 kimchi`), without loading the project's `.env` or `bunfig.toml`. The code records the token usage of each model request, read from the client's transcripts, and each tool call with its outcome. It also keeps copies of the files each tool works on, from before and after the call. It then matches file changes to your Git commits and asks `gh` or `glab` which pull requests contain those commits. It doesn't change prompts or replies, and if recording fails, your session carries on.
 
 Records are saved in SQLite databases under `~/.local/state/kimchi-adapters`, one for each account. The plugins keep no key: they read Kimchi's sign-in each time they upload. File copies never leave your machine. While recording is on, copies older than seven days are deleted.
 
