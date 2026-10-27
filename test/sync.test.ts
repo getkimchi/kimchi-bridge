@@ -183,7 +183,7 @@ test("configure sets only OTLP export, keeps the disable state, and refuses keys
   await expect(
     cli(["configure"], stdin({ apiUrl: "https://app.kimchi.dev/api", apiKey: "synthetic-key" })),
   ).rejects.toThrow("Kimchi's sign-in");
-  await expect(cli(["login"])).rejects.toThrow("unknown command");
+  await expect(cli(["frobnicate"])).rejects.toThrow("unknown command");
 });
 
 test("hook stores synchronously without spawning a worker and session stays in its original account", async () => {

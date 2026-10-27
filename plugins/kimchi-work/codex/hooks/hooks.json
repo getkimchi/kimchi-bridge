@@ -1,23 +1,152 @@
 {
   "hooks": {
-    "SessionStart": [{"hooks": [
-      {"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3},
-      {"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" sync", "timeout": 10, "async": true}
-    ]}],
-    "UserPromptSubmit": [{"hooks": [
-      {"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3},
-      {"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" sync", "timeout": 10, "async": true}
-    ]}],
-    "PreToolUse": [{"hooks": [{"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3}]}],
-    "PostToolUse": [{"hooks": [{"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3}]}],
-    "PostToolUseFailure": [{"hooks": [{"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3}]}],
-    "PostModelRequest": [{"hooks": [{"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3}]}],
-    "SubagentStart": [{"hooks": [{"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3}]}],
-    "Stop": [{"hooks": [
-      {"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3},
-      {"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" sync", "timeout": 10, "async": true}
-    ]}],
-    "SessionEnd": [{"hooks": [{"type": "command", "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex", "timeout": 3}]}]
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" gateway ensure --quick",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hint",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" sync",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" gateway ensure --quick",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" sync",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostModelRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" gateway ensure --quick",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" sync",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/kimchi-bridge\" hook codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
   }
 }
