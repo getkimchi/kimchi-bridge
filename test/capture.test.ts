@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
@@ -11,19 +12,18 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkSignal, lockSync, remainingTime, safeRead, withDeadline } from "../src/platform.ts";
 import {
   Recorder,
-  digest,
   filePaths,
   patchInput,
   referencedPaths,
   repository,
   type Scope,
 } from "../src/work/capture.ts";
-import { Open } from "../src/work/ledger.ts";
 import { git } from "../src/work/git.ts";
-import { CheckSignal, RemainingTime, WithDeadline, lockSync, safeRead } from "../src/platform.ts";
-import { NewID, StableID } from "../src/work/protocol.ts";
+import { Store } from "../src/work/ledger.ts";
+import { digest, stableId } from "../src/work/protocol.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -34,10 +34,10 @@ function fixture(source = "codex") {
   const root = join(base, "project"),
     state = join(base, "state");
   mkdirSync(root);
-  const store = Open(state),
-    r = new Recorder(store, source, store.DeviceID());
+  const store = new Store(state),
+    r = new Recorder(store, source, store.deviceId());
   cleanups.push(() => {
-    store.Close();
+    store.close();
     rmSync(base, { recursive: true, force: true });
   });
   return { base, root, state, store, r };
@@ -47,7 +47,7 @@ function scope(root: string, session = "s", turn = "t", agent = ""): Scope {
   return { Session: session, Turn: turn, Agent: agent, CWD: root, Root, Repo, Repository };
 }
 function prompt(r: Recorder, root: string, session: string, turn: string, text: string) {
-  r.Record({
+  r.record({
     stage: "UserPromptSubmit",
     event: { session_id: session, turn_id: turn, cwd: root, prompt: text },
   });
@@ -62,9 +62,9 @@ function edit(root: string, path: string, call = "edit", old = "before", replace
     tool_input: { file_path: path, old_string: old, new_string: replacement },
   };
 }
-function events(store: ReturnType<typeof Open>, kind: string) {
+function events(store: Store, kind: string) {
   return (
-    store.DB.query("SELECT body FROM events WHERE kind=? ORDER BY rowid").all(kind) as {
+    store.db.query("SELECT body FROM events WHERE kind=? ORDER BY rowid").all(kind) as {
       body: Uint8Array;
     }[]
   ).map((row) => JSON.parse(Buffer.from(row.body).toString()));
@@ -97,7 +97,7 @@ test("repository discovery preserves native Git roots and common identities for 
   for (const cwd of [root, subdir, linked, linkedSubdir, unborn, trailing]) {
     const expectedRoot = git(cwd, "rev-parse", "--show-toplevel"),
       common = git(expectedRoot, "rev-parse", "--path-format=absolute", "--git-common-dir");
-    expect(repository(cwd)).toEqual([expectedRoot, StableID("git-common-dir", common), undefined]);
+    expect(repository(cwd)).toEqual([expectedRoot, stableId("git-common-dir", common), undefined]);
   }
   expect(repository(linked)[1]).toBe(repository(root)[1]);
   const nonGit = join(base, "not a repository"),
@@ -135,7 +135,7 @@ test("platform defers libc binding until native work and caches the real library
   const path = join(root, "file");
   writeFileSync(path, "allowed");
   const module = new URL("../src/platform.ts", import.meta.url).pathname;
-  const script = `const ffi=require('bun:ffi');const original=ffi.dlopen;let opened=0;ffi.dlopen=(...args)=>{opened++;return original(...args)};const p=await import(${JSON.stringify(module)});p.CheckSignal();p.RemainingTime(undefined,1000);const afterImport=opened;const bytes=p.safeRead(${JSON.stringify(root)},${JSON.stringify(path)}).bytes.toString();const afterRead=opened;const guard=p.lockSync(${JSON.stringify(state)});if(!guard)throw Error('unexpected lock contention');guard.close();try{p.safeRead(${JSON.stringify(root)},'missing')}catch(error){if(error.code!=='ENOENT')throw error}process.stdout.write(JSON.stringify({afterImport,afterRead,afterLockAndError:opened,bytes}))`;
+  const script = `const ffi=require('bun:ffi');const original=ffi.dlopen;let opened=0;ffi.dlopen=(...args)=>{opened++;return original(...args)};const p=await import(${JSON.stringify(module)});p.checkSignal();p.remainingTime(undefined,1000);const afterImport=opened;const bytes=p.safeRead(${JSON.stringify(root)},${JSON.stringify(path)}).bytes.toString();const afterRead=opened;const guard=p.lockSync(${JSON.stringify(state)});if(!guard)throw Error('unexpected lock contention');guard.close();try{p.safeRead(${JSON.stringify(root)},'missing')}catch(error){if(error.code!=='ENOENT')throw error}process.stdout.write(JSON.stringify({afterImport,afterRead,afterLockAndError:opened,bytes}))`;
   const result = execFileSync(process.execPath, ["-e", script], { stdio: "pipe" });
   expect(JSON.parse(result.toString())).toEqual({
     afterImport: 0,
@@ -231,12 +231,12 @@ test("kernel flock excludes a second process and releases when closed", () => {
 });
 
 test("wall clock deadlines survive a blocked event loop and inherit a parent budget", () => {
-  const parent = WithDeadline(10),
-    child = WithDeadline(1000, parent);
-  expect(RemainingTime(child, 1000)).toBeLessThanOrEqual(10);
+  const parent = withDeadline(10),
+    child = withDeadline(1000, parent);
+  expect(remainingTime(child, 1000)).toBeLessThanOrEqual(10);
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
-  expect(() => CheckSignal(child)).toThrow();
-  expect(() => RemainingTime(parent, 2000)).toThrow();
+  expect(() => checkSignal(child)).toThrow();
+  expect(() => remainingTime(parent, 2000)).toThrow();
 });
 
 test("saved plan revisions continue across harnesses and ambiguity creates separate work", () => {
@@ -245,9 +245,9 @@ test("saved plan revisions continue across harnesses and ambiguity creates separ
   writeFileSync(plan, "implement authentication\n");
   prompt(r, root, "s", "t", "plan authentication");
   const original = r.work(scope(root)),
-    other = new Recorder(store, "claude-code", r.Device);
-  r.RegisterPlan(root, plan, original, scope(root));
-  other.Record({
+    other = new Recorder(store, "claude-code", r.device);
+  r.registerPlan(root, plan, original, scope(root));
+  other.record({
     stage: "turn.start",
     sessionId: "claude",
     cwd: root,
@@ -258,7 +258,7 @@ test("saved plan revisions continue across harnesses and ambiguity creates separ
   prompt(r, root, "changed", "t", `implement \`${plan}\``);
   expect(r.work(scope(root, "changed"))).not.toBe(original);
   writeFileSync(plan, "implement authentication\n");
-  r.RegisterPlan(root, plan, NewID(), scope(root));
+  r.registerPlan(root, plan, randomUUID(), scope(root));
   prompt(r, root, "ambiguous", "t", `implement \`${plan}\``);
   expect(r.work(scope(root, "ambiguous"))).not.toBe(original);
   expect(events(store, "work").at(-1).work.reason).toBe("ambiguous_plan_reference");
@@ -286,7 +286,7 @@ test("subagents inherit launch work after the parent changes tasks", () => {
   const { root, r } = fixture();
   prompt(r, root, "s", "t", "parent");
   const before = r.work(scope(root));
-  r.Record({
+  r.record({
     stage: "SubagentStart",
     event: { session_id: "s", turn_id: "t", agent_id: "child", cwd: root },
   });
@@ -303,7 +303,7 @@ test("two native processes racing the same turn keep one work ID and session def
   const ledgerModule = new URL("../src/work/ledger.ts", import.meta.url).pathname;
   const children = [0, 1].map((index) => {
     const ready = join(base, `ready-${index}`);
-    const script = `const f=require('node:fs');const{Recorder}=await import(${JSON.stringify(captureModule)});const{Open}=await import(${JSON.stringify(ledgerModule)});const store=Open(${JSON.stringify(state)});const r=new Recorder(store,'codex',store.DeviceID());const original=r.workExact.bind(r);let first=true;r.workExact=(s)=>{const work=original(s);if(first){first=false;f.writeFileSync(${JSON.stringify(ready)},'ready');const until=Date.now()+3000;while(!f.existsSync(${JSON.stringify(start)})){if(Date.now()>until)throw Error('barrier expired');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,2)}}return work};try{r.bind(${JSON.stringify(s)},'New work: same turn')}finally{store.Close()}`;
+    const script = `const f=require('node:fs');const{Recorder}=await import(${JSON.stringify(captureModule)});const{Store}=await import(${JSON.stringify(ledgerModule)});const store=new Store(${JSON.stringify(state)});const r=new Recorder(store,'codex',store.deviceId());const original=r.workExact.bind(r);let first=true;r.workExact=(s)=>{const work=original(s);if(first){first=false;f.writeFileSync(${JSON.stringify(ready)},'ready');const until=Date.now()+3000;while(!f.existsSync(${JSON.stringify(start)})){if(Date.now()>until)throw Error('barrier expired');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,2)}}return work};try{r.bind(${JSON.stringify(s)},'New work: same turn')}finally{store.close()}`;
     const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     child.stderr!.on("data", (bytes) => {
@@ -325,13 +325,13 @@ test("two native processes racing the same turn keep one work ID and session def
     }
     writeFileSync(start, "start");
     await Promise.all(children.map((child) => child.exited));
-    const binding = store.DB.query(
-      "SELECT work_id FROM bindings WHERE session_id='race'",
-    ).get() as { work_id: string };
-    const current = store.DB.query("SELECT value FROM meta WHERE key='codex:race:work'").get() as {
+    const binding = store.db
+      .query("SELECT work_id FROM bindings WHERE session_id='race'")
+      .get() as { work_id: string };
+    const current = store.db.query("SELECT value FROM meta WHERE key='codex:race:work'").get() as {
       value: string;
     };
-    expect((store.DB.query("SELECT count(*) AS n FROM work").get() as { n: number }).n).toBe(1);
+    expect((store.db.query("SELECT count(*) AS n FROM work").get() as { n: number }).n).toBe(1);
     expect(current.value).toBe(binding.work_id);
     expect(events(store, "work")).toHaveLength(1);
   } finally {
@@ -345,18 +345,18 @@ test("before capture persists bytes before editing and replay cannot change the 
   writeFileSync(path, "before\n");
   prompt(r, root, "s", "t", "edit");
   const e = edit(root, path);
-  r.Record({ stage: "PreToolUse", event: e });
-  expect(store.Blob(digest("before\n")).toString()).toBe("before\n");
-  const beforeBody = store.DB.query("SELECT body FROM tool_state").get();
+  r.record({ stage: "PreToolUse", event: e });
+  expect(store.blob(digest("before\n")).toString()).toBe("before\n");
+  const beforeBody = store.db.query("SELECT body FROM tool_state").get();
   writeFileSync(path, "after\n");
-  r.Record({ stage: "PreToolUse", event: e });
-  expect(store.DB.query("SELECT body FROM tool_state").get()).toEqual(beforeBody);
-  r.Record({ stage: "PostToolUse", event: e });
+  r.record({ stage: "PreToolUse", event: e });
+  expect(store.db.query("SELECT body FROM tool_state").get()).toEqual(beforeBody);
+  r.record({ stage: "PostToolUse", event: e });
   const captured = events(store, "file");
   expect(captured).toHaveLength(1);
   expect(captured[0].file.quality).toBe("tool_observed");
-  expect(store.Blob(digest("after\n")).toString()).toBe("after\n");
-  r.Record({ stage: "PostToolUse", event: e });
+  expect(store.blob(digest("after\n")).toString()).toBe("after\n");
+  r.record({ stage: "PostToolUse", event: e });
   expect(events(store, "file")).toEqual(captured);
   expect(events(store, "tool")).toHaveLength(1);
 });
@@ -366,7 +366,7 @@ test("Claude mod flat Read and Edit payloads retain their exact native file evid
     path = join(root, "file");
   writeFileSync(path, "before\n");
   const record = (stage: string, event: Record<string, unknown>, result = {}) =>
-    r.Record({ stage, sessionId: "s", cwd: root, event, result });
+    r.record({ stage, sessionId: "s", cwd: root, event, result });
   record("turn.start", { turnId: "t", text: "edit the file" });
   const read = { tool: "Read", toolCallId: "read", file_path: path };
   record("tool.before", read);
@@ -385,8 +385,8 @@ test("Claude mod flat Read and Edit payloads retain their exact native file evid
   expect(files).toHaveLength(2);
   expect(files[0].file.operation).toBe("read");
   expect(files[1].file.quality).toBe("tool_observed");
-  expect(store.Blob(digest("before\n")).toString()).toBe("before\n");
-  expect(store.Blob(digest("after\n")).toString()).toBe("after\n");
+  expect(store.blob(digest("before\n")).toString()).toBe("before\n");
+  expect(store.blob(digest("after\n")).toString()).toBe("after\n");
 });
 
 test("concurrent edits retain observed transitions without claiming the native edit", () => {
@@ -395,11 +395,11 @@ test("concurrent edits retain observed transitions without claiming the native e
   writeFileSync(path, "before\n");
   prompt(r, root, "s", "t", "edit");
   const e = edit(root, path);
-  r.Record({ stage: "PreToolUse", event: e });
+  r.record({ stage: "PreToolUse", event: e });
   writeFileSync(path, "human\n");
-  r.Record({ stage: "PostToolUse", event: e });
+  r.record({ stage: "PostToolUse", event: e });
   expect(events(store, "file")[0].file.quality).toBe("observed");
-  expect(store.DB.query("SELECT key FROM meta WHERE key LIKE 'git-change:%'").all()).toHaveLength(
+  expect(store.db.query("SELECT key FROM meta WHERE key LIKE 'git-change:%'").all()).toHaveLength(
     0,
   );
 });
@@ -410,11 +410,11 @@ test("failed native tools and missing preimages remain unconfirmed", () => {
   writeFileSync(path, "before\n");
   prompt(r, root, "s", "t", "edit");
   const e = edit(root, path);
-  r.Record({ stage: "PostToolUse", event: e });
+  r.record({ stage: "PostToolUse", event: e });
   expect(events(store, "tool")).toHaveLength(0);
-  r.Record({ stage: "PreToolUse", event: e });
+  r.record({ stage: "PreToolUse", event: e });
   writeFileSync(path, "after\n");
-  r.Record({ stage: "PostToolUseFailure", event: e });
+  r.record({ stage: "PostToolUseFailure", event: e });
   expect(events(store, "tool")[0].tool.outcome).toBe("failed");
   expect(events(store, "file")[0].file.quality).toBe("observed");
 });
@@ -432,18 +432,18 @@ test("native writes register real plans and reads retain their observed revision
     tool_name: "Write",
     tool_input: { file_path: path, content: "plan\n" },
   };
-  r.Record({ stage: "PreToolUse", event: write });
+  r.record({ stage: "PreToolUse", event: write });
   writeFileSync(path, "plan\n");
-  r.Record({ stage: "PostToolUse", event: write });
-  expect(store.DB.query("SELECT hash FROM plans").all()).toEqual([{ hash: digest("plan\n") }]);
+  r.record({ stage: "PostToolUse", event: write });
+  expect(store.db.query("SELECT hash FROM plans").all()).toEqual([{ hash: digest("plan\n") }]);
   const read = {
     ...write,
     tool_use_id: "read",
     tool_name: "Read",
     tool_input: { file_path: path },
   };
-  r.Record({ stage: "PreToolUse", event: read });
-  r.Record({ stage: "PostToolUse", event: read });
+  r.record({ stage: "PreToolUse", event: read });
+  r.record({ stage: "PostToolUse", event: read });
   expect(events(store, "file").at(-1).file.operation).toBe("read");
 });
 
@@ -455,44 +455,44 @@ test("file aliases work without allowing symlink contents or tracker self-captur
   symlinkSync(join(base, "secret"), join(root, "secret"));
   prompt(r, root, "s", "t", "read");
   const e = { ...edit(root, join(root, "secret")), tool_name: "Read" };
-  r.Record({ stage: "PreToolUse", event: e });
-  r.Record({ stage: "PostToolUse", event: e });
+  r.record({ stage: "PreToolUse", event: e });
+  r.record({ stage: "PostToolUse", event: e });
   expect(events(store, "file")).toHaveLength(0);
-  expect(() => store.Blob(digest("secret"))).toThrow();
+  expect(() => store.blob(digest("secret"))).toThrow();
   const [paths] = filePaths(scope(root), edit(root, join(root, ".git", "config")));
   expect(paths).toHaveLength(0);
   const aliasRoot = root.startsWith("/private/var/") ? root.slice("/private".length) : root;
   const native = edit(aliasRoot, join(aliasRoot, "file"), "alias-edit");
-  r.Record({ stage: "PreToolUse", event: native });
+  r.record({ stage: "PreToolUse", event: native });
   writeFileSync(path, "after\n");
-  r.Record({ stage: "PostToolUse", event: native });
+  r.record({ stage: "PostToolUse", event: native });
   expect(events(store, "file")).toHaveLength(1);
   expect(events(store, "file")[0].file.quality).toBe("tool_observed");
 });
 
 test("tracker state inside a checkout never becomes captured implementation evidence", () => {
   const { root, r } = fixture(),
-    nested = Open(join(root, ".tracker"));
+    nested = new Store(join(root, ".tracker"));
   try {
-    r.Store = nested;
-    const path = join(nested.Dir, "config.json");
+    r.store = nested;
+    const path = join(nested.dir, "config.json");
     writeFileSync(path, "before\n");
     prompt(r, root, "s", "t", "edit");
     const e = edit(root, path);
-    r.Record({ stage: "PreToolUse", event: e });
+    r.record({ stage: "PreToolUse", event: e });
     writeFileSync(path, "after\n");
-    r.Record({ stage: "PostToolUse", event: e });
+    r.record({ stage: "PostToolUse", event: e });
     expect(events(nested, "file")).toHaveLength(0);
-    expect(nested.DB.query("SELECT hash FROM blobs").all()).toHaveLength(0);
+    expect(nested.db.query("SELECT hash FROM blobs").all()).toHaveLength(0);
   } finally {
-    nested.Close();
+    nested.close();
   }
 });
 
 test("exact patches preserve native attribution while fuzzy or moved files stay observed", () => {
   const { root, r } = fixture(),
     path = join(root, "file");
-  const before = { hash: r.Store.PutBlob(Buffer.from("before\n")), exists: true, complete: true };
+  const before = { hash: r.store.putBlob(Buffer.from("before\n")), exists: true, complete: true };
   const patch = {
     tool_name: "apply_patch",
     tool_input: "*** Begin Patch\n*** Update File: file\n@@\n-before\n+after\n*** End Patch",
@@ -511,7 +511,7 @@ test("exact patches preserve native attribution while fuzzy or moved files stay 
     ),
   ).toBeUndefined();
   const repeated = {
-    hash: r.Store.PutBlob(Buffer.from("before\nbefore\n")),
+    hash: r.store.putBlob(Buffer.from("before\nbefore\n")),
     exists: true,
     complete: true,
   };
@@ -528,7 +528,7 @@ test("SDK patches cover add, delete, multiple hunks and reject whitespace fuzz",
   };
   expect(r.expected(absent, added, root, path)).toBe(digest("first\nsecond\n"));
   const before = {
-    hash: r.Store.PutBlob(Buffer.from("alpha\nbefore\nmiddle\nlater\nomega\n")),
+    hash: r.store.putBlob(Buffer.from("alpha\nbefore\nmiddle\nlater\nomega\n")),
     exists: true,
     complete: true,
   };
@@ -539,7 +539,7 @@ test("SDK patches cover add, delete, multiple hunks and reject whitespace fuzz",
   };
   expect(r.expected(before, patch, root, path)).toBe(digest("alpha\nafter\nmiddle\ndone\nomega\n"));
   const fuzzy = {
-    hash: r.Store.PutBlob(Buffer.from("  before  \n")),
+    hash: r.store.putBlob(Buffer.from("  before  \n")),
     exists: true,
     complete: true,
   };
@@ -567,13 +567,13 @@ test("SDK patches cover add, delete, multiple hunks and reject whitespace fuzz",
     tool_input: "*** Begin Patch\n*** Update File: file\n@@ anchor\n-before\n+after\n*** End Patch",
   };
   const skipped = {
-    hash: r.Store.PutBlob(Buffer.from("before\nanchor\n before \n")),
+    hash: r.store.putBlob(Buffer.from("before\nanchor\n before \n")),
     exists: true,
     complete: true,
   };
   expect(r.expected(skipped, anchored, root, path)).toBeUndefined();
   const exact = {
-    hash: r.Store.PutBlob(Buffer.from("anchor\nbefore\n")),
+    hash: r.store.putBlob(Buffer.from("anchor\nbefore\n")),
     exists: true,
     complete: true,
   };

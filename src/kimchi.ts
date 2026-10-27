@@ -17,7 +17,7 @@ export class IdentityError extends Error {}
 // Kimchi's sign-in, in the order of its resolveGatewayCredentials: an API key (KIMCHI_API_KEY,
 // then the global config), else its saved login, whose SSO token carries its organization.
 // Project .kimchi/config.json keys stay Kimchi's: the plugins can't see its project trust.
-export function KimchiSignIn(
+export function kimchiSignIn(
   environmentKey = "",
   dir = join(process.env.HOME || homedir(), ".config", "kimchi"),
   env: Record<string, string | undefined> = process.env,
@@ -67,7 +67,7 @@ function kimchiApiUrl(config: Record<string, unknown>, env: Record<string, strin
 }
 // Kimchi's normalizeSelfHostedBaseUrl: an absolute http(s) URL without trailing slashes.
 function origin(value: string): string {
-  value = BaseUrl(value.trim());
+  value = baseUrl(value.trim());
   try {
     return ["http:", "https:"].includes(new URL(value).protocol) ? value : "";
   } catch {
@@ -75,7 +75,7 @@ function origin(value: string): string {
   }
 }
 
-export function ValidID(id: unknown): id is string {
+export function validId(id: unknown): id is string {
   if (typeof id !== "string") return false;
   const parts = id.split("-");
   if (parts.map((part) => part.length).join(",") !== "8,4,4,4,12") return false;
@@ -87,7 +87,7 @@ export function ValidID(id: unknown): id is string {
 }
 
 export const hasControl = (text: string) => ["\r", "\n", "\0"].some((char) => text.includes(char));
-export function BaseUrl(value: string): string {
+export function baseUrl(value: string): string {
   while (value.endsWith("/")) value = value.slice(0, -1);
   return value;
 }
@@ -108,7 +108,7 @@ export function secureEndpoint(endpoint: unknown): void {
     throw new Error("reporting requires HTTPS");
 }
 
-export function CredentialHash(k: SignIn): string {
+export function credentialHash(k: SignIn): string {
   return createHash("sha256")
     .update([k.apiUrl, k.token ?? "", k.organizationId ?? ""].join("\0"))
     .digest("hex");
@@ -117,6 +117,7 @@ export function CredentialHash(k: SignIn): string {
 export function request(url: string, init: RequestInit, signal?: AbortSignal): Promise<Response> {
   return fetch(url, {
     ...init,
+    // A redirect would carry the credentials to another host.
     redirect: "manual",
     signal: signal
       ? AbortSignal.any([signal, AbortSignal.timeout(15_000)])
@@ -124,7 +125,6 @@ export function request(url: string, init: RequestInit, signal?: AbortSignal): P
   });
 }
 
-/** The response body as text, read up to a size bound. */
 export async function readBody(response: Response, limit: number): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) return "";
@@ -154,11 +154,11 @@ export function authorization(k: SignIn): Record<string, string> {
 }
 
 /** Verify a sign-in the way Kimchi's uploader does (api-keys:verify) and return its account. */
-export async function Authenticate(k: SignIn, signal?: AbortSignal) {
+export async function authenticate(k: SignIn, signal?: AbortSignal) {
   secureEndpoint(k.apiUrl);
   if (!k.token || hasControl(k.token + (k.organizationId ?? "")))
     throw new Error("invalid Kimchi sign-in");
-  const apiUrl = BaseUrl(k.apiUrl);
+  const apiUrl = baseUrl(k.apiUrl);
   let identity: { organizationId?: unknown; userId?: unknown };
   try {
     const verify = await request(
@@ -169,7 +169,7 @@ export async function Authenticate(k: SignIn, signal?: AbortSignal) {
     if (verify.status !== 200)
       throw new IdentityError(`Kimchi sign-in verification returned HTTP ${verify.status}`);
     identity = JSON.parse(await readBody(verify, 1 << 20));
-    if (!identity || !ValidID(identity.organizationId) || !ValidID(identity.userId))
+    if (!identity || !validId(identity.organizationId) || !validId(identity.userId))
       throw new IdentityError("invalid reporting account identity");
     if (
       k.organizationId &&
@@ -185,6 +185,6 @@ export async function Authenticate(k: SignIn, signal?: AbortSignal) {
     apiUrl,
     organizationId: (identity.organizationId as string).toLowerCase(),
     actorId: (identity.userId as string).toLowerCase(),
-    credentialHash: CredentialHash(k),
+    credentialHash: credentialHash(k),
   };
 }

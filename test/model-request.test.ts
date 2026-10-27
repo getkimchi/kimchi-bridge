@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Recorder } from "../src/work/capture.ts";
-import { Open, type Store } from "../src/work/ledger.ts";
-import { Hash, Parse, type Event } from "../src/work/protocol.ts";
+import { Store } from "../src/work/ledger.ts";
+import { canonicalHash, parseJson, type Event } from "../src/work/protocol.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -14,16 +14,16 @@ function fixture() {
   const base = realpathSync(mkdtempSync(join(tmpdir(), "pr-cost-model-hook-")));
   const root = join(base, "project");
   mkdirSync(root);
-  const store = Open(join(base, "state")),
-    recorder = new Recorder(store, "codex", store.DeviceID());
+  const store = new Store(join(base, "state")),
+    recorder = new Recorder(store, "codex", store.deviceId());
   cleanup.push(() => {
-    store.Close();
+    store.close();
     rmSync(base, { recursive: true, force: true });
   });
   return { base, root, store, recorder };
 }
 function prompt(recorder: Recorder, root: string, turn: string, text = "implement") {
-  recorder.Record({
+  recorder.record({
     event: {
       hook_event_name: "UserPromptSubmit",
       session_id: "session",
@@ -34,7 +34,7 @@ function prompt(recorder: Recorder, root: string, turn: string, text = "implemen
   });
 }
 function callback(root: string, extra: Record<string, unknown> = {}) {
-  return Parse(
+  return parseJson(
     JSON.stringify({
       hook_event_name: "PostModelRequest",
       session_id: "session",
@@ -56,19 +56,19 @@ function callback(root: string, extra: Record<string, unknown> = {}) {
   );
 }
 function observations(store: Store): Event[] {
-  return store.Events().filter((e) => e.coverage?.code.startsWith("native_model_request_"));
+  return store.events().filter((e) => e.coverage?.code.startsWith("native_model_request_"));
 }
 
 test("identical completed callbacks remain two supplementary observations and never charge usage", () => {
   const { root, store, recorder } = fixture();
-  recorder.Record({
+  recorder.record({
     version: "0.164.0",
     event: { hook_event_name: "SessionStart", session_id: "session", cwd: root },
   });
   prompt(recorder, root, "turn");
   const native = callback(root);
-  recorder.Record({ event: native });
-  recorder.Record({ event: native });
+  recorder.record({ event: native });
+  recorder.record({ event: native });
   const records = observations(store);
   expect(records).toHaveLength(2);
   expect(records[0]!.entityId).not.toBe(records[1]!.entityId);
@@ -92,18 +92,18 @@ test("identical completed callbacks remain two supplementary observations and ne
       },
     });
   }
-  expect(store.Events().filter((e) => e.usage)).toHaveLength(0);
+  expect(store.events().filter((e) => e.usage)).toHaveLength(0);
   expect(
-    store.Events().filter((e) => e.coverage?.code === "native_auxiliary_usage_coverage_unknown"),
+    store.events().filter((e) => e.coverage?.code === "native_auxiliary_usage_coverage_unknown"),
   ).toHaveLength(1);
-  expect(store.Status().diagnostics.native_model_request_identity_missing).toBe(2);
-  const batch = store.PendingBatch()!;
-  expect(Hash(store.PendingBatch())).toBe(Hash(batch));
-  store.Acknowledge(batch, {
+  expect(store.status().diagnostics.native_model_request_identity_missing).toBe(2);
+  const batch = store.pendingBatch()!;
+  expect(canonicalHash(store.pendingBatch())).toBe(canonicalHash(batch));
+  store.acknowledge(batch, {
     batchId: batch.id,
     receipts: batch.events.map((e) => ({ id: e.id!, revision: e.revision!, status: "accepted" })),
   });
-  expect(store.PendingBatch()).toBeNull();
+  expect(store.pendingBatch()).toBeNull();
   const config = JSON.parse(
     readFileSync(new URL("../plugins/kimchi-work/codex/hooks/hooks.json", import.meta.url), "utf8"),
   );
@@ -116,7 +116,7 @@ test("identical completed callbacks remain two supplementary observations and ne
 test("failure, cancellation and unknown status preserve missing usage and exclude raw error content", () => {
   const { root, store, recorder } = fixture();
   for (const status of ["failed", "cancelled", "SENSITIVE_STATUS"])
-    recorder.Record({
+    recorder.record({
       event: callback(root, {
         status,
         error: "SENSITIVE_ERROR",
@@ -131,18 +131,18 @@ test("failure, cancellation and unknown status preserve missing usage and exclud
     "native_model_request_unknown",
   ]);
   for (const e of observations(store)) expect(e.coverage!.observedUsage).toBeUndefined();
-  expect(JSON.stringify(store.Events()).includes("SENSITIVE")).toBe(false);
+  expect(JSON.stringify(store.events()).includes("SENSITIVE")).toBe(false);
   for (const token_usage of [undefined, [], "SENSITIVE_USAGE", 7])
-    recorder.Record({ event: callback(root, { token_usage }) });
+    recorder.record({ event: callback(root, { token_usage }) });
   for (const e of observations(store)) expect(e.coverage!.observedUsage).toBeUndefined();
-  expect(store.Events().some((e) => e.usage)).toBe(false);
+  expect(store.events().some((e) => e.usage)).toBe(false);
 });
 
 test("model callbacks use exact turn or known agent work and never borrow a later session default", () => {
   const { root, store, recorder } = fixture();
   prompt(recorder, root, "first", "New work: first");
-  const first = store.Events()[0]!.workId;
-  recorder.Record({
+  const first = store.events()[0]!.workId;
+  recorder.record({
     event: {
       hook_event_name: "SubagentStart",
       session_id: "session",
@@ -153,15 +153,15 @@ test("model callbacks use exact turn or known agent work and never borrow a late
   });
   prompt(recorder, root, "next", "New work: next");
   const next = store
-    .Events()
+    .events()
     .filter((e) => e.work)
     .at(-1)!.workId;
   expect(first).not.toBe(next);
-  recorder.Record({ event: callback(root, { turn_id: "first" }) });
-  recorder.Record({ event: callback(root, { turn_id: "unknown" }) });
-  recorder.Record({ event: callback(root, { turn_id: undefined }) });
-  recorder.Record({ event: callback(root, { turn_id: "child-turn", agent_id: "child" }) });
-  recorder.Record({ event: callback(root, { turn_id: "unknown", agent_id: "unseen-child" }) });
+  recorder.record({ event: callback(root, { turn_id: "first" }) });
+  recorder.record({ event: callback(root, { turn_id: "unknown" }) });
+  recorder.record({ event: callback(root, { turn_id: undefined }) });
+  recorder.record({ event: callback(root, { turn_id: "child-turn", agent_id: "child" }) });
+  recorder.record({ event: callback(root, { turn_id: "unknown", agent_id: "unseen-child" }) });
   const records = observations(store);
   expect(records[0]!.workId).toBe(first);
   expect(records[1]!.workId).toBeUndefined();
@@ -174,7 +174,7 @@ test("model callbacks use exact turn or known agent work and never borrow a late
 
 test("native counter normalization stays strict and never turns absent counters into zeros", () => {
   const { root, store, recorder } = fixture();
-  recorder.Record({
+  recorder.record({
     event: callback(root, {
       token_usage: { input_tokens: "31", cached_input_tokens: 0, output_tokens: 1.5 },
     }),
@@ -185,11 +185,11 @@ test("native counter normalization stays strict and never turns absent counters 
     { input_tokens: 1_000_000_000_001 },
     { output_tokens: 1, reasoning_output_tokens: 2 },
   ])
-    expect(() => recorder.Record({ event: callback(root, { token_usage }) })).toThrow(
+    expect(() => recorder.record({ event: callback(root, { token_usage }) })).toThrow(
       "invalid typed event evidence",
     );
   expect(observations(store)).toHaveLength(1);
-  expect(store.Events().some((e) => e.usage)).toBe(false);
+  expect(store.events().some((e) => e.usage)).toBe(false);
 });
 
 test("model callbacks register native transcript/version without running recovery or changing financial records", () => {
@@ -214,18 +214,18 @@ test("model callbacks register native transcript/version without running recover
       },
     });
   writeFileSync(path, records.map((e) => JSON.stringify(e)).join("\n") + "\n");
-  recorder.Record({ event: callback(root, { transcript_path: path }) });
-  recorder.Record({ event: callback(root, { transcript_path: path }) });
+  recorder.record({ event: callback(root, { transcript_path: path }) });
+  recorder.record({ event: callback(root, { transcript_path: path }) });
   expect(observations(store).every((e) => e.sourceVersion === "0.164.0")).toBe(true);
-  expect(store.Events().filter((e) => e.usage)).toHaveLength(0);
+  expect(store.events().filter((e) => e.usage)).toHaveLength(0);
   expect(
     (
-      store.DB.query(
-        "SELECT count(*) AS n FROM meta WHERE key LIKE 'transcript:codex:%'",
-      ).get() as any
+      store.db
+        .query("SELECT count(*) AS n FROM meta WHERE key LIKE 'transcript:codex:%'")
+        .get() as any
     ).n,
   ).toBe(1);
-  recorder.RecoverContext();
-  expect(store.Events().filter((e) => e.usage)).toHaveLength(2);
+  recorder.recoverContext();
+  expect(store.events().filter((e) => e.usage)).toHaveLength(2);
   expect(observations(store)).toHaveLength(2);
 });

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -15,31 +15,30 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { Open, type Store } from "../src/work/ledger";
+import { Store } from "../src/work/ledger";
 import {
-  CanonicalTime,
-  EncodeBatch,
-  EncodeEvent,
-  Hash,
-  Integer,
-  NewID,
-  NumberText,
-  Parse,
-  StableID,
-  Stringify,
-  Validate,
-  ValidateBatch,
+  canonicalHash,
+  canonicalTime,
+  encodeBatch,
+  encodeEvent,
+  integer,
+  numberText,
+  parseJson,
+  stableId,
+  stringifyJson,
+  validateBatch,
+  validateEvent,
   type Acknowledgement,
   type Batch,
   type Event,
 } from "../src/work/protocol";
 import {
-  DecodeOTLP,
-  Load,
-  Root,
-  Save,
-  SessionStateDir,
-  StateDir,
+  decodeOtlp,
+  loadConfig,
+  saveConfig,
+  sessionStateDir,
+  stateDir,
+  stateRoot,
   type Config,
 } from "../src/settings";
 
@@ -58,7 +57,7 @@ function temp(): string {
   return dir;
 }
 function store(): Store {
-  const s = Open(temp());
+  const s = new Store(temp());
   stores.push(s);
   return s;
 }
@@ -78,7 +77,7 @@ function ack(b: Batch): Acknowledgement {
     receipts: b.events.map((e) => ({ id: e.id!, revision: e.revision!, status: "accepted" })),
   };
 }
-function account(actor = NewID(), key = "kimchi-key"): Config {
+function account(actor: string = randomUUID(), key = "kimchi-key"): Config {
   return {
     apiUrl: "https://api.cast.ai",
     organizationId: "11111111-1111-1111-1111-111111111111",
@@ -89,7 +88,7 @@ function account(actor = NewID(), key = "kimchi-key"): Config {
 afterEach(() => {
   for (const s of stores.splice(0)) {
     try {
-      s.Close();
+      s.close();
     } catch {}
   }
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -101,37 +100,37 @@ describe("Go wire and identity compatibility", () => {
   test("all eight typed payloads match Go encoding, hashes and validation", () => {
     expect(inputs.length).toBe(8);
     for (const [i, e] of inputs.entries()) {
-      expect(EncodeEvent(e)).toBe(golden.events[i].body);
-      expect(Hash(e)).toBe(golden.events[i].hash);
+      expect(encodeEvent(e)).toBe(golden.events[i].body);
+      expect(canonicalHash(e)).toBe(golden.events[i].hash);
       expect(golden.events[i].validation).toBe("");
-      expect(() => Validate(e)).not.toThrow();
+      expect(() => validateEvent(e)).not.toThrow();
     }
-    expect(StableID(...golden.stableParts)).toBe(golden.stableId);
-    expect(CanonicalTime("2026-10-23T12:30:40.123400000+00:00")).toBe("2026-10-23T12:30:40.1234Z");
-    expect(CanonicalTime("2026-10-23T12:30:40.123400000+02:30")).toBe(
+    expect(stableId(...golden.stableParts)).toBe(golden.stableId);
+    expect(canonicalTime("2026-10-23T12:30:40.123400000+00:00")).toBe("2026-10-23T12:30:40.1234Z");
+    expect(canonicalTime("2026-10-23T12:30:40.123400000+02:30")).toBe(
       "2026-10-23T12:30:40.1234+02:30",
     );
   });
   test("native JSON preserves large IDs, numeric lexemes and UTF8 key order", () => {
-    const value = Parse(golden.nativeInput);
-    expect(Stringify(value)).toBe(golden.nativeBody);
-    expect(Hash(value)).toBe(golden.nativeHash);
-    expect(NumberText(value.z)).toBe("9007199254740993");
-    expect(Integer(Parse("1000000000000"))).toBe(1_000_000_000_000);
-    expect(Integer(Parse("1e3"))).toBeUndefined();
-    expect(Integer(Parse("1.0"))).toBeUndefined();
-    expect(Integer(Parse("9223372036854775808"))).toBeUndefined();
+    const value = parseJson(golden.nativeInput);
+    expect(stringifyJson(value)).toBe(golden.nativeBody);
+    expect(canonicalHash(value)).toBe(golden.nativeHash);
+    expect(numberText(value.z)).toBe("9007199254740993");
+    expect(integer(parseJson("1000000000000"))).toBe(1_000_000_000_000);
+    expect(integer(parseJson("1e3"))).toBeUndefined();
+    expect(integer(parseJson("1.0"))).toBeUndefined();
+    expect(integer(parseJson("9223372036854775808"))).toBeUndefined();
   });
   test("known zero and unknown counters stay different; malformed evidence rejected", () => {
     const e = structuredClone(inputs[1]!);
-    const zero = Hash(e);
+    const zero = canonicalHash(e);
     delete e.usage!.raw.cacheReadTokens;
-    expect(Hash(e)).not.toBe(zero);
+    expect(canonicalHash(e)).not.toBe(zero);
     e.usage!.raw.inputTokens = "1000000000001";
-    expect(() => Validate(e)).toThrow("invalid typed event evidence");
+    expect(() => validateEvent(e)).toThrow("invalid typed event evidence");
     const bad = { ...inputs[0]!, coverage: { code: "also", count: "1" } };
-    expect(() => Validate(bad)).toThrow("exactly one");
-    expect(() => ValidateBatch({ version: 1, id: "b", events: [inputs[0]!, inputs[0]!] })).toThrow(
+    expect(() => validateEvent(bad)).toThrow("exactly one");
+    expect(() => validateBatch({ version: 1, id: "b", events: [inputs[0]!, inputs[0]!] })).toThrow(
       "duplicate",
     );
   });
@@ -155,86 +154,86 @@ describe("legacy persistence and delivery", () => {
         ).run(...(values as any[]));
       }
     db.close();
-    const s = Open(dir);
+    const s = new Store(dir);
     stores.push(s);
-    expect(s.DeviceID()).toBe(event().deviceId);
-    expect(s.Events()).toEqual(golden.observations);
-    const pending = s.PendingBatch()!;
-    expect(EncodeBatch(pending)).toBe(EncodeBatch(golden.pendingBatch));
-    s.Acknowledge(pending, ack(pending));
-    expect(s.PendingBatch()!.events[0]!.revision).toBe("2");
-    s.Observe({ ...event("persisted", "2"), observeTime: "2026-10-24T12:00:00Z" });
-    expect(s.Events().length).toBe(2);
-    s.Observe(event("persisted", "3"));
-    const third = s.Events()[2]!;
+    expect(s.deviceId()).toBe(event().deviceId);
+    expect(s.events()).toEqual(golden.observations);
+    const pending = s.pendingBatch()!;
+    expect(encodeBatch(pending)).toBe(encodeBatch(golden.pendingBatch));
+    s.acknowledge(pending, ack(pending));
+    expect(s.pendingBatch()!.events[0]!.revision).toBe("2");
+    s.observe({ ...event("persisted", "2"), observeTime: "2026-10-24T12:00:00Z" });
+    expect(s.events().length).toBe(2);
+    s.observe(event("persisted", "3"));
+    const third = s.events()[2]!;
     expect(third.revision).toBe("3");
     expect(third.baseRevision).toBe("2");
     expect(third.baseHash).toBe(
-      golden.observations[1].baseHash === Hash(golden.observations[0])
-        ? Hash(golden.observations[1])
+      golden.observations[1].baseHash === canonicalHash(golden.observations[0])
+        ? canonicalHash(golden.observations[1])
         : "invalid-Go-fixture",
     );
-    expect((s.DB.query("PRAGMA user_version").get() as any).user_version).not.toBe(0);
+    expect((s.db.query("PRAGMA user_version").get() as any).user_version).not.toBe(0);
   });
   test("fresh observations produce exactly the Go event IDs and chains", () => {
     const s = store();
-    s.Observe(event("persisted", "1"));
-    s.Observe(event("persisted", "2"));
-    expect(s.Events()).toEqual(golden.observations);
+    s.observe(event("persisted", "1"));
+    s.observe(event("persisted", "2"));
+    expect(s.events()).toEqual(golden.observations);
   });
   test("235 observations upload bounded deltas and survive lost ACK restart", () => {
     const dir = temp();
-    let s = Open(dir);
-    for (let i = 0; i < 235; i++) s.Observe(event("entity-" + i));
-    const original = s.PendingBatch()!,
-      body = EncodeBatch(original);
-    s.Close();
-    s = Open(dir);
+    let s = new Store(dir);
+    for (let i = 0; i < 235; i++) s.observe(event("entity-" + i));
+    const original = s.pendingBatch()!,
+      body = encodeBatch(original);
+    s.close();
+    s = new Store(dir);
     stores.push(s);
-    expect(EncodeBatch(s.PendingBatch()!)).toBe(body);
-    expect(() => s.Acknowledge(original, { batchId: original.id, receipts: [] })).toThrow(
+    expect(encodeBatch(s.pendingBatch()!)).toBe(body);
+    expect(() => s.acknowledge(original, { batchId: original.id, receipts: [] })).toThrow(
       "incomplete",
     );
     const sizes: number[] = [];
-    for (let b = s.PendingBatch(); b; b = s.PendingBatch()) {
+    for (let b = s.pendingBatch(); b; b = s.pendingBatch()) {
       sizes.push(b.events.length);
-      expect(Buffer.byteLength(EncodeBatch(b))).toBeLessThan((1 << 20) + 4096);
-      s.Acknowledge(b, ack(b));
-      s.Acknowledge(b, ack(b));
+      expect(Buffer.byteLength(encodeBatch(b))).toBeLessThan((1 << 20) + 4096);
+      s.acknowledge(b, ack(b));
+      s.acknowledge(b, ack(b));
     }
     expect(sizes).toEqual([100, 100, 35]);
-    s.Observe(event("entity-0"));
-    expect(s.PendingBatch()).toBeNull();
-    s.Observe(event("entity-0", "2"));
-    expect(s.PendingBatch()!.events).toHaveLength(1);
-    const totals = s.Status(),
-      actual = s.DB.query("SELECT SUM(length(body)) AS bytes FROM events").get() as any;
+    s.observe(event("entity-0"));
+    expect(s.pendingBatch()).toBeNull();
+    s.observe(event("entity-0", "2"));
+    expect(s.pendingBatch()!.events).toHaveLength(1);
+    const totals = s.status(),
+      actual = s.db.query("SELECT SUM(length(body)) AS bytes FROM events").get() as any;
     expect(totals.normalizedBytes).toBe(actual.bytes);
   });
   test("recursive 413 splits preserve event order and byte identity on retries", () => {
     const s = store();
-    for (let i = 1; i <= 8; i++) s.Observe(event("same", String(i)));
-    const original = s.PendingBatch()!,
+    for (let i = 1; i <= 8; i++) s.observe(event("same", String(i)));
+    const original = s.pendingBatch()!,
       ids = original.events.map((e) => e.id!);
-    s.SplitBatch(original);
+    s.splitBatch(original);
     const seen: string[] = [];
     for (let i = 0; i < 20; i++) {
-      const b = s.PendingBatch();
+      const b = s.pendingBatch();
       if (!b) break;
-      expect(EncodeBatch(s.PendingBatch()!)).toBe(EncodeBatch(b));
+      expect(encodeBatch(s.pendingBatch()!)).toBe(encodeBatch(b));
       if (b.events.length > 1) {
-        s.SplitBatch(b);
+        s.splitBatch(b);
         continue;
       }
       seen.push(b.events[0]!.id!);
-      expect(() => s.SplitBatch(b)).toThrow("retained");
-      s.Acknowledge(b, ack(b));
+      expect(() => s.splitBatch(b)).toThrow("retained");
+      s.acknowledge(b, ack(b));
     }
     expect(seen).toEqual(ids);
-    expect(s.Status().pending).toBe(0);
-    const e = s.Events()[0]!;
-    s.Put(e);
-    expect(() => s.Put({ ...e, coverage: { code: "test", count: "99" } })).toThrow(
+    expect(s.status().pending).toBe(0);
+    const e = s.events()[0]!;
+    s.put(e);
+    expect(() => s.put({ ...e, coverage: { code: "test", count: "99" } })).toThrow(
       "identity conflicts",
     );
   });
@@ -243,18 +242,18 @@ describe("legacy persistence and delivery", () => {
 describe("durable evidence and account pins", () => {
   test("raw BLOBs deduplicate, enforce shared legacy cap and reject corruption", () => {
     const dir = temp();
-    let s = Open(dir);
-    const hash = s.PutBlob(Buffer.from("before"));
-    s.PutBlob(null);
-    s.Close();
-    s = Open(dir);
+    let s = new Store(dir);
+    const hash = s.putBlob(Buffer.from("before"));
+    s.putBlob(null);
+    s.close();
+    s = new Store(dir);
     stores.push(s);
-    expect(s.Blob(hash).toString()).toBe("before");
+    expect(s.blob(hash).toString()).toBe("before");
     expect(statSync(join(dir, "ledger.sqlite")).mode & 0o777).toBe(0o600);
-    s.DB.query("UPDATE blob_totals SET total_bytes=? WHERE id=1").run(256 << 20);
-    expect(s.PutBlob(Buffer.from("before"))).toBe(hash);
-    expect(() => s.PutBlob(Buffer.from("new"))).toThrow("capacity");
-    s.DB.exec("DELETE FROM blobs; UPDATE blob_totals SET total_bytes=0 WHERE id=1");
+    s.db.query("UPDATE blob_totals SET total_bytes=? WHERE id=1").run(256 << 20);
+    expect(s.putBlob(Buffer.from("before"))).toBe(hash);
+    expect(() => s.putBlob(Buffer.from("new"))).toThrow("capacity");
+    s.db.exec("DELETE FROM blobs; UPDATE blob_totals SET total_bytes=0 WHERE id=1");
     const legacy = join(dir, "blobs");
     mkdirSync(legacy);
     writeFileSync(join(legacy, hash), "before");
@@ -262,56 +261,58 @@ describe("durable evidence and account pins", () => {
     const fd = openSync(padding, "w");
     closeSync(fd);
     truncateSync(padding, (256 << 20) - 6);
-    expect(() => s.PutBlob(Buffer.from("new"))).toThrow("capacity");
-    expect(s.PutBlob(Buffer.from("before"))).toBe(hash);
+    expect(() => s.putBlob(Buffer.from("new"))).toThrow("capacity");
+    expect(s.putBlob(Buffer.from("before"))).toBe(hash);
     writeFileSync(join(legacy, hash), "changed");
-    expect(() => s.Blob(hash)).toThrow("hash mismatch");
-    expect(() => s.Blob("../ledger.sqlite")).toThrow("invalid evidence hash");
+    expect(() => s.blob(hash)).toThrow("hash mismatch");
+    expect(() => s.blob("../ledger.sqlite")).toThrow("invalid evidence hash");
   });
   test("100 sessions share one registry and preserve old account pins after rotation", () => {
     process.env.KIMCHI_BRIDGE_HOME = temp();
     const c = account();
-    const before = StateDir(c),
-      pin = SessionStateDir(c, "codex", "old");
+    const before = stateDir(c),
+      pin = sessionStateDir(c, "codex", "old");
     expect(pin).toBe(before);
     const rotated = account(c.actorId, "rotated");
-    expect(StateDir(rotated)).toBe(before);
+    expect(stateDir(rotated)).toBe(before);
     const next = account();
-    expect(StateDir(next)).not.toBe(before);
-    expect(SessionStateDir(next, "codex", "old")).toBe(before);
-    for (let i = 0; i < 100; i++) SessionStateDir(c, "codex", String(i));
-    expect(existsSync(join(Root(), "session-accounts"))).toBe(false);
-    mkdirSync(join(Root(), "session-accounts"));
-    const old = NewID();
+    expect(stateDir(next)).not.toBe(before);
+    expect(sessionStateDir(next, "codex", "old")).toBe(before);
+    for (let i = 0; i < 100; i++) sessionStateDir(c, "codex", String(i));
+    expect(existsSync(join(stateRoot(), "session-accounts"))).toBe(false);
+    mkdirSync(join(stateRoot(), "session-accounts"));
+    const old = randomUUID();
     writeFileSync(
-      join(Root(), "session-accounts", StableID("codex", "legacy") + ".json"),
+      join(stateRoot(), "session-accounts", stableId("codex", "legacy") + ".json"),
       JSON.stringify(old),
     );
-    expect(basename(SessionStateDir(c, "codex", "legacy"))).toBe(old);
-    expect(basename(SessionStateDir(c, "claude-code", "legacy"))).toBe(basename(before));
+    expect(basename(sessionStateDir(c, "codex", "legacy"))).toBe(old);
+    expect(basename(sessionStateDir(c, "claude-code", "legacy"))).toBe(basename(before));
   });
   test("private atomic config saves drop an earlier release's key and runtime and decode only OTLP", () => {
     process.env.KIMCHI_BRIDGE_HOME = temp();
     const c = { ...account(), disabled: true };
-    Save({
+    saveConfig({
       ...c,
       apiKey: "earlier-release-key",
       enabled: true,
       runtimeExecutable: "/managed/runtime",
-      runtimeRevision: NewID(),
+      runtimeRevision: randomUUID(),
     } as Config);
-    expect(Load()).toEqual(c);
-    expect(readFileSync(join(Root(), "config.json"), "utf8")).not.toContain("earlier-release-key");
-    expect(statSync(join(Root(), "config.json")).mode & 0o777).toBe(0o600);
-    const decoded = DecodeOTLP(
+    expect(loadConfig()).toEqual(c);
+    expect(readFileSync(join(stateRoot(), "config.json"), "utf8")).not.toContain(
+      "earlier-release-key",
+    );
+    expect(statSync(join(stateRoot(), "config.json")).mode & 0o777).toBe(0o600);
+    const decoded = decodeOtlp(
       JSON.stringify({ otlpUrl: "https://collector.example/v1/logs", runtimeExecutable: "/x" }),
     );
     expect(decoded).toEqual({
       otlpUrl: "https://collector.example/v1/logs",
       otlpHeaders: undefined,
     });
-    expect(() => DecodeOTLP("x".repeat((32 << 10) + 1))).toThrow("too large");
-    expect(() => DecodeOTLP(JSON.stringify({ otlpUrl: "http://collector.example" }))).toThrow(
+    expect(() => decodeOtlp("x".repeat((32 << 10) + 1))).toThrow("too large");
+    expect(() => decodeOtlp(JSON.stringify({ otlpUrl: "http://collector.example" }))).toThrow(
       "HTTPS",
     );
   });

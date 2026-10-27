@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 declare const Temporal: {
   Instant: {
     from(value: string): {
@@ -10,12 +10,12 @@ declare const Temporal: {
   };
 };
 
-export const Version = 1;
-export const ZeroTime = "0001-01-01T00:00:00Z";
-type Object = Record<string, any>;
-export const obj = (value: unknown): Object =>
-  value && typeof value === "object" && !Array.isArray(value) ? (value as Object) : {};
-export function str(value: Object | undefined, ...keys: string[]): string {
+export const protocolVersion = 1;
+export const zeroTime = "0001-01-01T00:00:00Z";
+export type JsonObject = Record<string, any>;
+export const obj = (value: unknown): JsonObject =>
+  value && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : {};
+export function str(value: JsonObject | undefined, ...keys: string[]): string {
   for (const key of keys) if (typeof value?.[key] === "string" && value[key]) return value[key];
   return "";
 }
@@ -33,7 +33,7 @@ export interface RawUsage {
   cacheWrites?: CacheWrite[];
   reasoningTokens?: string;
 }
-export interface CacheWrite {
+interface CacheWrite {
   ttlSeconds: number;
   tokens: string;
 }
@@ -42,17 +42,17 @@ export interface IssueKey {
   source: string;
   revision?: string;
 }
-export interface RequestAlias {
+interface RequestAlias {
   namespace: string;
   id: string;
   source: string;
 }
-export interface Credit {
+interface Credit {
   amount: string;
   unit: string;
   basis: string;
 }
-export interface Iteration {
+interface Iteration {
   id: string;
   model?: string;
   schema: string;
@@ -84,7 +84,7 @@ export interface Usage {
   credits?: Credit[];
   aliases?: RequestAlias[];
 }
-export interface Work {
+interface Work {
   title?: string;
   planId?: string;
   planRevision?: string;
@@ -92,7 +92,7 @@ export interface Work {
   quality: string;
   issueKeys?: IssueKey[];
 }
-export interface Tool {
+interface Tool {
   callId: string;
   name?: string;
   requestEntityId?: string;
@@ -100,7 +100,7 @@ export interface Tool {
   outcome: string;
   durationMs?: string;
 }
-export interface File {
+interface File {
   fileId: string;
   toolCallId?: string;
   beforeRevision?: string;
@@ -108,7 +108,7 @@ export interface File {
   operation: string;
   quality: string;
 }
-export interface Commit {
+interface Commit {
   id: string;
   parents?: string[];
   quality: string;
@@ -125,7 +125,7 @@ export interface PullRequest {
   title?: string;
   issueKeys?: IssueKey[];
 }
-export interface Link {
+interface Link {
   fromKind: string;
   fromId: string;
   toKind: string;
@@ -133,7 +133,7 @@ export interface Link {
   quality: string;
   reason: string;
 }
-export interface Coverage {
+interface Coverage {
   code: string;
   count: string;
   windowStartTime?: string;
@@ -170,7 +170,7 @@ export interface Batch {
   id: string;
   events: Event[];
 }
-export interface Receipt {
+interface Receipt {
   id: string;
   status: string;
   revision: string;
@@ -184,7 +184,7 @@ export interface Acknowledgement {
 
 // JSON.parse's source argument prevents rounding provider IDs and changing native
 // numeric lexemes used in Go's map hashes (for example 1e3 versus 1000).
-export class NativeNumber {
+class NativeNumber {
   constructor(public readonly lexeme: string) {}
   toString(): string {
     return this.lexeme;
@@ -193,16 +193,16 @@ export class NativeNumber {
     return Number(this.lexeme);
   }
 }
-export function Parse(text: string): any {
+export function parseJson(text: string): any {
   return JSON.parse(text, ((_: string, value: unknown, context?: { source?: string }) =>
     typeof value === "number" ? new NativeNumber(context?.source ?? String(value)) : value) as any);
 }
-export function NumberText(value: unknown): string | undefined {
+export function numberText(value: unknown): string | undefined {
   if (value instanceof NativeNumber) return value.lexeme;
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   return undefined;
 }
-export function Integer(value: unknown): number | undefined {
+export function integer(value: unknown): number | undefined {
   if (value instanceof NativeNumber) {
     let n: bigint;
     try {
@@ -381,8 +381,8 @@ class Ordered {
   constructor(readonly fields: [string, unknown][]) {}
 }
 const timestampCache = new Map<string, string>();
-function timeText(value: unknown): string {
-  const s = value instanceof Date ? value.toISOString() : String(value ?? ZeroTime);
+export function canonicalTime(value: unknown): string {
+  const s = value instanceof Date ? value.toISOString() : String(value ?? zeroTime);
   const cached = timestampCache.get(s);
   if (cached !== undefined) return cached;
   const instant = Temporal.Instant.from(s);
@@ -397,7 +397,6 @@ function timeText(value: unknown): string {
   timestampCache.set(s, result);
   return result;
 }
-export const CanonicalTime = timeText;
 function shape(name: string, value: any): Ordered {
   const fields: [string, unknown][] = [];
   for (const [key, type, omit] of schemas[name]!) {
@@ -425,7 +424,7 @@ function convert(type: string, value: any): any {
   if (type === "q") return String(value ?? "0");
   if (type === "n") return value ?? 0;
   if (type === "b") return value ?? false;
-  if (type === "t") return timeText(value);
+  if (type === "t") return canonicalTime(value);
   return shape(type, value);
 }
 function quoted(value: string): string {
@@ -436,10 +435,10 @@ function quoted(value: string): string {
     .replaceAll("\u2028", "\\u2028")
     .replaceAll("\u2029", "\\u2029");
 }
-export function Stringify(value: any): string {
+export function stringifyJson(value: any): string {
   if (value instanceof NativeNumber) return value.lexeme;
   if (value instanceof Ordered)
-    return "{" + value.fields.map(([k, v]) => quoted(k) + ":" + Stringify(v)).join(",") + "}";
+    return "{" + value.fields.map(([k, v]) => quoted(k) + ":" + stringifyJson(v)).join(",") + "}";
   if (value == null) return "null";
   if (typeof value === "string") return quoted(value);
   if (typeof value === "bigint") return value.toString();
@@ -448,38 +447,37 @@ export function Stringify(value: any): string {
     return JSON.stringify(value);
   }
   if (typeof value === "boolean") return String(value);
-  if (value instanceof Date) return quoted(timeText(value));
-  if (Array.isArray(value)) return "[" + value.map(Stringify).join(",") + "]";
+  if (value instanceof Date) return quoted(canonicalTime(value));
+  if (Array.isArray(value)) return "[" + value.map(stringifyJson).join(",") + "]";
   return (
     "{" +
     Object.keys(value)
       .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
       .filter((k) => value[k] !== undefined)
-      .map((k) => quoted(k) + ":" + Stringify(value[k]))
+      .map((k) => quoted(k) + ":" + stringifyJson(value[k]))
       .join(",") +
     "}"
   );
 }
-export function EncodeEvent(value: Event): string {
-  return Stringify(shape("event", value));
+export function encodeEvent(value: Event): string {
+  return stringifyJson(shape("event", value));
 }
-export function EncodeBatch(value: Batch): string {
-  return Stringify(shape("batch", value));
+export function encodeBatch(value: Batch): string {
+  return stringifyJson(shape("batch", value));
 }
-export function Hash(value: any): string {
+export const digest = (bytes: Uint8Array | string): string =>
+  createHash("sha256").update(bytes).digest("hex");
+export function canonicalHash(value: any): string {
   const body =
     value && typeof value === "object" && !Array.isArray(value) && "entityId" in value
-      ? EncodeEvent(value)
+      ? encodeEvent(value)
       : value && typeof value === "object" && "version" in value && "events" in value
-        ? EncodeBatch(value)
-        : Stringify(value);
-  return createHash("sha256").update(body).digest("hex");
+        ? encodeBatch(value)
+        : stringifyJson(value);
+  return digest(body);
 }
-export function NewID(): string {
-  return randomUUID();
-}
-export function StableID(...parts: string[]): string {
-  const h = createHash("sha256").update(Stringify(parts)).digest("hex").slice(0, 32);
+export function stableId(...parts: string[]): string {
+  const h = digest(stringifyJson(parts)).slice(0, 32);
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 const payloads = [
@@ -492,7 +490,7 @@ const payloads = [
   "link",
   "coverage",
 ] as const;
-export function Kind(e: Event): string {
+export function eventKind(e: Event): string {
   const key = payloads.find((k) => e[k] != null);
   return key === "pullRequest" ? "pull_request" : (key ?? "");
 }
@@ -508,7 +506,7 @@ const bounded = (s: any, max: number) =>
 const opaque = (s: any) => bounded(s, 128) && !containsAny(s ?? "", "/\\@?#|");
 const quality = (s: any) =>
   ["observed", "inferred", "confirmed", "tool_observed", "ambiguous", "unknown"].includes(s);
-export const gitID = (s: any) =>
+export const gitId = (s: any) =>
   typeof s === "string" &&
   (s.length === 40 || s.length === 64) &&
   Buffer.from(s, "hex").toString("hex") === s;
@@ -579,7 +577,7 @@ function issueValid(keys: IssueKey[] = []): boolean {
     })
   );
 }
-export function Validate(e: Event): void {
+export function validateEvent(e: Event): void {
   const rev = dec(e.revision),
     base = dec(e.baseRevision ?? "0");
   if (
@@ -589,7 +587,7 @@ export function Validate(e: Event): void {
     rev == null ||
     rev < 1 ||
     !e.observeTime ||
-    e.observeTime === ZeroTime ||
+    e.observeTime === zeroTime ||
     !Number.isFinite(Date.parse(e.observeTime)) ||
     !e.source ||
     !bounded(e.source, 64)
@@ -601,7 +599,7 @@ export function Validate(e: Event): void {
   for (const id of [e.id, e.entityId, e.deviceId, e.workId, e.sessionId, e.turnId, e.agentId])
     if (Buffer.byteLength(id ?? "") > 128 || containsAny(id ?? "", "\r\n\0"))
       throw new Error("invalid identity");
-  if (Buffer.byteLength(EncodeEvent(e)) > 65536) throw new Error("event exceeds bound");
+  if (Buffer.byteLength(encodeEvent(e)) > 65536) throw new Error("event exceeds bound");
   const invalid = () => {
     throw new Error("invalid typed event evidence");
   };
@@ -720,10 +718,10 @@ export function Validate(e: Event): void {
   if (e.commit) {
     const c = e.commit;
     if (
-      !gitID(c.id) ||
+      !gitId(c.id) ||
       (c.parents?.length ?? 0) > 16 ||
       !quality(c.quality) ||
-      c.parents?.some((p) => !gitID(p))
+      c.parents?.some((p) => !gitId(p))
     )
       invalid();
   }
@@ -752,7 +750,7 @@ export function Validate(e: Event): void {
       !["open", "closed", "merged"].includes(p.state) ||
       !bounded(p.title, 512) ||
       !issueValid(p.issueKeys) ||
-      (p.mergeCommitId && !gitID(p.mergeCommitId))
+      (p.mergeCommitId && !gitId(p.mergeCommitId))
     )
       invalid();
   }
@@ -786,9 +784,9 @@ export function Validate(e: Event): void {
       invalid();
   }
 }
-export function ValidateBatch(b: Batch): void {
+export function validateBatch(b: Batch): void {
   if (
-    b.version !== Version ||
+    b.version !== protocolVersion ||
     !b.id ||
     Buffer.byteLength(b.id) > 128 ||
     !b.events.length ||
@@ -797,7 +795,7 @@ export function ValidateBatch(b: Batch): void {
     throw new Error("invalid batch");
   const seen = new Set<string>();
   for (const e of b.events) {
-    Validate(e);
+    validateEvent(e);
     if (seen.has(e.id!)) throw new Error("duplicate event in batch");
     seen.add(e.id!);
   }

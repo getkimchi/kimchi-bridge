@@ -3,26 +3,26 @@ import { appendFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Recorder, repository, type Scope } from "../src/work/capture.ts";
-import { Open } from "../src/work/ledger.ts";
-import { Parse, StableID } from "../src/work/protocol.ts";
 import {
-  claudeUsage,
-  openAIUsage,
-  RecoverContext,
-  registerTranscript,
-  telemetry,
-  route,
-  version,
-} from "../src/work/recovery.ts";
-import {
-  issueKeys,
   git,
-  providerID,
+  issueKeys,
+  providerId,
   pullRequest,
-  ReconcileGit,
+  reconcileGit,
   saveMeta,
   scmEnvironment,
 } from "../src/work/git.ts";
+import { Store } from "../src/work/ledger.ts";
+import { parseJson, stableId } from "../src/work/protocol.ts";
+import {
+  claudeUsage,
+  openAiUsage,
+  recoverContext,
+  registerTranscript,
+  route,
+  saveSourceVersion,
+  telemetry,
+} from "../src/work/recovery.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -32,10 +32,10 @@ function fixture(source = "codex") {
   const base = mkdtempSync(join(tmpdir(), "pr-cost-recovery-"));
   const root = join(base, "project");
   mkdirSync(root);
-  const store = Open(join(base, "state"));
-  const r = new Recorder(store, source, store.DeviceID());
+  const store = new Store(join(base, "state"));
+  const r = new Recorder(store, source, store.deviceId());
   cleanups.push(() => {
-    store.Close();
+    store.close();
     rmSync(base, { recursive: true, force: true });
   });
   const scope: Scope = {
@@ -48,13 +48,13 @@ function fixture(source = "codex") {
   };
   return { base, root, store, r, scope };
 }
-function latest(store: ReturnType<typeof Open>, kind: string) {
+function latest(store: Store, kind: string) {
   return JSON.parse(
     Buffer.from(
       (
-        store.DB.query("SELECT body FROM events WHERE kind=? ORDER BY rowid DESC LIMIT 1").get(
-          kind,
-        ) as any
+        store.db
+          .query("SELECT body FROM events WHERE kind=? ORDER BY rowid DESC LIMIT 1")
+          .get(kind) as any
       ).body,
     ).toString(),
   );
@@ -63,7 +63,7 @@ const at = "2026-10-23T12:00:00.123456789Z";
 
 test("Codex recovery preserves absent usage, lossless counter identity, duplicate and partial-line replay", () => {
   const { root, store, r, scope } = fixture();
-  r.Record({
+  r.record({
     stage: "UserPromptSubmit",
     event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "implement" },
   });
@@ -91,17 +91,17 @@ test("Codex recovery preserves absent usage, lossless counter identity, duplicat
     path,
     JSON.stringify(context) + "\n" + JSON.stringify(usage) + "\n" + JSON.stringify(usage),
   );
-  RecoverContext(r);
+  recoverContext(r);
   const event = latest(store, "usage");
   expect(event.usage.raw).toEqual({ inputTokens: "100", outputTokens: "3", cacheReadTokens: "10" });
   expect(event.usage.reportedModel).toBe("observed-model");
   expect(event.observeTime).toBe(at);
   expect(event.workId).toBeTruthy();
   appendFileSync(path, "\n");
-  RecoverContext(r);
-  RecoverContext(r);
+  recoverContext(r);
+  recoverContext(r);
   expect(
-    (store.DB.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
+    (store.db.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
   ).toBe(1);
   appendFileSync(
     path,
@@ -113,23 +113,23 @@ test("Codex recovery preserves absent usage, lossless counter identity, duplicat
       },
     }) + "\n",
   );
-  RecoverContext(r);
+  recoverContext(r);
   expect(
-    (store.DB.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
+    (store.db.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
   ).toBe(2);
 });
 
 test("Claude telemetry and transcript revise one request and attach its exact tool identity", () => {
   const { root, store, r, scope } = fixture("claude-code");
-  r.Record({
+  r.record({
     stage: "UserPromptSubmit",
     event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "implement" },
   });
   const [canonical, repo, ref] = repository(root);
   Object.assign(scope, { Root: canonical, Repo: repo, Repository: ref });
-  store.DB.query("INSERT INTO meta(key,value) VALUES(?,?)").run("prompt-turn:s:prompt", "turn");
+  store.db.query("INSERT INTO meta(key,value) VALUES(?,?)").run("prompt-turn:s:prompt", "turn");
   const request = "00000000-0000-0000-0000-000000000001";
-  const e = Parse(
+  const e = parseJson(
     JSON.stringify({
       event: "api_request",
       attributes: {
@@ -171,13 +171,15 @@ test("Claude telemetry and transcript revise one request and attach its exact to
       }) +
       "\n",
   );
-  RecoverContext(r);
+  recoverContext(r);
   telemetry(r, scope, e, "castai", "unknown");
-  RecoverContext(r);
+  recoverContext(r);
   expect(
-    store.DB.query(
-      "SELECT count(DISTINCT entity_id) AS entities,count(*) AS revisions FROM events WHERE kind='usage'",
-    ).get(),
+    store.db
+      .query(
+        "SELECT count(DISTINCT entity_id) AS entities,count(*) AS revisions FROM events WHERE kind='usage'",
+      )
+      .get(),
   ).toEqual({ entities: 1, revisions: 2 });
   const event = latest(store, "usage");
   expect(event.usage.channel).toBe("transcript");
@@ -192,7 +194,7 @@ test("Claude telemetry and transcript revise one request and attach its exact to
     JSON.stringify({ type: "assistant", message: { id: "bad", usage: { input_tokens: 1 } } }) +
       "\n",
   );
-  expect(() => RecoverContext(r)).toThrow("transcript recovery incomplete");
+  expect(() => recoverContext(r)).toThrow("transcript recovery incomplete");
 });
 
 test.each(["flat", "nested", "mixed", "zero-flat", "invalid-flat"])(
@@ -234,7 +236,7 @@ test.each(["flat", "nested", "mixed", "zero-flat", "invalid-flat"])(
         },
       }) + "\n",
     );
-    RecoverContext(r);
+    recoverContext(r);
     const event = latest(store, "usage");
     expect(event.usage.raw).toEqual({ inputTokens: "202", outputTokens: "22" });
     expect(event.usage.iterations.map((item: any) => [item.model, item.raw])).toEqual([
@@ -257,24 +259,24 @@ test.each(["flat", "nested", "mixed", "zero-flat", "invalid-flat"])(
       ],
       ["returned", { inputTokens: "202", outputTokens: "22" }],
     ]);
-    RecoverContext(r);
+    recoverContext(r);
     expect(
-      (store.DB.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
+      (store.db.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
     ).toBe(1);
   },
 );
 
 test("SCM IDs remain exact, target repository owns fork PRs and credentials stay host-bound", () => {
   const source = { provider: "github", host: "github.com", name: "fork/repo", id: "name:fixture" };
-  const raw = Parse(
+  const raw = parseJson(
     '{"id":9007199254740993,"number":7,"html_url":"https://github.com/target/repo/pull/7","state":"open","title":"WID-12: feature","base":{"repo":{"id":9007199254740995,"full_name":"target/repo"}}}',
   );
   const [repo, pr] = pullRequest(source, raw);
   expect(repo.id).toBe("9007199254740995");
   expect(pr.id).toBe("9007199254740993");
   expect(pr.issueKeys).toEqual([{ key: "WID-12", source: "title" }]);
-  expect(providerID(Parse("9223372036854775808"))).toBe("");
-  expect(providerID(Parse("1e3"))).toBe("");
+  expect(providerId(parseJson("9223372036854775808"))).toBe("");
+  expect(providerId(parseJson("1e3"))).toBe("");
   expect(() => pullRequest({ ...source, host: "untrusted.example" }, raw)).toThrow();
   const previous = process.env.GITHUB_TOKEN;
   process.env.GITHUB_TOKEN = "synthetic-secret";
@@ -293,10 +295,10 @@ test("SCM IDs remain exact, target repository owns fork PRs and credentials stay
 });
 
 test("native int64 usage readers preserve decimal identity before bounded event validation", () => {
-  const raw = Parse(
+  const raw = parseJson(
     '{"input_tokens":9007199254740993,"output_tokens":1e3,"cache_read_input_tokens":-0}',
   );
-  expect(openAIUsage(raw).inputTokens).toBe("9007199254740993");
+  expect(openAiUsage(raw).inputTokens).toBe("9007199254740993");
   expect(claudeUsage(raw).inputTokens).toBe("9007199254740993");
   expect(claudeUsage(raw).cacheReadTokens).toBe("0");
   expect(claudeUsage(raw).outputTokens).toBeUndefined();
@@ -329,20 +331,20 @@ test("batched recovery commits the valid prefix and resumes without another char
       "\n" +
       lines.slice(123).join(""),
   );
-  expect(() => RecoverContext(r)).toThrow();
+  expect(() => recoverContext(r)).toThrow();
   expect(
-    (store.DB.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
+    (store.db.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
   ).toBe(123);
-  expect((store.DB.query("SELECT offset FROM cursors WHERE path=?").get(path) as any).offset).toBe(
+  expect((store.db.query("SELECT offset FROM cursors WHERE path=?").get(path) as any).offset).toBe(
     Buffer.byteLength(prefix),
   );
   writeFileSync(path, lines.join(""));
-  RecoverContext(r);
-  RecoverContext(r);
+  recoverContext(r);
+  recoverContext(r);
   expect(
-    (store.DB.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
+    (store.db.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n,
   ).toBe(240);
-  expect((store.DB.query("PRAGMA synchronous").get() as any).synchronous).toBe(2);
+  expect((store.db.query("PRAGMA synchronous").get() as any).synchronous).toBe(2);
 });
 
 test("Git revisits a late commit and excludes the old identical revision", () => {
@@ -360,7 +362,7 @@ test("Git revisits a late commit and excludes the old identical revision", () =>
   };
   const old = commit("after\n", "old");
   commit("before\n", "baseline");
-  r.Record({
+  r.record({
     stage: "UserPromptSubmit",
     event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
   });
@@ -372,23 +374,23 @@ test("Git revisits a late commit and excludes the old identical revision", () =>
     tool_name: "Edit",
     tool_input: { file_path: path, old_string: "before", new_string: "after" },
   };
-  r.Record({ stage: "PreToolUse", event: e });
+  r.record({ stage: "PreToolUse", event: e });
   writeFileSync(path, "after\n");
-  r.Record({ stage: "PostToolUse", event: e });
-  ReconcileGit(r);
+  r.record({ stage: "PostToolUse", event: e });
+  reconcileGit(r);
   git(root, "add", "file.txt");
   git(root, "commit", "-m", "later");
   const sha = git(root, "rev-parse", "HEAD");
   for (let i = 0; i < 2; i++) {
-    store.DB.query("DELETE FROM meta WHERE key='git-last-pass'").run();
-    ReconcileGit(r);
+    store.db.query("DELETE FROM meta WHERE key='git-last-pass'").run();
+    reconcileGit(r);
   }
   expect(
-    (store.DB.query("SELECT count(*) AS n FROM events WHERE kind='commit'").get() as any).n,
+    (store.db.query("SELECT count(*) AS n FROM events WHERE kind='commit'").get() as any).n,
     JSON.stringify({
-      changes: store.DB.query("SELECT * FROM file_changes").all(),
-      meta: store.DB.query("SELECT * FROM meta WHERE key LIKE 'git-%'").all(),
-      diagnostics: store.DB.query("SELECT * FROM diagnostics").all(),
+      changes: store.db.query("SELECT * FROM file_changes").all(),
+      meta: store.db.query("SELECT * FROM meta WHERE key LIKE 'git-%'").all(),
+      diagnostics: store.db.query("SELECT * FROM diagnostics").all(),
     }),
   ).toBe(1);
   expect(latest(store, "commit").commit.id).toBe(sha);
@@ -405,15 +407,15 @@ test("collector Git reconciliation preserves the originating source, version and
   writeFileSync(path, "before\n");
   git(root, "add", "file.txt");
   git(root, "commit", "-m", "baseline");
-  version(r, scope.Session, "native-test-version");
-  const collector = new Recorder(store, "collector", r.Device);
-  version(collector, scope.Session, "collector-test-version");
+  saveSourceVersion(r, scope.Session, "native-test-version");
+  const collector = new Recorder(store, "collector", r.device);
+  saveSourceVersion(collector, scope.Session, "collector-test-version");
   expect(r.event(scope, "native-default", "")).toMatchObject({
-    source: r.Source,
+    source: r.source,
     sourceVersion: "native-test-version",
-    entityId: StableID(r.Source, scope.Session, "native-default"),
+    entityId: stableId(r.source, scope.Session, "native-default"),
   });
-  r.Record({
+  r.record({
     stage: "UserPromptSubmit",
     event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
   });
@@ -425,23 +427,23 @@ test("collector Git reconciliation preserves the originating source, version and
     tool_name: "Edit",
     tool_input: { file_path: path, old_string: "before", new_string: "after" },
   };
-  r.Record({ stage: "PreToolUse", event });
+  r.record({ stage: "PreToolUse", event });
   writeFileSync(path, "after\n");
-  r.Record({ stage: "PostToolUse", event });
+  r.record({ stage: "PostToolUse", event });
   git(root, "add", "file.txt");
   git(root, "commit", "-m", "implementation");
   const sha = git(root, "rev-parse", "HEAD"),
     work = r.work(scope);
   expect(work).not.toBe("");
-  ReconcileGit(collector);
+  reconcileGit(collector);
   for (const [kind, entity] of [
     ["commit", `commit:${sha}`],
     ["link", `work-commit:${work}:${sha}`],
   ]) {
     expect(latest(store, kind!)).toMatchObject({
-      source: r.Source,
+      source: r.source,
       sourceVersion: "native-test-version",
-      entityId: StableID(r.Source, scope.Session, entity!),
+      entityId: stableId(r.source, scope.Session, entity!),
       workId: work,
     });
   }
@@ -476,11 +478,11 @@ test("PR refresh revises lifecycle while retaining one exact commit membership l
     name: "fork/repo",
   };
   const sha = "a".repeat(40),
-    key = `tracked-commit:${StableID(scope.Repo, sha)}`;
+    key = `tracked-commit:${stableId(scope.Repo, sha)}`;
   const tracked = { Scope: scope, Source: "codex", SHA: sha, CreatedAt: new Date().toISOString() };
-  version(r, scope.Session, "native-test-version");
-  const collector = new Recorder(store, "collector", r.Device);
-  version(collector, scope.Session, "collector-test-version");
+  saveSourceVersion(r, scope.Session, "native-test-version");
+  const collector = new Recorder(store, "collector", r.device);
+  saveSourceVersion(collector, scope.Session, "collector-test-version");
   const raw = {
     id: 42,
     number: 7,
@@ -495,8 +497,8 @@ test("PR refresh revises lifecycle while retaining one exact commit membership l
       JSON.stringify([{ ...raw, ...(merged ? { state: "closed", merged_at: at } : {}) }]),
     );
     saveMeta(r, key, tracked);
-    store.DB.query("DELETE FROM meta WHERE key IN ('git-last-pass','git-pass-after')").run();
-    ReconcileGit(collector);
+    store.db.query("DELETE FROM meta WHERE key IN ('git-last-pass','git-pass-after')").run();
+    reconcileGit(collector);
   }
   expect(latest(store, "pull_request").revision).toBe("2");
   expect(latest(store, "pull_request").repository.id).toBe("99");
@@ -505,13 +507,13 @@ test("PR refresh revises lifecycle while retaining one exact commit membership l
     ["link", `commit-pr:${sha}:99:42`],
   ]) {
     expect(latest(store, kind!)).toMatchObject({
-      source: r.Source,
+      source: r.source,
       sourceVersion: "native-test-version",
-      entityId: StableID(r.Source, scope.Session, entity!),
+      entityId: stableId(r.source, scope.Session, entity!),
     });
   }
   expect(
-    (store.DB.query("SELECT count(*) AS n FROM events WHERE kind='link'").get() as any).n,
+    (store.db.query("SELECT count(*) AS n FROM events WHERE kind='link'").get() as any).n,
   ).toBe(1);
 });
 

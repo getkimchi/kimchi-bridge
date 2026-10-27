@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { basename, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -11,16 +12,17 @@ import {
   writeFileSync,
 } from "node:fs";
 import {
-  Authenticate,
-  CredentialHash,
-  ValidID,
+  authenticate,
+  credentialHash,
   hasControl,
   object,
   secureEndpoint,
+  validId,
   type SignIn,
 } from "./kimchi.ts";
-import { OpenDatabase } from "./platform.ts";
-import { NewID, StableID } from "./work/protocol.ts";
+import { openDatabase } from "./platform.ts";
+// Account folders and session pins are named with the work protocol's stable IDs.
+import { stableId } from "./work/protocol.ts";
 
 /** The account Kimchi's sign-in was verified as, OTLP export, and whether capture is paused. */
 export interface Config {
@@ -32,33 +34,33 @@ export interface Config {
   otlpHeaders?: Record<string, string>;
   disabled?: boolean;
 }
-export function Root(): string {
+export function stateRoot(): string {
   const path = process.env.KIMCHI_BRIDGE_HOME;
   return path && isAbsolute(path) ? path : join(homedir(), ".local", "state", "kimchi-bridge");
 }
-export function Load(): Config {
+export function loadConfig(): Config {
   try {
-    return JSON.parse(readFileSync(join(Root(), "config.json"), "utf8"));
+    return JSON.parse(readFileSync(join(stateRoot(), "config.json"), "utf8"));
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw e;
   }
 }
-export function StateDir(c: Config): string {
+export function stateDir(c: Config): string {
   let account = "local";
   try {
-    ValidateConfig(c);
-    account = StableID(c.apiUrl!, c.organizationId!, c.actorId!);
+    validateConfig(c);
+    account = stableId(c.apiUrl!, c.organizationId!, c.actorId!);
   } catch {}
-  return join(Root(), "accounts", account);
+  return join(stateRoot(), "accounts", account);
 }
-export function Save(config: Config): void {
+export function saveConfig(config: Config): void {
   // Earlier releases kept their own reporting key and runtime here; Kimchi provides both.
   const { apiKey, accessToken, enabled, runtimeExecutable, runtimeRevision, ...c } =
     config as Config & Record<string, unknown>;
-  ValidateOTLP(c);
-  mkdirSync(Root(), { recursive: true, mode: 0o700 });
-  const tmp = join(Root(), ".config-" + NewID());
+  validateOtlp(c);
+  mkdirSync(stateRoot(), { recursive: true, mode: 0o700 });
+  const tmp = join(stateRoot(), ".config-" + randomUUID());
   try {
     const fd = openSync(tmp, "wx", 0o600);
     try {
@@ -67,8 +69,8 @@ export function Save(config: Config): void {
     } finally {
       closeSync(fd);
     }
-    renameSync(tmp, join(Root(), "config.json"));
-    const dir = openSync(Root(), "r");
+    renameSync(tmp, join(stateRoot(), "config.json"));
+    const dir = openSync(stateRoot(), "r");
     try {
       fsyncSync(dir);
     } finally {
@@ -84,23 +86,23 @@ export function Save(config: Config): void {
 }
 
 /** Verify Kimchi's sign-in when it changed. A different account drops the old account's exporter. */
-export async function Verify(k: SignIn, signal?: AbortSignal): Promise<Config> {
-  const before = Load();
-  if (!k.token || before.credentialHash === CredentialHash(k)) return before;
-  const identity = await Authenticate(k, signal);
+export async function verifySignIn(k: SignIn, signal?: AbortSignal): Promise<Config> {
+  const before = loadConfig();
+  if (!k.token || before.credentialHash === credentialHash(k)) return before;
+  const identity = await authenticate(k, signal);
   // Read again, keeping what changed during the request, such as disable or configure.
-  const latest = Load();
+  const latest = loadConfig();
   const next: Config = { ...latest, ...identity };
-  if (latest.actorId && StateDir(next) !== StateDir(latest)) {
+  if (latest.actorId && stateDir(next) !== stateDir(latest)) {
     delete next.otlpUrl;
     delete next.otlpHeaders;
   }
-  Save(next);
+  saveConfig(next);
   return next;
 }
 
 /** configure sets OTLP export only; reporting uses Kimchi's sign-in. */
-export function DecodeOTLP(data: string | Uint8Array): Pick<Config, "otlpUrl" | "otlpHeaders"> {
+export function decodeOtlp(data: string | Uint8Array): Pick<Config, "otlpUrl" | "otlpHeaders"> {
   if (Buffer.byteLength(data) > 32 << 10) throw new Error("configuration too large");
   let c: Record<string, unknown>;
   try {
@@ -111,11 +113,11 @@ export function DecodeOTLP(data: string | Uint8Array): Pick<Config, "otlpUrl" | 
   if (["apiUrl", "apiKey", "api_key", "accessToken"].some((key) => key in c))
     throw new Error("the plugins report with Kimchi's sign-in; configure sets OTLP export only");
   const otlp = { otlpUrl: c.otlpUrl, otlpHeaders: c.otlpHeaders } as Config;
-  ValidateOTLP(otlp);
+  validateOtlp(otlp);
   return otlp;
 }
 
-export function ValidateOTLP(c: Config): void {
+function validateOtlp(c: Config): void {
   if (c.otlpUrl) secureEndpoint(c.otlpUrl);
   const headers = c.otlpHeaders ?? {};
   if (typeof headers !== "object" || Array.isArray(headers) || Object.keys(headers).length > 16)
@@ -134,30 +136,30 @@ export function ValidateOTLP(c: Config): void {
   }
 }
 
-export function ValidateConfig(c: Config): void {
+export function validateConfig(c: Config): void {
   secureEndpoint(c.apiUrl);
-  ValidateOTLP(c);
-  if (!ValidID(c.organizationId) || !ValidID(c.actorId)) throw new Error("invalid account");
+  validateOtlp(c);
+  if (!validId(c.organizationId) || !validId(c.actorId)) throw new Error("invalid account");
 }
 
-const validAccount = (s: unknown) => s === "local" || ValidID(s);
-export function SessionStateDir(c: Config, source: string, session: string): string {
+const validAccount = (s: unknown) => s === "local" || validId(s);
+export function sessionStateDir(c: Config, source: string, session: string): string {
   if (
     !["codex", "claude-code"].includes(source) ||
     !session ||
     Buffer.byteLength(session) > 512 ||
-    Array.from("\0\r\n").some((c) => session.includes(c))
+    hasControl(session)
   )
     throw new Error("invalid native session");
-  const db = OpenDatabase(join(Root(), "session-accounts.sqlite"));
+  const db = openDatabase(join(stateRoot(), "session-accounts.sqlite"));
   try {
     db.exec("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,account TEXT NOT NULL)");
-    const id = StableID(source, session);
+    const id = stableId(source, session);
     let row = db.query("SELECT account FROM sessions WHERE id=?").get(id) as any;
     if (!row) {
-      let account: unknown = basename(StateDir(c));
+      let account: unknown = basename(stateDir(c));
       try {
-        const body = readFileSync(join(Root(), "session-accounts", id + ".json"));
+        const body = readFileSync(join(stateRoot(), "session-accounts", id + ".json"));
         if (body.length > 256) throw new Error("invalid native account binding");
         account = JSON.parse(body.toString());
       } catch (e) {
@@ -168,7 +170,7 @@ export function SessionStateDir(c: Config, source: string, session: string): str
       row = db.query("SELECT account FROM sessions WHERE id=?").get(id) as any;
     }
     if (!validAccount(row.account)) throw new Error("invalid native account binding");
-    return join(Root(), "accounts", row.account);
+    return join(stateRoot(), "accounts", row.account);
   } finally {
     db.close();
   }

@@ -1,20 +1,20 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { BaseUrl, CredentialHash, IdentityError, KimchiSignIn, type SignIn } from "./kimchi.ts";
+import { IdentityError, baseUrl, credentialHash, kimchiSignIn, type SignIn } from "./kimchi.ts";
 import {
-  DecodeOTLP,
-  Load,
-  Save,
-  SessionStateDir,
-  StateDir,
-  Verify,
+  decodeOtlp,
+  loadConfig,
+  saveConfig,
+  sessionStateDir,
+  stateDir,
+  verifySignIn,
   type Config,
 } from "./settings.ts";
 import { Recorder, type Native } from "./work/capture.ts";
-import { Flush, FlushOTLP } from "./work/delivery.ts";
-import { Open } from "./work/ledger.ts";
-import { EncodeEvent, Kind, Parse, Stringify } from "./work/protocol.ts";
-import { Run as Sync } from "./work/sync.ts";
+import { flush, flushOtlp } from "./work/delivery.ts";
+import { Store } from "./work/ledger.ts";
+import { encodeEvent, eventKind, parseJson, stringifyJson } from "./work/protocol.ts";
+import { sync } from "./work/sync.ts";
 
 declare const BUILD_VERSION: string | undefined;
 const version = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev";
@@ -48,24 +48,24 @@ function csvCell(value: string): string {
 async function sessionAccount(c: Config, environmentKey?: string): Promise<Config> {
   let k: SignIn;
   try {
-    k = KimchiSignIn(environmentKey);
+    k = kimchiSignIn(environmentKey);
   } catch {
     return c;
   }
   if (!k.token) return {};
   try {
-    return await Verify(k, AbortSignal.timeout(1000));
+    return await verifySignIn(k, AbortSignal.timeout(1000));
   } catch (error) {
     const refreshed =
       !(error instanceof IdentityError) &&
       k.organizationId !== undefined &&
       k.organizationId.toLowerCase() === c.organizationId &&
-      BaseUrl(k.apiUrl) === c.apiUrl;
+      baseUrl(k.apiUrl) === c.apiUrl;
     return refreshed ? c : {};
   }
 }
 
-export async function Run(
+export async function run(
   args: string[],
   stdin = input,
   output: (text: string) => void = (text) => {
@@ -79,7 +79,7 @@ export async function Run(
   // Unreadable Kimchi settings mean no sign-in: local recording continues, uploads wait.
   const signIn = (): SignIn => {
     try {
-      return KimchiSignIn(environmentKey);
+      return kimchiSignIn(environmentKey);
     } catch {
       return { apiUrl: "" };
     }
@@ -107,28 +107,29 @@ export async function Run(
     return;
   }
   if (command === "configure") {
-    Save({ ...Load(), ...DecodeOTLP(await stdin(32 << 10)) });
+    saveConfig({ ...loadConfig(), ...decodeOtlp(await stdin(32 << 10)) });
     output("OTLP export configured.\n");
     return;
   }
-  let c = Load();
+  let c = loadConfig();
   if (command === "activate") {
-    Save(c);
+    saveConfig(c);
     return;
   }
   if (command === "enable" || command === "disable") {
     c.disabled = command === "disable";
-    Save(c);
+    saveConfig(c);
     output(`Capture ${command}d. Local records retained.\n`);
     return;
   }
+  // worker is the command earlier releases ran for background sync.
   if (command === "sync" || command === "worker") {
     const controller = new AbortController();
     const cancel = () => controller.abort();
     process.once("SIGTERM", cancel);
     process.once("SIGINT", cancel);
     try {
-      await Sync(signIn(), controller.signal);
+      await sync(signIn(), controller.signal);
     } finally {
       process.off("SIGTERM", cancel);
       process.off("SIGINT", cancel);
@@ -140,9 +141,9 @@ export async function Run(
   if (command === "flush") {
     if (!k.token) throw new Error("sign in to Kimchi to report; local records retained");
     // Verify before opening the ledger, so records go only to the account this sign-in owns.
-    c = await Verify(k);
+    c = await verifySignIn(k);
   }
-  let s = Open(StateDir(c));
+  let s = new Store(stateDir(c));
   try {
     switch (command) {
       case "hook": {
@@ -152,16 +153,16 @@ export async function Run(
         try {
           data = await stdin(4 << 20);
         } catch {
-          s.Diagnostic("hook_input_too_large");
+          s.diagnostic("hook_input_too_large");
           return;
         }
         let native: Native;
         try {
-          const parsed = Parse(data.toString("utf8"));
+          const parsed = parseJson(data.toString("utf8"));
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
           native = (args[1] === "codex" ? { event: parsed } : parsed) as Native;
         } catch {
-          s.Diagnostic("hook_invalid_json");
+          s.diagnostic("hook_invalid_json");
           return;
         }
         const session = native.sessionId || native.event?.session_id;
@@ -172,19 +173,19 @@ export async function Run(
             : c;
         let dir: string;
         try {
-          dir = SessionStateDir(account, args[1], typeof session === "string" ? session : "");
+          dir = sessionStateDir(account, args[1], typeof session === "string" ? session : "");
         } catch {
-          s.Diagnostic("session_account_binding_failed");
+          s.diagnostic("session_account_binding_failed");
           return;
         }
-        if (dir !== s.Dir) {
-          s.Close();
-          s = Open(dir);
+        if (dir !== s.dir) {
+          s.close();
+          s = new Store(dir);
         }
         try {
-          new Recorder(s, args[1], s.DeviceID()).Record(native);
+          new Recorder(s, args[1], s.deviceId()).record(native);
         } catch {
-          s.Diagnostic("hook_capture_failed");
+          s.diagnostic("hook_capture_failed");
         }
         return;
       }
@@ -194,22 +195,22 @@ export async function Run(
             version,
             disabled: c.disabled ?? false,
             kimchiSignedIn: Boolean(k.token),
-            reportingVerified: Boolean(k.token) && c.credentialHash === CredentialHash(k),
+            reportingVerified: Boolean(k.token) && c.credentialHash === credentialHash(k),
             organizationId: c.organizationId ?? "",
-            ledger: StateDir(c),
-            accounting: s.Status(),
+            ledger: stateDir(c),
+            accounting: s.status(),
           }) + "\n",
         );
         return;
       case "recover":
       case "flush": {
         for (const source of ["claude-code", "codex"])
-          new Recorder(s, source, s.DeviceID()).RecoverContext();
+          new Recorder(s, source, s.deviceId()).recoverContext();
         if (command === "recover") return;
-        while (await Flush(s, c, k)) {
+        while (await flush(s, c, k)) {
           /* durable queue advances only on receipts */
         }
-        while (await FlushOTLP(s, c)) {
+        while (await flushOtlp(s, c)) {
           /* independent destination receipts */
         }
         output("All pending records acknowledged.\n");
@@ -218,9 +219,9 @@ export async function Run(
       case "export": {
         if (args.length !== 2 || !["jsonl", "csv"].includes(args[1]))
           throw new Error("export requires jsonl or csv");
-        const events = s.Events();
+        const events = s.events();
         if (args[1] === "jsonl") {
-          for (const event of events) output(EncodeEvent(event) + "\n");
+          for (const event of events) output(encodeEvent(event) + "\n");
           return;
         }
         output("event_id,kind,source,work_id,session_id,turn_id,observed_at,usage_json\n");
@@ -228,13 +229,13 @@ export async function Run(
           output(
             [
               event.id ?? "",
-              Kind(event),
+              eventKind(event),
               event.source,
               event.workId ?? "",
               event.sessionId ?? "",
               event.turnId ?? "",
               event.observeTime,
-              event.usage ? Stringify(event.usage) : "",
+              event.usage ? stringifyJson(event.usage) : "",
             ]
               .map(csvCell)
               .join(",") + "\n",
@@ -245,14 +246,15 @@ export async function Run(
         throw new Error(`unknown command ${JSON.stringify(command)}`);
     }
   } finally {
-    s.Close();
+    s.close();
   }
 }
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
+  // Hooks and syncs fail silently: Codex shows their output in the session.
   const passive = ["hook", "sync", "worker"].includes(args[0]);
-  void Run(args).catch((error) => {
+  void run(args).catch((error) => {
     if (!passive) {
       console.error(error instanceof Error ? error.message : "command failed");
       process.exitCode = 1;

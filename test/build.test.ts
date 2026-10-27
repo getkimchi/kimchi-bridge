@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BuildBundle, ReleaseVersion, SHIM } from "../scripts/package.ts";
+import { buildBundle, releaseVersion, shim } from "../scripts/package.ts";
 
 // What the installer leaves: the shim, the current code and a runtime link. Bun stands in
 // for Kimchi's binary, which runs the code as Bun does when BUN_BE_BUN=1 is set.
@@ -19,14 +19,14 @@ async function installed(root: string, version: string) {
     helper = join(root, "bin", "kimchi-bridge");
   mkdirSync(prefix, { recursive: true });
   mkdirSync(join(root, "bin"));
-  await BuildBundle(version, join(prefix, "current.mjs"));
+  await buildBundle(version, join(prefix, "current.mjs"));
   symlinkSync(process.execPath, join(prefix, "runtime"));
-  writeFileSync(helper, SHIM, { mode: 0o755 });
+  writeFileSync(helper, shim, { mode: 0o755 });
   return { prefix, helper };
 }
 
 test("packager only accepts the installer release formats", () => {
-  for (const version of ["v0.1.0", "v0.1.0-rc.9"]) expect(ReleaseVersion(version)).toBe(version);
+  for (const version of ["v0.1.0", "v0.1.0-rc.9"]) expect(releaseVersion(version)).toBe(version);
   for (const version of [
     "v0.1.0-beta.1",
     "v0.1.0+metadata",
@@ -34,7 +34,7 @@ test("packager only accepts the installer release formats", () => {
     "v1.2.3 || >0",
     "v0.1.0-rc.-1",
   ])
-    expect(() => ReleaseVersion(version)).toThrow();
+    expect(() => releaseVersion(version)).toThrow();
 });
 
 test("the shim runs the code on Kimchi's runtime without the project's .env or bunfig.toml", async () => {
