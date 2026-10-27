@@ -496,6 +496,22 @@ export function eventKind(e: Event): string {
 }
 const containsAny = (s: string, chars: string) => Array.from(chars).some((c) => s.includes(c));
 const digit = (c: string) => c >= "0" && c <= "9";
+// A Git host, optionally with its HTTPS port (name or name:port), as the snapshot route accepted.
+// The backend and Kimchi apply the same rule.
+export function validHost(host: string): boolean {
+  const colon = host.indexOf(":");
+  const name = colon < 0 ? host : host.slice(0, colon);
+  if (!name || containsAny(name, "/\\@?#| :")) return false;
+  if (colon < 0) return true;
+  const port = host.slice(colon + 1);
+  return (
+    port.length >= 1 &&
+    port.length <= 5 &&
+    Array.from(port).every(digit) &&
+    Number(port) >= 1 &&
+    Number(port) <= 65535
+  );
+}
 const bounded = (s: any, max: number) =>
   typeof (s ?? "") === "string" &&
   Buffer.byteLength(s ?? "") <= max &&
@@ -610,7 +626,7 @@ export function validateEvent(e: Event): void {
     (!["github", "gitlab"].includes(r.provider) ||
       !r.host ||
       !bounded(r.host, 253) ||
-      containsAny(r.host, "/\\@?#| :") ||
+      !validHost(r.host) ||
       !r.id ||
       !opaque(r.id) ||
       !bounded(r.name, 256) ||
@@ -741,7 +757,7 @@ export function validateEvent(e: Event): void {
       u.search ||
       u.hash ||
       !r ||
-      u.hostname.toLowerCase() !== r.host.toLowerCase() ||
+      u.host.toLowerCase() !== r.host.toLowerCase() ||
       !p.id ||
       !opaque(p.id) ||
       !Number.isInteger(p.number) ||

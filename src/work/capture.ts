@@ -123,7 +123,8 @@ export function repository(cwd: string): [string, string, Repository | undefined
       return [root, local, undefined];
     if (url.password || url.search || url.hash || (url.protocol === "https:" && url.username))
       return [root, local, undefined];
-    host = url.host;
+    // An HTTPS remote's port belongs to the web host; an SSH remote's port does not.
+    host = url.protocol === "https:" ? url.host : url.hostname;
     name = url.pathname.slice(1);
     if (name.endsWith(".git")) name = name.slice(0, -4);
   } catch {
