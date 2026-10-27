@@ -27,8 +27,8 @@ export interface Config extends DeliveryConfig {
   disabled?: boolean;
 }
 export function Root(): string {
-  const path = process.env.KIMCHI_ADAPTERS_HOME;
-  return path && isAbsolute(path) ? path : join(homedir(), ".local", "state", "kimchi-adapters");
+  const path = process.env.KIMCHI_BRIDGE_HOME;
+  return path && isAbsolute(path) ? path : join(homedir(), ".local", "state", "kimchi-bridge");
 }
 export function Load(): Config {
   try {

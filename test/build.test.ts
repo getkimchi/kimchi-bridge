@@ -16,7 +16,7 @@ import { BuildBundle, ReleaseVersion, SHIM } from "../scripts/package.ts";
 // for Kimchi's binary, which runs the code as Bun does when BUN_BE_BUN=1 is set.
 async function installed(root: string, version: string) {
   const prefix = join(root, "prefix"),
-    helper = join(root, "bin", "kimchi-adapters");
+    helper = join(root, "bin", "kimchi-bridge");
   mkdirSync(prefix, { recursive: true });
   mkdirSync(join(root, "bin"));
   await BuildBundle(version, join(prefix, "current.mjs"));
@@ -49,7 +49,7 @@ test("the shim runs the code on Kimchi's runtime without the project's .env or b
     mkdirSync(home);
     writeFileSync(
       join(project, ".env"),
-      `KIMCHI_ADAPTERS_HOME=${redirect}\nKIMCHI_API_KEY=untrusted-project-key\n`,
+      `KIMCHI_BRIDGE_HOME=${redirect}\nKIMCHI_API_KEY=untrusted-project-key\n`,
     );
     writeFileSync(
       join(project, "preload.js"),
@@ -63,8 +63,8 @@ test("the shim runs the code on Kimchi's runtime without the project's .env or b
         env: {
           HOME: home,
           PATH: process.env.PATH!,
-          KIMCHI_ADAPTERS_PREFIX: prefix,
-          KIMCHI_ADAPTERS_HOME: state,
+          KIMCHI_BRIDGE_PREFIX: prefix,
+          KIMCHI_BRIDGE_HOME: state,
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -130,8 +130,8 @@ test("the shipped helper reports with Kimchi's sign-in and leaves Kimchi's setti
     const env = {
       HOME: home,
       PATH: process.env.PATH!,
-      KIMCHI_ADAPTERS_PREFIX: prefix,
-      KIMCHI_ADAPTERS_HOME: state,
+      KIMCHI_BRIDGE_PREFIX: prefix,
+      KIMCHI_BRIDGE_HOME: state,
       KIMCHI_REMOTE_ENDPOINT: api.url.origin,
     };
     // Spawn asynchronously so this process keeps serving the fake API.

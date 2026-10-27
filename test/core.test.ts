@@ -51,7 +51,7 @@ const golden = JSON.parse(
 );
 const dirs: string[] = [];
 const stores: Store[] = [];
-const priorHome = process.env.KIMCHI_ADAPTERS_HOME;
+const priorHome = process.env.KIMCHI_BRIDGE_HOME;
 function temp(): string {
   const dir = mkdtempSync(join(tmpdir(), "kimchi-ts-core-"));
   dirs.push(dir);
@@ -93,8 +93,8 @@ afterEach(() => {
     } catch {}
   }
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  if (priorHome === undefined) delete process.env.KIMCHI_ADAPTERS_HOME;
-  else process.env.KIMCHI_ADAPTERS_HOME = priorHome;
+  if (priorHome === undefined) delete process.env.KIMCHI_BRIDGE_HOME;
+  else process.env.KIMCHI_BRIDGE_HOME = priorHome;
 });
 
 describe("Go wire and identity compatibility", () => {
@@ -269,7 +269,7 @@ describe("durable evidence and account pins", () => {
     expect(() => s.Blob("../ledger.sqlite")).toThrow("invalid evidence hash");
   });
   test("100 sessions share one registry and preserve old account pins after rotation", () => {
-    process.env.KIMCHI_ADAPTERS_HOME = temp();
+    process.env.KIMCHI_BRIDGE_HOME = temp();
     const c = account();
     const before = StateDir(c),
       pin = SessionStateDir(c, "codex", "old");
@@ -291,7 +291,7 @@ describe("durable evidence and account pins", () => {
     expect(basename(SessionStateDir(c, "claude-code", "legacy"))).toBe(basename(before));
   });
   test("private atomic config saves drop an earlier release's key and runtime and decode only OTLP", () => {
-    process.env.KIMCHI_ADAPTERS_HOME = temp();
+    process.env.KIMCHI_BRIDGE_HOME = temp();
     const c = { ...account(), disabled: true };
     Save({
       ...c,

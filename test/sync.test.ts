@@ -12,13 +12,13 @@ import { Load, Save, SessionStateDir, StateDir, type Config } from "../src/setti
 import { Run } from "../src/sync.ts";
 
 let root: string;
-const variables = ["KIMCHI_ADAPTERS_HOME", "KIMCHI_API_KEY", "HOME", "KIMCHI_REMOTE_ENDPOINT"];
+const variables = ["KIMCHI_BRIDGE_HOME", "KIMCHI_API_KEY", "HOME", "KIMCHI_REMOTE_ENDPOINT"];
 let previous: (string | undefined)[] = [];
 const cleanups: (() => void)[] = [];
 beforeEach(() => {
   previous = variables.map((name) => process.env[name]);
   root = mkdtempSync(join(tmpdir(), "kimchi-sync-"));
-  process.env.KIMCHI_ADAPTERS_HOME = root;
+  process.env.KIMCHI_BRIDGE_HOME = root;
   // Kimchi's sign-in is read from this HOME, never the developer's.
   process.env.HOME = root;
   delete process.env.KIMCHI_API_KEY;

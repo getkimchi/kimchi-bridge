@@ -10,7 +10,7 @@ import { KimchiSignIn, Load, Save, SessionStateDir, StateDir, Verify } from "../
 
 let root: string, kimchi: string;
 const variables = [
-  "KIMCHI_ADAPTERS_HOME",
+  "KIMCHI_BRIDGE_HOME",
   "KIMCHI_API_KEY",
   "HOME",
   "KIMCHI_REMOTE_ENDPOINT",
@@ -24,7 +24,7 @@ beforeEach(() => {
   kimchi = join(root, ".config", "kimchi");
   mkdirSync(join(kimchi, "harness"), { recursive: true });
   process.env.HOME = root;
-  process.env.KIMCHI_ADAPTERS_HOME = join(root, "reporting");
+  process.env.KIMCHI_BRIDGE_HOME = join(root, "reporting");
   for (const name of variables.slice(3)) delete process.env[name];
   delete process.env.KIMCHI_API_KEY;
 });

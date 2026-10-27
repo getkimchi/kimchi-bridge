@@ -27,12 +27,12 @@ export function ReleaseVersion(value: string): string {
   return value;
 }
 
-// Every plugin's bin/kimchi-adapters, and the user's command. Kimchi's runtime runs the code
+// Every plugin's bin/kimchi-bridge, and the user's command. Kimchi's runtime runs the code
 // the installer made current, without loading the project's .env or bunfig.toml. Without Kimchi
 // only a terminal gets the hint: Codex shows every hook's output in the session.
 export const SHIM = `#!/bin/sh
-prefix=\${KIMCHI_ADAPTERS_PREFIX:-$HOME/.local/share/kimchi-adapters}
-[ -x "$prefix/runtime" ] || { [ ! -t 2 ] || echo 'kimchi-adapters: run the Kimchi installer.' >&2; exit 0; }
+prefix=\${KIMCHI_BRIDGE_PREFIX:-$HOME/.local/share/kimchi-bridge}
+[ -x "$prefix/runtime" ] || { [ ! -t 2 ] || echo 'kimchi-bridge: run the Kimchi installer.' >&2; exit 0; }
 exec env BUN_BE_BUN=1 "$prefix/runtime" --no-env-file --config=/dev/null "$prefix/current.mjs" "$@"
 `;
 
@@ -60,23 +60,23 @@ async function main() {
   ReleaseVersion(version);
   const root = resolve(import.meta.dir, ".."),
     out = resolve(output),
-    stage = mkdtempSync(join(tmpdir(), "pr-cost-package-"));
+    stage = mkdtempSync(join(tmpdir(), "kimchi-bridge-package-"));
   // Clients key hook trust by marketplace, so each client's marketplace changes only when its
   // own plugin wiring does: a release that changes only code needs no new registration or review.
   const market = (client: string) => {
     const wiring = createHash("sha256").update(SHIM);
     for (const path of files(join(root, "plugins", client)))
       wiring.update(relative(root, path)).update("\0").update(readFileSync(path));
-    return `kimchi-work-${wiring.digest("hex").slice(0, 12)}`;
+    return `kimchi-bridge-${wiring.digest("hex").slice(0, 12)}`;
   };
   try {
     for (const path of ["bin", "lib", "markets", ".claude-plugin", ".agents/plugins"])
       mkdirSync(join(stage, path), { recursive: true });
-    await BuildBundle(version, join(stage, "lib/kimchi-adapters.mjs"));
+    await BuildBundle(version, join(stage, "lib/kimchi-bridge.mjs"));
     cpSync(join(root, "plugins"), join(stage, "plugins"), { recursive: true });
     for (const bin of ["bin", "plugins/claude/bin", "plugins/codex/bin"]) {
       mkdirSync(join(stage, bin), { recursive: true });
-      writeFileSync(join(stage, bin, "kimchi-adapters"), SHIM, { mode: 0o755 });
+      writeFileSync(join(stage, bin, "kimchi-bridge"), SHIM, { mode: 0o755 });
     }
     writeFileSync(
       join(stage, ".claude-plugin/marketplace.json"),
@@ -112,7 +112,7 @@ async function main() {
     cpSync(join(root, "install.sh"), join(stage, "install.sh"));
     cpSync(join(root, "install.sh"), join(stage, "bootstrap.sh"));
     mkdirSync(out, { recursive: true });
-    const name = "kimchi-adapters.tar.gz";
+    const name = "kimchi-bridge.tar.gz";
     const tar = Bun.spawnSync(["tar", "-czf", join(out, name), "-C", stage, "."], {
       env: { ...process.env, COPYFILE_DISABLE: "1" },
       stderr: "inherit",

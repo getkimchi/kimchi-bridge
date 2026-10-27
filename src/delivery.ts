@@ -250,7 +250,7 @@ export async function FlushOTLP(s: Store, c: Config, signal?: AbortSignal): Prom
     resourceLogs: [
       {
         resource: {
-          attributes: [{ key: "service.name", value: { stringValue: "kimchi-adapters" } }],
+          attributes: [{ key: "service.name", value: { stringValue: "kimchi-bridge" } }],
         },
         scopeLogs: [{ scope: { name: "getkimchi.work", version: "1" }, logRecords: records }],
       },

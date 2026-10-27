@@ -93,7 +93,7 @@ export async function Run(
   };
   if (!args.length)
     throw new Error(
-      "usage: kimchi-adapters status | enable | disable | flush | export jsonl|csv | version",
+      "usage: kimchi-bridge status | enable | disable | flush | export jsonl|csv | version",
     );
   const command = args[0];
   if (command === "version") {
@@ -104,7 +104,7 @@ export async function Run(
     if (!["claude", "codex", "both"].includes(args[1]))
       throw new Error("choose claude, codex or both");
     const prefix =
-      process.env.KIMCHI_ADAPTERS_PREFIX || join(homedir(), ".local", "share", "kimchi-adapters");
+      process.env.KIMCHI_BRIDGE_PREFIX || join(homedir(), ".local", "share", "kimchi-bridge");
     const proc = Bun.spawn(["bash", join(prefix, "install.sh"), ...args], {
       stdin: "inherit",
       stdout: "inherit",

@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Native plugin management for the package in Kimchi's release. No inference settings.
 umask 077
-prefix=${KIMCHI_ADAPTERS_PREFIX:-"$HOME/.local/share/kimchi-adapters"}
-bin_dir=${KIMCHI_ADAPTERS_BIN_DIR:-"$HOME/.local/bin"}
+prefix=${KIMCHI_BRIDGE_PREFIX:-"$HOME/.local/share/kimchi-bridge"}
+bin_dir=${KIMCHI_BRIDGE_BIN_DIR:-"$HOME/.local/bin"}
 action=${1:-install}
 client=${2:-both}
 requested=${3:-}
@@ -29,7 +29,7 @@ if [[ "$action" == status ]]; then
     if [[ -f "$prefix/installed/$cli" ]]; then printf '%s: %s\n' "$cli" "$(cat "$prefix/installed/$cli")"; else printf '%s: not installed\n' "$cli"; fi
   done
   [[ ! -f "$prefix/installed/code" ]] || printf 'code: %s\n' "$(cat "$prefix/installed/code")"
-  [[ ! -x "$bin_dir/kimchi-adapters" ]] || "$bin_dir/kimchi-adapters" status
+  [[ ! -x "$bin_dir/kimchi-bridge" ]] || "$bin_dir/kimchi-bridge" status
   exit 0
 fi
 for cli in "${clients[@]}"; do
@@ -38,18 +38,20 @@ for cli in "${clients[@]}"; do
   command -v "$cli" >/dev/null || fail "Install official $cli first."
 done
 mkdir -p "$prefix/installed" "$bin_dir"
-if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-adapters" || -L "$bin_dir/kimchi-adapters" ) ]]; then
-  existing=$(readlink "$bin_dir/kimchi-adapters") || fail 'Refusing to replace an unmanaged kimchi-adapters binary.'
-  case "$existing" in "$prefix/releases/"*/bin/kimchi-adapters) ;; *) fail 'Refusing to replace an unmanaged kimchi-adapters link.' ;; esac
+if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-bridge" || -L "$bin_dir/kimchi-bridge" ) ]]; then
+  existing=$(readlink "$bin_dir/kimchi-bridge") || fail 'Refusing to replace an unmanaged kimchi-bridge binary.'
+  case "$existing" in "$prefix/releases/"*/bin/kimchi-bridge) ;; *) fail 'Refusing to replace an unmanaged kimchi-bridge link.' ;; esac
 fi
 mkdir "$prefix/install.lock" 2>/dev/null || fail "Another installer is running ($prefix/install.lock)."
 trap 'rmdir "$prefix/install.lock"' EXIT
-# A client's receipt names its registered marketplace, which changes only with the plugin
-# wiring. Receipts from earlier releases name the version their marketplace was named after.
+# A client's receipt names its registered marketplace, kimchi-bridge-<hash>, which changes only
+# with the plugin wiring. Earlier releases registered kimchi-work-<hash> or kimchi-work-<version>,
+# and their receipts name that version; cleanup still removes those registrations.
 market_of() { if valid_version "$1"; then printf 'kimchi-work-%s' "${1//./-}"; else printf '%s' "$1"; fi; }
 valid_market() {
-  case "$1" in kimchi-work-*) ;; *) return 1 ;; esac
-  case "${1#kimchi-work-}" in ""|*[!0123456789abcdefghijklmnopqrstuvwxyz-]*) return 1 ;; esac
+  local name
+  case "$1" in kimchi-bridge-*) name=${1#kimchi-bridge-} ;; kimchi-work-*) name=${1#kimchi-work-} ;; *) return 1 ;; esac
+  case "$name" in ""|*[!0123456789abcdefghijklmnopqrstuvwxyz-]*) return 1 ;; esac
 }
 remove_market() {
   local cli=$1 market selector output
@@ -80,13 +82,13 @@ if [[ "$action" == uninstall ]]; then
       rm -- "$state"
     done
   done
-  if [[ ! -f "$prefix/installed/claude" && ! -f "$prefix/installed/codex" && -x "$bin_dir/kimchi-adapters" ]]; then "$bin_dir/kimchi-adapters" disable; fi
+  if [[ ! -f "$prefix/installed/claude" && ! -f "$prefix/installed/codex" && -x "$bin_dir/kimchi-bridge" ]]; then "$bin_dir/kimchi-bridge" disable; fi
   printf '%s\n' 'Selected plugins removed. Reporting credentials, ledger and release files are retained.'
   exit 0
 fi
 
 script_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-[[ -f "$script_root/VERSION" && -f "$script_root/lib/kimchi-adapters.mjs" ]] || fail 'Kimchi installs and updates the plugins: run the Kimchi installer.'
+[[ -f "$script_root/VERSION" && -f "$script_root/lib/kimchi-bridge.mjs" ]] || fail 'Kimchi installs and updates the plugins: run the Kimchi installer.'
 version=$(cat "$script_root/VERSION")
 [[ -z "$requested" || "$requested" == "$version" ]] || fail 'Requested version differs from this package.'
 valid_version "$version" || fail 'Invalid package version.'
@@ -105,10 +107,10 @@ fi
 # one rename: a running hook sees the old or the new target.
 ln -s "$runtime" "$prefix/.runtime.$$"
 mv -f -- "$prefix/.runtime.$$" "$prefix/runtime"
-ln -s "$target/lib/kimchi-adapters.mjs" "$prefix/.current.$$"
+ln -s "$target/lib/kimchi-bridge.mjs" "$prefix/.current.$$"
 mv -f -- "$prefix/.current.$$" "$prefix/current.mjs"
-ln -s "$target/bin/kimchi-adapters" "$bin_dir/.kimchi-adapters.new.$$"
-mv -f -- "$bin_dir/.kimchi-adapters.new.$$" "$bin_dir/kimchi-adapters"
+ln -s "$target/bin/kimchi-bridge" "$bin_dir/.kimchi-bridge.new.$$"
+mv -f -- "$bin_dir/.kimchi-bridge.new.$$" "$bin_dir/kimchi-bridge"
 registered=
 for cli in "${clients[@]}"; do
   market=$(cat "$script_root/markets/$cli")
@@ -142,7 +144,7 @@ for cli in "${clients[@]}"; do
 done
 # Saving the settings drops what earlier releases kept there (their reporting key), which also
 # stops an earlier release's resident daemon.
-"$bin_dir/kimchi-adapters" activate
+"$bin_dir/kimchi-bridge" activate
 # Written last, and only once every added client has this package's registration, so Kimchi's
 # next update retries a client whose registration failed.
 current=1
@@ -153,8 +155,8 @@ if [[ -n "$current" ]]; then
   printf '%s\n' "$version" > "$prefix/installed/code.new"
   mv -- "$prefix/installed/code.new" "$prefix/installed/code"
 fi
-# Keep the bootstrap, rather than a package-bound script, for kimchi-adapters uninstall.
+# Keep the bootstrap, rather than a package-bound script, for kimchi-bridge uninstall.
 cp "$target/bootstrap.sh" "$prefix/install.sh"
 chmod 700 "$prefix/install.sh"
-printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-adapters status" 'Existing inference and enterprise telemetry settings are unchanged.'
+printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-bridge status" 'Existing inference and enterprise telemetry settings are unchanged.'
 [[ -z "$registered" ]] || printf '%s\n' 'Start a new Claude Code or Codex session; Codex asks you to trust the hooks.'
