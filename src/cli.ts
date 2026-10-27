@@ -23,6 +23,7 @@ import { flush, flushOtlp } from "./work/delivery.ts";
 import { Store } from "./work/ledger.ts";
 import { encodeEvent, eventKind, parseJson, stringifyJson } from "./work/protocol.ts";
 import { sync } from "./work/sync.ts";
+import { cliEntry } from "./platform.ts";
 
 declare const BUILD_VERSION: string | undefined;
 const version = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev";
@@ -150,7 +151,7 @@ export async function run(
     if (detached) {
       const child = Bun.spawn(
         [
-          process.execPath,
+          ...cliEntry(),
           "login",
           "--foreground",
           ...args.slice(1).filter((arg) => arg !== "--detached"),

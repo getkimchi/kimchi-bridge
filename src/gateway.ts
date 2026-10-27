@@ -19,9 +19,8 @@ import type { Config } from "./settings.ts";
 import { stateRoot } from "./settings.ts";
 import type { SignIn } from "./kimchi.ts";
 import { baseUrl } from "./kimchi.ts";
-import { lockSync } from "./platform.ts";
+import { cliEntry, lockSync } from "./platform.ts";
 import {
-  bearerToken,
   endpointsForCredential,
   ensureFresh,
   gatewayHeaders,
@@ -457,7 +456,7 @@ function systemdUnitPath(): string {
   return join(homeDir(), ".config", "systemd", "user", "kimchi-bridge-gateway.service");
 }
 
-function installService(binary: string): "launchd" | "systemd" | null {
+function installService(entry: string[]): "launchd" | "systemd" | null {
   if (serviceEnvOff()) return null;
   if (process.platform === "darwin") {
     try {
@@ -468,7 +467,7 @@ function installService(binary: string): "launchd" | "systemd" | null {
   <key>Label</key><string>${SERVICE_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${binary}</string>
+${entry.map((part) => `    <string>${part}</string>`).join("\n")}
     <string>gateway</string>
     <string>run</string>
   </array>
@@ -501,7 +500,7 @@ function installService(binary: string): "launchd" | "systemd" | null {
 Description=Kimchi bridge LLM gateway proxy
 
 [Service]
-ExecStart=${binary} gateway run
+ExecStart=${entry.join(" ")} gateway run
 Restart=always
 
 [Install]
@@ -582,7 +581,7 @@ function log(line: string): void {
 }
 
 function spawnDaemon(): void {
-  const child = Bun.spawn([process.execPath, "gateway", "run"], {
+  const child = Bun.spawn([...cliEntry(), "gateway", "run"], {
     stdin: "ignore",
     stdout: "ignore",
     stderr: "ignore",
@@ -921,7 +920,7 @@ export async function enable(
   } else if (proxyMode) {
     const outcome = await ensure();
     daemon = outcome === "running" || outcome === "started" ? outcome : "off";
-    service = installService(process.execPath);
+    service = installService(cliEntry());
   } else {
     stop();
   }
