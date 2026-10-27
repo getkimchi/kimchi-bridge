@@ -1,6 +1,6 @@
 # Kimchi PR-cost plugins
 
-Plugins for the official Claude Code and Codex CLIs. They record the token usage of your coding sessions, link it to the pull requests that contain your changes and upload it to Cast AI with your Kimchi sign-in. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
+Plugins for the official Claude Code and Codex CLIs. They record the token usage of your coding sessions, link it to the pull requests that contain your changes and upload it to your Kimchi account. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
 
 ## Install
 
@@ -80,8 +80,8 @@ Claude Code and Codex hooks run the plugins' code on Kimchi's own runtime (`BUN_
 
 Records are saved in SQLite databases under `~/.local/state/kimchi-bridge`, one for each account. The plugins keep no key: they read Kimchi's sign-in each time they upload. File copies never leave your machine. While recording is on, copies older than seven days are deleted.
 
-A background sync uploads new records to the Cast AI API when a session starts, after each turn and every 30 seconds while Claude Code is open. Records that fail to upload stay queued for the next sync. Nothing runs while the clients are closed.
+A background sync uploads new records to the Kimchi API when a session starts, after each turn and every 30 seconds while Claude Code is open. Records that fail to upload stay queued for the next sync. Nothing runs while the clients are closed.
 
 Uploads contain IDs, timestamps, token counts, model names, tool names and outcomes, commit IDs, repository names, pull request numbers, titles and links, `New work:` titles, and issue keys found in titles and branch names. They don't contain prompts, replies, code, file contents, file paths, or tool inputs and outputs.
 
-Cast AI prices the usage and shows the cost of each pull request in the Kimchi console, under Reporting → PR costs.
+Kimchi prices the usage and shows the cost of each pull request in the Kimchi console, under Reporting → PR costs.

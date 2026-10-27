@@ -226,7 +226,7 @@ test("nested 413 splits keep event revisions and survive accepted-but-lost respo
   }
 });
 
-test("OTLP partial failure retries independently without Cast credentials", async () => {
+test("OTLP partial failure retries independently without Kimchi credentials", async () => {
   const s = store();
   s.put(event());
   const bodies: string[] = [];
@@ -234,7 +234,7 @@ test("OTLP partial failure retries independently without Cast credentials", asyn
     expect(req.headers.get("authorization")).toBe("Bearer customer-only");
     expect(req.headers.get("x-api-key")).toBeNull();
     bodies.push(await req.text());
-    expect(bodies.at(-1)).not.toContain("cast-only-secret");
+    expect(bodies.at(-1)).not.toContain("kimchi-only-secret");
     expect(JSON.parse(bodies.at(-1)!).resourceLogs[0].scopeLogs[0].logRecords[0].timeUnixNano).toBe(
       "1792758645123456789",
     );
@@ -246,7 +246,7 @@ test("OTLP partial failure retries independently without Cast credentials", asyn
     apiUrl,
     organizationId: randomUUID(),
     actorId: randomUUID(),
-    credentialHash: credentialHash({ apiUrl, token: "cast-only-secret" }),
+    credentialHash: credentialHash({ apiUrl, token: "kimchi-only-secret" }),
     otlpUrl: apiUrl + "/v1/logs",
     otlpHeaders: { Authorization: "Bearer customer-only" },
   };

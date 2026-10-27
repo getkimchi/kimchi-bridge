@@ -79,7 +79,7 @@ function ack(b: Batch): Acknowledgement {
 }
 function account(actor: string = randomUUID(), key = "kimchi-key"): Config {
   return {
-    apiUrl: "https://api.cast.ai",
+    apiUrl: "https://app.kimchi.dev/api",
     organizationId: "11111111-1111-1111-1111-111111111111",
     actorId: actor,
     credentialHash: createHash("sha256").update(key).digest("hex"),

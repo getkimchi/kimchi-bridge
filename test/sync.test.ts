@@ -62,7 +62,7 @@ test("sync honors cancellation and disabled capture", async () => {
   abort.abort();
   await expect(sync(signedOut, abort.signal)).rejects.toThrow();
   saveConfig({ disabled: true });
-  await sync({ apiUrl: "https://api.cast.ai", token: "never-verified" });
+  await sync({ apiUrl: "https://app.kimchi.dev/api", token: "never-verified" });
   expect(existsSync(join(stateDir({}), "worker.lock"))).toBe(false);
 });
 
@@ -181,7 +181,7 @@ test("configure sets only OTLP export, keeps the disable state, and refuses keys
   expect(c.disabled).toBe(true);
   expect(output).toBe("OTLP export configured.\n");
   await expect(
-    cli(["configure"], stdin({ apiUrl: "https://api.cast.ai", apiKey: "synthetic-key" })),
+    cli(["configure"], stdin({ apiUrl: "https://app.kimchi.dev/api", apiKey: "synthetic-key" })),
   ).rejects.toThrow("Kimchi's sign-in");
   await expect(cli(["login"])).rejects.toThrow("unknown command");
 });
@@ -215,10 +215,13 @@ test("hook stores synchronously without spawning a worker and session stays in i
   }
   expect(existsSync(join(original, "worker.lock"))).toBe(false);
   const c: Config = {
-    apiUrl: "https://api.cast.ai",
+    apiUrl: "https://app.kimchi.dev/api",
     organizationId: randomUUID(),
     actorId: randomUUID(),
-    credentialHash: credentialHash({ apiUrl: "https://api.cast.ai", token: "synthetic-key" }),
+    credentialHash: credentialHash({
+      apiUrl: "https://app.kimchi.dev/api",
+      token: "synthetic-key",
+    }),
   };
   saveConfig(c);
   expect(sessionStateDir(c, "codex", "session")).toBe(original);
