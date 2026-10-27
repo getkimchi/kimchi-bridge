@@ -192,6 +192,43 @@ test("native counter normalization stays strict and never turns absent counters 
   expect(store.events().some((e) => e.usage)).toBe(false);
 });
 
+test("Codex calls through Kimchi's gateway provider are Kimchi's", () => {
+  for (const [provider, want] of [
+    ["kimchi", "castai"],
+    ["openai", "unknown"],
+  ]) {
+    const { root, store, recorder } = fixture(),
+      path = join(root, "rollout.jsonl");
+    prompt(recorder, root, "turn");
+    const at = "2026-10-23T12:30:40.123456789Z";
+    const records = [
+      {
+        type: "session_meta",
+        timestamp: at,
+        payload: { cli_version: "0.164.0", model_provider: provider },
+      },
+      { type: "turn_context", timestamp: at, payload: { turn_id: "turn", model: "gpt-5.4" } },
+      {
+        type: "event_msg",
+        timestamp: at,
+        payload: {
+          type: "token_count",
+          info: {
+            last_token_usage: { input_tokens: 31, output_tokens: 5 },
+            total_token_usage: { input_tokens: 31, output_tokens: 5 },
+          },
+        },
+      },
+    ];
+    writeFileSync(path, records.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    recorder.record({ event: callback(root, { transcript_path: path }) });
+    recorder.recoverContext();
+    const usage = store.events().filter((e) => e.usage);
+    expect(usage).toHaveLength(1);
+    expect(usage[0]!.usage!.observedRoute).toBe(want!);
+  }
+});
+
 test("model callbacks register native transcript/version without running recovery or changing financial records", () => {
   const { root, store, recorder } = fixture(),
     path = join(root, "rollout.jsonl");

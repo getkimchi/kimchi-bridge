@@ -14,6 +14,7 @@ import {
   type RawUsage,
   type Usage,
 } from "./protocol.ts";
+import { gatewayPort, KIMCHI_PROVIDER, loadGatewayState } from "../gateway.ts";
 import { checkSignal } from "../platform.ts";
 import type { Recorder, Scope } from "./capture.ts";
 
@@ -187,6 +188,8 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
   if (r.source === "codex" && str(v, "type") === "session_meta") {
     const value = str(obj(v.payload), "cli_version");
     if (value) saveSourceVersion(r, s.Session, value);
+    const provider = str(obj(v.payload), "model_provider");
+    if (provider) r.store.setMeta(`provider:${t.path}`, provider);
     return;
   }
   if (r.source === "claude-code" && !["user", "assistant"].includes(str(v, "type"))) return;
@@ -219,7 +222,8 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
       channel: "transcript",
       schema: "openai-responses-v1",
       counterScope: "request",
-      observedRoute: t.route,
+      // Kimchi's gateway bills calls made through the provider kimchi-bridge's gateway command adds.
+      observedRoute: r.store.meta(`provider:${t.path}`) === KIMCHI_PROVIDER ? "castai" : t.route,
       billingBasis: t.basis,
       correlation: s.Turn ? "native_transcript_turn" : "session_only",
       provider: "openai",
@@ -362,15 +366,29 @@ export function route(source: string): string {
   )
     return "cloud-provider";
   if (!process.env.ANTHROPIC_BASE_URL) return "provider-api";
-  let host: string;
+  let url: URL;
   try {
-    host = new URL(process.env.ANTHROPIC_BASE_URL).hostname.toLowerCase();
+    url = new URL(process.env.ANTHROPIC_BASE_URL);
   } catch {
     return "unknown";
   }
+  const host = url.hostname.toLowerCase();
   if (host === "api.anthropic.com") return "provider-api";
   if (["cast.ai", "kimchi.dev"].some((d) => host === d || host.endsWith(`.${d}`))) return "castai";
+  if (kimchiProxy(url)) return "castai";
   return host ? "customer-gateway" : "unknown";
+}
+// kimchi-bridge's gateway proxy listens on loopback and forwards every call to Kimchi's gateway.
+function kimchiProxy(url: URL): boolean {
+  if (!["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) return false;
+  try {
+    const state = loadGatewayState();
+    return (
+      state.enabled === true && state.mode !== "direct" && Number(url.port) === gatewayPort(state)
+    );
+  } catch {
+    return false;
+  }
 }
 function requestEntity(response: string, request: string): string {
   return request ? `request:${request}` : `response:${response}`;

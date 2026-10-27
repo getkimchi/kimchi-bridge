@@ -35,7 +35,7 @@ const DEFAULT_PORT = 8766;
 const PORT_SCAN_SPAN = 10;
 const HEALTH_PATH = "/healthz";
 const HEALTH_MARKER = "kimchi-bridge-gateway";
-const KIMCHI_PROVIDER = "kimchi";
+export const KIMCHI_PROVIDER = "kimchi";
 const CODEX_PROVIDER_NAME = "Kimchi Gateway";
 /** Placeholder bearer for proxy mode; the proxy replaces it per request. */
 const PROXY_PLACEHOLDER = "kimchi-gateway";

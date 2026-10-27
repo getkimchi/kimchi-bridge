@@ -547,6 +547,34 @@ test("PR refresh revises lifecycle while retaining one exact commit membership l
   ).toBe(1);
 });
 
+test("calls through kimchi-bridge's gateway proxy are Kimchi's", () => {
+  const before = { url: process.env.ANTHROPIC_BASE_URL, home: process.env.KIMCHI_BRIDGE_HOME };
+  const root = mkdtempSync(join(tmpdir(), "kimchi-gateway-route-"));
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  process.env.KIMCHI_BRIDGE_HOME = root;
+  const state = (value: object) => writeFileSync(join(root, "gateway.json"), JSON.stringify(value));
+  try {
+    process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:8799/anthropic";
+    expect(route("claude-code")).toBe("customer-gateway");
+    state({ enabled: true, mode: "proxy", port: 8799 });
+    expect(route("claude-code")).toBe("castai");
+    process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:8800/anthropic";
+    expect(route("claude-code")).toBe("customer-gateway");
+    process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:8799/anthropic";
+    state({ enabled: true, mode: "direct", port: 8799 });
+    expect(route("claude-code")).toBe("customer-gateway");
+    state({ enabled: false, mode: "proxy", port: 8799 });
+    expect(route("claude-code")).toBe("customer-gateway");
+  } finally {
+    for (const [key, value] of [
+      ["ANTHROPIC_BASE_URL", before.url],
+      ["KIMCHI_BRIDGE_HOME", before.home],
+    ] as const)
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+  }
+});
+
 test("route matching respects DNS boundaries", () => {
   const before = process.env.ANTHROPIC_BASE_URL;
   try {
