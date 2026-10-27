@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Private release bootstrap and native plugin management. No inference settings.
+# Native plugin management for the package in Kimchi's release. No inference settings.
 umask 077
-repo=getkimchi/kimchi-adapters
 prefix=${KIMCHI_ADAPTERS_PREFIX:-"$HOME/.local/share/kimchi-adapters"}
 bin_dir=${KIMCHI_ADAPTERS_BIN_DIR:-"$HOME/.local/bin"}
 action=${1:-install}
@@ -39,9 +38,7 @@ if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-adapters" || -L "$bin_dir/
   case "$existing" in "$prefix/releases/"*/bin/kimchi-adapters) ;; *) fail 'Refusing to replace an unmanaged kimchi-adapters link.' ;; esac
 fi
 mkdir "$prefix/install.lock" 2>/dev/null || fail "Another installer is running ($prefix/install.lock)."
-temp=
-cleanup() { [[ -z "$temp" ]] || rm -rf -- "$temp"; rmdir "$prefix/install.lock"; }
-trap cleanup EXIT
+trap 'rmdir "$prefix/install.lock"' EXIT
 market_name() { printf 'kimchi-work-%s' "${1//./-}"; }
 remove_version() {
   local cli=$1 version=$2 market selector output
@@ -78,36 +75,11 @@ fi
 
 for cli in "${clients[@]}"; do "$cli" plugin --help >/dev/null || fail "$cli does not support native plugins. Update the official CLI."; done
 script_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [[ -f "$script_root/VERSION" && -x "$script_root/bin/kimchi-adapters" ]]; then
-  version=$(cat "$script_root/VERSION")
-  [[ -z "$requested" || "$requested" == "$version" ]] || fail 'Requested version differs from this package.'
-  valid_version "$version" || fail 'Invalid package version.'
-  package=$script_root
-else
-  command -v gh >/dev/null || fail 'Private releases require GitHub CLI. Install gh and run gh auth login.'
-  version=$requested
-  [[ -n "$version" ]] || version=$(gh release list --repo "$repo" --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')
-  valid_version "$version" || fail 'Specify a release such as v0.1.0-rc.1.'
-  case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) fail 'Supported platforms: macOS and Linux.' ;; esac
-  case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=amd64 ;; *) fail 'Supported CPUs: arm64 and amd64.' ;; esac
-  asset="kimchi-adapters_${os}_${arch}.tar.gz"
-  temp=$(mktemp -d "$prefix/.download.XXXXXXXX")
-  gh release download "$version" --repo "$repo" --dir "$temp" --pattern "$asset" --pattern SHA256SUMS
-  expected=$(awk -v asset="$asset" '$2 == asset { print $1 }' "$temp/SHA256SUMS")
-  case "$expected" in *[!0123456789abcdef]*) fail 'Missing release checksum.' ;; esac
-  [[ ${#expected} -eq 64 ]] || fail 'Missing release checksum.'
-  if command -v sha256sum >/dev/null; then actual=$(sha256sum "$temp/$asset" | awk '{print $1}'); else actual=$(shasum -a 256 "$temp/$asset" | awk '{print $1}'); fi
-  [[ "$expected" == "$actual" ]] || fail 'Release checksum mismatch.'
-  tar -tzf "$temp/$asset" > "$temp/entries" || fail 'Unsafe release archive listing.'
-  while IFS= read -r entry; do
-    case "$entry" in /*|..|../*|*/../*|*/..) fail 'Unsafe release archive path.' ;; esac
-  done < "$temp/entries"
-  tar -tvzf "$temp/$asset" | awk 'substr($1,1,1)!="-" && substr($1,1,1)!="d" {bad=1} END {exit bad}' || fail 'Release archive contains links or special files.'
-  mkdir "$temp/package"
-  tar -xzf "$temp/$asset" -C "$temp/package"
-  [[ "$(cat "$temp/package/VERSION")" == "$version" ]] || fail 'Release version mismatch.'
-  package="$temp/package"
-fi
+[[ -f "$script_root/VERSION" && -x "$script_root/bin/kimchi-adapters" ]] || fail 'Kimchi installs and updates the plugins: run the Kimchi installer.'
+version=$(cat "$script_root/VERSION")
+[[ -z "$requested" || "$requested" == "$version" ]] || fail 'Requested version differs from this package.'
+valid_version "$version" || fail 'Invalid package version.'
+package=$script_root
 
 target="$prefix/releases/$version"
 mkdir -p "$prefix/releases"
@@ -148,19 +120,8 @@ for cli in "${clients[@]}"; do
 done
 ln -s "$target/bin/kimchi-adapters" "$bin_dir/.kimchi-adapters.new.$$"
 mv -f -- "$bin_dir/.kimchi-adapters.new.$$" "$bin_dir/kimchi-adapters"
-# Keep the bootstrap, rather than a package-bound script, for future updates.
+# Keep the bootstrap, rather than a package-bound script, for kimchi-adapters uninstall.
 cp "$target/bootstrap.sh" "$prefix/install.sh"
 chmod 700 "$prefix/install.sh"
 "$bin_dir/kimchi-adapters" activate
-if configured=$("$bin_dir/kimchi-adapters" login --from-kimchi --if-present); then
-  if [[ -n "$configured" ]]; then
-    printf '%s\n' "$configured"
-  elif [[ -t 1 ]]; then
-    "$bin_dir/kimchi-adapters" login || fail "Plugins installed; reporting login was not completed. Run $bin_dir/kimchi-adapters login to retry."
-  else
-    printf '%s\n' "Sign in once: $bin_dir/kimchi-adapters login (opens the same key-creation flow as Kimchi)."
-  fi
-else
-  fail "Plugins installed; the saved Kimchi login could not be verified. Run $bin_dir/kimchi-adapters login to create a reporting key."
-fi
-printf '%s\n' "Installed $client $version. Start a new client session and accept its plugin trust prompt." "Control: $bin_dir/kimchi-adapters status" 'Existing inference and enterprise telemetry settings are unchanged.'
+printf '%s\n' "Installed $client $version. Start a new client session and accept its plugin trust prompt." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-adapters status" 'Existing inference and enterprise telemetry settings are unchanged.'

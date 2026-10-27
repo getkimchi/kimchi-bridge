@@ -33,7 +33,15 @@ import {
   type Batch,
   type Event,
 } from "../src/protocol";
-import { Decode, Load, Root, Save, SessionStateDir, StateDir, type Config } from "../src/settings";
+import {
+  DecodeOTLP,
+  Load,
+  Root,
+  Save,
+  SessionStateDir,
+  StateDir,
+  type Config,
+} from "../src/settings";
 
 const inputs = JSON.parse(
   readFileSync(new URL("./fixtures/event-inputs.json", import.meta.url), "utf8"),
@@ -74,12 +82,8 @@ function account(actor = NewID(), key = "kimchi-key"): Config {
   return {
     apiUrl: "https://api.cast.ai",
     organizationId: "11111111-1111-1111-1111-111111111111",
-    apiKey: key,
     actorId: actor,
-    credentialHash: createHash("sha256")
-      .update("\0" + key)
-      .digest("hex"),
-    enabled: true,
+    credentialHash: createHash("sha256").update(key).digest("hex"),
   };
 }
 afterEach(() => {
@@ -286,15 +290,23 @@ describe("durable evidence and account pins", () => {
     expect(basename(SessionStateDir(c, "codex", "legacy"))).toBe(old);
     expect(basename(SessionStateDir(c, "claude-code", "legacy"))).toBe(basename(before));
   });
-  test("private atomic config saves preserve activation and decode discards selectors", () => {
+  test("private atomic config saves preserve activation, drop an old stored key and decode only OTLP", () => {
     process.env.KIMCHI_ADAPTERS_HOME = temp();
     const c = { ...account(), runtimeExecutable: "/managed/runtime", runtimeRevision: NewID() };
-    Save(c);
+    Save({ ...c, apiKey: "earlier-release-key", enabled: true } as Config);
     expect(Load()).toEqual(c);
+    expect(readFileSync(join(Root(), "config.json"), "utf8")).not.toContain("earlier-release-key");
     expect(statSync(join(Root(), "config.json")).mode & 0o777).toBe(0o600);
-    const decoded = Decode(JSON.stringify(c));
-    expect(decoded.runtimeExecutable).toBeUndefined();
-    expect(decoded.runtimeRevision).toBeUndefined();
-    expect(() => Decode("x".repeat((32 << 10) + 1))).toThrow("too large");
+    const decoded = DecodeOTLP(
+      JSON.stringify({ otlpUrl: "https://collector.example/v1/logs", runtimeExecutable: "/x" }),
+    );
+    expect(decoded).toEqual({
+      otlpUrl: "https://collector.example/v1/logs",
+      otlpHeaders: undefined,
+    });
+    expect(() => DecodeOTLP("x".repeat((32 << 10) + 1))).toThrow("too large");
+    expect(() => DecodeOTLP(JSON.stringify({ otlpUrl: "http://collector.example" }))).toThrow(
+      "HTTPS",
+    );
   });
 });

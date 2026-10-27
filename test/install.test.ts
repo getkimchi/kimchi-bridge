@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -41,72 +40,6 @@ function environment(root: string, bin: string): Record<string, string> {
 }
 afterEach(() => {
   for (const root of dirs.splice(0)) rmSync(root, { recursive: true, force: true });
-});
-
-describe("release bootstrap rejects untrusted archives", () => {
-  for (const kind of ["checksum", "traversal", "symlink"] as const)
-    test(kind, async () => {
-      const root = temp(),
-        bin = join(root, "fake-bin");
-      mkdirSync(bin);
-      const os = process.platform === "darwin" ? "darwin" : "linux",
-        arch = process.arch === "arm64" ? "arm64" : "amd64";
-      const name = `kimchi-adapters_${os}_${arch}.tar.gz`,
-        asset = join(root, name),
-        env = environment(root, bin);
-      if (kind === "symlink") {
-        const files = join(root, "files");
-        mkdirSync(files);
-        symlinkSync(join(root, "unowned"), join(files, "link"));
-        const tar = spawnSync("tar", ["-czf", asset, "-C", files, "link"], {
-          env,
-          encoding: "utf8",
-        });
-        expect(tar.status).toBe(0);
-      } else {
-        // Use Bun's native archive writer instead of implementing tar headers.
-        const Archive = (
-          Bun as unknown as {
-            Archive: new (files: Record<string, string>) => { bytes(): Promise<Uint8Array> };
-          }
-        ).Archive;
-        const archive = new Archive({ "../escaped": "x" });
-        writeFileSync(asset, Bun.gzipSync(Uint8Array.from(await archive.bytes())));
-      }
-      const hash =
-        kind === "checksum"
-          ? "0".repeat(64)
-          : createHash("sha256").update(readFileSync(asset)).digest("hex");
-      const sums = join(root, "SHA256SUMS");
-      writeFileSync(sums, `${hash}  ${name}\n`);
-      executable(
-        join(bin, "gh"),
-        `#!/bin/sh
-if [ "$1" = release ] && [ "$2" = list ]; then printf '%s\\n' v0.1.0-rc.5;exit 0;fi
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = --dir ]; then dest=$2;shift 2;else shift;fi
-done
-cp "$FIXTURE_ASSET" "$dest/$FIXTURE_NAME"
-cp "$FIXTURE_SUMS" "$dest/SHA256SUMS"
-`,
-      );
-      executable(join(bin, "claude"), "#!/bin/sh\nexit 0\n");
-      const result = run(installer, ["install", "claude"], {
-        ...env,
-        FIXTURE_ASSET: asset,
-        FIXTURE_SUMS: sums,
-        FIXTURE_NAME: name,
-      });
-      expect(result.status).not.toBe(0);
-      const expected = {
-        checksum: "checksum mismatch",
-        traversal: "Unsafe release archive",
-        symlink: "links or special files",
-      }[kind];
-      expect(result.output).toContain(expected);
-      expect(existsSync(join(root, "escaped"))).toBe(false);
-      expect(existsSync(join(root, "install", "releases"))).toBe(false);
-    });
 });
 
 describe("updates retry durable previous-version cleanup", () => {
@@ -185,51 +118,25 @@ exit 0
     });
 });
 
-describe("installer reporting sign-in", () => {
-  for (const mode of ["configured", "missing", "failed"] as const)
-    test(mode, () => {
-      const root = temp(),
-        bin = join(root, "fake-bin"),
-        pkg = join(root, "package"),
-        env = environment(root, bin);
-      for (const path of [bin, join(pkg, "bin")]) mkdirSync(path, { recursive: true });
-      for (const name of ["install.sh", "bootstrap.sh"])
-        writeFileSync(join(pkg, name), readFileSync(installer));
-      writeFileSync(join(pkg, "VERSION"), "v0.2.0\n");
-      executable(join(bin, "claude"), "#!/bin/sh\nexit 0\n");
-      executable(
-        join(pkg, "bin/kimchi-adapters"),
-        `#!/bin/sh
-printf '%s\\n' "$*" >> "$FIXTURE_HELPER_CALLS"
-if [ "$1" = login ] && [ "$2" = --from-kimchi ]; then
-  case "$FIXTURE_LOGIN" in
-    configured) printf '%s\\n' 'Reporting configured with your Kimchi API key.' ;;
-    failed) printf '%s\\n' 'Reporting key could not be verified' >&2; exit 1 ;;
-  esac
-fi
-`,
-      );
-      const calls = join(root, "helper-calls");
-      const result = run(join(pkg, "install.sh"), ["install", "claude"], {
-        ...env,
-        FIXTURE_LOGIN: mode,
-        FIXTURE_HELPER_CALLS: calls,
-      });
-      expect(readFileSync(calls, "utf8").split("\n").filter(Boolean)).toEqual([
-        "activate",
-        "login --from-kimchi --if-present",
-      ]);
-      expect(existsSync(join(root, "install/installed/claude"))).toBe(true);
-      if (mode === "failed") {
-        expect(result.status).not.toBe(0);
-        expect(result.output).toContain(
-          "Plugins installed; the saved Kimchi login could not be verified",
-        );
-      } else {
-        expect(result.status).toBe(0);
-        expect(result.output).toContain(
-          mode === "configured" ? "Reporting configured" : "Sign in once:",
-        );
-      }
-    });
+test("installer activates the helper and reports with Kimchi's sign-in", () => {
+  const root = temp(),
+    bin = join(root, "fake-bin"),
+    pkg = join(root, "package"),
+    env = environment(root, bin);
+  for (const path of [bin, join(pkg, "bin")]) mkdirSync(path, { recursive: true });
+  for (const name of ["install.sh", "bootstrap.sh"])
+    writeFileSync(join(pkg, name), readFileSync(installer));
+  writeFileSync(join(pkg, "VERSION"), "v0.2.0\n");
+  executable(join(bin, "claude"), "#!/bin/sh\nexit 0\n");
+  const calls = join(root, "helper-calls");
+  executable(join(pkg, "bin/kimchi-adapters"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${calls}"\n`);
+  const result = run(join(pkg, "install.sh"), ["install", "claude"], env);
+  expect(result.status).toBe(0);
+  expect(result.output).toContain("Reports with your Kimchi sign-in");
+  expect(readFileSync(calls, "utf8")).toBe("activate\n");
+  expect(readFileSync(join(root, "install/installed/claude"), "utf8")).toBe("v0.2.0\n");
+  // The kept bootstrap can uninstall, but only Kimchi's release installs or updates.
+  const update = run(join(root, "install/install.sh"), ["update", "claude"], env);
+  expect(update.status).not.toBe(0);
+  expect(update.output).toContain("run the Kimchi installer");
 });

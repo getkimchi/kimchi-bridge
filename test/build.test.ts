@@ -45,7 +45,10 @@ test("compiled helper ignores project dotenv and bunfig configuration", async ()
     });
     expect(result.exitCode).toBe(0);
     expect(result.stderr.toString()).toBe("");
-    expect(JSON.parse(result.stdout.toString()).ledger).toBe(join(state, "accounts/local"));
+    expect(JSON.parse(result.stdout.toString())).toMatchObject({
+      ledger: join(state, "accounts/local"),
+      kimchiSignedIn: false,
+    });
     expect(existsSync(redirect)).toBe(false);
     expect(existsSync(canary)).toBe(false);
     const withoutOverride = Bun.spawnSync([helper, "status"], {
@@ -65,8 +68,8 @@ test("compiled helper ignores project dotenv and bunfig configuration", async ()
   }
 }, 15000);
 
-test("compiled standalone login completes the browser callback without changing inference", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pr-cost-login-compiled-"));
+test("compiled helper reports with Kimchi's sign-in and leaves Kimchi's settings unchanged", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pr-cost-sign-in-compiled-"));
   const key = "synthetic-key-not-a-credential";
   const user = "11111111-1111-4111-8111-111111111111";
   const org = "22222222-2222-4222-8222-222222222222";
@@ -74,74 +77,75 @@ test("compiled standalone login completes the browser callback without changing 
   const api = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(request) {
-      requests.push(new URL(request.url).pathname);
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      requests.push(path);
       expect(request.headers.get("authorization")).toBe(`Bearer ${key}`);
-      return Response.json(
-        new URL(request.url).pathname.endsWith("api-keys:verify")
-          ? { organizationId: org, userId: user }
-          : { id: user, username: "fixture" },
-      );
+      if (path.endsWith("api-keys:verify"))
+        return Response.json({ organizationId: org, userId: user });
+      const batch = JSON.parse(await request.text()).batch;
+      return Response.json({
+        batchId: batch.id,
+        receipts: batch.events.map((e: { id: string; revision: string }) => ({
+          id: e.id,
+          revision: e.revision,
+          status: "accepted",
+        })),
+      });
     },
   });
-  let child: ReturnType<typeof Bun.spawn> | undefined;
   try {
     const home = join(root, "home"),
       state = join(root, "state"),
       project = join(root, "project");
-    mkdirSync(home);
+    mkdirSync(join(home, ".config", "kimchi"), { recursive: true });
     mkdirSync(project);
-    const inference = join(project, "provider-settings.json"),
-      original = '{"baseUrl":"https://woven-gateway.invalid"}\n';
-    writeFileSync(inference, original);
+    const settings = join(home, ".config", "kimchi", "config.json"),
+      original = JSON.stringify({ apiKey: key, llmEndpoint: "https://inference.invalid/keep" });
+    writeFileSync(settings, original);
     const helper = join(root, "helper");
-    await BuildHelper("login-test", helper);
-    child = Bun.spawn([helper, "login", "--no-browser"], {
-      cwd: project,
-      env: {
-        HOME: home,
-        PATH: process.env.PATH!,
-        KIMCHI_ADAPTERS_HOME: state,
-        KIMCHI_WEB_APP_URL: api.url.origin,
-        KIMCHI_REMOTE_ENDPOINT: api.url.origin,
-      },
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-      signal: AbortSignal.timeout(5000),
+    await BuildHelper("sign-in-test", helper);
+    const env = {
+      HOME: home,
+      PATH: process.env.PATH!,
+      KIMCHI_ADAPTERS_HOME: state,
+      KIMCHI_REMOTE_ENDPOINT: api.url.origin,
+    };
+    // Spawn asynchronously so this process keeps serving the fake API.
+    const run = async (args: string[], input?: object) => {
+      const child = Bun.spawn([helper, ...args], {
+        cwd: project,
+        env,
+        stdin: input ? Buffer.from(JSON.stringify(input)) : "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(await child.exited).toBe(0);
+      expect(await new Response(child.stderr).text()).toBe("");
+      return new Response(child.stdout).text();
+    };
+    const event = { session_id: "session", turn_id: "turn", cwd: project };
+    await run(["hook", "codex"], { ...event, hook_event_name: "SessionStart", source: "startup" });
+    await run(["hook", "codex"], {
+      ...event,
+      hook_event_name: "UserPromptSubmit",
+      prompt: "New work: x",
     });
-    const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
-    let output = "";
-    while (!output.includes("\n")) {
-      const next = await reader.read();
-      if (next.done) throw new Error("login exited before opening its callback");
-      output += Buffer.from(next.value).toString();
-    }
-    const launch = new URL(output.split("\n")[0]!.slice("Kimchi login: ".length));
-    expect(launch.pathname).toBe("/cli-auth");
-    const callback = new URL(launch.searchParams.get("callback")!);
-    callback.searchParams.set("state", launch.searchParams.get("state")!);
-    callback.searchParams.set("token", key);
-    const response = await fetch(callback);
-    expect(response.status).toBe(200);
-    await response.text();
-    for (;;) {
-      const next = await reader.read();
-      if (next.done) break;
-      output += Buffer.from(next.value).toString();
-    }
-    expect(await child.exited).toBe(0);
-    const error = await new Response(child.stderr as ReadableStream<Uint8Array>).text();
-    expect(error).toBe("");
-    expect(output).not.toContain(key);
-    const config = JSON.parse(readFileSync(join(state, "config.json"), "utf8"));
-    expect(config.apiKey).toBe(key);
-    expect(config.actorId).toBe(user);
-    expect(config.organizationId).toBe(org);
-    expect(requests).toEqual(["/ai-optimizer/v1beta/api-keys:verify", "/v1/me"]);
-    expect(readFileSync(inference, "utf8")).toBe(original);
+    expect(await run(["flush"])).toBe("All pending records acknowledged.\n");
+    expect(requests).toEqual([
+      "/ai-optimizer/v1beta/api-keys:verify",
+      `/ai-optimizer/v1beta/organizations/${org}/pr-cost-events:batchIngest`,
+    ]);
+    const status = JSON.parse(await run(["status"]));
+    expect(status).toMatchObject({
+      kimchiSignedIn: true,
+      reportingVerified: true,
+      organizationId: org,
+    });
+    expect(status.accounting.pending).toBe(0);
+    expect(readFileSync(join(state, "config.json"), "utf8")).not.toContain(key);
+    expect(readFileSync(settings, "utf8")).toBe(original);
   } finally {
-    child?.kill();
     api.stop(true);
     rmSync(root, { recursive: true, force: true });
   }
