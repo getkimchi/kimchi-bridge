@@ -182,6 +182,24 @@ test("partial and invalid acknowledgements retain the identical pending batch", 
   expect(new Set(bodies).size).toBe(1);
 });
 
+test("a 409 sends the batch's events again under a new batch ID", async () => {
+  const s = store();
+  s.put(event());
+  const ids: string[] = [];
+  const apiUrl = server(async (req) => {
+    const batch = parseJson(await req.text()).batch as Batch;
+    ids.push(batch.id);
+    if (ids.length === 1) return new Response(null, { status: 409 });
+    return acknowledgement(batch);
+  });
+  const [c, k] = configured(apiUrl);
+  expect(await flush(s, c, k)).toBe(true);
+  expect(await flush(s, c, k)).toBe(true);
+  expect(ids).toHaveLength(2);
+  expect(ids[1]).not.toBe(ids[0]);
+  expect(s.status().pending).toBe(0);
+});
+
 test("nested 413 splits keep event revisions and survive accepted-but-lost responses", async () => {
   for (const acceptedLarge of [false, true]) {
     const s = store(),

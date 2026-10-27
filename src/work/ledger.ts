@@ -27,7 +27,9 @@ import {
 } from "./protocol.ts";
 
 const conflictError = new Error("event identity conflicts with persisted content");
-const schemaVersion = 0x4b570001;
+const schemaVersion = 0x4b570002;
+// Ledgers up to rc.5 named a revision's base by its hash.
+const hashBaseVersion = 0x4b570001;
 const schema = `CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,entity_id TEXT NOT NULL,kind TEXT NOT NULL,body BLOB NOT NULL,hash TEXT NOT NULL,created_at INTEGER NOT NULL,acked_at INTEGER,blocked TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS pending_events ON events(acked_at,created_at);
@@ -70,7 +72,10 @@ export class Store {
           .transaction(() => {
             this.db.exec(schema);
             // Unknown future markers are not claimed by this version.
-            if (version === 0) this.db.exec(`PRAGMA user_version=${schemaVersion}`);
+            if (version === 0 || version === hashBaseVersion) {
+              this.baseByEventId();
+              this.db.exec(`PRAGMA user_version=${schemaVersion}`);
+            }
           })
           .immediate();
     } catch (e) {
@@ -80,6 +85,28 @@ export class Store {
   }
   close(): void {
     this.db.close();
+  }
+  // No server accepted an event that names its base by hash, so the base becomes the event ID in place and a
+  // frozen batch holding such a revision is rebuilt.
+  private baseByEventId(): void {
+    const rows = this.db.query("SELECT id,body FROM events").all() as any[];
+    const events = rows.map((row) => JSON.parse(bodyText(row.body)));
+    const ids = new Map(events.map((e) => [`${e.entityId}\n${e.revision}`, e.id]));
+    const update = this.db.query("UPDATE events SET body=?,hash=? WHERE id=?");
+    for (const [i, { baseHash, ...e }] of events.entries()) {
+      if (!baseHash) continue;
+      const rebased: Event = {
+        ...e,
+        baseEventId: ids.get(`${e.entityId}\n${e.baseRevision}`) ?? "",
+      };
+      update.run(Buffer.from(encodeEvent(rebased)), canonicalHash(rebased), rows[i].id);
+    }
+    for (const row of this.db.query("SELECT id,body FROM batches").all() as any[])
+      if (JSON.parse(bodyText(row.body)).events.some((e: any) => e.baseHash))
+        this.db.query("DELETE FROM batches WHERE id=?").run(row.id);
+    this.db.exec(
+      "UPDATE ledger_totals SET total_bytes=(SELECT COALESCE(SUM(length(body)),0) FROM events),pending_bytes=(SELECT COALESCE(SUM(length(body)),0) FROM events WHERE acked_at IS NULL) WHERE id=1",
+    );
   }
   private tx<T>(fn: () => T): T {
     return this.db.transaction(fn).immediate();
@@ -198,7 +225,7 @@ export class Store {
   }
   observe(input: Event): void {
     this.tx(() => {
-      const e = { ...input, revision: "1", baseRevision: "0", baseHash: "" };
+      const e = { ...input, revision: "1", baseRevision: "0", baseEventId: "" };
       const old = this.latest(e.entityId);
       if (old) {
         const neutral = (v: Event): Event => ({
@@ -206,13 +233,13 @@ export class Store {
           id: "",
           revision: "0",
           baseRevision: "0",
-          baseHash: "",
+          baseEventId: "",
           observeTime: zeroTime,
         });
         if (canonicalHash(neutral(old)) === canonicalHash(neutral(e))) return;
         e.revision = (BigInt(old.revision!) + 1n).toString();
         e.baseRevision = old.revision!;
-        e.baseHash = canonicalHash(old);
+        e.baseEventId = old.id!;
       }
       e.id = stableId(e.entityId, canonicalHash(e));
       validateEvent(e);
@@ -265,19 +292,25 @@ export class Store {
       if (
         !want.has(r.id) ||
         want.get(r.id) !== r.revision ||
-        !["accepted", "unchanged"].includes(r.status)
+        !["accepted", "unchanged", "conflict"].includes(r.status)
       )
         throw new Error("invalid event acknowledgement");
       want.delete(r.id);
     }
     if (want.size) throw new Error("missing event acknowledgement");
+    // The server kept its own revision of a conflicting event's entity: the event stays out of later batches and
+    // status counts it as blocked.
+    const conflicts = new Set(ack.receipts.filter((r) => r.status === "conflict").map((r) => r.id));
     this.tx(() => {
       for (const e of b.events)
         this.db
-          .query("UPDATE events SET acked_at=? WHERE id=? AND hash=?")
-          .run(now(), e.id!, canonicalHash(e));
+          .query("UPDATE events SET acked_at=?,blocked=? WHERE id=? AND hash=?")
+          .run(now(), conflicts.has(e.id!) ? "conflict" : "", e.id!, canonicalHash(e));
       this.db.query("DELETE FROM batches WHERE id=?").run(b.id);
     });
+  }
+  dropBatch(b: Batch): void {
+    this.db.query("DELETE FROM batches WHERE id=?").run(b.id);
   }
   splitBatch(b: Batch): void {
     if (b.events.length < 2)

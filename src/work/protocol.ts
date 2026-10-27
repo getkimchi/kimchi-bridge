@@ -146,7 +146,7 @@ export interface Event {
   entityId: string;
   revision?: string;
   baseRevision?: string;
-  baseHash?: string;
+  baseEventId?: string;
   source: string;
   sourceVersion: string;
   deviceId: string;
@@ -352,7 +352,7 @@ const schemas: Record<string, readonly Field[]> = {
     ["entityId", "s"],
     ["revision", "q"],
     ["baseRevision", "q", "empty"],
-    ["baseHash", "s", "empty"],
+    ["baseEventId", "s", "empty"],
     ["source", "s"],
     ["sourceVersion", "s"],
     ["deviceId", "s"],
@@ -612,7 +612,7 @@ export function validateEvent(e: Event): void {
     throw new Error("missing event identity");
   if (payloads.filter((k) => e[k] != null).length !== 1)
     throw new Error("exactly one typed event is required");
-  if (base !== rev - 1n || (rev > 1n && !e.baseHash)) throw new Error("invalid revision chain");
+  if (base !== rev - 1n || (rev > 1n && !e.baseEventId)) throw new Error("invalid revision chain");
   for (const id of [e.id, e.entityId, e.deviceId, e.workId, e.sessionId, e.turnId, e.agentId])
     if (Buffer.byteLength(id ?? "") > 128 || containsAny(id ?? "", "\r\n\0"))
       throw new Error("invalid identity");

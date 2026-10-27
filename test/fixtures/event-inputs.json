@@ -26,7 +26,7 @@
     "entityId": "entity-usage",
     "revision": "2",
     "baseRevision": "1",
-    "baseHash": "previous",
+    "baseEventId": "previous",
     "source": "claude-code",
     "sourceVersion": "2.1.0",
     "deviceId": "device",

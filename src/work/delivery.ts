@@ -56,6 +56,13 @@ export async function flush(
     s.splitBatch(batch);
     return true;
   }
+  // The server holds other content under this batch ID, so its events go out in a new batch.
+  if (response.status === 409) {
+    await response.body?.cancel().catch(() => {});
+    s.diagnostic("upload_batch_conflict");
+    s.dropBatch(batch);
+    return true;
+  }
   if (response.status !== 200) {
     await response.body?.cancel().catch(() => {});
     s.diagnostic(`upload_http_${response.status}`);
