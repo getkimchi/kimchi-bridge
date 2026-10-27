@@ -597,3 +597,18 @@ test("route matching respects DNS boundaries", () => {
     else process.env.ANTHROPIC_BASE_URL = before;
   }
 });
+
+test("an HTTPS remote keeps its port; an SSH remote's port is not the web host's", () => {
+  const { root } = fixture();
+  git(root, "init", "--initial-branch=main");
+  const host = (remote: string) => {
+    git(root, "remote", "remove", "origin").toString();
+    git(root, "remote", "add", "origin", remote);
+    return repository(root)[2]?.host;
+  };
+  git(root, "remote", "add", "origin", "https://example.invalid/x.git");
+  expect(host("https://ghe.example.com:8443/team/repo.git")).toBe("ghe.example.com:8443");
+  expect(host("https://ghe.example.com:443/team/repo.git")).toBe("ghe.example.com");
+  expect(host("ssh://git@ghe.example.com:2222/team/repo.git")).toBe("ghe.example.com");
+  expect(host("git@github.com:team/repo.git")).toBe("github.com");
+});

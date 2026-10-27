@@ -28,6 +28,7 @@ import {
   stringifyJson,
   validateBatch,
   validateEvent,
+  validHost,
   type Acknowledgement,
   type Batch,
   type Event,
@@ -316,4 +317,26 @@ describe("durable evidence and account pins", () => {
       "HTTPS",
     );
   });
+});
+
+test("a repository host may carry its HTTPS port, as the snapshot route accepted", () => {
+  for (const host of ["github.com", "ghe.example.com:8443", "gitlab.example.com:1", "h:65535"])
+    expect([host, validHost(host)]).toEqual([host, true]);
+  for (const host of [
+    "",
+    ":443",
+    "h:",
+    "h:0",
+    "h:08443",
+    "h:65536",
+    "h:123456",
+    "h:1:2",
+    "h:+1",
+    "h:1a",
+    "a b",
+    "h/x",
+    "u@h",
+    "h:１",
+  ])
+    expect([host, validHost(host)]).toEqual([host, false]);
 });
