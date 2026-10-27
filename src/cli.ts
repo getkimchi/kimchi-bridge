@@ -1,6 +1,13 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { IdentityError, baseUrl, credentialHash, kimchiSignIn, type SignIn } from "./kimchi.ts";
+import {
+  IdentityError,
+  baseUrl,
+  credentialHash,
+  kimchiReportingEnabled,
+  kimchiSignIn,
+  type SignIn,
+} from "./kimchi.ts";
 import {
   decodeOtlp,
   loadConfig,
@@ -64,8 +71,10 @@ function resolveSignIn(environmentKey: string | undefined): SignIn {
 // A starting session reports to the account Kimchi's sign-in verifies as. A sign-in that cannot be
 // read (Kimchi rewriting auth.json) keeps the verified account, and so does an unreachable API for
 // an SSO token of that same organization, as after a token refresh. Otherwise the account is
-// unknown, and the session stays on this machine.
+// unknown, and the session stays on this machine. So does a session that starts while Kimchi's PR
+// reporting is off.
 async function sessionAccount(c: Config, environmentKey?: string): Promise<Config> {
+  if (!kimchiReportingEnabled(c.organizationId)) return {};
   let k: SignIn;
   try {
     k = resolveSignIn(environmentKey);
@@ -312,6 +321,8 @@ export async function run(
   const k = command === "flush" || command === "status" ? signIn() : { apiUrl: "" };
   if (command === "flush") {
     if (!k.token) throw new Error("sign in to Kimchi to report; local records retained");
+    if (!kimchiReportingEnabled(c.organizationId))
+      throw new Error("Kimchi's PR reporting is off; local records retained");
     // Verify before opening the ledger, so records go only to the account this sign-in owns.
     c = await verifySignIn(k);
   }
@@ -368,6 +379,7 @@ export async function run(
             version,
             disabled: c.disabled ?? false,
             kimchiSignedIn: Boolean(k.token),
+            kimchiReporting: kimchiReportingEnabled(c.organizationId),
             reportingVerified: Boolean(k.token) && c.credentialHash === credentialHash(k),
             signInSource: environmentKey
               ? "key"

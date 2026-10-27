@@ -65,6 +65,8 @@ kimchi-bridge gateway disable
 
 A session reports to the account the sign-in verified when the session started. Sessions that start while signed out stay on your machine and are never uploaded.
 
+The plugins also follow Kimchi's PR reporting setting. If you turn it off with `/pr-reporting off` in Kimchi, turn off Kimchi's telemetry, or your organization turns usage reporting off, the plugins upload nothing, and sessions that start meanwhile stay on your machine. `kimchi-bridge status` shows the setting as `kimchiReporting`.
+
 ### Check and control reporting
 
 | Command | What it does |

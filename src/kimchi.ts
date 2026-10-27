@@ -37,6 +37,43 @@ export function kimchiSignIn(
   if (login.type === "api_key" && text(login.key)) return { apiUrl, token: text(login.key) };
   return { apiUrl };
 }
+// Kimchi's PR-reporting switch, decided as Kimchi decides it. An explicit /pr-reporting on or off
+// wins. Otherwise reporting follows telemetry (KIMCHI_TELEMETRY_ENABLED, then telemetry.enabled, on
+// by default) with the organization's cached usage-reporting directive applied. An unreadable
+// reporting state reads as off, and an unreadable config or policy cache as unset, as in Kimchi.
+export function kimchiReportingEnabled(
+  organizationId = "",
+  dir = join(process.env.HOME || homedir(), ".config", "kimchi"),
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  let state: Record<string, unknown>;
+  try {
+    state = kimchiFile(join(dir, "harness", "pr-cost-reporting", "state.json"));
+  } catch {
+    return false;
+  }
+  if (state.followsTelemetry !== true && typeof state.enabled === "boolean") return state.enabled;
+  const read = (name: string) => {
+    try {
+      return kimchiFile(join(dir, name));
+    } catch {
+      return {};
+    }
+  };
+  const flag = env.KIMCHI_TELEMETRY_ENABLED;
+  const telemetry =
+    flag !== undefined
+      ? flag !== "0" && flag !== "false"
+      : object(read("config.json").telemetry).enabled !== false;
+  // Kimchi caches the directive of the organization it last signed in to. FORCE_OFF also holds
+  // before this session's organization is known.
+  const cache = read("org-policy.json");
+  const sameOrganization = text(cache.orgId).toLowerCase() === organizationId.toLowerCase();
+  const directive = text(object(cache.policy).usageReporting);
+  if (directive === "FORCE_OFF" && (!organizationId || sameOrganization)) return false;
+  if (directive === "FORCE_ON" && organizationId && sameOrganization) return true;
+  return telemetry;
+}
 export const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
 const text = (v: unknown) => (typeof v === "string" ? v : "");
