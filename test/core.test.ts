@@ -327,6 +327,7 @@ test("a repository host may carry its HTTPS port, as the snapshot route accepted
     ":443",
     "h:",
     "h:0",
+    "h:08443",
     "h:65536",
     "h:123456",
     "h:1:2",
