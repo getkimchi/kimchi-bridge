@@ -6,8 +6,8 @@
       "validation": ""
     },
     {
-      "body": "{\"id\":\"e-usage\",\"entityId\":\"entity-usage\",\"revision\":\"2\",\"baseRevision\":\"1\",\"baseHash\":\"previous\",\"source\":\"claude-code\",\"sourceVersion\":\"2.1.0\",\"deviceId\":\"device\",\"observeTime\":\"2026-10-23T12:30:40.1Z\",\"usage\":{\"channel\":\"transcript\",\"requestId\":\"req_1\",\"responseId\":\"msg_1\",\"schema\":\"anthropic-messages-v1\",\"counterScope\":\"request\",\"observedRoute\":\"provider-api\",\"reportedModel\":\"sonnet\",\"actualModel\":\"claude-sonnet\",\"provider\":\"anthropic\",\"serviceTier\":\"default\",\"region\":\"us\",\"billingBasis\":\"api\",\"correlation\":\"exact\",\"raw\":{\"inputTokens\":\"1000000000000\",\"outputTokens\":\"400\",\"cacheReadTokens\":\"0\",\"cacheWriteTokens\":\"90\",\"cacheWrites\":[{\"ttlSeconds\":300,\"tokens\":\"70\"},{\"ttlSeconds\":3600,\"tokens\":\"20\"}],\"reasoningTokens\":\"10\"},\"iterations\":[{\"id\":\"one\",\"model\":\"sonnet\",\"schema\":\"anthropic-messages-v1\",\"raw\":{\"inputTokens\":\"10\",\"cacheReadTokens\":\"0\"},\"stopReason\":\"end_turn\",\"billingStatus\":\"billable\"}],\"finalIterationId\":\"one\",\"attemptsComplete\":false,\"stopReason\":\"end_turn\",\"billingStatus\":\"billable\",\"durationMs\":\"0\",\"credits\":[{\"amount\":\"0.01\",\"unit\":\"credit\",\"basis\":\"reported\"}],\"aliases\":[{\"namespace\":\"provider-request-id\",\"id\":\"req_1\",\"source\":\"transcript\"}]}}",
-      "hash": "fffe54972724bbe6d49557a941582220b856826bd6e29f7277f39bb1b83f6aaa",
+      "body": "{\"id\":\"e-usage\",\"entityId\":\"entity-usage\",\"revision\":\"2\",\"baseRevision\":\"1\",\"baseEventId\":\"previous\",\"source\":\"claude-code\",\"sourceVersion\":\"2.1.0\",\"deviceId\":\"device\",\"observeTime\":\"2026-10-23T12:30:40.1Z\",\"usage\":{\"channel\":\"transcript\",\"requestId\":\"req_1\",\"responseId\":\"msg_1\",\"schema\":\"anthropic-messages-v1\",\"counterScope\":\"request\",\"observedRoute\":\"provider-api\",\"reportedModel\":\"sonnet\",\"actualModel\":\"claude-sonnet\",\"provider\":\"anthropic\",\"serviceTier\":\"default\",\"region\":\"us\",\"billingBasis\":\"api\",\"correlation\":\"exact\",\"raw\":{\"inputTokens\":\"1000000000000\",\"outputTokens\":\"400\",\"cacheReadTokens\":\"0\",\"cacheWriteTokens\":\"90\",\"cacheWrites\":[{\"ttlSeconds\":300,\"tokens\":\"70\"},{\"ttlSeconds\":3600,\"tokens\":\"20\"}],\"reasoningTokens\":\"10\"},\"iterations\":[{\"id\":\"one\",\"model\":\"sonnet\",\"schema\":\"anthropic-messages-v1\",\"raw\":{\"inputTokens\":\"10\",\"cacheReadTokens\":\"0\"},\"stopReason\":\"end_turn\",\"billingStatus\":\"billable\"}],\"finalIterationId\":\"one\",\"attemptsComplete\":false,\"stopReason\":\"end_turn\",\"billingStatus\":\"billable\",\"durationMs\":\"0\",\"credits\":[{\"amount\":\"0.01\",\"unit\":\"credit\",\"basis\":\"reported\"}],\"aliases\":[{\"namespace\":\"provider-request-id\",\"id\":\"req_1\",\"source\":\"transcript\"}]}}",
+      "hash": "875d0d8a4a68047b14179304997aaeaa9fadb90126b9594af4032b87a5467e80",
       "validation": ""
     },
     {
@@ -43,7 +43,7 @@
   ],
   "nativeBody": "{\"a\":1e3,\"n\":-0,\"text\":\"\\u003c\\u0026\\u003e\\u2028\",\"z\":9007199254740993,\"\":2,\"𐀀\":1}",
   "nativeHash": "c6c8a466a65cfacb98572f388b6847db8f0ef0cebe303ea31189ee10653f7fe2",
-  "nativeInput": "{\"z\":9007199254740993,\"a\":1e3,\"n\":-0,\"text\":\"\u003c\u0026\u003e\\u2028\",\"𐀀\":1,\"\":2}",
+  "nativeInput": "{\"z\":9007199254740993,\"a\":1e3,\"n\":-0,\"text\":\"<&>\\u2028\",\"𐀀\":1,\"\":2}",
   "observations": [
     {
       "id": "dbddce86-59bf-1728-2031-96b8257c8989",
@@ -122,7 +122,7 @@
     "CREATE TRIGGER event_size_insert AFTER INSERT ON events BEGIN UPDATE ledger_totals SET total_bytes=total_bytes+length(new.body),pending_bytes=pending_bytes+CASE WHEN new.acked_at IS NULL THEN length(new.body) ELSE 0 END WHERE id=1; END"
   ],
   "stableId": "6490dfe6-85e3-d581-eb3e-619e0491bfe2",
-  "stableParts": ["codex", "session \u003c\u0026\u003e 🥬\u2028", "plan/path.md"],
+  "stableParts": ["codex", "session <&> 🥬 ", "plan/path.md"],
   "tables": {
     "batch_order": [],
     "batches": [

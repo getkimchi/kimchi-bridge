@@ -137,7 +137,7 @@ describe("Go wire and identity compatibility", () => {
 });
 
 describe("legacy persistence and delivery", () => {
-  test("opens Go schema, replays pending batch and continues existing revision hashes", () => {
+  test("opens Go schema, replays pending batch and continues revisions by event ID", () => {
     const dir = temp(),
       db = new Database(join(dir, "ledger.sqlite"));
     for (const ddl of golden.schema) db.exec(ddl);
@@ -157,7 +157,13 @@ describe("legacy persistence and delivery", () => {
     const s = new Store(dir);
     stores.push(s);
     expect(s.deviceId()).toBe(event().deviceId);
-    expect(s.events()).toEqual(golden.observations);
+    // rc.5 named the second revision's base by hash; it now names the first revision's event ID.
+    const [first, second] = golden.observations;
+    const { baseHash, ...rebased } = second;
+    expect(baseHash).toBe(canonicalHash(first));
+    expect(s.events()).toEqual([first, { ...rebased, baseEventId: first.id }]);
+    const sizes = s.db.query("SELECT SUM(length(body)) AS bytes FROM events").get() as any;
+    expect(s.status().normalizedBytes).toBe(sizes.bytes);
     const pending = s.pendingBatch()!;
     expect(encodeBatch(pending)).toBe(encodeBatch(golden.pendingBatch));
     s.acknowledge(pending, ack(pending));
@@ -168,18 +174,33 @@ describe("legacy persistence and delivery", () => {
     const third = s.events()[2]!;
     expect(third.revision).toBe("3");
     expect(third.baseRevision).toBe("2");
-    expect(third.baseHash).toBe(
-      golden.observations[1].baseHash === canonicalHash(golden.observations[0])
-        ? canonicalHash(golden.observations[1])
-        : "invalid-Go-fixture",
-    );
+    expect(third.baseEventId).toBe(second.id);
     expect((s.db.query("PRAGMA user_version").get() as any).user_version).not.toBe(0);
   });
-  test("fresh observations produce exactly the Go event IDs and chains", () => {
+  test("fresh observations produce the Go event IDs and chain revisions by event ID", () => {
     const s = store();
     s.observe(event("persisted", "1"));
     s.observe(event("persisted", "2"));
-    expect(s.events()).toEqual(golden.observations);
+    const [first, second] = s.events();
+    expect(first).toEqual(golden.observations[0]);
+    expect(second!.revision).toBe("2");
+    expect(second!.baseEventId).toBe(first!.id);
+  });
+  test("a conflict receipt sets its event aside", () => {
+    const s = store();
+    s.observe(event("kept"));
+    s.observe(event("stale"));
+    const b = s.pendingBatch()!;
+    s.acknowledge(b, {
+      batchId: b.id,
+      receipts: b.events.map((e) => ({
+        id: e.id!,
+        revision: e.revision!,
+        status: e.entityId === "stale" ? "conflict" : "accepted",
+      })),
+    });
+    expect(s.pendingBatch()).toBeNull();
+    expect(s.status()).toMatchObject({ pending: 0, blocked: 1 });
   });
   test("235 observations upload bounded deltas and survive lost ACK restart", () => {
     const dir = temp();
