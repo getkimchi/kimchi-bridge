@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run as cli } from "../src/cli.ts";
-import { credentialHash, kimchiSignIn } from "../src/kimchi.ts";
+import { credentialHash, kimchiReportingEnabled, kimchiSignIn } from "../src/kimchi.ts";
 import {
   loadConfig,
   saveConfig,
@@ -23,6 +23,7 @@ const variables = [
   "HOME",
   "KIMCHI_REMOTE_ENDPOINT",
   "KIMCHI_REGION",
+  "KIMCHI_TELEMETRY_ENABLED",
 ];
 let previous: (string | undefined)[] = [];
 const cleanups: (() => void)[] = [];
@@ -187,6 +188,62 @@ test("a session reports to the account Kimchi was signed in to when it started",
   expect(sessionStateDir(c, "codex", "before-sign-in")).toBe(stateDir({}));
   expect(sessionStateDir(c, "codex", "after-sign-in")).toBe(stateDir(c));
   expect(sessionStateDir(c, "codex", "next")).toBe(stateDir(c));
+});
+
+test("follows Kimchi's PR-reporting switch: explicit choice, then telemetry with the org directive", () => {
+  const organization = randomUUID();
+  const enabled = (env: Record<string, string> = {}, org: string = organization) =>
+    kimchiReportingEnabled(org, kimchi, env);
+  const policy = (usageReporting: string) =>
+    writeFileSync(
+      join(kimchi, "org-policy.json"),
+      JSON.stringify({ keyFingerprint: "key", orgId: organization, policy: { usageReporting } }),
+    );
+  const state = (text: string) => writeFileSync(join(reporting, "state.json"), text);
+  const reporting = join(kimchi, "harness", "pr-cost-reporting");
+  expect(enabled()).toBe(true);
+  kimchiFiles({ telemetry: { enabled: false } });
+  expect(enabled()).toBe(false);
+  expect(enabled({ KIMCHI_TELEMETRY_ENABLED: "1" })).toBe(true);
+  kimchiFiles({});
+  expect(enabled({ KIMCHI_TELEMETRY_ENABLED: "false" })).toBe(false);
+  policy("FORCE_OFF");
+  expect(enabled()).toBe(false);
+  expect(enabled({}, "")).toBe(false);
+  expect(enabled({}, randomUUID())).toBe(true);
+  policy("FORCE_ON");
+  kimchiFiles({ telemetry: { enabled: false } });
+  expect(enabled()).toBe(true);
+  expect(enabled({}, "")).toBe(false);
+  // An explicit /pr-reporting choice wins over telemetry and the directive, as in Kimchi.
+  mkdirSync(reporting, { recursive: true });
+  state(JSON.stringify({ version: 1, enabled: false }));
+  expect(enabled()).toBe(false);
+  policy("FORCE_OFF");
+  state(JSON.stringify({ version: 1, enabled: true }));
+  expect(enabled()).toBe(true);
+  state(JSON.stringify({ version: 1, enabled: true, followsTelemetry: true }));
+  expect(enabled()).toBe(false);
+  state("{");
+  expect(enabled()).toBe(false);
+});
+
+test("while Kimchi's PR reporting is off, sessions stay local and nothing is sent", async () => {
+  const requests: string[] = [];
+  const apiUrl = server((request) => {
+    requests.push(new URL(request.url).pathname);
+    return Response.json({ organizationId: randomUUID(), userId: randomUUID() });
+  });
+  process.env.KIMCHI_REMOTE_ENDPOINT = apiUrl;
+  kimchiFiles({ apiKey: "kimchi-key", telemetry: { enabled: false } });
+  await cli(
+    ["hook", "codex"],
+    stdin({ hook_event_name: "SessionStart", session_id: "off", cwd: root }),
+  );
+  expect(sessionStateDir(loadConfig(), "codex", "off")).toBe(stateDir({}));
+  await cli(["sync"]);
+  await expect(cli(["flush"])).rejects.toThrow("PR reporting is off");
+  expect(requests).toEqual([]);
 });
 
 test("flush verifies first and uploads only the signed-in account's ledger, with SSO's organization", async () => {

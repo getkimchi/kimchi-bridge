@@ -1,6 +1,6 @@
 import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import type { SignIn } from "../kimchi.ts";
+import { kimchiReportingEnabled, type SignIn } from "../kimchi.ts";
 import { checkSignal, lockSync, withDeadline } from "../platform.ts";
 import { loadConfig, stateDir, stateRoot, verifySignIn } from "../settings.ts";
 import { Recorder } from "./capture.ts";
@@ -86,7 +86,8 @@ export async function sync(k: SignIn, signal?: AbortSignal): Promise<void> {
   signal = withDeadline(8000, signal);
   checkSignal(signal);
   let c = loadConfig();
-  if (c.disabled) return;
+  // While Kimchi's PR reporting is off, nothing is verified or uploaded; records stay local.
+  if (c.disabled || !kimchiReportingEnabled(c.organizationId)) return;
   try {
     c = await verifySignIn(k, signal);
   } catch {
