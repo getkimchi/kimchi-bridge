@@ -140,6 +140,24 @@ test("a release that changes only code relinks it without the clients' plugin ma
   expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.3.0\n");
 });
 
+test("a lock left by a killed installer is replaced; a live or fresh one is not", () => {
+  const { pkg, env, prefix } = fixture("v0.3.0", "kimchi-bridge-0123456789ab");
+  for (const cli of ["claude", "codex"])
+    writeFileSync(join(prefix, "installed", cli), "kimchi-bridge-0123456789ab\n");
+  const lock = join(prefix, "install.lock");
+  mkdirSync(lock);
+  const update = () => run(join(pkg, "install.sh"), ["update", "both"], env);
+  // Without a pid the lock may belong to an installer that has not written it yet.
+  expect(update().output).toContain("Another installer is running");
+  writeFileSync(join(lock, "pid"), `${process.pid}\n`);
+  expect(update().output).toContain("Another installer is running");
+  const exited = spawnSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).stdout.trim();
+  writeFileSync(join(lock, "pid"), exited + "\n");
+  const replaced = update();
+  expect(replaced.status).toBe(0);
+  expect(existsSync(lock)).toBe(false);
+});
+
 test("the installer needs Kimchi and leaves updates to Kimchi's release", () => {
   const { root, pkg, env, prefix, calls } = fixture("v0.2.0", "kimchi-bridge-0123456789ab");
   const missing = run(join(pkg, "install.sh"), ["install", "claude"], {

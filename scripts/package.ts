@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
@@ -64,6 +65,8 @@ async function main() {
   const root = resolve(import.meta.dir, ".."),
     out = resolve(output),
     stage = mkdtempSync(join(tmpdir(), "kimchi-bridge-package-"));
+  // The archive's top folder becomes share/kimchi/bridge in Kimchi's release; mkdtemp makes it 0700.
+  chmodSync(stage, 0o755);
   // Clients key hook trust by marketplace, so each client's marketplace changes only when its
   // own plugin wiring does: a release that changes only code needs no new registration or review.
   const market = (client: string) => {
@@ -116,7 +119,8 @@ async function main() {
     cpSync(join(root, "install.sh"), join(stage, "bootstrap.sh"));
     mkdirSync(out, { recursive: true });
     const name = "kimchi-bridge.tar.gz";
-    const tar = Bun.spawnSync(["tar", "-czf", join(out, name), "-C", stage, "."], {
+    // Without --no-xattrs a macOS build carries com.apple.provenance, which GNU tar warns about.
+    const tar = Bun.spawnSync(["tar", "--no-xattrs", "-czf", join(out, name), "-C", stage, "."], {
       env: { ...process.env, COPYFILE_DISABLE: "1" },
       stderr: "inherit",
     });

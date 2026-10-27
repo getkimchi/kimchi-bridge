@@ -44,8 +44,19 @@ if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-bridge" || -L "$bin_dir/ki
   existing=$(readlink "$bin_dir/kimchi-bridge") || fail 'Refusing to replace an unmanaged kimchi-bridge binary.'
   case "$existing" in "$prefix/releases/"*/bin/kimchi-bridge) ;; *) fail 'Refusing to replace an unmanaged kimchi-bridge link.' ;; esac
 fi
-mkdir "$prefix/install.lock" 2>/dev/null || fail "Another installer is running ($prefix/install.lock)."
-trap 'rmdir "$prefix/install.lock"' EXIT
+lock="$prefix/install.lock"
+# A lock whose installer is gone (killed, or the machine lost power) would block every later
+# install and update, so it is replaced. A lock without a pid is held for ten minutes: its
+# installer may not have written the pid yet, or it came from an earlier release.
+if ! mkdir "$lock" 2>/dev/null; then
+  holder=$(cat "$lock/pid" 2>/dev/null) || holder=
+  if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then fail "Another installer is running ($lock)."; fi
+  if [[ -z "$holder" && -z "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then fail "Another installer is running ($lock)."; fi
+  rm -rf -- "$lock"
+  mkdir "$lock" 2>/dev/null || fail "Another installer is running ($lock)."
+fi
+printf '%s\n' "$$" > "$lock/pid"
+trap 'rm -rf -- "$lock"' EXIT
 # A client's receipt names its registered marketplace, kimchi-bridge-<hash>, which changes only
 # with the plugin wiring. Earlier releases registered kimchi-work-<hash> or kimchi-work-<version>,
 # and their receipts name that version; cleanup still removes those registrations.
