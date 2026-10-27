@@ -496,8 +496,8 @@ export function eventKind(e: Event): string {
 }
 const containsAny = (s: string, chars: string) => Array.from(chars).some((c) => s.includes(c));
 const digit = (c: string) => c >= "0" && c <= "9";
-// A Git host, optionally with its HTTPS port (name or name:port), as the snapshot route accepted.
-// The backend and Kimchi apply the same rule.
+// A Git host, optionally with its HTTPS port (name or name:port, 1-65535 without a leading zero),
+// as the snapshot route accepted. The backend and Kimchi apply the same rule.
 export function validHost(host: string): boolean {
   const colon = host.indexOf(":");
   const name = colon < 0 ? host : host.slice(0, colon);
@@ -507,6 +507,7 @@ export function validHost(host: string): boolean {
   return (
     port.length >= 1 &&
     port.length <= 5 &&
+    port[0] !== "0" &&
     Array.from(port).every(digit) &&
     Number(port) >= 1 &&
     Number(port) <= 65535
