@@ -1,6 +1,6 @@
-# Kimchi PR-cost plugins
+# Kimchi bridge
 
-Plugins for the official Claude Code and Codex CLIs. They record the token usage of your coding sessions, link it to the pull requests that contain your changes and upload it to your Kimchi account. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
+Kimchi plugins for other coding harnesses, run by the `kimchi-bridge` command. The `kimchi-work` plugin works with the official Claude Code and Codex CLIs. It records the token usage of your coding sessions, links it to the pull requests that contain your changes and uploads it to your Kimchi account. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
 
 ## Install
 
@@ -85,3 +85,7 @@ A background sync uploads new records to the Kimchi API when a session starts, a
 Uploads contain IDs, timestamps, token counts, model names, tool names and outcomes, commit IDs, repository names, pull request numbers, titles and links, `New work:` titles, and issue keys found in titles and branch names. They don't contain prompts, replies, code, file contents, file paths, or tool inputs and outputs.
 
 Kimchi prices the usage and shows the cost of each pull request in the Kimchi console, under Reporting → PR costs.
+
+## Repository layout
+
+Shared code lives at the top of `src/`: the `kimchi-bridge` command in `cli.ts`, Kimchi's sign-in in `kimchi.ts`, local settings and session binding in `settings.ts`, and platform helpers in `platform.ts`. A plugin's code lives in its own folder under `src/`, and its Claude Code and Codex files in `plugins/<plugin>/claude/` and `plugins/<plugin>/codex/`. The `kimchi-work` plugin uses `src/work/` and `plugins/kimchi-work/`.
