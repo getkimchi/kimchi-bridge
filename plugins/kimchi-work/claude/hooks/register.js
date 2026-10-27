@@ -29,20 +29,11 @@ async function ensure($) {
     // Best effort: the next tick retries.
   }
 }
-async function hint($) {
-  try {
-    const result = await $.process.run([$.plugin.root + '/bin/kimchi-bridge', 'hint'], {timeoutMs: 2000});
-    const text = result && typeof result === 'object' ? String(result.stdout ?? result.output ?? '') : '';
-    if (text.trim() && $.ui && typeof $.ui.notice === 'function') $.ui.notice(text.trim());
-  } catch {
-    // Hints are best effort.
-  }
-}
+// The sign-in hint is hooks.json's SessionStart command: Claude Code refuses to load a module that reads $.ui as a value.
 export function register(on) {
   on('session.start', async ($, e, next) => {
     await record($, 'session.start', e);
     await ensure($);
-    await hint($);
     $.clock.after(0, async () => { await sync($); });
     $.clock.every(30000, async () => { await sync($); await ensure($); });
     return next(e);

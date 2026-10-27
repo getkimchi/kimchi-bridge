@@ -123,9 +123,9 @@ export async function run(
     return;
   }
   if (command === "hint") {
-    // One line, and only when the plugin is not set up; silent otherwise.
+    // One line, and only when the plugin is not set up; silent otherwise. Kimchi's own sign-in sets it up too.
     const status = await loginStatus();
-    if (status.state === "signed-out")
+    if (status.state === "signed-out" && !signIn().token)
       output(
         "Kimchi is not signed in. Sign in with the /kimchi-login command (or run `kimchi-bridge login` in a terminal) to record work and route model requests through the Kimchi gateway.\n",
       );
