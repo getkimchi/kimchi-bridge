@@ -1,57 +1,30 @@
 # Kimchi PR-cost plugins
 
-Plugins for the official Claude Code and Codex CLIs. They record the token usage of your coding sessions, link it to the pull requests that contain your changes and upload it to Cast AI. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
+Plugins for the official Claude Code and Codex CLIs. They record the token usage of your coding sessions, link it to the pull requests that contain your changes and upload it to Cast AI with your Kimchi sign-in. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
 
 ## Install
 
 ### Requirements
 
+- Kimchi, installed with its install script. The plugins run on Kimchi's runtime.
 - Claude Code (`claude`), Codex (`codex`) or both, in a version that supports plugins.
-- GitHub CLI (`gh`), signed in with access to `getkimchi/kimchi-adapters`.
-- GitLab CLI (`glab`), signed in, if your repositories are on GitLab.
+- GitHub CLI (`gh`) signed in for repositories on GitHub, GitLab CLI (`glab`) signed in for repositories on GitLab.
 - For a self-hosted GitHub or GitLab, `GH_HOST` or `GITLAB_HOST` set to its host name.
 - macOS or Linux (glibc), on arm64 or x86-64.
 
-### Install together with the Kimchi CLI
+### Install with Kimchi
 
-Kimchi's installer installs or updates the Kimchi CLI and adds the plugins. Choose `claude`, `codex` or `both`:
+Kimchi's installer installs the Kimchi CLI and adds the plugins to each official client it finds:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/getkimchi/kimchi/7fbbb81b7876d4734ad7d423fad8fc373aa47417/scripts/install.sh | bash -s -- --adapters both
+curl -fsSL https://github.com/getkimchi/kimchi/releases/latest/download/install.sh | bash
 ```
 
-To pin versions, set `KIMCHI_ADAPTERS_VERSION` for the plugins and `KIMCHI_VERSION` for the Kimchi CLI.
-
-### Install the plugins only
-
-1. Clone this repository:
-
-   ```sh
-   gh repo clone getkimchi/kimchi-adapters
-   cd kimchi-adapters
-   ```
-
-2. Run the installer. Choose `claude`, `codex` or `both`:
-
-   ```sh
-   bash install.sh install both
-   ```
-
-The installer downloads the newest release with `gh`, verifies its checksum and adds the plugins through each client's plugin manager. To install a specific release, add its tag as a third argument.
-
-### After installing
-
-Both installers add the `kimchi-adapters` command to `~/.local/bin` and set up reporting sign-in (see [Sign in](#sign-in)). Start a new Claude Code or Codex session and accept the plugin trust prompt.
+Start a new Claude Code or Codex session. Codex first shows "Hooks need review"; choose to trust them. If you install Claude Code or Codex later, run Kimchi's installer again.
 
 ### Update
 
-Finish your active Claude Code and Codex sessions. Then run the update with the same choice you installed (`claude`, `codex` or `both`):
-
-```sh
-kimchi-adapters update both
-```
-
-This installs the newest release, or the tag you add as a third argument, and removes the old version. Your sign-in is kept.
+Kimchi's releases include the plugins, and Kimchi updates the plugins it added when it updates itself. Open sessions switch to the new code with their next hook. Only an update that changes the plugins' hooks registers them again: open Codex sessions then stop recording until you start a new one, and Codex asks you to trust the new hooks.
 
 ### Uninstall
 
@@ -68,49 +41,21 @@ This installs the newest release, or the tag you add as a third argument, and re
    kimchi-adapters uninstall both
    ```
 
-Your sign-in, local records and downloaded releases stay in `~/.local/state/kimchi-adapters` and `~/.local/share/kimchi-adapters` until you delete them.
+Your local records and the plugin files stay in `~/.local/state/kimchi-adapters` and `~/.local/share/kimchi-adapters` until you delete them. Kimchi's updates leave removed plugins removed; running Kimchi's installer adds them again.
 
 ## Use
 
 ### Sign in
 
-The installer keeps an existing reporting sign-in. Otherwise it uses your Kimchi API key from `KIMCHI_API_KEY` or `~/.config/kimchi/config.json`. If there is no key, it opens a browser sign-in, or prints the command to run when it isn't running in a terminal.
+There is nothing to set up: the plugins report with your Kimchi sign-in. They use the API key in `KIMCHI_API_KEY` or `~/.config/kimchi/config.json`, or else your Kimchi SSO login, in Kimchi's region. To sign in or switch accounts, run `kimchi`.
 
-To sign in again or switch accounts:
-
-```sh
-kimchi-adapters login
-```
-
-This opens the Kimchi console in your browser, where you create an API key. The key is verified and saved for reporting only. The Kimchi CLI's sign-in and your inference settings don't change. The key must belong to a Kimchi user; service-account keys are rejected.
-
-A session reports to the account that was signed in when the session started. Sessions that start before you sign in stay on your machine and are never uploaded.
-
-| Command | What it does |
-| --- | --- |
-| `kimchi-adapters login --from-kimchi` | Uses your Kimchi API key from `KIMCHI_API_KEY` or `~/.config/kimchi/config.json` instead of the browser. |
-| `kimchi-adapters login --region eu` | Signs in to the EU region. |
-| `kimchi-adapters login https://your-console.example` | Signs in to a self-hosted console. |
-| `kimchi-adapters login --no-browser` | Prints the sign-in link instead of opening it. |
-
-To sign in with a key file instead, save the API URL and key in a private JSON file and pass it to `configure`. Use `https://api.eu.cast.ai` for the EU region. If `KIMCHI_API_KEY` is set, it replaces the key in the file.
-
-```json
-{
-  "apiUrl": "https://api.cast.ai",
-  "apiKey": "YOUR-KIMCHI-API-KEY"
-}
-```
-
-```sh
-kimchi-adapters configure < /path/to/private/reporting.json
-```
+A session reports to the account Kimchi was signed in to when the session started. Sessions that start while Kimchi is signed out stay on your machine and are never uploaded.
 
 ### Check and control reporting
 
 | Command | What it does |
 | --- | --- |
-| `kimchi-adapters status` | Shows the sign-in state, the local data folder, queued uploads and recording problems. |
+| `kimchi-adapters status` | Shows whether Kimchi is signed in and verified, the local data folder, queued uploads and recording problems. |
 | `kimchi-adapters flush` | Uploads all queued records now. |
 | `kimchi-adapters disable` | Pauses recording and background uploads. Local records are kept. |
 | `kimchi-adapters enable` | Resumes recording and uploads. |
@@ -131,9 +76,9 @@ To continue the same work in another session, or in the other client, have the a
 
 ## How it works
 
-The plugins run the bundled `kimchi-adapters` program from Claude Code and Codex hooks. It records the token usage of each model request, read from the client's transcripts, and each tool call with its outcome. It also keeps copies of the files each tool works on, from before and after the call. It then matches file changes to your Git commits and asks `gh` or `glab` which pull requests contain those commits. It doesn't change prompts or replies, and if recording fails, your session carries on.
+Claude Code and Codex hooks run the plugins' code on Kimchi's own runtime (`BUN_BE_BUN=1 kimchi`), without loading the project's `.env` or `bunfig.toml`. The code records the token usage of each model request, read from the client's transcripts, and each tool call with its outcome. It also keeps copies of the files each tool works on, from before and after the call. It then matches file changes to your Git commits and asks `gh` or `glab` which pull requests contain those commits. It doesn't change prompts or replies, and if recording fails, your session carries on.
 
-Records are saved in SQLite databases under `~/.local/state/kimchi-adapters`, one for each account. Your API key is in `config.json` in the same folder, readable only by you. File copies never leave your machine. While recording is on, copies older than seven days are deleted.
+Records are saved in SQLite databases under `~/.local/state/kimchi-adapters`, one for each account. The plugins keep no key: they read Kimchi's sign-in each time they upload. File copies never leave your machine. While recording is on, copies older than seven days are deleted.
 
 A background sync uploads new records to the Cast AI API when a session starts, after each turn and every 30 seconds while Claude Code is open. Records that fail to upload stay queued for the next sync. Nothing runs while the clients are closed.
 

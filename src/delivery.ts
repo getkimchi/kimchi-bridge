@@ -10,17 +10,23 @@ import {
 } from "./protocol.ts";
 
 declare const Temporal: { Instant: { from(value: string): { epochNanoseconds: bigint } } };
-class IdentityError extends Error {}
+/** The API answered, and the sign-in is not a verified account. */
+export class IdentityError extends Error {}
 
+/** Kimchi's sign-in, read for each upload and never saved. */
+export interface SignIn {
+  apiUrl: string;
+  token?: string;
+  /** Kimchi's SSO organization, sent as X-CastAi-Organization-Id with an SSO token. */
+  organizationId?: string;
+}
+
+/** The account a Kimchi sign-in was verified as. */
 export interface Config {
   apiUrl?: string;
   organizationId?: string;
-  apiKey?: string;
-  /** Read existing installations without changing their account binding. New configure uses a Kimchi API key. */
-  accessToken?: string;
   actorId?: string;
   credentialHash?: string;
-  enabled?: boolean;
   otlpUrl?: string;
   otlpHeaders?: Record<string, string>;
 }
@@ -37,7 +43,7 @@ export function ValidID(id: unknown): id is string {
 }
 
 const hasControl = (text: string) => ["\r", "\n", "\0"].some((char) => text.includes(char));
-function baseUrl(value: string): string {
+export function BaseUrl(value: string): string {
   while (value.endsWith("/")) value = value.slice(0, -1);
   return value;
 }
@@ -58,8 +64,7 @@ function secureEndpoint(endpoint: unknown): void {
     throw new Error("reporting requires HTTPS");
 }
 
-export function ValidateConfig(c: Config, allowMissingOrganization = false): void {
-  secureEndpoint(c.apiUrl);
+export function ValidateOTLP(c: Config): void {
   if (c.otlpUrl) secureEndpoint(c.otlpUrl);
   const headers = c.otlpHeaders ?? {};
   if (typeof headers !== "object" || Array.isArray(headers) || Object.keys(headers).length > 16)
@@ -76,24 +81,24 @@ export function ValidateConfig(c: Config, allowMissingOrganization = false): voi
     if (["host", "content-length", "transfer-encoding"].includes(key.toLowerCase()))
       throw new Error("reserved OTLP header");
   }
-  if ((!allowMissingOrganization || c.organizationId) && !ValidID(c.organizationId))
-    throw new Error("invalid organization");
-  if (!c.apiKey && !c.accessToken) throw new Error("Kimchi API key required");
-  if (c.apiKey && c.accessToken) throw new Error("provide one reporting credential");
-  const key = c.apiKey || c.accessToken;
-  if (typeof key !== "string" || hasControl(key)) throw new Error("invalid reporting credential");
 }
 
-export function CredentialHash(c: Config): string {
+export function ValidateConfig(c: Config): void {
+  secureEndpoint(c.apiUrl);
+  ValidateOTLP(c);
+  if (!ValidID(c.organizationId) || !ValidID(c.actorId)) throw new Error("invalid account");
+}
+
+export function CredentialHash(k: SignIn): string {
   return createHash("sha256")
-    .update((c.accessToken ?? "") + "\0" + (c.apiKey ?? ""))
+    .update([k.apiUrl, k.token ?? "", k.organizationId ?? ""].join("\0"))
     .digest("hex");
 }
 
-export function Ready(c: Config): void {
+export function Ready(c: Config, k: SignIn): void {
   ValidateConfig(c);
-  if (!ValidID(c.actorId) || c.credentialHash !== CredentialHash(c))
-    throw new Error("run configure to verify this reporting user");
+  if (!k.token) throw new Error("sign in to Kimchi to report");
+  if (c.credentialHash !== CredentialHash(k)) throw new Error("Kimchi sign-in not verified yet");
 }
 
 function request(url: string, init: RequestInit, signal?: AbortSignal): Promise<Response> {
@@ -130,73 +135,67 @@ async function jsonBody(response: Response, limit: number, allowEmpty = false): 
   return Parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-function bearer(c: Config): Record<string, string> {
-  return { Authorization: `Bearer ${c.apiKey || c.accessToken}` };
+// Kimchi's gatewayAuthHeaders: the bearer, plus the organization header for SSO.
+function authorization(k: SignIn): Record<string, string> {
+  return {
+    Authorization: `Bearer ${k.token}`,
+    ...(k.organizationId ? { "X-CastAi-Organization-Id": k.organizationId } : {}),
+  };
 }
 
-export async function Authenticate(c: Config, signal?: AbortSignal): Promise<Config> {
-  ValidateConfig(c, true);
-  if (!c.apiKey || c.accessToken) throw new Error("configure requires a Kimchi API key");
-  const apiUrl = baseUrl(c.apiUrl!);
+/** Verify a sign-in the way Kimchi's uploader does (api-keys:verify) and return its account. */
+export async function Authenticate(k: SignIn, signal?: AbortSignal): Promise<Config> {
+  secureEndpoint(k.apiUrl);
+  if (!k.token || hasControl(k.token + (k.organizationId ?? "")))
+    throw new Error("invalid Kimchi sign-in");
+  const apiUrl = BaseUrl(k.apiUrl);
   let identity: { organizationId?: unknown; userId?: unknown };
-  let profile: { id?: unknown; username?: unknown };
   try {
     const verify = await request(
       `${apiUrl}/ai-optimizer/v1beta/api-keys:verify`,
-      { method: "POST", headers: { ...bearer(c), Accept: "application/json" } },
+      { method: "POST", headers: { ...authorization(k), Accept: "application/json" } },
       signal,
     );
     if (verify.status !== 200)
-      throw new IdentityError(`reporting key verification returned HTTP ${verify.status}`);
+      throw new IdentityError(`Kimchi sign-in verification returned HTTP ${verify.status}`);
     identity = (await jsonBody(verify, 1 << 20)) as typeof identity;
     if (!identity || !ValidID(identity.organizationId) || !ValidID(identity.userId))
       throw new IdentityError("invalid reporting account identity");
     if (
-      c.organizationId &&
-      c.organizationId.toLowerCase() !== identity.organizationId.toLowerCase()
+      k.organizationId &&
+      k.organizationId.toLowerCase() !== identity.organizationId.toLowerCase()
     )
-      throw new IdentityError("organization does not match Kimchi API key");
-    const me = await request(
-      `${apiUrl}/v1/me`,
-      { headers: { ...bearer(c), Accept: "application/json" } },
-      signal,
-    );
-    if (me.status !== 200) throw new IdentityError(`reporting identity returned HTTP ${me.status}`);
-    profile = (await jsonBody(me, 1 << 20)) as typeof profile;
-    if (
-      !profile ||
-      !ValidID(profile.id) ||
-      typeof profile.username !== "string" ||
-      !profile.username ||
-      profile.id.toLowerCase() !== identity.userId.toLowerCase()
-    )
-      throw new IdentityError("reporting requires a verified Kimchi user");
+      throw new IdentityError("organization does not match the Kimchi sign-in");
   } catch (error) {
     // Native transport exceptions may contain request headers or response bodies.
     if (error instanceof IdentityError) throw error;
     throw new Error("reporting identity endpoint unavailable or invalid response");
   }
   return {
-    ...c,
     apiUrl,
     organizationId: (identity.organizationId as string).toLowerCase(),
-    actorId: (profile.id as string).toLowerCase(),
-    credentialHash: CredentialHash(c),
+    actorId: (identity.userId as string).toLowerCase(),
+    credentialHash: CredentialHash(k),
   };
 }
 
-export async function Flush(s: Store, c: Config, signal?: AbortSignal): Promise<boolean> {
-  if (!c.enabled) return false;
-  Ready(c);
+export async function Flush(
+  s: Store,
+  c: Config,
+  k: SignIn,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!k.token) return false;
+  Ready(c, k);
   const batch = s.PendingBatch(signal);
   if (!batch) return false;
   let response: Response;
   try {
     response = await request(
-      `${baseUrl(c.apiUrl!)}/ai-optimizer/v1beta/organizations/${encodeURIComponent(c.organizationId!)}/pr-cost-events:batchIngest`,
+      `${BaseUrl(c.apiUrl!)}/ai-optimizer/v1beta/organizations/${encodeURIComponent(c.organizationId!)}/pr-cost-events:batchIngest`,
       {
         method: "POST",
-        headers: { ...bearer(c), "Content-Type": "application/json" },
+        headers: { ...authorization(k), "Content-Type": "application/json" },
         body: `{"batch":${EncodeBatch(batch)}}`,
       },
       signal,

@@ -1,11 +1,11 @@
 import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { Recorder } from "./capture.ts";
-import { Flush, FlushOTLP } from "./delivery.ts";
+import { Flush, FlushOTLP, type SignIn } from "./delivery.ts";
 import { PruneEvidence } from "./git.ts";
 import { Open } from "./ledger.ts";
 import { CheckSignal, WithDeadline, lockSync } from "./platform.ts";
-import { Load, Root, StateDir, type Config } from "./settings.ts";
+import { Load, Root, StateDir, Verify } from "./settings.ts";
 
 function accountLedgers(stateRoot: string): string[] {
   const root = join(stateRoot, "accounts");
@@ -81,12 +81,16 @@ function recoverInactiveAccounts(stateRoot: string, activeDir: string, signal?: 
 }
 
 // One pass: the native lifecycle hook/timer schedules the next attempt.
-export async function Run(c: Config, signal?: AbortSignal): Promise<void> {
+export async function Run(k: SignIn, signal?: AbortSignal): Promise<void> {
   signal = WithDeadline(8000, signal);
   CheckSignal(signal);
-  const latest = Load();
-  if (latest.disabled || StateDir(latest) !== StateDir(c)) return;
-  c = latest;
+  let c = Load();
+  if (c.disabled) return;
+  try {
+    c = await Verify(k, signal);
+  } catch {
+    // Upload reports the unverified sign-in as delivery_pending; local recovery continues.
+  }
   const guard = lockSync(StateDir(c));
   if (!guard) return;
   try {
@@ -127,7 +131,7 @@ export async function Run(c: Config, signal?: AbortSignal): Promise<void> {
       for (let i = 0; i < 10 && !signal?.aborted; i++) {
         CheckSignal(signal);
         try {
-          if (!(await Flush(s, c, signal))) break;
+          if (!(await Flush(s, c, k, signal))) break;
         } catch {
           s.Diagnostic("delivery_pending");
           break;

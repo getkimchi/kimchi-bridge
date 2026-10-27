@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Recorder } from "../src/capture.ts";
@@ -12,23 +12,25 @@ import { Load, Save, SessionStateDir, StateDir, type Config } from "../src/setti
 import { Run } from "../src/sync.ts";
 
 let root: string;
-let previousRoot: string | undefined;
-let previousKey: string | undefined;
+const variables = ["KIMCHI_ADAPTERS_HOME", "KIMCHI_API_KEY", "HOME", "KIMCHI_REMOTE_ENDPOINT"];
+let previous: (string | undefined)[] = [];
 const cleanups: (() => void)[] = [];
 beforeEach(() => {
-  previousRoot = process.env.KIMCHI_ADAPTERS_HOME;
-  previousKey = process.env.KIMCHI_API_KEY;
+  previous = variables.map((name) => process.env[name]);
   root = mkdtempSync(join(tmpdir(), "kimchi-sync-"));
   process.env.KIMCHI_ADAPTERS_HOME = root;
+  // Kimchi's sign-in is read from this HOME, never the developer's.
+  process.env.HOME = root;
   delete process.env.KIMCHI_API_KEY;
+  delete process.env.KIMCHI_REMOTE_ENDPOINT;
 });
 afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
   rmSync(root, { recursive: true, force: true });
-  if (previousRoot === undefined) delete process.env.KIMCHI_ADAPTERS_HOME;
-  else process.env.KIMCHI_ADAPTERS_HOME = previousRoot;
-  if (previousKey === undefined) delete process.env.KIMCHI_API_KEY;
-  else process.env.KIMCHI_API_KEY = previousKey;
+  variables.forEach((name, i) => {
+    if (previous[i] === undefined) delete process.env[name];
+    else process.env[name] = previous[i];
+  });
 });
 function server(handler: (request: Request) => Response | Promise<Response>): string {
   const running = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: handler });
@@ -37,39 +39,30 @@ function server(handler: (request: Request) => Response | Promise<Response>): st
 }
 const stdin = (value: unknown) => async () => Buffer.from(JSON.stringify(value));
 
+const signedOut = { apiUrl: "" };
+
 test("sync makes one pass and skips an already held native worker lock", async () => {
   const c: Config = {};
   Save(c);
   const guard = lockSync(StateDir(c));
   expect(guard).not.toBeNull();
-  await Run(c);
+  await Run(signedOut);
   guard!.close();
   const started = performance.now();
-  await Run(c);
+  await Run(signedOut);
   expect(performance.now() - started).toBeLessThan(1000);
   const next = lockSync(StateDir(c));
   expect(next).not.toBeNull();
   next!.close();
 });
 
-test("sync honors cancellation, disabled capture, and switched active accounts", async () => {
+test("sync honors cancellation and disabled capture", async () => {
   const abort = new AbortController();
   abort.abort();
-  await expect(Run({}, abort.signal)).rejects.toThrow();
+  await expect(Run(signedOut, abort.signal)).rejects.toThrow();
   Save({ disabled: true });
-  await Run({});
+  await Run({ apiUrl: "https://api.cast.ai", token: "never-verified" });
   expect(existsSync(join(StateDir({}), "worker.lock"))).toBe(false);
-  const c: Config = {
-    apiUrl: "https://api.cast.ai",
-    organizationId: NewID(),
-    actorId: NewID(),
-    apiKey: "synthetic-key",
-    enabled: true,
-  };
-  c.credentialHash = CredentialHash(c);
-  Save(c);
-  await Run({});
-  expect(existsSync(join(StateDir(c), "worker.lock"))).toBe(false);
 });
 
 test("sync stops when recovery exhausts its inherited deadline and releases the lock", async () => {
@@ -87,14 +80,14 @@ test("sync stops when recovery exhausts its inherited deadline and releases the 
     now += 30;
   });
   try {
-    await expect(Run({}, WithDeadline(20))).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(Run(signedOut, WithDeadline(20))).rejects.toMatchObject({ name: "TimeoutError" });
     expect(now).toBe(initialNow + 30);
     expect(recovery).toHaveBeenCalledTimes(1);
     const guard = lockSync(StateDir({}));
     expect(guard).not.toBeNull();
     guard!.close();
     recovery.mockImplementation((signal) => CheckSignal(signal));
-    await Run({});
+    await Run(signedOut);
     expect(recovery).toHaveBeenCalledTimes(3);
   } finally {
     recovery.mockRestore();
@@ -110,7 +103,6 @@ test("next sync retries the original offline batch and recovers late usage exact
     const path = new URL(req.url).pathname;
     if (path.endsWith("api-keys:verify"))
       return Response.json({ organizationId: org, userId: actor });
-    if (path === "/v1/me") return Response.json({ id: actor, username: "auth0|fixture" });
     bodies.push(await req.text());
     if (bodies.length === 1) return new Response(null, { status: 503 });
     const batch = Parse(bodies.at(-1)!).batch as Batch;
@@ -119,7 +111,8 @@ test("next sync retries the original offline batch and recovers late usage exact
       receipts: batch.events.map((e) => ({ id: e.id, revision: e.revision, status: "accepted" })),
     });
   });
-  const c = await Authenticate({ apiUrl, apiKey: "synthetic-key", enabled: true });
+  const k = { apiUrl, token: "synthetic-key" };
+  const c = await Authenticate(k);
   Save(c);
   const s = Open(StateDir(c));
   try {
@@ -136,7 +129,7 @@ test("next sync retries the original offline batch and recovers late usage exact
         transcript_path: path,
       },
     });
-    await Run(c);
+    await Run(k);
     expect(bodies.length).toBe(1);
     expect(s.Status().pending).toBe(1);
     writeFileSync(
@@ -153,10 +146,10 @@ test("next sync retries the original offline batch and recovers late usage exact
         },
       }) + "\n",
     );
-    await Run(c);
+    await Run(k);
     expect(bodies.length).toBe(3);
     expect(bodies[0]).toBe(bodies[1]);
-    await Run(c);
+    await Run(k);
     expect(bodies.length).toBe(3);
     expect(
       (
@@ -171,36 +164,25 @@ test("next sync retries the original offline batch and recovers late usage exact
   }
 });
 
-test("configure takes the Kimchi environment key and retains runtime activation and disable state", async () => {
-  const actor = NewID(),
-    org = NewID();
-  const apiUrl = server((req) => {
-    expect(req.headers.get("authorization")).toBe("Bearer environment-synthetic-key");
-    return Response.json(
-      new URL(req.url).pathname.endsWith("api-keys:verify")
-        ? { organizationId: org, userId: actor }
-        : { id: actor, username: "fixture" },
-    );
-  });
-  Save({ disabled: true, runtimeExecutable: "/owned/helper", runtimeRevision: NewID() });
-  process.env.KIMCHI_API_KEY = "environment-synthetic-key";
+test("configure sets only OTLP export, keeps the disable state, and refuses keys", async () => {
+  Save({ disabled: true });
   let output = "";
-  await CLI(
-    ["configure"],
-    stdin({ apiUrl, apiKey: "stdin-synthetic-key", runtimeExecutable: "/untrusted/from-json" }),
-    (text) => {
-      output += text;
-    },
-  );
+  const exporter = {
+    otlpUrl: "https://collector.example/v1/logs",
+    otlpHeaders: { Authorization: "Bearer collector-only" },
+  };
+  await CLI(["configure"], stdin({ ...exporter, disabled: false }), (text) => {
+    output += text;
+  });
   const c = Load();
-  expect(c.apiKey).toBe("environment-synthetic-key");
-  expect(c.organizationId).toBe(org);
-  expect(c.actorId).toBe(actor);
-  expect(c.enabled).toBe(true);
+  expect(c.otlpUrl).toBe(exporter.otlpUrl);
+  expect(c.otlpHeaders).toEqual(exporter.otlpHeaders);
   expect(c.disabled).toBe(true);
-  expect(c.runtimeExecutable).toBe("/owned/helper");
-  expect(process.env.KIMCHI_API_KEY).toBeUndefined();
-  expect(output).not.toContain("environment-synthetic-key");
+  expect(output).toBe("OTLP export configured.\n");
+  await expect(
+    CLI(["configure"], stdin({ apiUrl: "https://api.cast.ai", apiKey: "synthetic-key" })),
+  ).rejects.toThrow("Kimchi's sign-in");
+  await expect(CLI(["login"])).rejects.toThrow("unknown command");
 });
 
 test("hook stores synchronously without spawning a worker and session stays in its original account", async () => {
@@ -212,7 +194,7 @@ test("hook stores synchronously without spawning a worker and session stays in i
     cwd: root,
     prompt: "New work: fixture",
   };
-  Save({ runtimeExecutable: "/does/not/run" });
+  Save({});
   await CLI(["hook", "codex"], stdin(payload), (text) => {
     output += text;
   });
@@ -235,10 +217,8 @@ test("hook stores synchronously without spawning a worker and session stays in i
     apiUrl: "https://api.cast.ai",
     organizationId: NewID(),
     actorId: NewID(),
-    apiKey: "synthetic-key",
-    enabled: true,
+    credentialHash: CredentialHash({ apiUrl: "https://api.cast.ai", token: "synthetic-key" }),
   };
-  c.credentialHash = CredentialHash(c);
   Save(c);
   expect(SessionStateDir(c, "codex", "session")).toBe(original);
   await CLI(["hook", "codex"], stdin({ ...payload, turn_id: "turn-2" }), (text) => {
@@ -257,19 +237,24 @@ test("CSV export guards formulas and status never outputs reporting credentials"
   for (const value of ['=HYPERLINK("bad")', "+1", "-1", "@x", "\tvalue", "\rvalue"])
     expect(csvText(value)).toBe("'" + value);
   for (const value of ["", "123", "normal"]) expect(csvText(value)).toBe(value);
+  mkdirSync(join(root, ".config", "kimchi"), { recursive: true });
+  writeFileSync(
+    join(root, ".config", "kimchi", "config.json"),
+    JSON.stringify({ apiKey: "synthetic-private-key" }),
+  );
+  // Kimchi's default region uploads to its console's /api.
+  const apiUrl = "https://app.kimchi.dev/api";
   const c: Config = {
-    apiUrl: "https://api.cast.ai",
+    apiUrl,
     organizationId: NewID(),
     actorId: NewID(),
-    apiKey: "synthetic-private-key",
-    enabled: true,
+    credentialHash: CredentialHash({ apiUrl, token: "synthetic-private-key" }),
   };
-  c.credentialHash = CredentialHash(c);
   Save(c);
   let output = "";
   await CLI(["status"], undefined, (text) => {
     output += text;
   });
   expect(output).not.toContain("synthetic-private-key");
-  expect(JSON.parse(output).reportingConfigured).toBe(true);
+  expect(JSON.parse(output)).toMatchObject({ kimchiSignedIn: true, reportingVerified: true });
 });

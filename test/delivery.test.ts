@@ -10,6 +10,7 @@ import {
   Ready,
   ValidateConfig,
   type Config,
+  type SignIn,
 } from "../src/delivery.ts";
 import { Open, type Store } from "../src/ledger.ts";
 import { Hash, NewID, Parse, type Batch, type Event } from "../src/protocol.ts";
@@ -44,16 +45,13 @@ function server(handler: (request: Request) => Response | Promise<Response>): st
   cleanups.push(() => running.stop(true));
   return running.url.href.slice(0, -1);
 }
-function configured(apiUrl: string): Config {
-  const c: Config = {
-    apiUrl,
-    organizationId: NewID(),
-    actorId: NewID(),
-    apiKey: "synthetic-kimchi-key",
-    enabled: true,
-  };
-  c.credentialHash = CredentialHash(c);
-  return c;
+// A verified account and the Kimchi sign-in it was verified with.
+function configured(apiUrl: string): [Config, SignIn] {
+  const k = { apiUrl, token: "synthetic-kimchi-key" };
+  return [
+    { apiUrl, organizationId: NewID(), actorId: NewID(), credentialHash: CredentialHash(k) },
+    k,
+  ];
 }
 function acknowledgement(batch: Batch) {
   return Response.json({
@@ -62,70 +60,57 @@ function acknowledgement(batch: Batch) {
   });
 }
 
-test("Kimchi key discovers its org, verifies user ownership, and keeps only stable identity", async () => {
-  const actor = NewID(),
-    org = NewID(),
-    calls: string[] = [];
-  const apiUrl = server((req) => {
-    expect(req.headers.get("authorization")).toBe("Bearer synthetic-kimchi-key");
-    expect(req.headers.get("x-api-key")).toBeNull();
-    const path = new URL(req.url).pathname;
-    calls.push(path);
-    if (path.endsWith("api-keys:verify")) {
-      expect(req.method).toBe("POST");
-      return Response.json({ organizationId: org, userId: actor });
-    }
-    expect(req.method).toBe("GET");
-    return Response.json({
-      id: actor,
-      username: "auth0|fixture",
-      email: "discard@example.invalid",
-      readmeIoJwt: "never-persist",
+test("a Kimchi API key or SSO login verifies like Kimchi's uploader and keeps only stable identity", async () => {
+  for (const sso of [false, true]) {
+    const actor = NewID(),
+      org = NewID(),
+      calls: string[] = [];
+    const apiUrl = server((req) => {
+      expect(req.headers.get("authorization")).toBe("Bearer synthetic-kimchi-token");
+      expect(req.headers.get("x-castai-organization-id")).toBe(sso ? org : null);
+      calls.push(`${req.method} ${new URL(req.url).pathname}`);
+      return Response.json({
+        organizationId: org,
+        userId: actor,
+        email: "discard@example.invalid",
+      });
     });
-  });
-  const c = await Authenticate({ apiUrl: apiUrl + "/", apiKey: "synthetic-kimchi-key" });
-  expect(c.organizationId).toBe(org);
-  expect(c.actorId).toBe(actor);
-  expect(c.apiUrl).toBe(apiUrl);
-  expect(() => Ready(c)).not.toThrow();
-  expect(JSON.stringify(c)).not.toContain("never-persist");
-  expect(JSON.stringify(c)).not.toContain("discard@example.invalid");
-  expect(calls).toEqual(["/ai-optimizer/v1beta/api-keys:verify", "/v1/me"]);
-  expect(() => Ready({ ...c, apiKey: "replacement-key" })).toThrow("run configure");
+    const k = {
+      apiUrl: apiUrl + "/",
+      token: "synthetic-kimchi-token",
+      ...(sso ? { organizationId: org } : {}),
+    };
+    const c = await Authenticate(k);
+    expect(c).toEqual({
+      apiUrl,
+      organizationId: org,
+      actorId: actor,
+      credentialHash: CredentialHash(k),
+    });
+    expect(() => Ready(c, k)).not.toThrow();
+    expect(calls).toEqual(["POST /ai-optimizer/v1beta/api-keys:verify"]);
+    expect(() => Ready(c, { ...k, token: "replacement-token" })).toThrow("not verified");
+    expect(() => Ready(c, { apiUrl })).toThrow("sign in to Kimchi");
+  }
 });
 
-test("onboarding rejects mismatched org, mismatched owner, and service-account profiles", async () => {
-  for (const mode of ["org", "owner", "service", "missing-owner"]) {
-    const org = NewID(),
-      actor = NewID();
-    const apiUrl = server((req) =>
-      new URL(req.url).pathname.endsWith("api-keys:verify")
-        ? Response.json({
-            organizationId: org,
-            ...(mode === "missing-owner" ? {} : { userId: actor }),
-          })
-        : Response.json({
-            id: mode === "owner" ? NewID() : actor,
-            ...(mode === "service" ? {} : { username: "auth0|fixture" }),
-          }),
+test("verification rejects another SSO organization and a missing user", async () => {
+  for (const mode of ["org", "missing-owner"]) {
+    const org = NewID();
+    const apiUrl = server(() =>
+      Response.json({
+        organizationId: org,
+        ...(mode === "missing-owner" ? {} : { userId: NewID() }),
+      }),
     );
     await expect(
       Authenticate({
         apiUrl,
-        apiKey: "synthetic-key",
+        token: "synthetic-token",
         ...(mode === "org" ? { organizationId: NewID() } : {}),
       }),
     ).rejects.toThrow();
   }
-});
-
-test("new configure requires a Kimchi API key while existing bearer config remains readable", async () => {
-  const c = configured("https://api.cast.ai");
-  delete c.apiKey;
-  c.accessToken = "legacy-bearer";
-  c.credentialHash = CredentialHash(c);
-  expect(() => Ready(c)).not.toThrow();
-  await expect(Authenticate(c)).rejects.toThrow("Kimchi API key");
 });
 
 test("reporting refuses unsafe URLs and credentials do not follow redirects", async () => {
@@ -134,7 +119,7 @@ test("reporting refuses unsafe URLs and credentials do not follow redirects", as
     "https://secret@example.com",
     "https://example.com?token=secret",
   ]) {
-    expect(() => ValidateConfig({ apiUrl, organizationId: NewID(), apiKey: "key" })).toThrow();
+    expect(() => ValidateConfig({ apiUrl, organizationId: NewID(), actorId: NewID() })).toThrow();
   }
   let reached = false;
   const destination = server(() => {
@@ -148,7 +133,7 @@ test("reporting refuses unsafe URLs and credentials do not follow redirects", as
         headers: { Location: destination },
       }),
   );
-  await expect(Authenticate({ apiUrl, apiKey: "synthetic-key" })).rejects.toThrow("HTTP 302");
+  await expect(Authenticate({ apiUrl, token: "synthetic-key" })).rejects.toThrow("HTTP 302");
   expect(reached).toBe(false);
 });
 
@@ -160,19 +145,21 @@ test("lost response retries the identical durable batch and uses only Bearer aut
   const apiUrl = server(async (req) => {
     expect(req.headers.get("authorization")).toBe("Bearer synthetic-kimchi-key");
     expect(req.headers.get("x-api-key")).toBeNull();
+    expect(req.headers.get("x-castai-organization-id")).toBeNull();
     expect(new URL(req.url).pathname).toContain("/pr-cost-events:batchIngest");
     bodies.push(await req.text());
     if (bodies.length === 1)
       return new Response("synthetic-kimchi-key upstream response", { status: 503 });
     return acknowledgement(Parse(bodies.at(-1)!).batch);
   });
-  const c = configured(apiUrl);
-  await expect(Flush(s, c)).rejects.toThrow("HTTP 503; batch retained");
-  expect(await Flush(s, c)).toBe(true);
+  const [c, k] = configured(apiUrl);
+  expect(await Flush(s, c, { apiUrl })).toBe(false);
+  await expect(Flush(s, c, k)).rejects.toThrow("HTTP 503; batch retained");
+  expect(await Flush(s, c, k)).toBe(true);
   expect(bodies[0]).toBe(bodies[1]);
   expect(bodies[0]).not.toContain("synthetic-kimchi-key");
   expect(s.Status().pending).toBe(0);
-  expect(await Flush(s, c)).toBe(false);
+  expect(await Flush(s, c, k)).toBe(false);
 });
 
 test("partial and invalid acknowledgements retain the identical pending batch", async () => {
@@ -186,11 +173,11 @@ test("partial and invalid acknowledgements retain the identical pending batch", 
     if (bodies.length === 2) return new Response("not JSON");
     return acknowledgement(batch);
   });
-  const c = configured(apiUrl);
-  await expect(Flush(s, c)).rejects.toThrow();
-  await expect(Flush(s, c)).rejects.toThrow("invalid reporting acknowledgement");
+  const [c, k] = configured(apiUrl);
+  await expect(Flush(s, c, k)).rejects.toThrow();
+  await expect(Flush(s, c, k)).rejects.toThrow("invalid reporting acknowledgement");
   expect(s.Status().pending).toBe(1);
-  expect(await Flush(s, c)).toBe(true);
+  expect(await Flush(s, c, k)).toBe(true);
   expect(new Set(bodies).size).toBe(1);
 });
 
@@ -224,10 +211,10 @@ test("nested 413 splits keep event revisions and survive accepted-but-lost respo
       }
       return acknowledgement(batch);
     });
-    const c = configured(apiUrl);
+    const [c, k] = configured(apiUrl);
     for (let i = 0; i < 64; i++) {
       try {
-        if (!(await Flush(s, c))) break;
+        if (!(await Flush(s, c, k))) break;
       } catch {
         /* simulate the next native sync retry */
       }
@@ -257,7 +244,8 @@ test("OTLP partial failure retries independently without Cast credentials", asyn
   const c: Config = {
     apiUrl,
     organizationId: NewID(),
-    apiKey: "cast-only-secret",
+    actorId: NewID(),
+    credentialHash: CredentialHash({ apiUrl, token: "cast-only-secret" }),
     otlpUrl: apiUrl + "/v1/logs",
     otlpHeaders: { Authorization: "Bearer customer-only" },
   };

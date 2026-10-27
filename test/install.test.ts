@@ -1,13 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   rmSync,
-  statSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,193 +41,154 @@ afterEach(() => {
   for (const root of dirs.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-describe("release bootstrap rejects untrusted archives", () => {
-  for (const kind of ["checksum", "traversal", "symlink"] as const)
-    test(kind, async () => {
-      const root = temp(),
-        bin = join(root, "fake-bin");
-      mkdirSync(bin);
-      const os = process.platform === "darwin" ? "darwin" : "linux",
-        arch = process.arch === "arm64" ? "arm64" : "amd64";
-      const name = `kimchi-adapters_${os}_${arch}.tar.gz`,
-        asset = join(root, name),
-        env = environment(root, bin);
-      if (kind === "symlink") {
-        const files = join(root, "files");
-        mkdirSync(files);
-        symlinkSync(join(root, "unowned"), join(files, "link"));
-        const tar = spawnSync("tar", ["-czf", asset, "-C", files, "link"], {
-          env,
-          encoding: "utf8",
-        });
-        expect(tar.status).toBe(0);
-      } else {
-        // Use Bun's native archive writer instead of implementing tar headers.
-        const Archive = (
-          Bun as unknown as {
-            Archive: new (files: Record<string, string>) => { bytes(): Promise<Uint8Array> };
-          }
-        ).Archive;
-        const archive = new Archive({ "../escaped": "x" });
-        writeFileSync(asset, Bun.gzipSync(Uint8Array.from(await archive.bytes())));
-      }
-      const hash =
-        kind === "checksum"
-          ? "0".repeat(64)
-          : createHash("sha256").update(readFileSync(asset)).digest("hex");
-      const sums = join(root, "SHA256SUMS");
-      writeFileSync(sums, `${hash}  ${name}\n`);
-      executable(
-        join(bin, "gh"),
-        `#!/bin/sh
-if [ "$1" = release ] && [ "$2" = list ]; then printf '%s\\n' v0.1.0-rc.5;exit 0;fi
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = --dir ]; then dest=$2;shift 2;else shift;fi
-done
-cp "$FIXTURE_ASSET" "$dest/$FIXTURE_NAME"
-cp "$FIXTURE_SUMS" "$dest/SHA256SUMS"
-`,
-      );
-      executable(join(bin, "claude"), "#!/bin/sh\nexit 0\n");
-      const result = run(installer, ["install", "claude"], {
-        ...env,
-        FIXTURE_ASSET: asset,
-        FIXTURE_SUMS: sums,
-        FIXTURE_NAME: name,
-      });
-      expect(result.status).not.toBe(0);
-      const expected = {
-        checksum: "checksum mismatch",
-        traversal: "Unsafe release archive",
-        symlink: "links or special files",
-      }[kind];
-      expect(result.output).toContain(expected);
-      expect(existsSync(join(root, "escaped"))).toBe(false);
-      expect(existsSync(join(root, "install", "releases"))).toBe(false);
-    });
-});
-
-describe("updates retry durable previous-version cleanup", () => {
-  for (const cli of ["claude", "codex"] as const)
-    test(cli, () => {
-      const root = temp(),
-        prefix = join(root, "install"),
-        bin = join(root, "bin"),
-        fake = join(root, "fake-bin"),
-        pkg = join(root, "package");
-      for (const path of [
-        join(prefix, "installed"),
-        join(prefix, "releases/v0.1.0/bin"),
-        bin,
-        fake,
-        join(pkg, "bin"),
-      ])
-        mkdirSync(path, { recursive: true, mode: 0o700 });
-      for (const path of [
-        join(prefix, "releases/v0.1.0/bin/kimchi-adapters"),
-        join(pkg, "bin/kimchi-adapters"),
-      ])
-        executable(path, "#!/bin/sh\nexit 0\n");
-      symlinkSync(
-        join(prefix, "releases/v0.1.0/bin/kimchi-adapters"),
-        join(bin, "kimchi-adapters"),
-      );
-      writeFileSync(join(pkg, "VERSION"), "v0.2.0\n");
-      const script = readFileSync(installer, "utf8");
-      executable(join(pkg, "install.sh"), script);
-      executable(join(pkg, "bootstrap.sh"), script);
-      const receipt = join(prefix, "installed", cli);
-      writeFileSync(receipt, "v0.1.0\n");
-      executable(
-        join(fake, cli),
-        `#!/bin/sh
+// A package as Kimchi's release carries it, and a fake Kimchi binary to run it.
+function fixture(version: string, market: string) {
+  const root = temp(),
+    pkg = join(root, "package"),
+    fake = join(root, "fake-bin");
+  for (const path of [join(pkg, "bin"), join(pkg, "lib"), join(pkg, "markets"), fake])
+    mkdirSync(path, { recursive: true });
+  const script = readFileSync(installer, "utf8");
+  executable(join(pkg, "install.sh"), script);
+  executable(join(pkg, "bootstrap.sh"), script);
+  executable(
+    join(pkg, "bin/kimchi-adapters"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> "${join(root, "helper-calls")}"\n`,
+  );
+  writeFileSync(join(pkg, "lib/kimchi-adapters.mjs"), "");
+  writeFileSync(join(pkg, "VERSION"), version + "\n");
+  for (const cli of ["claude", "codex"]) writeFileSync(join(pkg, "markets", cli), market + "\n");
+  executable(join(root, "kimchi"), "#!/bin/sh\nexit 0\n");
+  for (const cli of ["claude", "codex"])
+    executable(
+      join(fake, cli),
+      `#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_CALLS"
 case "$1/$2/$3" in
   plugin/uninstall/kimchi-work@kimchi-work-v0-1-0|plugin/remove/kimchi-work@kimchi-work-v0-1-0)
     if [ ! -e "$FAKE_FAILED" ]; then : > "$FAKE_FAILED";echo 'temporary native removal failure' >&2;exit 1;fi
     ;;
 esac
+[ "\${FAKE_FAIL_ADD:-}/$1/$2" != "${cli}/plugin/add" ] || { echo 'native add failure' >&2; exit 1; }
 exit 0
 `,
-      );
-      const env = {
-        ...environment(root, fake),
-        FAKE_CALLS: join(root, "calls"),
-        FAKE_FAILED: join(root, "failed"),
-      };
+    );
+  const env: Record<string, string> = {
+    ...environment(root, fake),
+    KIMCHI_BIN: join(root, "kimchi"),
+    FAKE_CALLS: join(root, "calls"),
+    FAKE_FAILED: join(root, "failed"),
+  };
+  const prefix = env.KIMCHI_ADAPTERS_PREFIX!;
+  mkdirSync(join(prefix, "installed"), { recursive: true });
+  const calls = () =>
+    existsSync(env.FAKE_CALLS!) ? readFileSync(env.FAKE_CALLS!, "utf8").split("\n") : [];
+  const helper = () => readFileSync(join(root, "helper-calls"), "utf8");
+  return { root, pkg, env, prefix, calls, helper };
+}
+
+describe("a new wiring registers once and retries removing the old registration", () => {
+  for (const cli of ["claude", "codex"] as const)
+    test(cli, () => {
+      const { pkg, env, prefix, calls } = fixture("v0.2.0", "kimchi-work-0123456789ab");
+      // Earlier releases named their receipt and marketplace after the version.
+      const receipt = join(prefix, "installed", cli);
+      writeFileSync(receipt, "v0.1.0\n");
       const first = run(join(pkg, "install.sh"), ["update", cli], env);
       expect(first.status).not.toBe(0);
       expect(first.output).toContain("temporary native removal failure");
-      expect(readFileSync(receipt + ".cleanup", "utf8")).toBe("v0.1.0\n");
+      expect(readFileSync(receipt + ".cleanup", "utf8")).toBe("kimchi-work-v0-1-0\n");
+      // The new registration already runs the new code while the old one waits for removal.
+      expect(readlinkSync(join(prefix, "current.mjs"))).toBe(
+        join(prefix, "releases/v0.2.0/lib/kimchi-adapters.mjs"),
+      );
+      expect(existsSync(join(prefix, "installed/code"))).toBe(false);
       const second = run(join(pkg, "install.sh"), ["update", cli], env);
       expect(second.status).toBe(0);
       expect(second.output).toContain("Installed " + cli + " v0.2.0");
       expect(existsSync(receipt + ".cleanup")).toBe(false);
-      expect(readFileSync(receipt, "utf8")).toBe("v0.2.0\n");
-      const helper = statSync(join(prefix, "releases/v0.2.0/bin/kimchi-adapters"));
-      const linked = statSync(join(prefix, "releases/v0.2.0/plugins", cli, "bin/kimchi-adapters"));
-      expect(linked.dev).toBe(helper.dev);
-      expect(linked.ino).toBe(helper.ino);
-      const calls = readFileSync(join(root, "calls"), "utf8").split("\n");
+      expect(readFileSync(receipt, "utf8")).toBe("kimchi-work-0123456789ab\n");
+      expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.2.0\n");
+      expect(readlinkSync(join(prefix, "runtime"))).toBe(env.KIMCHI_BIN);
       const install =
         cli === "claude"
-          ? "plugin install kimchi-work@kimchi-work-v0-2-0"
-          : "plugin add kimchi-work@kimchi-work-v0-2-0";
+          ? "plugin install kimchi-work@kimchi-work-0123456789ab"
+          : "plugin add kimchi-work@kimchi-work-0123456789ab";
       const remove =
         cli === "claude"
           ? "plugin uninstall kimchi-work@kimchi-work-v0-1-0"
           : "plugin remove kimchi-work@kimchi-work-v0-1-0";
-      expect(calls.filter((c) => c.startsWith(install + " ")).length).toBe(1);
-      expect(calls.filter((c) => c.startsWith(remove + " ")).length).toBe(2);
+      expect(calls().filter((c) => c.startsWith(install + " ")).length).toBe(1);
+      expect(calls().filter((c) => c.startsWith(remove + " ")).length).toBe(2);
       expect(existsSync(join(prefix, "install.lock"))).toBe(false);
     });
 });
 
-describe("installer reporting sign-in", () => {
-  for (const mode of ["configured", "missing", "failed"] as const)
-    test(mode, () => {
-      const root = temp(),
-        bin = join(root, "fake-bin"),
-        pkg = join(root, "package"),
-        env = environment(root, bin);
-      for (const path of [bin, join(pkg, "bin")]) mkdirSync(path, { recursive: true });
-      for (const name of ["install.sh", "bootstrap.sh"])
-        writeFileSync(join(pkg, name), readFileSync(installer));
-      writeFileSync(join(pkg, "VERSION"), "v0.2.0\n");
-      executable(join(bin, "claude"), "#!/bin/sh\nexit 0\n");
-      executable(
-        join(pkg, "bin/kimchi-adapters"),
-        `#!/bin/sh
-printf '%s\\n' "$*" >> "$FIXTURE_HELPER_CALLS"
-if [ "$1" = login ] && [ "$2" = --from-kimchi ]; then
-  case "$FIXTURE_LOGIN" in
-    configured) printf '%s\\n' 'Reporting configured with your Kimchi API key.' ;;
-    failed) printf '%s\\n' 'Reporting key could not be verified' >&2; exit 1 ;;
-  esac
-fi
-`,
-      );
-      const calls = join(root, "helper-calls");
-      const result = run(join(pkg, "install.sh"), ["install", "claude"], {
-        ...env,
-        FIXTURE_LOGIN: mode,
-        FIXTURE_HELPER_CALLS: calls,
-      });
-      expect(readFileSync(calls, "utf8").split("\n").filter(Boolean)).toEqual([
-        "activate",
-        "login --from-kimchi --if-present",
-      ]);
-      expect(existsSync(join(root, "install/installed/claude"))).toBe(true);
-      if (mode === "failed") {
-        expect(result.status).not.toBe(0);
-        expect(result.output).toContain(
-          "Plugins installed; the saved Kimchi login could not be verified",
-        );
-      } else {
-        expect(result.status).toBe(0);
-        expect(result.output).toContain(
-          mode === "configured" ? "Reporting configured" : "Sign in once:",
-        );
-      }
-    });
+test("a release that changes only code relinks it without the clients' plugin managers", () => {
+  const { pkg, env, prefix, calls } = fixture("v0.3.0", "kimchi-work-0123456789ab");
+  for (const cli of ["claude", "codex"])
+    writeFileSync(join(prefix, "installed", cli), "kimchi-work-0123456789ab\n");
+  writeFileSync(join(prefix, "installed/code"), "v0.2.0\n");
+  const result = run(join(pkg, "install.sh"), ["update", "both"], env);
+  expect(result.status).toBe(0);
+  expect(result.output).toContain("claude plugin already registered");
+  expect(result.output).toContain("codex plugin already registered");
+  expect(calls()).toEqual([]);
+  expect(readlinkSync(join(prefix, "current.mjs"))).toBe(
+    join(prefix, "releases/v0.3.0/lib/kimchi-adapters.mjs"),
+  );
+  expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.3.0\n");
+});
+
+test("the installer needs Kimchi and leaves updates to Kimchi's release", () => {
+  const { root, pkg, env, prefix, calls } = fixture("v0.2.0", "kimchi-work-0123456789ab");
+  const missing = run(join(pkg, "install.sh"), ["install", "claude"], {
+    ...env,
+    KIMCHI_BIN: join(root, "absent"),
+  });
+  expect(missing.status).not.toBe(0);
+  expect(missing.output).toContain("install Kimchi first");
+  expect(calls()).toEqual([]);
+  const result = run(join(pkg, "install.sh"), ["install", "claude"], env);
+  expect(result.status).toBe(0);
+  expect(result.output).toContain("Reports with your Kimchi sign-in");
+  expect(readFileSync(join(prefix, "installed/claude"), "utf8")).toBe("kimchi-work-0123456789ab\n");
+  // The kept bootstrap can uninstall, but only Kimchi's release installs or updates.
+  const update = run(join(prefix, "install.sh"), ["update", "claude"], env);
+  expect(update.status).not.toBe(0);
+  expect(update.output).toContain("run the Kimchi installer");
+  const uninstall = run(join(prefix, "install.sh"), ["uninstall", "claude"], env);
+  expect(uninstall.status).toBe(0);
+  expect(calls()).toContain("plugin uninstall kimchi-work@kimchi-work-0123456789ab --scope user");
+  expect(existsSync(join(prefix, "installed/claude"))).toBe(false);
+});
+
+test("a client whose registration failed keeps the code receipt old, so Kimchi retries it", () => {
+  const { pkg, env, prefix, helper } = fixture("v0.2.0", "kimchi-work-0123456789ab");
+  for (const cli of ["claude", "codex"])
+    writeFileSync(join(prefix, "installed", cli), "kimchi-work-000000000000\n");
+  writeFileSync(join(prefix, "installed/code"), "v0.1.0\n");
+  const failing = { ...env, FAKE_FAIL_ADD: "codex" };
+  // Kimchi runs the installer once per client, so Claude's success comes first.
+  expect(run(join(pkg, "install.sh"), ["update", "claude"], failing).status).toBe(0);
+  expect(run(join(pkg, "install.sh"), ["update", "codex"], failing).status).not.toBe(0);
+  expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.1.0\n");
+  expect(run(join(pkg, "install.sh"), ["update", "codex"], env).status).toBe(0);
+  expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.2.0\n");
+  // Each finished run saves the settings once, dropping an earlier release's stored key.
+  expect(
+    helper()
+      .split("\n")
+      .filter((line) => line === "activate").length,
+  ).toBe(2);
+});
+
+test("uninstalling both needs only the client the plugins were added to", () => {
+  const { pkg, env, prefix, calls } = fixture("v0.2.0", "kimchi-work-0123456789ab");
+  expect(run(join(pkg, "install.sh"), ["install", "claude"], env).status).toBe(0);
+  rmSync(join(env.PATH!.split(delimiter)[0]!, "codex"));
+  const result = run(join(prefix, "install.sh"), ["uninstall", "both"], env);
+  expect(result.status).toBe(0);
+  expect(calls()).toContain("plugin uninstall kimchi-work@kimchi-work-0123456789ab --scope user");
+  expect(existsSync(join(prefix, "installed/claude"))).toBe(false);
 });

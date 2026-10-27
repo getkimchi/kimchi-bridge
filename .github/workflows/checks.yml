@@ -24,7 +24,6 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm format:check
       - run: pnpm test
-      - run: pnpm build
       - run: bash -n install.sh scripts/package.sh
       - run: git diff --check
   package:
