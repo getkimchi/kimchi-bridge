@@ -309,6 +309,9 @@ export class Store {
       this.db.query("DELETE FROM batches WHERE id=?").run(b.id);
     });
   }
+  dropBatch(b: Batch): void {
+    this.db.query("DELETE FROM batches WHERE id=?").run(b.id);
+  }
   splitBatch(b: Batch): void {
     if (b.events.length < 2)
       throw new Error("one record exceeds the reporting payload limit; record retained");
