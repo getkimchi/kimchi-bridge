@@ -21,14 +21,33 @@ async function sync($) {
     // The durable queue is retried by the next timer or session.
   }
 }
+async function ensure($) {
+  try {
+    // Probe/spawn the LLM gateway proxy; returns fast and never blocks.
+    await $.process.run([$.plugin.root + '/bin/kimchi-bridge', 'gateway', 'ensure', '--quick'], {timeoutMs: 2000});
+  } catch {
+    // Best effort: the next tick retries.
+  }
+}
+async function hint($) {
+  try {
+    const result = await $.process.run([$.plugin.root + '/bin/kimchi-bridge', 'hint'], {timeoutMs: 2000});
+    const text = result && typeof result === 'object' ? String(result.stdout ?? result.output ?? '') : '';
+    if (text.trim() && $.ui && typeof $.ui.notice === 'function') $.ui.notice(text.trim());
+  } catch {
+    // Hints are best effort.
+  }
+}
 export function register(on) {
   on('session.start', async ($, e, next) => {
     await record($, 'session.start', e);
+    await ensure($);
+    await hint($);
     $.clock.after(0, async () => { await sync($); });
-    $.clock.every(30000, async () => { await sync($); });
+    $.clock.every(30000, async () => { await sync($); await ensure($); });
     return next(e);
   });
-  on('classic.UserPromptSubmit', async ($, e, next) => { await record($, 'classic.UserPromptSubmit', e); return next(e); });
+  on('classic.UserPromptSubmit', async ($, e, next) => { await ensure($); await record($, 'classic.UserPromptSubmit', e); return next(e); });
   on('turn.start', async ($, e, next) => { await record($, 'turn.start', e); return next(e); });
   on('tool.call', async ($, e, next) => {
     await record($, 'tool.before', e);

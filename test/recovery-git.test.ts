@@ -304,6 +304,40 @@ test("native int64 usage readers preserve decimal identity before bounded event 
   expect(claudeUsage(raw).outputTokens).toBeUndefined();
 });
 
+test("a lone message iteration takes the reply's model; other unnamed iterations stay unknown", () => {
+  const { root, store, r, scope } = fixture("claude-code");
+  const path = join(root, "iterations.jsonl");
+  registerTranscript(r, scope, path, "provider-api", "unknown");
+  const reply = (id: string, iterations: object[]) =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: at,
+      message: {
+        id,
+        model: "claude-opus-5-5",
+        usage: { input_tokens: 2, output_tokens: 395, iterations },
+      },
+    }) + "\n";
+  const counts = { input_tokens: 2, output_tokens: 395 };
+  writeFileSync(path, reply("lone", [{ type: "message", ...counts }]));
+  recoverContext(r);
+  expect(latest(store, "usage").usage.iterations.map((item: any) => item.model)).toEqual([
+    "claude-opus-5-5",
+  ]);
+  appendFileSync(
+    path,
+    reply("several", [
+      { type: "message", ...counts },
+      { type: "compaction", ...counts },
+    ]),
+  );
+  recoverContext(r);
+  expect(latest(store, "usage").usage.iterations.map((item: any) => item.model ?? "")).toEqual([
+    "",
+    "",
+  ]);
+});
+
 test("Codex usage carries the service tier its thread settings ask for", () => {
   const { root, store, r, scope } = fixture();
   const path = join(root, "tier.jsonl");

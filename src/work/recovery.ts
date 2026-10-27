@@ -262,7 +262,10 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     stopReason: str(m, "stop_reason"),
     attemptsComplete: false,
   };
-  if (Array.isArray(raw.iterations) && raw.iterations.length)
+  if (Array.isArray(raw.iterations) && raw.iterations.length) {
+    // A lone "message" iteration is the reply itself, so it ran on the reply's model; Anthropic
+    // names a model only when iterations can differ, as with a fallback. Unknown models stay unpriced.
+    const sole = raw.iterations.length === 1;
     u.iterations = raw.iterations.map((item: unknown, i: number) => {
       const it = obj(item);
       const flat = [
@@ -274,13 +277,14 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
       ].some((key) => Object.hasOwn(it, key));
       return {
         id: str(it, "id") || stableId(response, canonicalHash(i)),
-        model: str(it, "model"),
+        model: str(it, "model") || (sole && str(it, "type") === "message" ? str(m, "model") : ""),
         schema: u.schema,
         raw: claudeUsage(flat ? it : obj(it.usage)),
         stopReason: str(it, "stop_reason"),
         billingStatus: str(it, "billing_status"),
       };
     });
+  }
   let work = "";
   if (s.Agent) {
     work = r.work(s);

@@ -49,7 +49,23 @@ Your local records and the plugin files stay in `~/.local/state/kimchi-bridge` a
 
 There is nothing to set up: the plugins report with your Kimchi sign-in. They use the API key in `KIMCHI_API_KEY` or `~/.config/kimchi/config.json`, or else your Kimchi SSO login, in Kimchi's region. To sign in or switch accounts, run `kimchi`.
 
-A session reports to the account Kimchi was signed in to when the session started. Sessions that start while Kimchi is signed out stay on your machine and are never uploaded.
+The plugins also have their own sign-in, a CAST AI single sign-on (OAuth, with automatic token refresh) that works without the Kimchi CLI:
+
+```sh
+kimchi-bridge login
+```
+
+This opens a browser sign-in, asks for your organization when the account has several, and saves the credential under `~/.local/state/kimchi-bridge`. Inside Claude Code run `/kimchi-login`, in Codex ask it to use the `kimchi-login` skill. When the Kimchi CLI is signed in, `kimchi-bridge login --from-kimchi` reuses its credential without another browser round-trip.
+
+A successful sign-in also routes Claude Code and Codex model requests through the Kimchi LLM gateway (`llm.kimchi.dev`): it writes `~/.claude/settings.json` and `~/.codex/config.toml`, and runs a small local proxy that keeps OAuth tokens fresh and adds your organization header. API-key sign-ins connect direct, with the key embedded and no proxy. Revert anytime:
+
+```sh
+kimchi-bridge gateway disable
+```
+
+A session reports to the account the sign-in verified when the session started. Sessions that start while signed out stay on your machine and are never uploaded.
+
+The plugins also follow Kimchi's PR reporting setting. If you turn it off with `/pr-reporting off` in Kimchi, turn off Kimchi's telemetry, or your organization turns usage reporting off, the plugins upload nothing, and sessions that start meanwhile stay on your machine. `kimchi-bridge status` shows the setting as `kimchiReporting`.
 
 The plugins also follow Kimchi's PR reporting setting. If you turn it off with `/pr-reporting off` in Kimchi, turn off Kimchi's telemetry, or your organization turns usage reporting off, the plugins upload nothing, and sessions that start meanwhile stay on your machine. `kimchi-bridge status` shows the setting as `kimchiReporting`.
 
@@ -57,7 +73,17 @@ The plugins also follow Kimchi's PR reporting setting. If you turn it off with `
 
 | Command | What it does |
 | --- | --- |
-| `kimchi-bridge status` | Shows whether Kimchi is signed in and verified, the local data folder, queued uploads and recording problems. |
+| `kimchi-bridge login` | CAST AI SSO sign-in (OAuth); enables the gateway automatically. |
+| `kimchi-bridge login --from-kimchi` | Reuses the Kimchi CLI's saved sign-in. |
+| `kimchi-bridge login --region eu` | Signs in to the EU region. |
+| `kimchi-bridge login --org <id>` | Picks the organization when the account has several. |
+| `kimchi-bridge login --no-browser` | Prints the sign-in link instead of opening it. |
+| `kimchi-bridge login --reporting-only` | Signs in without switching inference to the gateway. |
+| `kimchi-bridge login status` | Prints the sign-in state as JSON (used by the in-client sign-in commands). |
+| `kimchi-bridge gateway enable` | Routes Claude Code and Codex through the Kimchi gateway in the mode matching your sign-in (OAuth via the local proxy; API keys direct). |
+| `kimchi-bridge gateway disable` | Restores the previous provider settings and stops the proxy. |
+| `kimchi-bridge gateway status` | Shows the gateway state as JSON. |
+| `kimchi-bridge status` | Shows whether the sign-in is verified, the gateway state, the local data folder, queued uploads and recording problems. |
 | `kimchi-bridge flush` | Uploads all queued records now. |
 | `kimchi-bridge disable` | Pauses recording and background uploads. Local records are kept. |
 | `kimchi-bridge enable` | Resumes recording and uploads. |

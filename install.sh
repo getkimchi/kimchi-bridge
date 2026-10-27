@@ -44,8 +44,19 @@ if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-bridge" || -L "$bin_dir/ki
   existing=$(readlink "$bin_dir/kimchi-bridge") || fail 'Refusing to replace an unmanaged kimchi-bridge binary.'
   case "$existing" in "$prefix/releases/"*/bin/kimchi-bridge) ;; *) fail 'Refusing to replace an unmanaged kimchi-bridge link.' ;; esac
 fi
-mkdir "$prefix/install.lock" 2>/dev/null || fail "Another installer is running ($prefix/install.lock)."
-trap 'rmdir "$prefix/install.lock"' EXIT
+lock="$prefix/install.lock"
+# A lock whose installer is gone (killed, or the machine lost power) would block every later
+# install and update, so it is replaced. A lock without a pid is held for ten minutes: its
+# installer may not have written the pid yet, or it came from an earlier release.
+if ! mkdir "$lock" 2>/dev/null; then
+  holder=$(cat "$lock/pid" 2>/dev/null) || holder=
+  if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then fail "Another installer is running ($lock)."; fi
+  if [[ -z "$holder" && -z "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then fail "Another installer is running ($lock)."; fi
+  rm -rf -- "$lock"
+  mkdir "$lock" 2>/dev/null || fail "Another installer is running ($lock)."
+fi
+printf '%s\n' "$$" > "$lock/pid"
+trap 'rm -rf -- "$lock"' EXIT
 # A client's receipt names its registered marketplace, kimchi-bridge-<hash>, which changes only
 # with the plugin wiring. Earlier releases registered kimchi-work-<hash> or kimchi-work-<version>,
 # and their receipts name that version; cleanup still removes those registrations.
@@ -103,6 +114,11 @@ mkdir -p "$prefix/releases"
 if [[ ! -d "$target" ]]; then
   staged=$(mktemp -d "$prefix/releases/.install.XXXXXXXX")
   cp -R "$script_root/." "$staged/"
+  # A Kimchi update can replace the package while it is copied; never keep a mixed copy.
+  if [[ "$(cat "$staged/VERSION" 2>/dev/null)" != "$version" || ! -f "$staged/lib/kimchi-bridge.mjs" ]]; then
+    rm -rf -- "$staged"
+    fail 'The package changed while it was copied: run the installer again.'
+  fi
   mv -- "$staged" "$target"
 fi
 # Every registered plugin runs this code, so link it before registering. Each link changes with
@@ -160,5 +176,5 @@ fi
 # Keep the bootstrap, rather than a package-bound script, for kimchi-bridge uninstall.
 cp "$target/bootstrap.sh" "$prefix/install.sh"
 chmod 700 "$prefix/install.sh"
-printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi.' "Control: $bin_dir/kimchi-bridge status" 'Existing inference and enterprise telemetry settings are unchanged.'
+printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi, or kimchi-bridge login for the browser SSO.' "Control: $bin_dir/kimchi-bridge status" 'kimchi-bridge login routes model requests through the Kimchi gateway; revert with kimchi-bridge gateway disable.'
 [[ -z "$registered" ]] || printf '%s\n' 'Start a new Claude Code or Codex session; Codex asks you to trust the hooks.'
