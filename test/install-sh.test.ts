@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, copyFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 
 /**
  * install.sh is the one artifact every install path funnels through (kimchi's
