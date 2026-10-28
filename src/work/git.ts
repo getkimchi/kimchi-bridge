@@ -131,7 +131,7 @@ export function reconcileGit(r: Recorder, signal?: AbortSignal) {
         continue;
       }
       try {
-        matchCommits(r, c, signal);
+        matchCommits(r, c, item.key.slice("git-change:".length), signal);
       } catch (e) {
         r.store.diagnostic("git_match_incomplete");
         failures.push(e);
@@ -160,7 +160,7 @@ function treeObject(
     throw new Error("not an ordinary file blob");
   return parts[2]!;
 }
-function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
+function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortSignal) {
   const root = rootOf(c.Scope),
     format = gitContext(signal, root, "rev-parse", "--show-object-format");
   const before = fileObject(r, c.Before, format),
@@ -174,15 +174,64 @@ function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
     r.store.diagnostic("git_history_bound");
     commits = commits.slice(0, 128);
   }
+  if (!commits.length) return;
+  const befores = new Set([before]),
+    refs = new Set(c.Refs || []);
+  // shortcut: inspect 128 prior file observations; raise the bound if longer chains must match.
+  const previous = r.store.db
+    .query(
+      `SELECT f.before_hash,f.after_hash,m.value FROM file_changes f
+       LEFT JOIN meta m ON m.key='git-change:'||f.id
+       WHERE f.repository=? AND f.path=? AND f.rowid<(SELECT rowid FROM file_changes WHERE id=?)
+       ORDER BY f.rowid DESC LIMIT 128`,
+    )
+    .all(c.Scope.Repo, c.Path, change) as {
+    before_hash: string;
+    after_hash: string;
+    value: string | null;
+  }[];
+  let hash = c.Before;
+  // Compose only consecutive verified edits by the same work and native writer.
+  for (const row of previous) {
+    checkSignal(signal);
+    if (row.before_hash === row.after_hash) continue;
+    if (!row.value) break;
+    const p: GitChange = JSON.parse(row.value);
+    if (
+      p.After !== hash ||
+      p.Work !== c.Work ||
+      p.Source !== c.Source ||
+      p.Scope.Session !== c.Scope.Session ||
+      p.Scope.Agent !== c.Scope.Agent ||
+      p.Scope.Repo !== c.Scope.Repo ||
+      rootOf(p.Scope) !== root ||
+      p.Path !== c.Path ||
+      Date.now() - Date.parse(p.CreatedAt) > 7 * 86400_000
+    )
+      break;
+    hash = p.Before;
+    befores.add(fileObject(r, hash, format));
+    for (const ref of p.Refs || []) refs.add(ref);
+  }
+  befores.delete(after);
   for (const sha of commits) {
     checkSignal(signal);
     if (!gitId(sha)) throw new Error("invalid commit identity");
     if (treeObject(signal, root, sha, path) !== after) continue;
     const parents = fields(gitContext(signal, root, "show", "--format=%P", "--no-patch", sha));
-    let matched = parents.length === 0 && before === "";
-    for (const parent of parents)
-      if (treeObject(signal, root, parent, path) === before) matched = true;
+    let matched = parents.length === 0 && befores.has(""),
+      direct = parents.length === 0 && before === "";
+    for (const parent of parents) {
+      const object = treeObject(signal, root, parent, path);
+      if (befores.has(object)) matched = true;
+      if (object === before) direct = true;
+    }
     if (!matched) continue;
+    if (
+      !direct &&
+      gitContext(signal, root, "rev-list", "--max-count=1", sha, "--not", ...refs) !== sha
+    )
+      continue;
     const event = r.event(c.Scope, `commit:${sha}`, c.Work, c.Source);
     event.commit = { id: sha, parents, quality: "inferred" };
     r.store.observe(event);

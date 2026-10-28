@@ -59,6 +59,55 @@ function latest(store: Store, kind: string) {
     ).toString(),
   );
 }
+function gitFixture(source: string) {
+  const f = fixture(source),
+    path = join(f.root, "file.txt");
+  git(f.root, "init", "--initial-branch=main");
+  git(f.root, "config", "user.email", "fixture@example.invalid");
+  git(f.root, "config", "user.name", "Fixture");
+  git(f.root, "config", "commit.gpgsign", "false");
+  git(f.root, "config", "core.hooksPath", "/dev/null");
+  const commit = () => {
+    git(f.root, "add", ".");
+    git(f.root, "commit", "-m", "fixture");
+    return git(f.root, "rev-parse", "HEAD");
+  };
+  writeFileSync(path, "before\n");
+  commit();
+  f.r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: f.root, prompt: "implement" },
+  });
+  let call = 0;
+  const edit = (
+    before: string,
+    after: string,
+    { recorder = f.r, session = "s", turn = "turn", agent = "", actual = after } = {},
+  ) => {
+    const event = {
+      session_id: session,
+      turn_id: turn,
+      agent_id: agent,
+      cwd: f.root,
+      tool_use_id: `edit-${++call}`,
+      ...(recorder.source === "codex"
+        ? {
+            tool_name: "apply_patch",
+            tool_input: {
+              command: `*** Begin Patch\n*** Update File: file.txt\n@@\n-${before}\n+${after}\n*** End Patch`,
+            },
+          }
+        : {
+            tool_name: "Edit",
+            tool_input: { file_path: path, old_string: before, new_string: after },
+          }),
+    };
+    recorder.record({ stage: "PreToolUse", event });
+    writeFileSync(path, actual + "\n");
+    recorder.record({ stage: "PostToolUse", event });
+  };
+  return { ...f, path, commit, edit };
+}
 const at = "2026-10-23T12:00:00.123456789Z";
 
 test("Codex recovery preserves absent usage, lossless counter identity, duplicate and partial-line replay", () => {
@@ -459,6 +508,155 @@ test("Git revisits a late commit and excludes the old identical revision", () =>
   ).toBe(1);
   expect(latest(store, "commit").commit.id).toBe(sha);
   expect(sha).not.toBe(old);
+});
+
+for (const source of ["claude-code", "codex"]) {
+  test(`${source} retains commit attribution after successive native edits`, () => {
+    const { store, r, edit, commit } = gitFixture(source);
+    saveSourceVersion(r, "s", "native-test-version");
+    edit("before", "middle");
+    edit("middle", "after");
+    const sha = commit(),
+      work = latest(store, "file").workId;
+    expect(store.db.query("SELECT quality FROM file_changes").all()).toEqual([
+      { quality: "tool_observed" },
+      { quality: "tool_observed" },
+    ]);
+    const collector = new Recorder(store, "collector", r.device);
+    for (let i = 0; i < 2; i++) {
+      store.db.query("DELETE FROM meta WHERE key IN ('git-last-pass','git-pass-after')").run();
+      // This local-only fixture tests commit replay without a provider lookup.
+      store.db
+        .query(
+          "UPDATE meta SET value=json_set(value,'$.CheckedAt',?) WHERE key LIKE 'tracked-commit:%'",
+        )
+        .run(new Date().toISOString());
+      reconcileGit(collector);
+      expect(store.db.query("SELECT id FROM events WHERE kind='commit'").all()).toHaveLength(1);
+      expect(store.db.query("SELECT id FROM events WHERE kind='link'").all()).toHaveLength(1);
+      expect(latest(store, "commit")).toMatchObject({
+        source,
+        sourceVersion: "native-test-version",
+        workId: work,
+        commit: { id: sha },
+      });
+      expect(latest(store, "link")).toMatchObject({
+        source,
+        sourceVersion: "native-test-version",
+        workId: work,
+        link: {
+          fromKind: "work",
+          fromId: work,
+          toKind: "commit",
+          toId: sha,
+          reason: "file_revision",
+        },
+      });
+    }
+  });
+}
+
+test("Git composes native edits across turns and intervening reads", () => {
+  const { root, path, store, r, edit, commit } = gitFixture("claude-code");
+  edit("before", "middle");
+  const read = {
+    session_id: "s",
+    turn_id: "turn",
+    cwd: root,
+    tool_use_id: "read",
+    tool_name: "Read",
+    tool_input: { file_path: path },
+  };
+  r.record({ stage: "PreToolUse", event: read });
+  r.record({ stage: "PostToolUse", event: read });
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "next-turn", cwd: root, prompt: "continue" },
+  });
+  edit("middle", "after", { turn: "next-turn" });
+  const sha = commit();
+  reconcileGit(r);
+  expect(latest(store, "commit").commit.id).toBe(sha);
+});
+
+for (const boundary of [
+  "work",
+  "session",
+  "source",
+  "agent",
+  "unobserved edit",
+  "unverified edit",
+]) {
+  test(`Git leaves ${boundary} boundaries unlinked`, () => {
+    const { root, path, store, r, edit, commit } = gitFixture("claude-code");
+    edit("before", "middle");
+    let session = "s",
+      turn = "turn",
+      agent = "",
+      recorder = r,
+      before = "middle";
+    if (boundary === "work") {
+      turn = "other-work-turn";
+      r.record({
+        stage: "UserPromptSubmit",
+        event: { session_id: session, turn_id: turn, cwd: root, prompt: "New work: another task" },
+      });
+    }
+    if (boundary === "session") session = "other-session";
+    if (boundary === "source") recorder = new Recorder(store, "codex", r.device);
+    if (boundary === "agent") {
+      agent = "child";
+      r.record({
+        stage: "SubagentStart",
+        event: { session_id: session, turn_id: turn, cwd: root, agent_id: agent },
+      });
+    }
+    if (boundary === "unobserved edit" || boundary === "unverified edit") {
+      before = "external";
+      if (boundary === "unobserved edit") writeFileSync(path, before + "\n");
+      else edit("middle", "expected", { actual: before });
+    }
+    edit(before, "after", { session, turn, agent, recorder });
+    if (boundary === "work" || boundary === "agent")
+      expect(
+        new Set(
+          store.db
+            .query("SELECT work_id FROM file_changes")
+            .all()
+            .map((row: any) => row.work_id),
+        ).size,
+      ).toBe(boundary === "work" ? 2 : 1);
+    commit();
+    reconcileGit(r);
+    expect(store.db.query("SELECT id FROM events WHERE kind IN ('commit','link')").all()).toEqual(
+      [],
+    );
+  });
+}
+
+test("Git does not attribute an unchanged file after native edits revert it", () => {
+  const { root, store, r, edit, commit } = gitFixture("codex");
+  edit("before", "middle");
+  edit("middle", "before");
+  writeFileSync(join(root, "unrelated.txt"), "human change\n");
+  commit();
+  reconcileGit(r);
+  expect(store.db.query("SELECT id FROM events WHERE kind IN ('commit','link')").all()).toEqual([]);
+});
+
+test("Git excludes a composed revision already reachable before an earlier edit", () => {
+  const { root, path, store, r, edit, commit } = gitFixture("claude-code");
+  const baseline = git(root, "rev-parse", "HEAD");
+  writeFileSync(path, "after\n");
+  const old = commit();
+  git(root, "branch", "old-result", old);
+  git(root, "reset", "--hard", baseline);
+  edit("before", "middle");
+  git(root, "branch", "-D", "old-result");
+  edit("middle", "after");
+  git(root, "branch", "old-result", old);
+  reconcileGit(r);
+  expect(store.db.query("SELECT id FROM events WHERE kind IN ('commit','link')").all()).toEqual([]);
 });
 
 test("collector Git reconciliation preserves the originating source, version and event identities", () => {
