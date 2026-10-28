@@ -229,10 +229,17 @@ test("direct mode derives the gateway URL from a kimchi app sign-in region (no K
   delete process.env.KIMCHI_BASE_URL;
   const original = globalThis.fetch;
   const stub = (async (input: any, init?: any) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : String(input);
+    const url =
+      typeof input === "string" ? input : input instanceof URL ? input.href : String(input);
     if (url.includes("/v1/models/metadata"))
       return Response.json({
-        models: [{ slug: "minimax-m3", is_serverless: true, limits: { context_window: 262144, max_output_tokens: 32768 } }],
+        models: [
+          {
+            slug: "minimax-m3",
+            is_serverless: true,
+            limits: { context_window: 262144, max_output_tokens: 32768 },
+          },
+        ],
       });
     return new Response("not found", { status: 404 });
   }) as typeof fetch;
@@ -243,7 +250,11 @@ test("direct mode derives the gateway URL from a kimchi app sign-in region (no K
     expect(claude.env.ANTHROPIC_BASE_URL).toBe("https://llm.kimchi.dev/anthropic");
     expect(loadGatewayState().mode).toBe("direct");
     await disable();
-    await enable({ apiUrl: "https://app.eu.kimchi.dev/api", token: "castai_v1_key" }, undefined, null);
+    await enable(
+      { apiUrl: "https://app.eu.kimchi.dev/api", token: "castai_v1_key" },
+      undefined,
+      null,
+    );
     const claudeEu = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
     expect(claudeEu.env.ANTHROPIC_BASE_URL).toBe("https://llm.eu.kimchi.dev/anthropic");
   } finally {

@@ -896,7 +896,8 @@ export async function enable(
     if (env) llmBase = baseUrl(env);
     else if (api === "https://api.eu.cast.ai" || api === "https://app.eu.kimchi.dev/api")
       llmBase = "https://llm.eu.kimchi.dev";
-    else if (api === "https://api.cast.ai" || api === "https://app.kimchi.dev/api") llmBase = "https://llm.kimchi.dev";
+    else if (api === "https://api.cast.ai" || api === "https://app.kimchi.dev/api")
+      llmBase = "https://llm.kimchi.dev";
     else
       throw new Error(
         "the gateway redirect needs a us/eu Kimchi sign-in, or KIMCHI_BASE_URL for a custom gateway",
