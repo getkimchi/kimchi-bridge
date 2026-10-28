@@ -790,6 +790,14 @@ export async function runDaemon(): Promise<void> {
       port = candidate;
       break;
     } catch {
+      // The preferred port lost the race to another of our daemons: exit
+      // quietly instead of scanning onto preferred+1 and lingering as a
+      // second proxy (IS-2 duplicates). Anything else (foreign listener)
+      // keeps the designed port-scan behaviour.
+      if (candidate === preferred && (await health(preferred)).ok) {
+        log(`duplicate daemon: port ${preferred} is already served; exiting`);
+        return;
+      }
       continue;
     }
   }
@@ -879,11 +887,17 @@ export async function enable(
     llmBase = endpoints.llmBaseUrl;
   } else {
     if (!signIn.token) throw new Error("run kimchi-bridge login before enabling the gateway");
+    // Derive the gateway base from the sign-in's region. The kimchi CLI
+    // sign-in reports the console API URL (app.kimchi.dev/api); the bridge's
+    // own OAuth store reports the CAST API base — accept both so a plain
+    // Kimchi sign-in (key or SSO) needs no KIMCHI_BASE_URL.
     const api = baseUrl(signIn.apiUrl);
     const env = process.env.KIMCHI_BASE_URL?.trim();
     if (env) llmBase = baseUrl(env);
-    else if (api === "https://api.eu.cast.ai") llmBase = "https://llm.eu.kimchi.dev";
-    else if (api === "https://api.cast.ai") llmBase = "https://llm.kimchi.dev";
+    else if (api === "https://api.eu.cast.ai" || api === "https://app.eu.kimchi.dev/api")
+      llmBase = "https://llm.eu.kimchi.dev";
+    else if (api === "https://api.cast.ai" || api === "https://app.kimchi.dev/api")
+      llmBase = "https://llm.kimchi.dev";
     else
       throw new Error(
         "the gateway redirect needs a us/eu Kimchi sign-in, or KIMCHI_BASE_URL for a custom gateway",

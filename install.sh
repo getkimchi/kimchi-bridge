@@ -140,7 +140,11 @@ for cli in "${clients[@]}"; do
   if [[ "$old" == "$market" ]]; then
     printf '%s plugin already registered\n' "$cli"
   else
-    "$cli" plugin --help >/dev/null || fail "$cli does not support native plugins. Update the official CLI."
+    if ! "$cli" plugin --help >/dev/null 2>&1; then
+      local detail
+      detail=$("$cli" plugin --help 2>&1 | head -3 | tr '\n' ' ')
+      fail "$cli does not support native plugins (preflight failed: ${detail:-unknown error}). Update the official CLI."
+    fi
     # Finish an interrupted cleanup before accepting a third registration.
     if [[ -f "$receipt.cleanup" ]]; then remove_market "$cli" "$(cat "$receipt.cleanup")";rm -- "$receipt.cleanup";fi
     if [[ "$cli" == claude ]]; then

@@ -49,6 +49,8 @@ Your local records and the plugin files stay in `~/.local/state/kimchi-bridge` a
 
 There is nothing to set up: the plugins report with your Kimchi sign-in. They use the API key in `KIMCHI_API_KEY` or `~/.config/kimchi/config.json`, or else your Kimchi SSO login, in Kimchi's region. To sign in or switch accounts, run `kimchi`.
 
+**One sign-in serves both surfaces — routing is opt-in.** When you are signed into Kimchi (key or SSO), `kimchi-bridge login` has nothing to sign in for: it binds the existing Kimchi sign-in for reporting only and does NOT send Claude Code or Codex through the gateway. To route inference through Kimchi, opt in explicitly — during install, on an update that first ships the plugins, or anytime with `kimchi bridge setup` (or `kimchi-bridge gateway enable`; revert with `kimchi bridge disable` / `kimchi-bridge gateway disable`). The separate CAST AI browser sign-in remains available for users who don't sign in with the Kimchi CLI (it enables the gateway as part of that flow).
+
 The plugins also have their own sign-in, a CAST AI single sign-on (OAuth, with automatic token refresh) that works without the Kimchi CLI:
 
 ```sh
