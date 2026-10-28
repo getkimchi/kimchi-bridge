@@ -131,6 +131,7 @@ ln -s "$target/bin/kimchi-bridge" "$bin_dir/.kimchi-bridge.new.$$"
 mv -f -- "$bin_dir/.kimchi-bridge.new.$$" "$bin_dir/kimchi-bridge"
 registered=
 for cli in "${clients[@]}"; do
+  [[ -f "$script_root/markets/$cli" ]] || fail 'Package missing its market receipts: reinstall the plugins.'
   market=$(cat "$script_root/markets/$cli")
   valid_market "$market" || fail 'Invalid package marketplace.'
   receipt="$prefix/installed/$cli"
@@ -141,18 +142,17 @@ for cli in "${clients[@]}"; do
     printf '%s plugin already registered\n' "$cli"
   else
     if ! "$cli" plugin --help >/dev/null 2>&1; then
-      local detail
-      detail=$("$cli" plugin --help 2>&1 | head -3 | tr '\n' ' ')
+      detail=$("$cli" plugin --help 2>&1 | head -3 | tr '\n' ' ' || true)
       fail "$cli does not support native plugins (preflight failed: ${detail:-unknown error}). Update the official CLI."
     fi
     # Finish an interrupted cleanup before accepting a third registration.
     if [[ -f "$receipt.cleanup" ]]; then remove_market "$cli" "$(cat "$receipt.cleanup")";rm -- "$receipt.cleanup";fi
     if [[ "$cli" == claude ]]; then
-      claude plugin marketplace add "$target" --scope user
-      claude plugin install "$plugin@$market" --scope user
+      if output=$(claude plugin marketplace add "$target" --scope user 2>&1); then printf '%s\n' "$output"; else fail "claude plugin marketplace add failed: ${output:-unknown error}"; fi
+      if output=$(claude plugin install "$plugin@$market" --scope user 2>&1); then printf '%s\n' "$output"; else fail "claude plugin install failed: ${output:-unknown error}"; fi
     else
-      codex plugin marketplace add "$target" --json
-      codex plugin add "$plugin@$market" --json
+      if output=$(codex plugin marketplace add "$target" --json 2>&1); then printf '%s\n' "$output"; else fail "codex plugin marketplace add failed: ${output:-unknown error}"; fi
+      if output=$(codex plugin add "$plugin@$market" --json 2>&1); then printf '%s\n' "$output"; else fail "codex plugin add failed: ${output:-unknown error}"; fi
     fi
     if [[ -n "$old" ]]; then printf '%s\n' "$old" > "$receipt.cleanup.new";mv -- "$receipt.cleanup.new" "$receipt.cleanup";fi
     printf '%s\n' "$market" > "$receipt.new"
@@ -166,7 +166,7 @@ for cli in "${clients[@]}"; do
 done
 # Saving the settings drops what earlier releases kept there (their reporting key), which also
 # stops an earlier release's resident daemon.
-"$bin_dir/kimchi-bridge" activate
+if output=$("$bin_dir/kimchi-bridge" activate 2>&1); then printf '%s\n' "$output"; else fail "kimchi-bridge activate failed: ${output:-unknown error}"; fi
 # Written last, and only once every added client has this package's registration, so Kimchi's
 # next update retries a client whose registration failed.
 current=1
@@ -178,7 +178,7 @@ if [[ -n "$current" ]]; then
   mv -- "$prefix/installed/code.new" "$prefix/installed/code"
 fi
 # Keep the bootstrap, rather than a package-bound script, for kimchi-bridge uninstall.
-cp "$target/bootstrap.sh" "$prefix/install.sh"
+cp "$target/bootstrap.sh" "$prefix/install.sh" || fail 'Package missing bootstrap.sh: reinstall the plugins.'
 chmod 700 "$prefix/install.sh"
 printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi, or kimchi-bridge login for the browser SSO.' "Control: $bin_dir/kimchi-bridge status" 'kimchi-bridge login routes model requests through the Kimchi gateway; revert with kimchi-bridge gateway disable.'
 [[ -z "$registered" ]] || printf '%s\n' 'Start a new Claude Code or Codex session; Codex asks you to trust the hooks.'
