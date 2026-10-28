@@ -106,6 +106,25 @@ const oauthSignIn: SignIn = {
   organizationId: org,
 };
 
+test("buildCodexCatalog falls back to the slug when display_name is empty (blank picker rows)", () => {
+  const catalog = buildCodexCatalog([
+    {
+      slug: "claude-opus-5",
+      display_name: "",
+      is_serverless: true,
+      limits: { context_window: 262144, max_output_tokens: 32768 },
+    },
+    {
+      slug: "glm-5.3-flash",
+      display_name: "GLM 5.3 Flash",
+      is_serverless: true,
+      limits: { context_window: 262144, max_output_tokens: 32768 },
+    },
+  ] as unknown as GatewayModel[]);
+  expect(catalog.models[0].display_name).toBe("claude-opus-5");
+  expect(catalog.models[1].display_name).toBe("GLM 5.3 Flash");
+});
+
 test("buildCodexToml emits the provider block and top-level keys", () => {
   const out = buildCodexToml(
     "http://127.0.0.1:8766/openai/v1",
