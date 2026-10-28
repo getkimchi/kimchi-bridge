@@ -409,6 +409,62 @@ test("proxyRequest streams the upstream body through untouched", async () => {
   expect(await response.text()).toBe("data: one\n\ndata: two\n\ndata: [DONE]\n\n");
 });
 
+test("proxyRequest strips server-side web_search tools that break the gateway streaming path", async () => {
+  oauthCredential();
+  let seenTypes: (string | undefined)[] | undefined;
+  const upstream = server(async (request) => {
+    const parsed = JSON.parse(await request.text()) as { tools?: { type?: string }[] };
+    seenTypes = parsed.tools?.map((tool) => tool.type);
+    return Response.json({ ok: true });
+  });
+  const request = new Request("http://127.0.0.1:8766/openai/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "minimax-m3",
+      stream: true,
+      input: "Reply with exactly: OK",
+      tools: [
+        { type: "function", name: "exec_command" },
+        { type: "web_search", external_web_access: false },
+        { type: "web_search_preview" },
+      ],
+    }),
+  });
+  const response = await proxyRequest(request, upstream);
+  expect(response.status).toBe(200);
+  expect(seenTypes).toEqual(["function"]);
+});
+
+test("proxyRequest forwards bodies without unsupported tools byte-identical, including non-JSON", async () => {
+  oauthCredential();
+  let raw = "";
+  const upstream = server(async (request) => {
+    raw = await request.text();
+    return Response.json({ ok: true });
+  });
+  const body = JSON.stringify({
+    model: "minimax-m3",
+    stream: true,
+    input: "hi",
+    tools: [{ type: "function", name: "exec_command" }],
+  });
+  await proxyRequest(
+    new Request("http://127.0.0.1:8766/openai/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    }),
+    upstream,
+  );
+  expect(raw).toBe(body);
+  await proxyRequest(
+    new Request("http://127.0.0.1:8766/openai/v1/responses", { method: "POST", body: "not json" }),
+    upstream,
+  );
+  expect(raw).toBe("not json");
+});
+
 test("gateway state persists, port resolution honors the environment, and health checks the marker", async () => {
   saveGatewayState({ enabled: true, mode: "proxy", port: 9123 });
   expect(loadGatewayState().port).toBe(9123);
