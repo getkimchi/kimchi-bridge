@@ -594,6 +594,9 @@ test("maintained Markdown and shell parsers recognize references without variabl
   expect(referencedPaths("implement $HOME/plan with spaces.md", root)).toHaveLength(0);
   const content = "*** Begin Patch\n*** Add File: file\n+literal $HOME\n*** End Patch";
   expect(patchInput({ tool_input: { cmd: `apply_patch '${content}'` } })).toBe(content);
+  // Codex 0.165 hook payloads, captured from a real session.
+  expect(patchInput({ tool_name: "apply_patch", tool_input: { command: content } })).toBe(content);
+  expect(patchInput({ tool_name: "Bash", tool_input: { command: content } })).toBe("");
   expect(patchInput({ tool_input: { cmd: `apply_patch '${content}'; echo side-effect` } })).toBe(
     "",
   );

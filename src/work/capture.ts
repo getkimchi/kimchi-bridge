@@ -177,6 +177,8 @@ export function patchInput(e: JsonObject): string {
   const input = toolInput(e);
   let patch = str(input, "patch", "input");
   if (typeof e.tool_input === "string") patch = e.tool_input;
+  // Codex 0.165's hooks pass apply_patch's raw patch as tool_input.command.
+  if (!patch && str(e, "tool_name") === "apply_patch") patch = str(input, "command");
   if (!patch) {
     try {
       const command = parseShell(str(input, "cmd", "command"), () => {
