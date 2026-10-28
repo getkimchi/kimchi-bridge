@@ -357,7 +357,10 @@ export function buildCodexCatalog(models: readonly GatewayModel[]): { models: Co
   return {
     models: models.map((m, index) => ({
       slug: m.slug,
-      display_name: m.display_name,
+      // The gateway's model registry currently serves empty display_name;
+      // codex's /model picker renders display_name, so fall back to the slug
+      // rather than showing blank rows (backend data-quality ticket open).
+      display_name: m.display_name || m.slug,
       name: m.slug,
       model: m.slug,
       provider: KIMCHI_PROVIDER,
