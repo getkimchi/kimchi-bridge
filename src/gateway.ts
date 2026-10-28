@@ -692,13 +692,57 @@ function forwardHeaders(incoming: Headers, auth: Record<string, string>): Header
   return headers;
 }
 
+// The gateway's serving stack (LiteLLM in front of vLLM) only implements
+// client-executed function tools. Responses-API server-side built-ins such as
+// {"type":"web_search"} pass request validation but then kill the streaming
+// path mid-stream with a generic overloaded_error, which codex surfaces as
+// "stream disconnected before completion". Both proxied routes hard-fail on
+// these tools today (the anthropic route answers 503), so strip the known
+// broken built-ins to keep requests working; revisit when the backend learns
+// to serve or cleanly reject them.
+const UNSUPPORTED_SERVER_TOOLS = ["web_search", "web_search_preview"];
+
+export function stripUnsupportedServerTools(body: ArrayBuffer, pathname: string): ArrayBuffer {
+  let parsed: { tools?: unknown };
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return body;
+  }
+  if (!Array.isArray(parsed.tools)) return body;
+  const kept = parsed.tools.filter((tool) => !isUnsupportedTool(tool));
+  if (kept.length === parsed.tools.length) return body; // nothing to drop: byte-identical passthrough
+  const dropped = parsed.tools.filter(isUnsupportedTool).map(describeToolType);
+  log(`stripped unsupported server tool(s) ${dropped.join(", ")} from ${pathname}`);
+  parsed.tools = kept;
+  return new TextEncoder().encode(JSON.stringify(parsed)).buffer as ArrayBuffer;
+}
+
+function isUnsupportedTool(tool: unknown): boolean {
+  if (typeof tool !== "object" || tool === null) return false;
+  const type = (tool as { type?: unknown }).type;
+  return typeof type === "string" && UNSUPPORTED_SERVER_TOOLS.includes(type);
+}
+
+function describeToolType(tool: unknown): string {
+  if (typeof tool === "object" && tool !== null && "type" in tool) {
+    const type = (tool as { type?: unknown }).type;
+    if (typeof type === "string") return type;
+  }
+  return "unknown";
+}
+
 export async function proxyRequest(request: Request, llmBase: string): Promise<Response> {
   const url = new URL(request.url);
   const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
   // Buffer the body so a 401 retry can re-send it; LLM request bodies are
   // finite JSON, and one in-flight buffer per request is bounded.
-  const body =
+  const buffered =
     request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
+  // Drop server-side built-in tools the backend cannot serve; everything else
+  // forwards byte-identical.
+  const body =
+    buffered === undefined ? undefined : stripUnsupportedServerTools(buffered, url.pathname);
   const forward = async (): Promise<Response> =>
     await fetch(upstream, {
       method: request.method,
