@@ -20,6 +20,8 @@ import {
 import {
   loginStatus,
   readLoginProgress,
+  saveCredential,
+  seedFromKimchi,
   signInFlow,
   storedSignIn,
   writeLoginProgress,
@@ -154,6 +156,51 @@ export async function run(
       throw new Error("choose --detached or --foreground, not both");
     if (values.region && values.region !== "us" && values.region !== "eu")
       throw new Error("choose region us or eu");
+    // One sign-in serves both surfaces: when a usable Kimchi sign-in already
+    // exists (env key, global config key, or Kimchi's saved login) and the
+    // bridge has no OAuth credential of its own, "login" has nothing to sign
+    // in for — bind the existing sign-in and turn the gateway on, no browser.
+    // A stored bridge credential keeps the browser flow (account switching).
+    if (!values["from-kimchi"] && !storedSignIn()) {
+      const existing = resolveSignIn(environmentKey);
+      if (existing.token) {
+        writeLoginProgress({ phase: "starting", startedAt: Date.now() });
+        try {
+          // SSO sign-ins adopt the refresh-bearing credential into the shared
+          // store (proxy mode); key sign-ins stay direct with the embedded key.
+          if (existing.organizationId) {
+            const seeded = seedFromKimchi();
+            if (seeded) saveCredential(seeded);
+          }
+          const bound = await verifySignIn(storedSignIn() ?? existing);
+          writeLoginProgress({ phase: "done", startedAt: Date.now(), finishedAt: Date.now() });
+          output(
+            `Reporting configured with your Kimchi sign-in (organization ${bound.organizationId ?? ""}).` +
+              "\n",
+          );
+          // Signing in does NOT route inference through the gateway by
+          // default: Kimchi's sign-in is shared, and routing is opt-in via
+          // `kimchi bridge setup` (or kimchi-bridge gateway enable).
+          if (!values["reporting-only"]) {
+            output(
+              "Gateway not enabled: run `kimchi bridge setup` or `kimchi-bridge gateway enable` to route " +
+                "Claude Code and Codex through the Kimchi gateway.\n",
+            );
+          } else {
+            output("Reporting only; inference settings are unchanged.\n");
+          }
+        } catch (error) {
+          writeLoginProgress({
+            phase: "error",
+            startedAt: Date.now(),
+            error: error instanceof Error ? error.message : "login failed",
+            finishedAt: Date.now(),
+          });
+          throw error;
+        }
+        return;
+      }
+    }
     // The OAuth sign-in waits on a browser callback for up to five minutes;
     // shells driven by agents may not wait that long, so run detached there.
     const detached = values.detached || (!values.foreground && !process.stdout.isTTY);
