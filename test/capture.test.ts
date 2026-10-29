@@ -361,6 +361,27 @@ test("before capture persists bytes before editing and replay cannot change the 
   expect(events(store, "tool")).toHaveLength(1);
 });
 
+test("each Claude Code prompt maps to its own turn, not the session's previous one", () => {
+  const { root, store, r } = fixture("claude-code");
+  const record = (stage: string, event: Record<string, unknown>) =>
+    r.record({ stage, sessionId: "s", cwd: root, event });
+  for (const [prompt, turn] of [
+    ["p1", "t1"],
+    ["p2", "t2"],
+  ]) {
+    record("classic.UserPromptSubmit", {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "s",
+      cwd: root,
+      prompt_id: prompt,
+      prompt: "edit the file",
+    });
+    record("turn.start", { turnId: turn, text: "edit the file" });
+  }
+  expect(store.meta("prompt-turn:s:p1")).toBe("t1");
+  expect(store.meta("prompt-turn:s:p2")).toBe("t2");
+});
+
 test("Claude mod flat Read and Edit payloads retain their exact native file evidence", () => {
   const { root, store, r } = fixture("claude-code"),
     path = join(root, "file");

@@ -475,7 +475,9 @@ export class Recorder {
       if (!s.Turn) throw new Error("prompt has no turn identity");
       this.bind(s, str(e, "text", "prompt"));
     }
-    if (s.Turn) {
+    // Claude Code's UserPromptSubmit comes before its turn starts, so s.Turn is still the previous turn there: turn.start
+    // maps the prompt it left pending.
+    if (s.Turn && stage !== "classic.UserPromptSubmit") {
       const prompt =
         str(e, "prompt_id") ||
         (stage === "turn.start" ? this.store.meta(`pending-prompt:${s.Session}`) : "");
