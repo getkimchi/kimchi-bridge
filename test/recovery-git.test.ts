@@ -411,6 +411,26 @@ test("a lone message iteration takes the reply's model; other unnamed iterations
   ]);
 });
 
+test("Claude Code's own <synthetic> replies, such as API errors, are not model calls", () => {
+  const { root, store, r, scope } = fixture("claude-code");
+  const path = join(root, "synthetic.jsonl");
+  registerTranscript(r, scope, path, "castai", "unknown");
+  const reply = (id: string, model: string) =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: at,
+      message: { id, model, usage: { input_tokens: 0, output_tokens: 0 } },
+    }) + "\n";
+  writeFileSync(path, reply("4300f96b-3f7b-4c1e-9d55-0d2f4a7c1e10", "<synthetic>"));
+  recoverContext(r);
+  expect(store.events().filter((e) => e.usage)).toHaveLength(0);
+  appendFileSync(path, reply("msg_01Real", "claude-opus-5-5"));
+  recoverContext(r);
+  expect(store.events().flatMap((e) => (e.usage ? [e.usage.responseId] : []))).toEqual([
+    "msg_01Real",
+  ]);
+});
+
 test("Codex usage carries the service tier its thread settings ask for", () => {
   const { root, store, r, scope } = fixture();
   const path = join(root, "tier.jsonl");

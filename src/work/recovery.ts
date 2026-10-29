@@ -263,7 +263,8 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     raw = obj(m.usage),
     response = str(m, "id"),
     nativeRequest = str(v, "requestId");
-  if (!hasObject(m.usage) || !response) return;
+  // Claude Code writes <synthetic> replies itself, such as API errors; no model ran.
+  if (!hasObject(m.usage) || !response || str(m, "model") === "<synthetic>") return;
   const u: Usage = {
     channel: "transcript",
     responseId: response,
