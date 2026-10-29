@@ -315,6 +315,28 @@ test.each(["flat", "nested", "mixed", "zero-flat", "invalid-flat"])(
   },
 );
 
+test("GitHub PRs carry Kimchi's lowercase repository path; GitLab keeps its case", () => {
+  const github = parseJson(
+    '{"id":11,"number":34,"html_url":"https://github.com/Lumbrook/Widgets/pull/34","state":"open","title":"t","base":{"repo":{"id":12,"full_name":"Lumbrook/Widgets"}}}',
+  );
+  const [repo, pr] = pullRequest({ provider: "github", host: "github.com", id: "name:x" }, github);
+  expect([repo.name, pr.uri]).toEqual([
+    "lumbrook/widgets",
+    "https://github.com/lumbrook/widgets/pull/34",
+  ]);
+  const gitlab = parseJson(
+    '{"id":21,"iid":5,"web_url":"https://gitlab.com/Lumbrook/Widgets/-/merge_requests/5","state":"opened","title":"t","target_project_id":22}',
+  );
+  const [glRepo, mr] = pullRequest(
+    { provider: "gitlab", host: "gitlab.com", id: "name:x" },
+    gitlab,
+  );
+  expect([glRepo.name, mr.uri]).toEqual([
+    "Lumbrook/Widgets",
+    "https://gitlab.com/Lumbrook/Widgets/-/merge_requests/5",
+  ]);
+});
+
 test("SCM IDs remain exact, target repository owns fork PRs and credentials stay host-bound", () => {
   const source = { provider: "github", host: "github.com", name: "fork/repo", id: "name:fixture" };
   const raw = parseJson(

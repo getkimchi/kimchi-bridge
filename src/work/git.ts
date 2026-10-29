@@ -513,6 +513,12 @@ export function pullRequest(source: Repository, v: JsonObject): [Repository, Pul
     (p.state === "merged" && !p.mergeTime)
   )
     throw new Error("invalid provider pull request");
+  // Kimchi writes GitHub paths in lowercase (work-attribution/costs.ts). The backend compares URLs exactly, so a PR
+  // that both report with different case shows as conflicting and, once merged, loses its cost.
+  if (source.provider === "github") {
+    repo.name = path.toLowerCase();
+    p.uri = `https://${source.host}/${repo.name}/pull/${number}`;
+  }
   p.title = metadataTitle(p.title || "");
   p.issueKeys = issueKeys(p.title, "title");
   const branch = source.provider === "gitlab" ? str(v, "source_branch") : str(obj(v.head), "ref");
