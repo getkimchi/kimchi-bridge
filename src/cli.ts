@@ -1,5 +1,6 @@
+import { appendFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   IdentityError,
   baseUrl,
@@ -28,6 +29,7 @@ import {
   type RegionId,
 } from "./oauth.ts";
 import { Recorder, type Native } from "./work/capture.ts";
+import { claudeTraceEnv, codexTraceConfig } from "./work/commits.ts";
 import { flush, flushOtlp } from "./work/delivery.ts";
 import { Store } from "./work/ledger.ts";
 import { encodeEvent, eventKind, parseJson, stringifyJson } from "./work/protocol.ts";
@@ -107,6 +109,8 @@ export async function run(
   delete process.env.KIMCHI_API_KEY;
   // Kimchi's runtime switch must not reach the git, gh and glab this starts.
   delete process.env.BUN_BE_BUN;
+  const prefix =
+    process.env.KIMCHI_BRIDGE_PREFIX || join(homedir(), ".local", "share", "kimchi-bridge");
   // Unreadable Kimchi settings mean no sign-in: local recording continues, uploads wait.
   const signIn = (): SignIn => {
     try {
@@ -321,8 +325,6 @@ export async function run(
   if (command === "uninstall") {
     if (!["claude", "codex", "both"].includes(args[1]))
       throw new Error("choose claude, codex or both");
-    const prefix =
-      process.env.KIMCHI_BRIDGE_PREFIX || join(homedir(), ".local", "share", "kimchi-bridge");
     const proc = Bun.spawn(["bash", join(prefix, "install.sh"), ...args], {
       stdin: "inherit",
       stdout: "inherit",
@@ -337,8 +339,39 @@ export async function run(
     return;
   }
   let c = loadConfig();
+  // Codex has no per-session environment: its agent commits are traced through its user config.
+  const codexTrace = (enable: boolean) => {
+    try {
+      if (!codexTraceConfig(enable))
+        output(
+          "Codex already sets shell_environment_policy.set: its agent commits are not traced.\n",
+        );
+    } catch {
+      output("Codex config unreadable: its agent commits are not traced.\n");
+    }
+  };
   if (command === "activate") {
     saveConfig(c);
+    if (existsSync(join(prefix, "installed", "codex"))) codexTrace(true);
+    return;
+  }
+  if (command === "codex-trace") {
+    if (args[1] !== "on" && args[1] !== "off")
+      throw new Error("usage: kimchi-bridge codex-trace on|off");
+    codexTrace(args[1] === "on");
+    return;
+  }
+  // Claude Code's SessionStart hook: trace the session's shell commands into its own directory.
+  if (command === "trace-env") {
+    const file = process.env.CLAUDE_ENV_FILE;
+    if (c.disabled || !file || !isAbsolute(file)) return;
+    try {
+      const event = parseJson((await stdin(1 << 20)).toString("utf8")) as any;
+      if (typeof event?.session_id === "string" && event.session_id)
+        appendFileSync(file, claudeTraceEnv(event.session_id));
+    } catch {
+      // Fail open: without the trace, commits still match through native file revisions.
+    }
     return;
   }
   if (command === "enable" || command === "disable") {

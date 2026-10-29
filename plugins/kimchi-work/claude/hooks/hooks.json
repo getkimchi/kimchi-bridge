@@ -15,6 +15,11 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" hint",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" trace-env",
+            "timeout": 2
           }
         ]
       }

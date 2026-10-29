@@ -89,6 +89,8 @@ remove_market() {
 if [[ "$action" == uninstall ]]; then
   for cli in "${clients[@]}"; do
     receipt="$prefix/installed/$cli"
+    # Remove the Codex shell environment that traces agent commits before the plugin goes.
+    if [[ "$cli" == codex && -x "$bin_dir/kimchi-bridge" ]]; then "$bin_dir/kimchi-bridge" codex-trace off || true; fi
     for state in "$receipt.cleanup" "$receipt"; do
       [[ -f "$state" ]] || continue
       remove_market "$cli" "$(cat "$state")"

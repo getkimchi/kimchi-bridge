@@ -64,6 +64,8 @@ interface TrackedCommit {
   SHA: string;
   CheckedAt?: string;
   CreatedAt: string;
+  Found?: boolean;
+  Merged?: boolean;
 }
 const fields = (s: string) =>
   s
@@ -93,32 +95,58 @@ export function refTips(root: string): string[] | null {
 export function reconcileGit(r: Recorder, signal?: AbortSignal) {
   signal = withDeadline(8000, signal);
   checkSignal(signal);
-  if (seconds() - Number(r.store.meta("git-last-pass")) < 60) return;
+  // Kimchi looks up due commits at every agent end. Due lookups go first and skip the gate, which only
+  // paces native-edit matching: Codex syncs only on hooks, and its Stop can follow the prompt's sync
+  // by a few seconds.
+  const fresh = r.store.db
+    .query(
+      `SELECT key,value FROM meta WHERE key LIKE 'tracked-commit:%'
+         AND coalesce(json_extract(value,'$.Merged'),0)=0
+         AND unixepoch()-unixepoch(coalesce(json_extract(value,'$.CheckedAt'),?)) >=
+             min(86400,(unixepoch()-unixepoch(json_extract(value,'$.CreatedAt')))/16.0)
+       ORDER BY coalesce(json_extract(value,'$.CheckedAt'),?) LIMIT 8`,
+    )
+    .all(zeroTime, zeroTime) as { key: string; value: string }[];
+  if (!fresh.length && seconds() - Number(r.store.meta("git-last-pass")) < 60) return;
   r.store.setMeta("git-last-pass", String(seconds()));
   const items = r.store.db
     .query(
       "SELECT key,value FROM meta WHERE (key LIKE 'git-change:%' OR key LIKE 'tracked-commit:%') AND key>? ORDER BY key LIMIT 32",
     )
     .all(r.store.meta("git-pass-after")) as { key: string; value: string }[];
-  if (!items.length) {
-    r.store.db.query("DELETE FROM meta WHERE key='git-pass-after'").run();
-    return;
-  }
-  const failures: unknown[] = [];
-  for (const item of items) {
+  if (!items.length) r.store.db.query("DELETE FROM meta WHERE key='git-pass-after'").run();
+  const failures: unknown[] = [],
+    seen = new Set<string>();
+  for (const item of [...fresh, ...items]) {
     checkSignal(signal);
-    r.store.setMeta("git-pass-after", item.key);
+    if (seen.has(item.key)) continue;
+    seen.add(item.key);
+    if (!fresh.includes(item)) r.store.setMeta("git-pass-after", item.key);
     if (item.key.startsWith("tracked-commit:")) {
       const c: TrackedCommit = JSON.parse(item.value);
-      if (Date.now() - Date.parse(c.CreatedAt) > 90 * 86400_000) {
+      // Kimchi's schedule: check a new commit at once, then after min(1 day, age/16); give up on
+      // one without a PR after 32 days, and stop once every PR it belongs to is merged.
+      const age = Date.now() - Date.parse(c.CreatedAt);
+      if (age > 90 * 86400_000 || (!c.Found && age > 32 * 86400_000)) {
         r.store.db.query("DELETE FROM meta WHERE key=?").run(item.key);
         continue;
       }
-      if (c.CheckedAt && Date.now() - Date.parse(c.CheckedAt) < 300_000) continue;
+      // A merged commit keeps its key, so native-edit matching cannot track it again.
+      if (
+        c.Merged ||
+        (c.CheckedAt && Date.now() - Date.parse(c.CheckedAt) < Math.min(86400_000, age / 16))
+      )
+        continue;
       c.CheckedAt = new Date().toISOString();
       saveMeta(r, item.key, c);
       try {
-        discoverPullRequests(r, c, signal);
+        const states = discoverPullRequests(r, c, signal);
+        if (states.length)
+          saveMeta(r, item.key, {
+            ...c,
+            Found: true,
+            Merged: states.every((state) => state === "merged"),
+          });
       } catch (e) {
         r.store.diagnostic("scm_lookup_incomplete");
         failures.push(e);
@@ -131,7 +159,7 @@ export function reconcileGit(r: Recorder, signal?: AbortSignal) {
         continue;
       }
       try {
-        matchCommits(r, c, signal);
+        matchCommits(r, c, item.key.slice("git-change:".length), signal);
       } catch (e) {
         r.store.diagnostic("git_match_incomplete");
         failures.push(e);
@@ -160,7 +188,7 @@ function treeObject(
     throw new Error("not an ordinary file blob");
   return parts[2]!;
 }
-function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
+function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortSignal) {
   const root = rootOf(c.Scope),
     format = gitContext(signal, root, "rev-parse", "--show-object-format");
   const before = fileObject(r, c.Before, format),
@@ -174,41 +202,102 @@ function matchCommits(r: Recorder, c: GitChange, signal?: AbortSignal) {
     r.store.diagnostic("git_history_bound");
     commits = commits.slice(0, 128);
   }
+  if (!commits.length) return;
+  const befores = new Set([before]),
+    refs = new Set(c.Refs || []);
+  // shortcut: inspect 128 prior file observations; raise the bound if longer chains must match.
+  const previous = r.store.db
+    .query(
+      `SELECT f.before_hash,f.after_hash,m.value FROM file_changes f
+       LEFT JOIN meta m ON m.key='git-change:'||f.id
+       WHERE f.repository=? AND f.path=? AND f.rowid<(SELECT rowid FROM file_changes WHERE id=?)
+       ORDER BY f.rowid DESC LIMIT 128`,
+    )
+    .all(c.Scope.Repo, c.Path, change) as {
+    before_hash: string;
+    after_hash: string;
+    value: string | null;
+  }[];
+  let hash = c.Before;
+  // Compose only consecutive verified edits by the same work and native writer.
+  for (const row of previous) {
+    checkSignal(signal);
+    if (row.before_hash === row.after_hash) continue;
+    if (!row.value) break;
+    const p: GitChange = JSON.parse(row.value);
+    if (
+      p.After !== hash ||
+      p.Work !== c.Work ||
+      p.Source !== c.Source ||
+      p.Scope.Session !== c.Scope.Session ||
+      p.Scope.Agent !== c.Scope.Agent ||
+      p.Scope.Repo !== c.Scope.Repo ||
+      rootOf(p.Scope) !== root ||
+      p.Path !== c.Path ||
+      Date.now() - Date.parse(p.CreatedAt) > 7 * 86400_000
+    )
+      break;
+    hash = p.Before;
+    befores.add(fileObject(r, hash, format));
+    for (const ref of p.Refs || []) refs.add(ref);
+  }
+  befores.delete(after);
   for (const sha of commits) {
     checkSignal(signal);
     if (!gitId(sha)) throw new Error("invalid commit identity");
     if (treeObject(signal, root, sha, path) !== after) continue;
     const parents = fields(gitContext(signal, root, "show", "--format=%P", "--no-patch", sha));
-    let matched = parents.length === 0 && before === "";
-    for (const parent of parents)
-      if (treeObject(signal, root, parent, path) === before) matched = true;
-    if (!matched) continue;
-    const event = r.event(c.Scope, `commit:${sha}`, c.Work, c.Source);
-    event.commit = { id: sha, parents, quality: "inferred" };
-    r.store.observe(event);
-    if (c.Work) {
-      const link = r.event(c.Scope, `work-commit:${c.Work}:${sha}`, c.Work, c.Source);
-      link.link = {
-        fromKind: "work",
-        fromId: c.Work,
-        toKind: "commit",
-        toId: sha,
-        quality: "inferred",
-        reason: "file_revision",
-      };
-      r.store.observe(link);
+    let matched = parents.length === 0 && befores.has(""),
+      direct = parents.length === 0 && before === "";
+    for (const parent of parents) {
+      const object = treeObject(signal, root, parent, path);
+      if (befores.has(object)) matched = true;
+      if (object === before) direct = true;
     }
-    const key = `tracked-commit:${stableId(c.Scope.Repo, sha)}`;
-    if (!r.store.meta(key))
-      saveMeta(r, key, {
-        Scope: c.Scope,
-        Source: c.Source,
-        SHA: sha,
-        CheckedAt: zeroTime,
-        CreatedAt: new Date().toISOString(),
-      });
+    if (!matched) continue;
+    if (
+      !direct &&
+      gitContext(signal, root, "rev-list", "--max-count=1", sha, "--not", ...refs) !== sha
+    )
+      continue;
+    // A traced agent commit already has stronger evidence; recording it again would flip revisions.
+    if (r.store.meta(`agent-commit:${stableId(c.Scope.Repo, sha)}`)) continue;
+    recordCommit(r, c.Scope, c.Work, c.Source, sha, parents, "inferred", "file_revision");
   }
 }
+
+/** A commit, its work link and the provider lookup that finds its PRs or MRs. */
+export function recordCommit(
+  r: Recorder,
+  scope: Scope,
+  work: string,
+  source: string,
+  sha: string,
+  parents: string[],
+  quality: string,
+  reason: string,
+) {
+  const event = r.event(scope, `commit:${sha}`, work, source);
+  event.commit = { id: sha, parents, quality };
+  r.store.observe(event);
+  if (work) {
+    const link = r.event(scope, `work-commit:${work}:${sha}`, work, source);
+    link.link = { fromKind: "work", fromId: work, toKind: "commit", toId: sha, quality, reason };
+    r.store.observe(link);
+  }
+  // A repository without a GitHub or GitLab identity has no PRs to find (Kimchi ends it quietly).
+  const key = `tracked-commit:${stableId(scope.Repo, sha)}`;
+  if (scope.Repository && !r.store.meta(key))
+    saveMeta(r, key, {
+      Scope: scope,
+      Source: source,
+      SHA: sha,
+      CheckedAt: zeroTime,
+      CreatedAt: new Date().toISOString(),
+    });
+}
+export const commitParents = (root: string, sha: string) =>
+  fields(git(root, "show", "--format=%P", "--no-patch", sha));
 
 export function scmEnvironment(repo: Repository): NodeJS.ProcessEnv {
   const blocked = new Set([
@@ -433,7 +522,8 @@ export function pullRequest(source: Repository, v: JsonObject): [Repository, Pul
   }
   return [repo, p];
 }
-function discoverPullRequests(r: Recorder, c: TrackedCommit, signal?: AbortSignal) {
+/** The states of the PRs or MRs that contain the commit. */
+function discoverPullRequests(r: Recorder, c: TrackedCommit, signal?: AbortSignal): string[] {
   const repo = c.Scope.Repository;
   if (!repo) throw new Error("SCM repository is unknown");
   const path =
@@ -465,12 +555,14 @@ function discoverPullRequests(r: Recorder, c: TrackedCommit, signal?: AbortSigna
     repo.provider === "gitlab"
       ? `projects/${id}/repository/commits/${c.SHA}/merge_requests`
       : `${path}/commits/${c.SHA}/pulls`;
+  const states: string[] = [];
   for (let page = 1; page <= 5; page++) {
     const prs = scmApi(c.Scope.CWD, repo, `${endpoint}?per_page=100&page=${page}`, signal);
     if (!Array.isArray(prs)) throw new Error("invalid SCM response");
     for (const raw of prs) {
       const [target, p] = pullRequest(repo, obj(raw)),
         s = { ...c.Scope, Repository: target };
+      states.push(p.state);
       const event = r.event(s, `pull-request:${target.id}:${p.id}`, "", c.Source);
       event.pullRequest = p;
       r.store.observe(event);
@@ -485,7 +577,7 @@ function discoverPullRequests(r: Recorder, c: TrackedCommit, signal?: AbortSigna
       };
       r.store.observe(link);
     }
-    if (prs.length < 100) return;
+    if (prs.length < 100) return states;
   }
   throw new Error("SCM pagination exceeds capture bound");
 }

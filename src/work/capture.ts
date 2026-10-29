@@ -1,11 +1,22 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseShell } from "shell-quote";
 import type { fromMarkdown as parseMarkdown } from "mdast-util-from-markdown";
 import type { applyDiff as applyPatchDiff } from "@openai/agents-core/utils";
 import { safeRead, within } from "../platform.ts";
-import { git, issueKeys, metadataTitle, reconcileGit, refTips, rootOf, saveMeta } from "./git.ts";
+import { traceDir, tracedCommits } from "./commits.ts";
+import {
+  commitParents,
+  git,
+  issueKeys,
+  metadataTitle,
+  reconcileGit,
+  recordCommit,
+  refTips,
+  rootOf,
+  saveMeta,
+} from "./git.ts";
 import { bodyText, type Store } from "./ledger.ts";
 import {
   canonicalHash,
@@ -580,6 +591,12 @@ export class Recorder {
     }
     const [paths, native] = filePaths(s, e),
       category = toolCategory(str(e, "tool_name", "tool"));
+    if (category === "shell")
+      try {
+        mkdirSync(traceDir(this.source, s.Session), { recursive: true });
+      } catch {
+        this.store.diagnostic("git_trace_unavailable");
+      }
     const refs = category === "read" ? null : refTips(s.CWD);
     const state: ToolState = {
       files: {},
@@ -645,6 +662,12 @@ export class Recorder {
       durationMs: String(Date.now() - new Date(state.started).getTime()),
     };
     this.store.observe(ev);
+    if (state.category === "shell")
+      try {
+        this.traceCommits(s, call, work, state.started);
+      } catch {
+        this.store.diagnostic("git_trace_incomplete");
+      }
     const [paths] = filePaths(s, e);
     for (const path of paths) state.files[path] ||= emptyFile();
     for (const [path, before] of Object.entries(state.files)) {
@@ -754,6 +777,46 @@ export class Recorder {
       }
     }
     this.store.db.query("INSERT OR IGNORE INTO meta(key,value) VALUES(?,'1')").run(done);
+  }
+  /** Commits made by this session's shell calls' own Git processes, as Kimchi records them. */
+  traceCommits(s: Scope, call: string, work: string, started: string) {
+    const dir = traceDir(this.source, s.Session);
+    for (const c of tracedCommits(join(dir, "events"), join(dir, "refs"))) {
+      let owner = work;
+      if (c.call && c.call !== call) {
+        // A call that returned before its command ended, such as unified exec polled later.
+        const row = this.store.db
+          .query("SELECT body FROM tool_state WHERE source=? AND session_id=? AND call_id=?")
+          .get(this.source, s.Session, c.call) as { body: string | Uint8Array } | null;
+        if (!row) continue;
+        owner = (JSON.parse(bodyText(row.body)) as ToolState).work;
+      } else if (!c.call) {
+        // Without a logged call, only a Claude Code session's lone shell call claims a commit,
+        // and only one its own command made.
+        const busy = this.store.db
+          .query(
+            `SELECT 1 FROM tool_state t
+             LEFT JOIN meta m ON m.key=t.source||':'||t.session_id||':'||t.call_id||':done'
+             WHERE t.source=? AND t.session_id=? AND t.call_id<>? AND m.key IS NULL
+               AND json_extract(t.body,'$.category')='shell'
+               AND unixepoch(json_extract(t.body,'$.started')) > unixepoch()-21600
+             LIMIT 1`,
+          )
+          .get(this.source, s.Session, call);
+        if (this.source !== "claude-code" || busy || c.time < Date.parse(started)) continue;
+      }
+      const [root, repo, identity] = repository(c.worktree);
+      const key = `agent-commit:${stableId(repo, c.sha)}`;
+      if (this.store.meta(key)) continue;
+      // ponytail: a rebased or picked copy follows any commit this ledger traced; Kimchi requires
+      // the original to belong to the same work.
+      if (c.rewrittenFrom && !this.store.meta(`agent-commit:${stableId(repo, c.rewrittenFrom)}`))
+        continue;
+      const scope = { ...s, Root: root, Repo: repo, Repository: identity };
+      const parents = commitParents(root, c.sha);
+      recordCommit(this, scope, owner, this.source, c.sha, parents, "observed", "agent_commit");
+      this.store.setMeta(key, "1");
+    }
   }
   expected(before: FileState, e: JsonObject, root: string, path: string): string | undefined {
     if (!before.complete) return;
