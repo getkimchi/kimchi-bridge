@@ -5,6 +5,7 @@ import { checkSignal, lockSync, withDeadline } from "../platform.ts";
 import { loadConfig, stateDir, stateRoot, verifySignIn } from "../settings.ts";
 import { Recorder } from "./capture.ts";
 import { flush, flushOtlp } from "./delivery.ts";
+import { pruneTraces } from "./commits.ts";
 import { pruneEvidence } from "./git.ts";
 import { Store } from "./ledger.ts";
 
@@ -86,6 +87,12 @@ export async function sync(k: SignIn, signal?: AbortSignal): Promise<void> {
   signal = withDeadline(8000, signal);
   checkSignal(signal);
   let c = loadConfig();
+  // Agent shells keep writing Git traces while reporting is off; idle ones are dropped regardless.
+  try {
+    pruneTraces();
+  } catch {
+    /* Retried on the next pass. */
+  }
   // While Kimchi's PR reporting is off, nothing is verified or uploaded; records stay local.
   if (c.disabled || !kimchiReportingEnabled(c.organizationId)) return;
   try {
