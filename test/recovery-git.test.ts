@@ -951,3 +951,43 @@ test("a Codex token_count takes its response ID only from the record with the sa
     expect(unmatched.usage.observedRoute).toBe("unknown");
   });
 });
+
+test("a Codex response ID too long for an event still names its billing tag", () => {
+  const { base, root, store, r, scope } = fixture();
+  withBridgeHome(base, () => {
+    // Kimchi's gateway encodes LiteLLM's route into response IDs, as it did for glm-5.3-flash.
+    const route = `litellm:custom_llm_provider:hosted_vllm;model_id:None;response_id:${"0".repeat(32)}`;
+    const response = `resp_${Buffer.from(route).toString("base64")}`;
+    expect(response.length).toBe(137);
+    recordTag(response, tag);
+    const path = join(root, "rollout.jsonl");
+    registerTranscript(r, scope, path, "unknown", "unknown");
+    const usage = {
+      input_tokens: 13062,
+      cached_input_tokens: 0,
+      output_tokens: 11,
+      reasoning_output_tokens: 9,
+      total_tokens: 13073,
+    };
+    writeFileSync(
+      path,
+      [
+        { type: "turn_context", payload: { turn_id: "turn", model: "m" } },
+        { type: "token_usage_record", payload: { response_id: response, usage } },
+        {
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: { last_token_usage: usage, total_token_usage: usage },
+          },
+        },
+      ]
+        .map((line) => JSON.stringify({ timestamp: at, ...line }))
+        .join("\n") + "\n",
+    );
+    recoverContext(r);
+    const [call] = usages(store);
+    expect(call.usage).toMatchObject({ requestId: tag, observedRoute: "castai" });
+    expect(call.usage.responseId).toBeUndefined();
+  });
+});

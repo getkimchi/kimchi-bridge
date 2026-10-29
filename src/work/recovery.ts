@@ -5,6 +5,7 @@ import {
   canonicalTime,
   numberText,
   obj,
+  opaque,
   parseJson,
   stableId,
   str,
@@ -241,10 +242,12 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     };
     const e = r.event(s, `token-count:${canonicalHash(info.total_token_usage)}`, r.workExact(s));
     // Only the record carrying this event's exact usage names its response.
-    const [response, key] = codexResponse(r.store.meta(`codex-response:${t.path}`));
-    if (response && key === codexUsageKey(obj(info.last_token_usage))) usage.responseId = response;
+    const [recorded, key] = codexResponse(r.store.meta(`codex-response:${t.path}`));
+    const response = key === codexUsageKey(obj(info.last_token_usage)) ? recorded : "";
+    // The gateway's IDs for some models exceed an event's bound; they still find their tag.
+    if (response && opaque(response)) usage.responseId = response;
     r.store.setMeta(`codex-response:${t.path}`, "");
-    billingTag(r, e.entityId, usage);
+    billingTag(r, e.entityId, usage, response);
     e.observeTime = observed;
     e.usage = usage;
     if (!s.Turn) r.store.diagnostic("usage_turn_missing");
@@ -314,7 +317,7 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     u.correlation = "native_transcript_prompt";
   }
   const e = r.event(s, requestEntity(response, nativeRequest), work);
-  billingTag(r, e.entityId, u, nativeRequest);
+  billingTag(r, e.entityId, u, response, nativeRequest);
   e.observeTime = observed;
   e.usage = u;
   r.store.observe(e);
@@ -407,10 +410,10 @@ function requestEntity(response: string, request: string): string {
  * A call the proxy tagged went to the Kimchi gateway, and its billing tag names its bill (Kimchi's kimchi-request
  * tag). The tag goes in requestId; an earlier revision's tag stays if a later lookup fails, so it never flaps.
  */
-function billingTag(r: Recorder, entityId: string, u: Usage, nativeRequest = "") {
+function billingTag(r: Recorder, entityId: string, u: Usage, response: string, nativeRequest = "") {
   const previous = r.store.latest(entityId)?.usage;
   const tag =
-    tagFor(u.responseId ?? "") ||
+    tagFor(response) ||
     (previous?.observedRoute === "castai" && previous.requestId !== nativeRequest
       ? previous.requestId
       : "");

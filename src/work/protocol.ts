@@ -520,7 +520,7 @@ const bounded = (s: any, max: number) =>
     const n = (c as string).codePointAt(0)!;
     return n <= 31 || (n >= 127 && n <= 159);
   });
-const opaque = (s: any) => bounded(s, 128) && !containsAny(s ?? "", "/\\@?#|");
+export const opaque = (s: any) => bounded(s, 128) && !containsAny(s ?? "", "/\\@?#|");
 const quality = (s: any) =>
   ["observed", "inferred", "confirmed", "tool_observed", "ambiguous", "unknown"].includes(s);
 export const gitId = (s: any) =>
