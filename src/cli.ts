@@ -353,6 +353,16 @@ export async function run(
   if (command === "activate") {
     saveConfig(c);
     if (existsSync(join(prefix, "installed", "codex"))) codexTrace(true);
+    // Gateway routing moves from the old direct mode to the local proxy, which tags each request so it is priced
+    // from its bill. A failure keeps the working direct connection.
+    const gateway = await import("./gateway.ts");
+    const routing = gateway.loadGatewayState();
+    if (routing.enabled === true && routing.mode === "direct")
+      await gateway
+        .enable(signIn(), (text) => output(text + "\n"))
+        .catch((error: unknown) =>
+          output(`Gateway kept its direct connection: ${(error as Error).message}\n`),
+        );
     return;
   }
   if (command === "codex-trace") {

@@ -1,9 +1,11 @@
 // Local loopback reverse proxy for the Kimchi LLM gateway, plus the Claude
-// Code and Codex config writers that point the CLIs at it. OAuth sign-ins
-// route through the proxy so the bearer stays fresh and the SSO organization
-// header rides on every request; API-key sign-ins are written direct to the
-// gateway with the embedded key, mirroring Kimchi's own integrations
-// (CAST AI, Apache-2.0: src/integrations/claude-code.ts, codex.ts).
+// Code and Codex config writers that point the CLIs at it. Every sign-in
+// routes through the proxy: OAuth keeps its bearer fresh and its SSO
+// organization header, an API key rides on each request, and each model
+// request carries Kimchi's billing tag so its bill can be found, as Kimchi's
+// own requests do (CAST AI, Apache-2.0: src/integrations/claude-code.ts,
+// codex.ts, extensions/work-attribution/request-tags.ts).
+import { randomUUID } from "node:crypto";
 import {
   appendFileSync,
   mkdirSync,
@@ -18,7 +20,7 @@ import { spawnSync } from "node:child_process";
 import type { Config } from "./settings.ts";
 import { stateRoot } from "./settings.ts";
 import type { SignIn } from "./kimchi.ts";
-import { baseUrl } from "./kimchi.ts";
+import { baseUrl, kimchiSignIn } from "./kimchi.ts";
 import { cliEntry, lockSync } from "./platform.ts";
 import {
   endpointsForCredential,
@@ -26,10 +28,12 @@ import {
   gatewayHeaders,
   isInvalidGrant,
   loadCredential,
+  ORGANIZATION_HEADER,
   refreshOAuth,
   saveCredential,
   seedFromKimchi,
 } from "./oauth.ts";
+import { billingTags, readResponseId, recordTag } from "./request-tags.ts";
 
 const DEFAULT_PORT = 8766;
 const PORT_SCAN_SPAN = 10;
@@ -602,7 +606,7 @@ function spawnDaemon(): void {
 export function ensureQuick(): "spawned" | "off" {
   const state = loadGatewayState();
   if (state.enabled !== true || state.mode === "direct") return "off";
-  if (!loadCredential()) return "off";
+  if (!upstream()) return "off";
   try {
     spawnDaemon();
   } catch {
@@ -621,7 +625,7 @@ export async function ensure(): Promise<
   const state = loadGatewayState();
   if (!state.enabled) return "disabled";
   if (state.mode === "direct") return "direct";
-  if (!loadCredential()) return "unauthenticated";
+  if (!upstream()) return "unauthenticated";
   const port = gatewayPort(state);
   if ((await health(port)).ok) return "running";
   const guard = lockSync(join(dirname(gatewayStatePath()), "gateway-spawn.lock"));
@@ -732,9 +736,60 @@ function describeToolType(tool: unknown): string {
   return "unknown";
 }
 
+// The model requests the gateway bills; each carries its own billing tag.
+const BILLED_PATHS = [
+  "/anthropic/v1/messages",
+  "/openai/v1/responses",
+  "/openai/v1/chat/completions",
+];
+
+/** The gateway for a Kimchi sign-in's region, or KIMCHI_BASE_URL for a custom gateway. */
+export function llmBaseFor(apiUrl: string): string | undefined {
+  const env = process.env.KIMCHI_BASE_URL?.trim();
+  if (env) return baseUrl(env);
+  // The kimchi CLI sign-in reports the console API URL (app.kimchi.dev/api);
+  // the bridge's own OAuth store reports the CAST API base.
+  const api = baseUrl(apiUrl);
+  if (api === "https://api.eu.cast.ai" || api === "https://app.eu.kimchi.dev/api")
+    return "https://llm.eu.kimchi.dev";
+  if (api === "https://api.cast.ai" || api === "https://app.kimchi.dev/api")
+    return "https://llm.kimchi.dev";
+  return undefined;
+}
+
+/** The gateway auth for Kimchi's API-key sign-in: its bearer, and its SSO organization when it has one. */
+function keyHeaders(signIn: SignIn): Record<string, string> {
+  const headers: Record<string, string> = { Authorization: `Bearer ${signIn.token}` };
+  if (signIn.organizationId) headers[ORGANIZATION_HEADER] = signIn.organizationId;
+  return headers;
+}
+
+/** Where the proxy forwards: the bridge's own OAuth sign-in, else Kimchi's API-key sign-in. */
+export function upstream():
+  | { llmBase: string; region?: string; organizationId?: string }
+  | undefined {
+  const credential = loadCredential();
+  if (credential)
+    return {
+      llmBase: endpointsForCredential(credential).llmBaseUrl,
+      region: credential.region,
+      organizationId: credential.orgId,
+    };
+  const signIn = kimchiSignIn(process.env.KIMCHI_API_KEY ?? "");
+  const llmBase = signIn.token ? llmBaseFor(signIn.apiUrl) : undefined;
+  return llmBase ? { llmBase, organizationId: signIn.organizationId } : undefined;
+}
+
 export async function proxyRequest(request: Request, llmBase: string): Promise<Response> {
   const url = new URL(request.url);
   const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
+  const credential = loadCredential();
+  const signIn = credential ? undefined : kimchiSignIn(process.env.KIMCHI_API_KEY ?? "");
+  if (!credential && !signIn?.token)
+    return new Response("Kimchi sign-in required; run kimchi-bridge login\n", {
+      status: 401,
+      headers: { "content-type": "text/plain" },
+    });
   // Buffer the body so a 401 retry can re-send it; LLM request bodies are
   // finite JSON, and one in-flight buffer per request is bounded.
   const buffered =
@@ -743,15 +798,33 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
   // forwards byte-identical.
   const body =
     buffered === undefined ? undefined : stripUnsupportedServerTools(buffered, url.pathname);
-  const forward = async (): Promise<Response> =>
-    await fetch(upstream, {
+  let json: unknown;
+  if (request.method === "POST" && BILLED_PATHS.includes(url.pathname) && body !== undefined)
+    try {
+      json = JSON.parse(new TextDecoder().decode(body));
+    } catch {
+      // An unreadable body goes untagged, as in Kimchi.
+    }
+  let requestId: string | undefined;
+  const forward = async (): Promise<Response> => {
+    const headers = forwardHeaders(
+      request.headers,
+      credential ? gatewayHeaders(await ensureFresh()) : keyHeaders(signIn!),
+    );
+    // Every attempt gets its own tag, so a retry's bill never joins the first attempt's.
+    const id = randomUUID();
+    const tags = billingTags(headers, json, id);
+    if (tags) headers.set("X-Tags", tags);
+    requestId = tags ? id : undefined;
+    return await fetch(upstream, {
       method: request.method,
-      headers: forwardHeaders(request.headers, gatewayHeaders(await ensureFresh())),
+      headers,
       body: body === undefined ? undefined : Buffer.from(body),
       redirect: "manual",
     });
+  };
   let response = await forward();
-  if (response.status === 401) {
+  if (response.status === 401 && credential) {
     // The bearer was rejected despite being fresh: force one rotation, then retry once.
     try {
       saveCredential(await refreshOAuth(await ensureFresh()));
@@ -775,12 +848,22 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
     if (HOP_BY_HOP.has(lower) || lower === "content-encoding") continue;
     headers.set(key, value);
   }
-  return new Response(response.body, { status: response.status, headers });
+  let reply = response.body;
+  const tagged = requestId;
+  if (tagged && response.ok && reply) {
+    // Transcripts name a call by its response ID, so remember which tag that response's request carried.
+    const [client, copy] = reply.tee();
+    reply = client;
+    void readResponseId(copy)
+      .then((id) => id && recordTag(id, tagged))
+      .catch((error: unknown) => log(`billing tag not recorded: ${(error as Error).message}`));
+  }
+  return new Response(reply, { status: response.status, headers });
 }
 
 export async function runDaemon(): Promise<void> {
-  const credential = loadCredential();
-  if (!credential) throw new Error("no saved sign-in; run kimchi-bridge login");
+  const target = upstream();
+  if (!target) throw new Error("no sign-in; run kimchi-bridge login or sign in to Kimchi");
   const state = loadGatewayState();
   const preferred = gatewayPort(state);
   let port = preferred;
@@ -802,24 +885,25 @@ export async function runDaemon(): Promise<void> {
         fetch: async (request: Request): Promise<Response> => {
           const url = new URL(request.url);
           if (url.pathname === HEALTH_PATH) {
-            const current = loadCredential();
+            const current = upstream();
             return Response.json({
               ok: true,
               service: HEALTH_MARKER,
               pid: process.pid,
               port: server?.port ?? candidate,
               region: current?.region,
-              organizationId: current?.orgId,
+              organizationId: current?.organizationId,
             });
           }
           const started = Date.now();
           try {
-            if (!loadCredential())
+            const current = upstream();
+            if (!current)
               return new Response("Kimchi sign-in required; run kimchi-bridge login\n", {
                 status: 401,
                 headers: { "content-type": "text/plain" },
               });
-            const response = await proxyRequest(request, endpoints.llmBaseUrl);
+            const response = await proxyRequest(request, current.llmBase);
             log(
               `${request.method} ${url.pathname} -> ${response.status} (${Date.now() - started}ms)`,
             );
@@ -852,15 +936,14 @@ export async function runDaemon(): Promise<void> {
     throw new Error(
       `no free port in ${preferred}..${preferred + PORT_SCAN_SPAN} for the gateway proxy`,
     );
-  const endpoints = endpointsForCredential(credential);
   saveGatewayState({
     ...state,
     enabled: true,
     mode: "proxy",
     port,
     pid: process.pid,
-    region: credential.region,
-    organizationId: credential.orgId,
+    region: target.region,
+    organizationId: target.organizationId,
   });
   if (port !== preferred) {
     // The persisted port moved; repoint the CLI configs so new sessions follow.
@@ -871,7 +954,7 @@ export async function runDaemon(): Promise<void> {
       log(`port moved to ${port} but CLI config rewrite failed: ${(error as Error).message}`);
     }
   }
-  log(`gateway proxy listening on 127.0.0.1:${port} -> ${endpoints.llmBaseUrl}`);
+  log(`gateway proxy listening on 127.0.0.1:${port} -> ${target.llmBase}`);
   // Poll for disable while running; SIGTERM also exits (default handler).
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, 10_000));
@@ -899,10 +982,10 @@ export interface EnableResult {
 }
 
 /**
- * Route the CLIs through the Kimchi gateway in the mode matching the sign-in:
- * OAuth credentials through the local proxy (adopting Kimchi's own saved
- * login into the shared credential store when only that exists), API keys
- * direct with the embedded key.
+ * Route the CLIs through the Kimchi gateway via the local proxy, for every
+ * sign-in: an OAuth credential (adopting Kimchi's own saved login into the
+ * shared credential store when only that exists) or Kimchi's API key. The
+ * proxy tags each model request so the backend can price it from its bill.
  */
 export async function enable(
   signIn: SignIn,
@@ -916,59 +999,45 @@ export async function enable(
     if (adopted && adopted.orgId) saveCredential(adopted);
   }
   const credential = loadCredential();
-  const proxyMode = credential !== undefined;
   const previousState = loadGatewayState();
+  const port = gatewayPort(previousState);
 
-  let anthropicBaseUrl: string;
-  let codexBaseUrl: string;
-  let bearer: string;
   let modelHeaders: Record<string, string>;
   let llmBase: string;
-  if (proxyMode) {
-    const endpoints = endpointsForCredential(credential!);
-    const port = gatewayPort(previousState);
-    anthropicBaseUrl = `http://127.0.0.1:${port}/anthropic`;
-    codexBaseUrl = `http://127.0.0.1:${port}/openai/v1`;
-    bearer = PROXY_PLACEHOLDER;
-    modelHeaders = gatewayHeaders(credential!);
-    llmBase = endpoints.llmBaseUrl;
+  if (credential) {
+    modelHeaders = gatewayHeaders(credential);
+    llmBase = endpointsForCredential(credential).llmBaseUrl;
   } else {
     if (!signIn.token) throw new Error("run kimchi-bridge login before enabling the gateway");
-    // Derive the gateway base from the sign-in's region. The kimchi CLI
-    // sign-in reports the console API URL (app.kimchi.dev/api); the bridge's
-    // own OAuth store reports the CAST API base — accept both so a plain
-    // Kimchi sign-in (key or SSO) needs no KIMCHI_BASE_URL.
-    const api = baseUrl(signIn.apiUrl);
-    const env = process.env.KIMCHI_BASE_URL?.trim();
-    if (env) llmBase = baseUrl(env);
-    else if (api === "https://api.eu.cast.ai" || api === "https://app.eu.kimchi.dev/api")
-      llmBase = "https://llm.eu.kimchi.dev";
-    else if (api === "https://api.cast.ai" || api === "https://app.kimchi.dev/api")
-      llmBase = "https://llm.kimchi.dev";
-    else
+    const base = llmBaseFor(signIn.apiUrl);
+    if (!base)
       throw new Error(
         "the gateway redirect needs a us/eu Kimchi sign-in, or KIMCHI_BASE_URL for a custom gateway",
       );
-    anthropicBaseUrl = `${llmBase}/anthropic`;
-    codexBaseUrl = `${llmBase}/openai/v1`;
-    bearer = signIn.token;
-    modelHeaders = { Authorization: `Bearer ${signIn.token}` };
+    modelHeaders = keyHeaders(signIn);
+    llmBase = base;
   }
 
   // Fetch the model list first: a failure leaves nothing written.
   const models = await fetchModels(llmBase, modelHeaders);
-  const claudePrevious = writeClaudeConfig(anthropicBaseUrl, bearer);
-  const codexPrevious = writeCodexConfig(codexBaseUrl, bearer, models);
+  const claudePrevious = writeClaudeConfig(`http://127.0.0.1:${port}/anthropic`, PROXY_PLACEHOLDER);
+  const codexPrevious = writeCodexConfig(
+    `http://127.0.0.1:${port}/openai/v1`,
+    PROXY_PLACEHOLDER,
+    models,
+  );
 
   const state: GatewayState = {
     ...previousState,
     enabled: true,
-    mode: proxyMode ? "proxy" : "direct",
-    ...(proxyMode ? { port: gatewayPort(previousState) } : {}),
-    previous: {
-      claude: claudePrevious,
-      ...(codexPrevious ? { codexTopLevel: codexPrevious } : {}),
-    },
+    mode: "proxy",
+    port,
+    // Re-enabling over our own settings (a direct-mode upgrade) keeps the user's
+    // original values, so disable still restores what they had before.
+    previous:
+      previousState.enabled && previousState.previous
+        ? previousState.previous
+        : { claude: claudePrevious, ...(codexPrevious ? { codexTopLevel: codexPrevious } : {}) },
   };
   saveGatewayState(state);
 
@@ -976,28 +1045,17 @@ export async function enable(
   let service: EnableResult["service"] = null;
   // KIMCHI_BRIDGE_DAEMON=0 skips the bring-up (test seam; the configs are
   // still written and the hooks' ensure starts the daemon in production).
-  if (proxyMode && process.env.KIMCHI_BRIDGE_DAEMON === "0") {
-    daemon = (await health(gatewayPort(state))).ok ? "running" : "off";
-  } else if (proxyMode) {
+  if (process.env.KIMCHI_BRIDGE_DAEMON === "0") {
+    daemon = (await health(port)).ok ? "running" : "off";
+  } else {
     const outcome = await ensure();
     daemon = outcome === "running" || outcome === "started" ? outcome : "off";
     service = installService(cliEntry());
-  } else {
-    stop();
   }
-  onMessage?.(
-    proxyMode
-      ? `Gateway enabled through the local proxy (127.0.0.1:${gatewayPort(state)}).`
-      : "Gateway enabled with a direct connection to the Kimchi gateway.",
-  );
+  onMessage?.(`Gateway enabled through the local proxy (127.0.0.1:${port}).`);
   onMessage?.("Claude Code and Codex now send their model requests through Kimchi.");
   onMessage?.("Revert anytime with: kimchi-bridge gateway disable");
-  return {
-    mode: proxyMode ? "proxy" : "direct",
-    port: proxyMode ? gatewayPort(state) : undefined,
-    daemon,
-    service,
-  };
+  return { mode: "proxy", port, daemon, service };
 }
 
 export async function disable(onMessage?: (message: string) => void): Promise<void> {
