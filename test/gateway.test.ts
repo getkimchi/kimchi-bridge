@@ -24,6 +24,7 @@ import {
 } from "../src/gateway.ts";
 import { credentialPath, saveCredential } from "../src/oauth.ts";
 import type { SignIn } from "../src/kimchi.ts";
+import { tagFor } from "../src/request-tags.ts";
 
 const org = "22222222-2222-4222-8222-222222222222";
 const user = "11111111-1111-4111-8111-111111111111";
@@ -31,11 +32,15 @@ const user = "11111111-1111-4111-8111-111111111111";
 let root: string;
 let previousRoot: string | undefined;
 let previousBase: string | undefined;
+let previousHome: string | undefined;
 const cleanups: (() => void)[] = [];
 beforeEach(() => {
   previousRoot = process.env.KIMCHI_BRIDGE_HOME;
   previousBase = process.env.KIMCHI_BASE_URL;
   root = mkdtempSync(join(tmpdir(), "kimchi-bridge-gateway-"));
+  // Kimchi's saved sign-in is read from HOME; never the developer's own.
+  previousHome = process.env.HOME;
+  process.env.HOME = join(root, "home");
   process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(root, "home");
   process.env.KIMCHI_BRIDGE_HOME = join(root, "state");
   process.env.KIMCHI_BRIDGE_SERVICE = "0";
@@ -49,6 +54,8 @@ afterEach(() => {
   delete process.env.KIMCHI_BRIDGE_CONFIG_HOME;
   delete process.env.KIMCHI_BRIDGE_SERVICE;
   delete process.env.KIMCHI_BRIDGE_DAEMON;
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
   if (previousBase === undefined) delete process.env.KIMCHI_BASE_URL;
   else process.env.KIMCHI_BASE_URL = previousBase;
   if (previousRoot === undefined) delete process.env.KIMCHI_BRIDGE_HOME;
@@ -77,6 +84,15 @@ const models: GatewayModel[] = [
     limits: { context_window: 262144, max_output_tokens: 32768 },
   },
 ];
+/** Kimchi's saved API-key sign-in, as its global config stores it. */
+function kimchiKey(apiKey: string, region = "us") {
+  mkdirSync(join(root, "home", ".config", "kimchi"), { recursive: true });
+  writeFileSync(
+    join(root, "home", ".config", "kimchi", "config.json"),
+    JSON.stringify({ apiKey, region }),
+  );
+}
+
 function modelsEndpoint(): string {
   return server((request) => {
     if (new URL(request.url).pathname === "/v1/models/metadata") return Response.json({ models });
@@ -230,26 +246,29 @@ test("enable in proxy mode writes proxy URLs and never a real credential into th
   expect(messages.some((m) => m.includes("Gateway enabled"))).toBe(true);
 });
 
-test("enable in direct mode embeds the API key and points straight at the gateway", async () => {
+test("enable with an API key routes through the local proxy and keeps the key out of the CLI configs", async () => {
   const llm = modelsEndpoint();
   process.env.KIMCHI_BASE_URL = llm;
+  kimchiKey("castai_v1_key");
   await enable({ apiUrl: "https://api.cast.ai", token: "castai_v1_key" }, undefined, null);
   const claude = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
-  expect(claude.env.ANTHROPIC_BASE_URL).toBe(`${llm}/anthropic`);
-  expect(claude.env.ANTHROPIC_AUTH_TOKEN).toBe("castai_v1_key");
+  expect(claude.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8766/anthropic");
+  expect(claude.env.ANTHROPIC_AUTH_TOKEN).not.toBe("castai_v1_key");
   const codex = readFileSync(codexConfigPath(), "utf8");
-  expect(codex).toContain(`base_url = "${llm}/openai/v1"`);
-  expect(codex).toContain('http_headers = { Authorization = "Bearer castai_v1_key" }');
-  expect(loadGatewayState().mode).toBe("direct");
+  expect(codex).toContain('base_url = "http://127.0.0.1:8766/openai/v1"');
+  expect(codex).not.toContain("castai_v1_key");
+  expect(loadGatewayState().mode).toBe("proxy");
   expect(existsSync(credentialPath())).toBe(false);
 });
 
-test("direct mode derives the gateway URL from a kimchi app sign-in region (no KIMCHI_BASE_URL)", async () => {
+test("an API-key sign-in's region picks the gateway behind the proxy (no KIMCHI_BASE_URL)", async () => {
   delete process.env.KIMCHI_BASE_URL;
   const original = globalThis.fetch;
-  const stub = (async (input: any, init?: any) => {
+  const fetched: string[] = [];
+  const stub = (async (input: any) => {
     const url =
       typeof input === "string" ? input : input instanceof URL ? input.href : String(input);
+    fetched.push(url);
     if (url.includes("/v1/models/metadata"))
       return Response.json({
         models: [
@@ -264,21 +283,30 @@ test("direct mode derives the gateway URL from a kimchi app sign-in region (no K
   }) as typeof fetch;
   globalThis.fetch = stub;
   try {
+    kimchiKey("castai_v1_key", "us");
     await enable({ apiUrl: "https://app.kimchi.dev/api", token: "castai_v1_key" }, undefined, null);
-    const claude = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
-    expect(claude.env.ANTHROPIC_BASE_URL).toBe("https://llm.kimchi.dev/anthropic");
-    expect(loadGatewayState().mode).toBe("direct");
+    expect(fetched.some((url) => url.startsWith("https://llm.kimchi.dev/"))).toBe(true);
+    expect(loadGatewayState().mode).toBe("proxy");
     await disable();
+    kimchiKey("castai_v1_key", "eu");
     await enable(
       { apiUrl: "https://app.eu.kimchi.dev/api", token: "castai_v1_key" },
       undefined,
       null,
     );
-    const claudeEu = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
-    expect(claudeEu.env.ANTHROPIC_BASE_URL).toBe("https://llm.eu.kimchi.dev/anthropic");
+    expect(fetched.some((url) => url.startsWith("https://llm.eu.kimchi.dev/"))).toBe(true);
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test("enable refuses a key that only KIMCHI_API_KEY holds, which the proxy daemon never sees", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  await expect(
+    enable({ apiUrl: "https://app.kimchi.dev/api", token: "castai_v1_key" }, undefined, null),
+  ).rejects.toThrow("the gateway proxy needs a saved sign-in");
+  expect(existsSync(claudeSettingsPath())).toBe(false);
+  expect(existsSync(codexConfigPath())).toBe(false);
 });
 
 test("enable without a sign-in leaves nothing written", async () => {
@@ -513,4 +541,103 @@ test("Status reports the gateway state", async () => {
   saveGatewayState({ enabled: true, mode: "proxy", port: 1, region: "us", organizationId: org });
   const state = await status();
   expect(state).toMatchObject({ enabled: true, mode: "proxy", port: 1, running: false });
+});
+
+async function recorded(responseId: string): Promise<string | undefined> {
+  for (let i = 0; i < 100 && !tagFor(responseId); i++)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  return tagFor(responseId);
+}
+
+test("proxyRequest tags each model request as Kimchi does and records the tag for its response", async () => {
+  oauthCredential();
+  const seen: (string | null)[] = [];
+  const upstream = server(async (request) => {
+    seen.push(request.headers.get("x-tags"));
+    await request.text();
+    return new Response(
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_tagged"}}\n\ndata: [DONE]\n\n',
+      { headers: { "content-type": "text/event-stream" } },
+    );
+  });
+  const response = await proxyRequest(
+    new Request("http://127.0.0.1:8766/anthropic/v1/messages?beta=true", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-tags": "team:web" },
+      body: JSON.stringify({ model: "m", messages: [] }),
+    }),
+    upstream,
+  );
+  expect(await response.text()).toContain("msg_tagged");
+  const tags = seen[0] ?? "";
+  expect(tags.startsWith("team:web,kimchi-request:")).toBe(true);
+  expect(await recorded("msg_tagged")).toBe(tags.slice("team:web,kimchi-request:".length));
+  // Token counts are not billed model requests.
+  await proxyRequest(
+    new Request("http://127.0.0.1:8766/anthropic/v1/messages/count_tokens", {
+      method: "POST",
+      body: "{}",
+    }),
+    upstream,
+  );
+  expect(seen[1]).toBeNull();
+});
+
+test("the proxy forwards an API-key sign-in with its key and tags its requests", async () => {
+  kimchiKey("castai_v1_key");
+  let auth = "";
+  let tags: string | null = null;
+  const upstream = server(async (request) => {
+    auth = request.headers.get("authorization") ?? "";
+    tags = request.headers.get("x-tags");
+    await request.text();
+    return Response.json({ id: "resp_key", object: "response" });
+  });
+  const response = await proxyRequest(
+    new Request("http://127.0.0.1:8766/openai/v1/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer kimchi-gateway" },
+      body: JSON.stringify({ model: "m", input: "hi" }),
+    }),
+    upstream,
+  );
+  expect(await response.json()).toEqual({ id: "resp_key", object: "response" });
+  expect(auth).toBe("Bearer castai_v1_key");
+  expect(String(tags).startsWith("kimchi-request:")).toBe(true);
+  expect(await recorded("resp_key")).toBe(String(tags).slice("kimchi-request:".length));
+});
+
+test("a retried request carries a fresh billing tag, as in Kimchi", async () => {
+  const tokenEndpoint = server(async () =>
+    Response.json({ access_token: "access-2", id_token: "id-token-2", expires_in: 3600 }),
+  );
+  saveCredential({
+    region: "us",
+    tokenUrl: `${tokenEndpoint}/oauth/token`,
+    clientId: "c",
+    useIdToken: true,
+    accessToken: "access",
+    idToken: "id-token",
+    refreshToken: "refresh",
+    expires: Date.now() + 3600_000,
+    orgId: org,
+    orgName: "Org",
+  });
+  const seen: (string | null)[] = [];
+  const upstream = server(async (request) => {
+    seen.push(request.headers.get("x-tags"));
+    await request.text();
+    if (seen.length === 1) return new Response("expired", { status: 401 });
+    return Response.json({ id: "msg_retry" });
+  });
+  await proxyRequest(
+    new Request("http://127.0.0.1:8766/anthropic/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "m", messages: [] }),
+    }),
+    upstream,
+  );
+  expect(seen).toHaveLength(2);
+  expect(seen[0]).not.toBe(seen[1]);
+  expect(await recorded("msg_retry")).toBe(String(seen[1]).slice("kimchi-request:".length));
 });

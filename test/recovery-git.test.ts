@@ -12,6 +12,7 @@ import {
   saveMeta,
   scmEnvironment,
 } from "../src/work/git.ts";
+import { recordTag } from "../src/request-tags.ts";
 import { Store } from "../src/work/ledger.ts";
 import { parseJson, stableId } from "../src/work/protocol.ts";
 import {
@@ -236,7 +237,8 @@ test("Claude telemetry and transcript revise one request and attach its exact to
     { ttlSeconds: 300, tokens: "3" },
     { ttlSeconds: 3600, tokens: "4" },
   ]);
-  expect(event.usage.aliases).toHaveLength(1);
+  // The backend reads castai-request-id as a bill ID, which a gateway request ID is not; tagged calls name their bill instead.
+  expect(event.usage.aliases).toBeUndefined();
   expect(event.workId).toBeTruthy();
   appendFileSync(
     path,
@@ -831,4 +833,121 @@ test("an HTTPS remote keeps its port; an SSH remote's port is not the web host's
   expect(host("https://ghe.example.com:443/team/repo.git")).toBe("ghe.example.com");
   expect(host("ssh://git@ghe.example.com:2222/team/repo.git")).toBe("ghe.example.com");
   expect(host("git@github.com:team/repo.git")).toBe("github.com");
+});
+
+function withBridgeHome<T>(base: string, run: () => T): T {
+  const previous = process.env.KIMCHI_BRIDGE_HOME;
+  process.env.KIMCHI_BRIDGE_HOME = join(base, "bridge");
+  try {
+    return run();
+  } finally {
+    if (previous === undefined) delete process.env.KIMCHI_BRIDGE_HOME;
+    else process.env.KIMCHI_BRIDGE_HOME = previous;
+  }
+}
+function usages(store: Store) {
+  return (
+    store.db.query("SELECT body FROM events WHERE kind='usage' ORDER BY rowid").all() as any[]
+  ).map((row) => JSON.parse(Buffer.from(row.body).toString()));
+}
+const tag = "11111111-2222-4333-8444-555555555555";
+
+test("a Claude call the proxy tagged uploads its billing tag as requestId on the gateway route", () => {
+  const { base, root, store, r, scope } = fixture("claude-code");
+  withBridgeHome(base, () => {
+    recordTag("msg_tagged", tag);
+    const path = join(root, "claude.jsonl");
+    registerTranscript(r, scope, path, "customer-gateway", "unknown");
+    const message = (id: string) =>
+      JSON.stringify({
+        type: "assistant",
+        timestamp: at,
+        message: {
+          id,
+          model: "model",
+          usage: {
+            input_tokens: 2,
+            output_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      });
+    writeFileSync(path, message("msg_tagged") + "\n" + message("msg_plain") + "\n");
+    recoverContext(r);
+    const [tagged, plain] = usages(store);
+    expect(tagged.usage).toMatchObject({
+      responseId: "msg_tagged",
+      requestId: tag,
+      observedRoute: "castai",
+    });
+    expect(plain.usage.requestId).toBeUndefined();
+    expect(plain.usage.observedRoute).toBe("customer-gateway");
+    // Reading the same response again after its tag is gone keeps one entity and keeps its tag.
+    rmSync(join(base, "bridge", "gateway-request-tags.sqlite"), { force: true });
+    appendFileSync(path, message("msg_tagged") + "\n");
+    recoverContext(r);
+    const again = usages(store).filter((event) => event.usage.responseId === "msg_tagged");
+    expect(new Set(again.map((event) => event.entityId)).size).toBe(1);
+    expect(again.at(-1).usage.requestId).toBe(tag);
+  });
+});
+
+test("a Codex token_count takes its response ID only from the record with the same usage", () => {
+  const { base, root, store, r, scope } = fixture();
+  withBridgeHome(base, () => {
+    recordTag("resp_tagged", tag);
+    const path = join(root, "rollout.jsonl");
+    registerTranscript(r, scope, path, "unknown", "unknown");
+    const usage = {
+      input_tokens: 4281,
+      cached_input_tokens: 1792,
+      output_tokens: 27,
+      reasoning_output_tokens: 24,
+      total_tokens: 4308,
+    };
+    const record = (response: string, counts: object) =>
+      JSON.stringify({
+        timestamp: at,
+        type: "token_usage_record",
+        payload: { turn_id: "turn", response_id: response, usage: counts },
+      });
+    const count = (last: object, total: object) =>
+      JSON.stringify({
+        timestamp: at,
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: { last_token_usage: last, total_token_usage: total },
+        },
+      });
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          timestamp: at,
+          type: "turn_context",
+          payload: { turn_id: "turn", model: "m" },
+        }),
+        record("resp_tagged", usage),
+        count(usage, { ...usage }),
+        // A record whose counts differ from the next event never lends that event its response ID.
+        record("resp_other", { ...usage, output_tokens: 25, total_tokens: 4306 }),
+        count(
+          { ...usage, output_tokens: 30, total_tokens: 4311 },
+          { ...usage, output_tokens: 57, total_tokens: 8619 },
+        ),
+      ].join("\n") + "\n",
+    );
+    recoverContext(r);
+    const [tagged, unmatched] = usages(store);
+    expect(tagged.usage).toMatchObject({
+      responseId: "resp_tagged",
+      requestId: tag,
+      observedRoute: "castai",
+    });
+    expect(unmatched.usage.responseId).toBeUndefined();
+    expect(unmatched.usage.requestId).toBeUndefined();
+    expect(unmatched.usage.observedRoute).toBe("unknown");
+  });
 });

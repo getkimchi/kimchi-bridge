@@ -15,6 +15,8 @@ import {
   type Usage,
 } from "./protocol.ts";
 import { checkSignal } from "../platform.ts";
+import { gatewayPort, loadGatewayState } from "../gateway.ts";
+import { tagFor } from "../request-tags.ts";
 import type { Recorder, Scope } from "./capture.ts";
 
 interface Transcript {
@@ -193,6 +195,7 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
   if (
     r.source === "codex" &&
     str(v, "type") !== "turn_context" &&
+    str(v, "type") !== "token_usage_record" &&
     !(
       str(v, "type") === "event_msg" &&
       ["token_count", "thread_settings_applied"].includes(str(obj(v.payload), "type"))
@@ -205,6 +208,14 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     if (str(v, "type") === "turn_context") {
       t.scope.Turn = str(p, "turn_id");
       r.store.setMeta(`model:${t.path}`, str(p, "model"));
+      return;
+    }
+    // Codex records each response's ID and usage just before the token_count event for that response.
+    if (str(v, "type") === "token_usage_record") {
+      r.store.setMeta(
+        `codex-response:${t.path}`,
+        stringifyJson([str(p, "response_id"), codexUsageKey(obj(p.usage))]),
+      );
       return;
     }
     // The backend prices only a known tier. Codex's thread settings name the tier it asks
@@ -229,6 +240,11 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
       reportedModel: r.store.meta(`model:${t.path}`),
     };
     const e = r.event(s, `token-count:${canonicalHash(info.total_token_usage)}`, r.workExact(s));
+    // Only the record carrying this event's exact usage names its response.
+    const [response, key] = codexResponse(r.store.meta(`codex-response:${t.path}`));
+    if (response && key === codexUsageKey(obj(info.last_token_usage))) usage.responseId = response;
+    r.store.setMeta(`codex-response:${t.path}`, "");
+    billingTag(r, e.entityId, usage);
     e.observeTime = observed;
     e.usage = usage;
     if (!s.Turn) r.store.diagnostic("usage_turn_missing");
@@ -242,12 +258,13 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
   }
   const m = obj(v.message),
     raw = obj(m.usage),
-    response = str(m, "id");
+    response = str(m, "id"),
+    nativeRequest = str(v, "requestId");
   if (!hasObject(m.usage) || !response) return;
   const u: Usage = {
     channel: "transcript",
     responseId: response,
-    requestId: str(v, "requestId"),
+    requestId: nativeRequest,
     schema: "anthropic-messages-v1",
     counterScope: "request",
     observedRoute: t.route,
@@ -296,8 +313,8 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     work = r.workExact(s);
     u.correlation = "native_transcript_prompt";
   }
-  proxyAlias(u);
-  const e = r.event(s, requestEntity(response, u.requestId || ""), work);
+  const e = r.event(s, requestEntity(response, nativeRequest), work);
+  billingTag(r, e.entityId, u, nativeRequest);
   e.observeTime = observed;
   e.usage = u;
   r.store.observe(e);
@@ -366,22 +383,62 @@ export function route(source: string): string {
   )
     return "cloud-provider";
   if (!process.env.ANTHROPIC_BASE_URL) return "provider-api";
-  let host: string;
+  let url: URL;
   try {
-    host = new URL(process.env.ANTHROPIC_BASE_URL).hostname.toLowerCase();
+    url = new URL(process.env.ANTHROPIC_BASE_URL);
   } catch {
     return "unknown";
   }
+  const host = url.hostname.toLowerCase();
   if (host === "api.anthropic.com") return "provider-api";
   if (["cast.ai", "kimchi.dev"].some((d) => host === d || host.endsWith(`.${d}`))) return "castai";
+  // The bridge's own loopback proxy forwards to the Kimchi gateway.
+  if (host === "127.0.0.1" || host === "localhost") {
+    const state = loadGatewayState();
+    if (state.enabled === true && state.mode === "proxy" && Number(url.port) === gatewayPort(state))
+      return "castai";
+  }
   return host ? "customer-gateway" : "unknown";
 }
 function requestEntity(response: string, request: string): string {
   return request ? `request:${request}` : `response:${response}`;
 }
-function proxyAlias(u: Usage) {
-  if (u.observedRoute === "castai" && u.requestId?.length === 36)
-    u.aliases = [{ namespace: "castai-request-id", id: u.requestId, source: u.channel }];
+/**
+ * A call the proxy tagged went to the Kimchi gateway, and its billing tag names its bill (Kimchi's kimchi-request
+ * tag). The tag goes in requestId; an earlier revision's tag stays if a later lookup fails, so it never flaps.
+ */
+function billingTag(r: Recorder, entityId: string, u: Usage, nativeRequest = "") {
+  const previous = r.store.latest(entityId)?.usage;
+  const tag =
+    tagFor(u.responseId ?? "") ||
+    (previous?.observedRoute === "castai" && previous.requestId !== nativeRequest
+      ? previous.requestId
+      : "");
+  if (!tag) return;
+  u.requestId = tag;
+  u.observedRoute = "castai";
+}
+/** Codex's usage fields that a token_usage_record and its token_count event share. */
+function codexUsageKey(usage: JsonObject): string {
+  return stringifyJson(
+    [
+      "input_tokens",
+      "cached_input_tokens",
+      "output_tokens",
+      "reasoning_output_tokens",
+      "total_tokens",
+    ].map((key) => usage[key] ?? null),
+  );
+}
+function codexResponse(value: string): [string, string] {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) && typeof parsed[0] === "string" && typeof parsed[1] === "string"
+      ? [parsed[0], parsed[1]]
+      : ["", ""];
+  } catch {
+    return ["", ""];
+  }
 }
 export function telemetry(
   r: Recorder,
@@ -427,7 +484,6 @@ export function telemetry(
     },
     durationMs: wireInteger(a.duration_ms),
   };
-  proxyAlias(u);
   event.usage = u;
   r.store.observe(event);
 }
