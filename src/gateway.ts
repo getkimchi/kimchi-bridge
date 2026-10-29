@@ -775,7 +775,8 @@ export function upstream():
       region: credential.region,
       organizationId: credential.orgId,
     };
-  const signIn = kimchiSignIn(process.env.KIMCHI_API_KEY ?? "");
+  // Kimchi's saved sign-in only: the CLI drops KIMCHI_API_KEY at start, and a detached daemon never inherits it.
+  const signIn = kimchiSignIn();
   const llmBase = signIn.token ? llmBaseFor(signIn.apiUrl) : undefined;
   return llmBase ? { llmBase, organizationId: signIn.organizationId } : undefined;
 }
@@ -784,7 +785,7 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
   const url = new URL(request.url);
   const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
   const credential = loadCredential();
-  const signIn = credential ? undefined : kimchiSignIn(process.env.KIMCHI_API_KEY ?? "");
+  const signIn = credential ? undefined : kimchiSignIn();
   if (!credential && !signIn?.token)
     return new Response("Kimchi sign-in required; run kimchi-bridge login\n", {
       status: 401,
@@ -1009,12 +1010,18 @@ export async function enable(
     llmBase = endpointsForCredential(credential).llmBaseUrl;
   } else {
     if (!signIn.token) throw new Error("run kimchi-bridge login before enabling the gateway");
-    const base = llmBaseFor(signIn.apiUrl);
+    // The proxy reads Kimchi's saved sign-in; a key only in KIMCHI_API_KEY never reaches the daemon.
+    const saved = kimchiSignIn();
+    if (!saved.token)
+      throw new Error(
+        "the gateway proxy needs a saved sign-in: sign in to Kimchi, or run kimchi-bridge login",
+      );
+    const base = llmBaseFor(saved.apiUrl);
     if (!base)
       throw new Error(
         "the gateway redirect needs a us/eu Kimchi sign-in, or KIMCHI_BASE_URL for a custom gateway",
       );
-    modelHeaders = keyHeaders(signIn);
+    modelHeaders = keyHeaders(saved);
     llmBase = base;
   }
 
