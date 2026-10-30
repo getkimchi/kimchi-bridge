@@ -35,6 +35,7 @@ let root: string;
 let previousRoot: string | undefined;
 let previousBase: string | undefined;
 let previousHome: string | undefined;
+let previousXdg: string | undefined;
 const cleanups: (() => void)[] = [];
 beforeEach(() => {
   previousRoot = process.env.KIMCHI_BRIDGE_HOME;
@@ -44,6 +45,9 @@ beforeEach(() => {
   previousHome = process.env.HOME;
   process.env.HOME = join(root, "home");
   process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(root, "home");
+  // On Linux, Claude Desktop's profiles live under XDG_CONFIG_HOME, which CI runners set to their own.
+  previousXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = join(root, "home", ".config");
   process.env.KIMCHI_BRIDGE_HOME = join(root, "state");
   process.env.KIMCHI_BRIDGE_SERVICE = "0";
   process.env.KIMCHI_BRIDGE_DAEMON = "0";
@@ -58,6 +62,8 @@ afterEach(() => {
   delete process.env.KIMCHI_BRIDGE_DAEMON;
   if (previousHome === undefined) delete process.env.HOME;
   else process.env.HOME = previousHome;
+  if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = previousXdg;
   if (previousBase === undefined) delete process.env.KIMCHI_BASE_URL;
   else process.env.KIMCHI_BASE_URL = previousBase;
   if (previousRoot === undefined) delete process.env.KIMCHI_BRIDGE_HOME;
