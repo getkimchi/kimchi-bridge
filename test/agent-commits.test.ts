@@ -230,6 +230,34 @@ test("a Claude Code session's lone shell call owns its trace even without a logg
   expect(latest(store, "commit").commit.id).toBe(g.plain("rev-parse", "HEAD"));
 });
 
+test("a call's commit counts even after commits in a repository its command already removed", () => {
+  const { g, store, hook, shell } = session("claude-code");
+  hook("PreToolUse", shell("toolu_1"));
+  // `npm test && git commit`: the tests commit in temporary repositories and remove them again.
+  const scratch = repo(g.trace);
+  scratch.traced("", "commit", "-q", "--allow-empty", "-m", "test fixture");
+  rmSync(scratch.root, { recursive: true, force: true });
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.traced("", "commit", "-q", "-am", "two");
+  hook("PostToolUse", shell("toolu_1"));
+  expect(latest(store, "commit").commit.id).toBe(g.plain("rev-parse", "HEAD"));
+});
+
+test("a lone Claude Code shell call's trace is read once, as Kimchi's per-call traces are", () => {
+  const { g, store, hook, shell } = session("claude-code");
+  hook("PreToolUse", shell("toolu_1"));
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.traced("", "commit", "-q", "-am", "two");
+  hook("PostToolUse", shell("toolu_1"));
+  // A session's earlier Git (a test suite: thousands of processes) must not slow every later hook.
+  expect(existsSync(join(g.trace, "events"))).toBe(false);
+  hook("PreToolUse", shell("toolu_2"));
+  writeFileSync(join(g.root, "f"), "3\n");
+  g.traced("", "commit", "-q", "-am", "three");
+  hook("PostToolUse", shell("toolu_2"));
+  expect(count(store, "commit")).toBe(2);
+});
+
 test("an overlapping shell call claims nothing it cannot identify", () => {
   const { g, store, hook, shell } = session("claude-code");
   hook("PreToolUse", shell("toolu_1"));
