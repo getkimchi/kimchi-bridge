@@ -346,6 +346,20 @@ test("a call's commit counts even after commits in a repository its command alre
   expect(latest(store, "commit").commit.id).toBe(g.plain("rev-parse", "HEAD"));
 });
 
+test("a call's commit counts when Git's background maintenance recreates a removed repository's folder", () => {
+  const { g, store, hook, shell } = session("claude-code");
+  hook("PreToolUse", shell("toolu_1"));
+  const scratch = repo(g.trace);
+  scratch.traced("", "commit", "-q", "--allow-empty", "-m", "test fixture");
+  rmSync(scratch.root, { recursive: true, force: true });
+  // Newer Git runs `git maintenance --detach` after a commit; it can write into the folder after it is removed.
+  mkdirSync(join(scratch.root, ".git"), { recursive: true });
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.traced("", "commit", "-q", "-am", "two");
+  hook("PostToolUse", shell("toolu_1"));
+  expect(latest(store, "commit").commit.id).toBe(g.plain("rev-parse", "HEAD"));
+});
+
 test("a lone Claude Code shell call's trace is read once, as Kimchi's per-call traces are", () => {
   const { g, store, hook, shell } = session("claude-code");
   hook("PreToolUse", shell("toolu_1"));

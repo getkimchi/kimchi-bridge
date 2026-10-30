@@ -857,19 +857,24 @@ export class Recorder {
         if (this.source !== "claude-code" || busy || c.time < Date.parse(started)) continue;
       }
       // As in Kimchi, a commit in a repository already removed (a test's temporary one) is skipped; it must
-      // not stop the commits after it.
+      // not stop the commits after it. Git's background maintenance can write into the folder after it is
+      // removed, so a repository that cannot be read costs only its own commit.
       if (!existsSync(c.worktree)) continue;
-      const [root, repo, identity, common] = repository(c.worktree);
-      const key = `agent-commit:${stableId(repo, c.sha)}`;
-      if (this.store.meta(key)) continue;
-      // ponytail: a rebased or picked copy follows any commit this ledger traced; Kimchi requires
-      // the original to belong to the same work.
-      if (c.rewrittenFrom && !this.store.meta(`agent-commit:${stableId(repo, c.rewrittenFrom)}`))
-        continue;
-      const scope = { ...s, Root: root, Repo: repo, Repository: identity, Common: common };
-      const parents = commitParents(root, c.sha);
-      recordCommit(this, scope, owner, this.source, c.sha, parents, "observed", "agent_commit");
-      this.store.setMeta(key, "1");
+      try {
+        const [root, repo, identity, common] = repository(c.worktree);
+        const key = `agent-commit:${stableId(repo, c.sha)}`;
+        if (this.store.meta(key)) continue;
+        // ponytail: a rebased or picked copy follows any commit this ledger traced; Kimchi requires
+        // the original to belong to the same work.
+        if (c.rewrittenFrom && !this.store.meta(`agent-commit:${stableId(repo, c.rewrittenFrom)}`))
+          continue;
+        const scope = { ...s, Root: root, Repo: repo, Repository: identity, Common: common };
+        const parents = commitParents(root, c.sha);
+        recordCommit(this, scope, owner, this.source, c.sha, parents, "observed", "agent_commit");
+        this.store.setMeta(key, "1");
+      } catch {
+        this.store.diagnostic("git_trace_incomplete");
+      }
     }
   }
   expected(before: FileState, e: JsonObject, root: string, path: string): string | undefined {
