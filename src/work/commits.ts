@@ -30,6 +30,8 @@ interface GitProcess {
   sid: string;
   start: number;
   end?: number;
+  /** The process's exit code, from trace2's exit event. */
+  code?: number;
   command?: string;
   worktree?: string;
   call?: string;
@@ -80,7 +82,10 @@ function processes(trace: string): GitProcess[] {
     if (event.event === "cmd_name") p.command = event.name;
     if (event.event === "def_repo") p.worktree = event.worktree;
     if (event.event === "def_param" && CALL_VARIABLES.includes(event.param)) p.call = event.value;
-    if (event.event === "exit") p.end = instant(event.time);
+    if (event.event === "exit") {
+      p.end = instant(event.time);
+      if (typeof event.code === "number") p.code = event.code;
+    }
   }
   return [...byId.values()];
 }
@@ -175,13 +180,29 @@ function headCommit(
 export function tracedCommits(trace: string, refs: string): TracedCommit[] {
   const running = processes(trace);
   const commits: TracedCommit[] = [];
-  let pending: { sha: string; rewrittenFrom?: string; owner: GitProcess } | undefined;
+  type Pending = { sha: string; rewrittenFrom?: string; owner: GitProcess };
+  const commitOf = (p: Pending): TracedCommit => ({
+    sha: p.sha,
+    worktree: p.owner.worktree!,
+    call: p.owner.call ?? "",
+    time: Math.floor(p.owner.start / 1000),
+    ...(p.rewrittenFrom ? { rewrittenFrom: p.rewrittenFrom } : {}),
+  });
+  let pending: Pending | undefined;
+  // A ref trace names no process, so another traced process's transaction (a background `git maintenance`, or
+  // another session's fetch in a shared trace) can open between a commit's HEAD move and its finish line. Such a
+  // commit counts when its own process exited 0.
+  const interrupted: Pending[] = [];
+  const settle = () => {
+    if (pending) interrupted.push(pending);
+    pending = undefined;
+  };
   let replayed: { sha: string; owner: GitProcess } | undefined;
   for (const line of lines(refs)) {
     const parsed = refLine(line);
     if (!parsed) continue;
     const { time, content } = parsed;
-    if (content === "transaction {") pending = undefined;
+    if (content === "transaction {") settle();
     const update = refUpdate(content);
     if (update && (update.ref === "CHERRY_PICK_HEAD" || update.ref === "REBASE_HEAD")) {
       const owner = ownerAt(time, running, (p) =>
@@ -200,20 +221,27 @@ export function tracedCommits(trace: string, refs: string): TracedCommit[] {
         );
       const owner = ownerAt(time, running, (p) => commitBy(p) !== undefined);
       const commit = commitBy(owner);
+      settle();
       pending = commit && owner ? { ...commit, owner } : undefined;
       if (commit?.rewrittenFrom) replayed = undefined;
     }
     if (!content.startsWith("finish: ")) continue;
-    if (pending && content === "finish: 0" && localTimeInProcess(time, pending.owner) !== undefined)
-      commits.push({
-        sha: pending.sha,
-        worktree: pending.owner.worktree!,
-        call: pending.owner.call ?? "",
-        time: Math.floor(pending.owner.start / 1000),
-        ...(pending.rewrittenFrom ? { rewrittenFrom: pending.rewrittenFrom } : {}),
-      });
-    pending = undefined;
+    if (
+      pending &&
+      content === "finish: 0" &&
+      localTimeInProcess(time, pending.owner) !== undefined
+    ) {
+      commits.push(commitOf(pending));
+      pending = undefined;
+    } else settle();
   }
+  settle();
+  for (const p of interrupted)
+    if (
+      p.owner.code === 0 &&
+      !commits.some((c) => c.sha === p.sha && c.worktree === p.owner.worktree)
+    )
+      commits.push(commitOf(p));
   return commits;
 }
 

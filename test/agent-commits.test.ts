@@ -279,6 +279,60 @@ test("a Claude Code session's lone shell call owns its trace even without a logg
   expect(latest(store, "commit").commit.id).toBe(g.plain("rev-parse", "HEAD"));
 });
 
+test("a commit counts when another traced process's ref transaction lands inside its own", () => {
+  // A ref trace names no process: a background `git maintenance` an earlier commit started, or another session's
+  // fetch in a shared trace, can open its transaction between this commit's HEAD move and its finish line.
+  const dir = temp(),
+    root = join(dir, "repo"),
+    start = Date.UTC(2026, 9, 30, 12, 0, 0) * 1000;
+  const fraction = (us: number) => String(us % 1_000_000).padStart(6, "0");
+  const iso = (us: number) =>
+    `${new Date(Math.floor(us / 1000)).toISOString().slice(0, 20)}${fraction(us)}Z`;
+  const local = (us: number) => {
+    const d = new Date(Math.floor(us / 1000)),
+      two = (n: number) => String(n).padStart(2, "0");
+    return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}.${fraction(us)}`;
+  };
+  const write = (code: number) => {
+    const commit = "20261030T120000.000000Z-H1-P1",
+      maintenance = `${commit}/20261030T120000.005000Z-H1-P2`;
+    const events = [
+      { event: "start", sid: commit, time: iso(start) },
+      { event: "def_repo", sid: commit, time: iso(start + 100), worktree: root },
+      { event: "cmd_name", sid: commit, time: iso(start + 200), name: "commit" },
+      { event: "start", sid: maintenance, time: iso(start + 5_000) },
+      { event: "def_repo", sid: maintenance, time: iso(start + 5_100), worktree: root },
+      { event: "cmd_name", sid: maintenance, time: iso(start + 5_200), name: "maintenance" },
+      { event: "exit", sid: maintenance, time: iso(start + 25_000), code: 0 },
+      { event: "exit", sid: commit, time: iso(start + 30_000), code },
+    ];
+    writeFileSync(join(dir, "events"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const line = (us: number, content: string) => `${local(us)} refs/debug.c:88         ${content}`;
+    const refs = [
+      line(start + 10_000, "transaction {"),
+      line(
+        start + 10_010,
+        `0: HEAD ${"a".repeat(40)} -> ${"b".repeat(40)} (F=0xd, T=0x1) "commit: two"`,
+      ),
+      line(start + 12_000, "transaction {"),
+      line(
+        start + 12_010,
+        `0: refs/heads/main ${"a".repeat(40)} -> ${"a".repeat(40)} (F=0x5, T=0x0) ""`,
+      ),
+      line(start + 12_020, "finish: 0"),
+      line(start + 14_000, "finish: 0"),
+    ];
+    writeFileSync(join(dir, "refs"), refs.join("\n") + "\n");
+  };
+  write(0);
+  expect(tracedCommits(join(dir, "events"), join(dir, "refs")).map((c) => c.sha)).toEqual([
+    "b".repeat(40),
+  ]);
+  // A commit whose process failed still does not count.
+  write(1);
+  expect(tracedCommits(join(dir, "events"), join(dir, "refs"))).toEqual([]);
+});
+
 test("a call's commit counts even after commits in a repository its command already removed", () => {
   const { g, store, hook, shell } = session("claude-code");
   hook("PreToolUse", shell("toolu_1"));
