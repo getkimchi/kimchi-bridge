@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -54,45 +54,51 @@ function repo(trace = join(temp(), "trace")) {
   const root = join(temp(), "repo");
   mkdirSync(root);
   mkdirSync(trace, { recursive: true });
-  const run = (env: Record<string, string>, ...args: string[]) =>
-    execFileSync(
-      "git",
-      [
-        "-c",
-        "user.name=Lab",
-        "-c",
-        "user.email=lab@example.invalid",
-        "-c",
-        "commit.gpgsign=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-        ...args,
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        // Ref traces print Git's local time; bun test runs JavaScript in UTC.
-        env: { ...process.env, TZ: Intl.DateTimeFormat().resolvedOptions().timeZone, ...env },
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    ).trim();
-  const traced = (call: string, ...args: string[]) =>
-    run(
-      {
-        GIT_TRACE2_EVENT: join(trace, "events"),
-        GIT_TRACE_REFS: join(trace, "refs"),
-        GIT_TRACE2_ENV_VARS: "CODEX_TOOL_CALL_ID",
-        ...(call ? { CODEX_TOOL_CALL_ID: call } : {}),
-      },
-      ...args,
-    );
+  const git = (args: string[]) => [
+    "-c",
+    "user.name=Lab",
+    "-c",
+    "user.email=lab@example.invalid",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    ...args,
+  ];
+  // Ref traces print Git's local time; bun test runs JavaScript in UTC.
+  const env = (extra: Record<string, string>) => ({
+    ...process.env,
+    TZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    ...extra,
+  });
+  const tracing = (call: string) => ({
+    GIT_TRACE2_EVENT: join(trace, "events"),
+    GIT_TRACE_REFS: join(trace, "refs"),
+    GIT_TRACE2_ENV_VARS: "CODEX_TOOL_CALL_ID",
+    ...(call ? { CODEX_TOOL_CALL_ID: call } : {}),
+  });
+  const run = (extra: Record<string, string>, ...args: string[]) =>
+    execFileSync("git", git(args), {
+      cwd: root,
+      encoding: "utf8",
+      env: env(extra),
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  const traced = (call: string, ...args: string[]) => run(tracing(call), ...args);
+  // A traced command left running, as another session's would be.
+  const start = (call: string, extra: Record<string, string>, ...args: string[]) =>
+    spawn("git", git(args), {
+      cwd: root,
+      env: env({ ...tracing(call), ...extra }),
+      stdio: ["pipe", "ignore", "ignore"],
+    });
   const plain = (...args: string[]) => run({}, ...args);
   plain("init", "-q", "-b", "main");
   writeFileSync(join(root, "f"), "1\n");
   plain("add", "f");
   plain("commit", "-q", "-m", "init");
   const commits = () => tracedCommits(join(trace, "events"), join(trace, "refs"));
-  return { root, trace, traced, plain, commits };
+  return { root, trace, traced, start, plain, commits };
 }
 
 test("agent shell commits, amends, reverts and new merges count; other ref moves do not", () => {
@@ -134,6 +140,49 @@ test("a cherry-pick of this agent's commit names the commit it replays", () => {
     [original, undefined],
     [copy, original],
   ]);
+});
+
+// Resolves when a background command started in `trace` exits; returns once its trace names it.
+function started(trace: string, command: string, child: ChildProcess) {
+  const exited = new Promise((done) => child.on("exit", done)),
+    events = join(trace, "events");
+  while (!existsSync(events) || !readFileSync(events, "utf8").includes(`"name":"${command}"`))
+    Bun.sleepSync(10);
+  return exited;
+}
+
+// Codex sessions share one trace, so another session's Git is often running while one commits.
+test("Git another session runs at the same moment does not hide a commit", async () => {
+  const trace = join(temp(), "trace");
+  const mine = repo(trace),
+    theirs = repo(trace);
+  const child = theirs.start("call-theirs", {}, "cat-file", "--batch");
+  const exited = started(trace, "cat-file", child);
+  writeFileSync(join(mine.root, "f"), "2\n");
+  mine.traced("call-1", "commit", "-q", "-am", "two");
+  child.stdin!.end();
+  await exited;
+  expect(mine.commits().map(({ sha, worktree, call }) => ({ sha, worktree, call }))).toEqual([
+    { sha: mine.plain("rev-parse", "HEAD"), worktree: mine.root, call: "call-1" },
+  ]);
+});
+
+test("of two commits made at the same moment, neither is claimed", async () => {
+  const trace = join(temp(), "trace");
+  const mine = repo(trace),
+    theirs = repo(trace);
+  // Their commit waits in its editor until released, so it runs throughout this one.
+  const editor = join(temp(), "editor");
+  const wait = '#!/bin/sh\nwhile [ ! -e "$0.go" ]; do sleep 0.01; done\necho theirs >"$1"\n';
+  writeFileSync(editor, wait, { mode: 0o755 });
+  writeFileSync(join(theirs.root, "f"), "theirs\n");
+  const child = theirs.start("call-theirs", { GIT_EDITOR: editor }, "commit", "-a");
+  const exited = started(trace, "commit", child);
+  writeFileSync(join(mine.root, "f"), "2\n");
+  mine.traced("call-1", "commit", "-q", "-am", "two");
+  writeFileSync(`${editor}.go`, "");
+  await exited;
+  expect(mine.commits().map((c) => c.sha)).toEqual([theirs.plain("rev-parse", "HEAD")]);
 });
 
 function session(source: string) {
