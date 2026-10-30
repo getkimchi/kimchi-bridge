@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   buildCodexCatalog,
   buildCodexToml,
+  claudeDesktop3pData,
   claudeSettingsPath,
   codexCatalogPath,
   codexConfigPath,
@@ -17,6 +18,7 @@ import {
   mergeCodexToml,
   proxyRequest,
   resolveMainModel,
+  rewriteClaudeDesktopConfig,
   saveGatewayState,
   status,
   stripCodexToml,
@@ -33,6 +35,7 @@ let root: string;
 let previousRoot: string | undefined;
 let previousBase: string | undefined;
 let previousHome: string | undefined;
+let previousXdg: string | undefined;
 const cleanups: (() => void)[] = [];
 beforeEach(() => {
   previousRoot = process.env.KIMCHI_BRIDGE_HOME;
@@ -42,6 +45,9 @@ beforeEach(() => {
   previousHome = process.env.HOME;
   process.env.HOME = join(root, "home");
   process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(root, "home");
+  // On Linux, Claude Desktop's profiles live under XDG_CONFIG_HOME, which CI runners set to their own.
+  previousXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = join(root, "home", ".config");
   process.env.KIMCHI_BRIDGE_HOME = join(root, "state");
   process.env.KIMCHI_BRIDGE_SERVICE = "0";
   process.env.KIMCHI_BRIDGE_DAEMON = "0";
@@ -56,6 +62,8 @@ afterEach(() => {
   delete process.env.KIMCHI_BRIDGE_DAEMON;
   if (previousHome === undefined) delete process.env.HOME;
   else process.env.HOME = previousHome;
+  if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = previousXdg;
   if (previousBase === undefined) delete process.env.KIMCHI_BASE_URL;
   else process.env.KIMCHI_BASE_URL = previousBase;
   if (previousRoot === undefined) delete process.env.KIMCHI_BRIDGE_HOME;
@@ -246,6 +254,72 @@ test("enable in proxy mode writes proxy URLs and never a real credential into th
   expect(state.mode).toBe("proxy");
   expect(state.port).toBe(8766);
   expect(messages.some((m) => m.includes("Gateway enabled"))).toBe(true);
+});
+
+/** Marks Claude Desktop installed: its main profile holds a config.json. Returns that profile's folder. */
+function desktopInstalled(): string {
+  const main = join(dirname(claudeDesktop3pData()), "Claude");
+  mkdirSync(main, { recursive: true });
+  writeFileSync(join(main, "config.json"), "{}");
+  return main;
+}
+/** The configLibrary entry the app applies. */
+function desktopEntry(): Record<string, unknown> {
+  const library = join(claudeDesktop3pData(), "configLibrary");
+  const meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+  return JSON.parse(readFileSync(join(library, `${meta.appliedId}.json`), "utf8"));
+}
+
+test("enable gives Claude Desktop only the Claude models, which it takes without a warning", async () => {
+  desktopInstalled();
+  const claude: GatewayModel[] = [
+    { ...models[0]!, slug: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6" },
+    { ...models[0]!, slug: "anthropic/claude-opus-4-6", display_name: "Claude Opus 4.6" },
+  ];
+  process.env.KIMCHI_BASE_URL = server((request) =>
+    new URL(request.url).pathname === "/v1/models/metadata"
+      ? Response.json({ models: [...models, ...claude] })
+      : new Response("not found", { status: 404 }),
+  );
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  expect(desktopEntry().inferenceModels).toEqual([
+    { name: "claude-sonnet-4-6" },
+    { name: "anthropic/claude-opus-4-6" },
+  ]);
+});
+
+test("without a Claude model enable leaves Claude Desktop as it was", async () => {
+  const main = desktopInstalled();
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  expect(existsSync(join(claudeDesktop3pData(), "configLibrary"))).toBe(false);
+  expect(existsSync(join(main, "claude_desktop_config.json"))).toBe(false);
+});
+
+test("the proxy's rewrite drops the models an older bridge gave Claude Desktop", () => {
+  desktopInstalled();
+  const library = join(claudeDesktop3pData(), "configLibrary"),
+    id = "11111111-2222-4333-8444-555555555555";
+  mkdirSync(library, { recursive: true });
+  writeFileSync(
+    join(library, "_meta.json"),
+    JSON.stringify({ appliedId: id, entries: [{ id, name: "Kimchi Gateway" }] }),
+  );
+  writeFileSync(
+    join(library, `${id}.json`),
+    JSON.stringify({
+      inferenceProvider: "gateway",
+      inferenceGatewayBaseUrl: "http://127.0.0.1:8766/anthropic",
+      inferenceModels: [{ name: "glm-5.3" }, { name: "claude-sonnet-4-6" }, { name: "kimi-k3" }],
+    }),
+  );
+  rewriteClaudeDesktopConfig("http://127.0.0.1:8767/anthropic");
+  expect(desktopEntry()).toMatchObject({
+    inferenceGatewayBaseUrl: "http://127.0.0.1:8767/anthropic",
+    inferenceModels: [{ name: "claude-sonnet-4-6" }],
+  });
 });
 
 test("enable with an API key routes through the local proxy and keeps the key out of the CLI configs", async () => {

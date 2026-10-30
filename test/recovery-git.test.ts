@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Recorder, repository, type Scope } from "../src/work/capture.ts";
 import {
   git,
@@ -15,7 +15,7 @@ import {
 } from "../src/work/git.ts";
 import { recordTag } from "../src/request-tags.ts";
 import { Store } from "../src/work/ledger.ts";
-import { parseJson, stableId } from "../src/work/protocol.ts";
+import { parseJson, stableId, str } from "../src/work/protocol.ts";
 import {
   claudeUsage,
   openAiUsage,
@@ -431,6 +431,26 @@ test("a lone message iteration takes the reply's model; other unnamed iterations
   expect(latest(store, "usage").usage.iterations.map((item: any) => item.model ?? "")).toEqual([
     "",
     "",
+  ]);
+});
+
+test("Claude Code's own <synthetic> replies, such as API errors, are not model calls", () => {
+  const { root, store, r, scope } = fixture("claude-code");
+  const path = join(root, "synthetic.jsonl");
+  registerTranscript(r, scope, path, "castai", "unknown");
+  const reply = (id: string, model: string) =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: at,
+      message: { id, model, usage: { input_tokens: 0, output_tokens: 0 } },
+    }) + "\n";
+  writeFileSync(path, reply("4300f96b-3f7b-4c1e-9d55-0d2f4a7c1e10", "<synthetic>"));
+  recoverContext(r);
+  expect(store.events().filter((e) => e.usage)).toHaveLength(0);
+  appendFileSync(path, reply("msg_01Real", "claude-opus-5-5"));
+  recoverContext(r);
+  expect(store.events().flatMap((e) => (e.usage ? [e.usage.responseId] : []))).toEqual([
+    "msg_01Real",
   ]);
 });
 
@@ -946,6 +966,113 @@ test("native edits in a removed worktree still match the commit made from them",
   });
 });
 
+test("native edits in a removed worktree outside its repository still match the commit made from them", () => {
+  const { base, store, r } = fixture("claude-code");
+  const main = join(base, "repo"),
+    worktree = join(base, "repo-feature"),
+    path = join(worktree, "file.txt");
+  mkdirSync(main);
+  for (const args of [
+    ["init", "--initial-branch=main"],
+    ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"],
+    ["config", "commit.gpgsign", "false"],
+    ["config", "core.hooksPath", "/dev/null"],
+  ])
+    git(main, ...args);
+  writeFileSync(join(main, "file.txt"), "before\n");
+  git(main, "add", ".");
+  git(main, "commit", "-m", "baseline");
+  // git worktree add ../repo-feature: no folder above the worktree holds the repository.
+  git(main, "worktree", "add", "-b", "feature", worktree);
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: worktree, prompt: "edit" },
+  });
+  const e = {
+    session_id: "s",
+    turn_id: "turn",
+    cwd: worktree,
+    tool_use_id: "call",
+    tool_name: "Edit",
+    tool_input: { file_path: path, old_string: "before", new_string: "after" },
+  };
+  r.record({ stage: "PreToolUse", event: e });
+  writeFileSync(path, "after\n");
+  r.record({ stage: "PostToolUse", event: e });
+  git(worktree, "commit", "-am", "edit");
+  const sha = git(worktree, "rev-parse", "HEAD");
+  git(main, "worktree", "remove", worktree);
+  reconcileGit(r);
+  expect(latest(store, "link").link).toMatchObject({
+    toKind: "commit",
+    toId: sha,
+    reason: "file_revision",
+  });
+});
+
+test("young commits due on every pass do not hold up native-edit matching", () => {
+  const { base, store, r } = fixture("claude-code");
+  const root = join(base, "repo"),
+    path = join(root, "file.txt");
+  mkdirSync(root);
+  for (const args of [
+    ["init", "--initial-branch=main"],
+    ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"],
+    ["config", "commit.gpgsign", "false"],
+    ["config", "core.hooksPath", "/dev/null"],
+  ])
+    git(root, ...args);
+  writeFileSync(path, "before\n");
+  git(root, "add", ".");
+  git(root, "commit", "-m", "baseline");
+  const e = {
+    session_id: "s",
+    turn_id: "turn",
+    cwd: root,
+    tool_use_id: "call",
+    tool_name: "Edit",
+    tool_input: { file_path: path, old_string: "before", new_string: "after" },
+  };
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
+  });
+  r.record({ stage: "PreToolUse", event: e });
+  writeFileSync(path, "after\n");
+  r.record({ stage: "PostToolUse", event: e });
+  git(root, "commit", "-am", "edit");
+  const sha = git(root, "rev-parse", "HEAD");
+  const change = (
+    store.db.query("SELECT key FROM meta WHERE key LIKE 'git-change:%'").get() as { key: string }
+  ).key;
+  // The pass has rotated up to the edit; after it sorts only a commit checked again on every pass, here one
+  // whose lookup fails at once.
+  store.setMeta("git-pass-after", change);
+  for (let pass = 0; pass < 3; pass++) {
+    store.setMeta(
+      "tracked-commit:young",
+      JSON.stringify({
+        Scope: { Session: "s" },
+        Source: "claude-code",
+        SHA: "0".repeat(40),
+        CreatedAt: new Date().toISOString(),
+      }),
+    );
+    try {
+      reconcileGit(r);
+    } catch {
+      // The young commit's lookup fails on every pass.
+    }
+  }
+  expect(latest(store, "link").link).toMatchObject({
+    toKind: "commit",
+    toId: sha,
+    reason: "file_revision",
+  });
+});
+
 test("route matching respects DNS boundaries", () => {
   const before = process.env.ANTHROPIC_BASE_URL;
   try {
@@ -1162,5 +1289,173 @@ test("a Codex response ID too long for an event still names its billing tag", ()
     const [call] = usages(store);
     expect(call.usage).toMatchObject({ requestId: tag, observedRoute: "castai" });
     expect(call.usage.responseId).toBeUndefined();
+  });
+});
+
+test("a Codex approval review's calls count for the session turn that asked for it", () => {
+  const { base, root, store, r, scope } = fixture();
+  withBridgeHome(base, () => {
+    r.record({
+      stage: "UserPromptSubmit",
+      event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "implement" },
+    });
+    const work = r.workExact(scope);
+    recordTag("resp_review", tag);
+    recordTag("resp_late", "22222222-2222-4333-8444-555555555555");
+    // Codex keeps rollouts in sessions/YYYY/MM/DD, named for the second each thread began.
+    const sessions = join(base, "codex", "sessions"),
+      now = new Date(),
+      today = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map((n) =>
+        String(n).padStart(2, "0"),
+      );
+    const usage = {
+      input_tokens: 15006,
+      cached_input_tokens: 5248,
+      output_tokens: 10,
+      reasoning_output_tokens: 0,
+      total_tokens: 15016,
+    };
+    const rollout = (day: string[], name: string, meta: object, response: string) => {
+      const path = join(sessions, ...day, `rollout-${name}.jsonl`),
+        turn = `${str(meta, "id")}-turn`;
+      mkdirSync(dirname(path), { recursive: true });
+      const lines = [
+        { type: "session_meta", payload: meta },
+        { type: "turn_context", payload: { turn_id: turn, model: "m" } },
+        {
+          type: "token_usage_record",
+          payload: { turn_id: turn, root_turn_id: "turn", response_id: response, usage },
+        },
+        {
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: { last_token_usage: usage, total_token_usage: usage },
+          },
+        },
+      ];
+      writeFileSync(
+        path,
+        lines.map((line) => JSON.stringify({ timestamp: at, ...line })).join("\n") + "\n",
+      );
+      return path;
+    };
+    const day = ["2026", "10", "23"],
+      review = { session_id: "s", parent_thread_id: "s", thread_source: "guardian_review" };
+    const main = rollout(day, "2026-10-23T12-00-00-s", { id: "s", session_id: "s" }, "resp_main");
+    rollout(day, "2026-10-23T12-00-05-review", { id: "review", ...review }, "resp_review");
+    const other = rollout(
+      day,
+      "2026-10-23T12-00-06-other",
+      { id: "other", session_id: "other" },
+      "resp_other",
+    );
+    // A review after midnight lands in the next day's folder.
+    rollout(today, `${today.join("-")}T00-00-01-late`, { id: "late", ...review }, "resp_late");
+    // The bridge learns of the session after its review began; it still finds the review.
+    registerTranscript(r, { ...scope, Turn: "" }, main, "unknown", "unknown");
+    recoverContext(r);
+    recoverContext(r);
+    const calls = usages(store);
+    // Each review's totals equal the session's here; each still counts once, as a call of its own.
+    expect(new Set(calls.map((e) => e.entityId)).size).toBe(3);
+    expect(
+      calls.map((e) => [e.sessionId, e.turnId, e.workId, e.usage.requestId ?? ""]).sort(),
+    ).toEqual([
+      ["s", "turn", work, ""],
+      ["s", "turn", work, tag],
+      ["s", "turn", work, "22222222-2222-4333-8444-555555555555"],
+    ]);
+    expect(store.meta(`transcript:codex:${other}`)).toBe("");
+  });
+});
+
+test("a Codex review thread forked after an interrupted review does not report the call it copied", () => {
+  const { base, root, store, r, scope } = fixture();
+  withBridgeHome(base, () => {
+    r.record({
+      stage: "UserPromptSubmit",
+      event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "implement" },
+    });
+    const work = r.workExact(scope),
+      next = "22222222-2222-4333-8444-555555555555";
+    recordTag("resp_review", tag);
+    recordTag("resp_next", next);
+    const day = join(base, "codex", "sessions", "2026", "10", "30");
+    mkdirSync(day, { recursive: true });
+    const rollout = (name: string, lines: object[]) => {
+      const path = join(day, `rollout-2026-10-30T${name}.jsonl`);
+      appendFileSync(
+        path,
+        lines.map((line) => JSON.stringify({ timestamp: at, ...line })).join("\n") + "\n",
+      );
+      return path;
+    };
+    const tokens = (input: number, output: number) => ({
+        input_tokens: input,
+        cached_input_tokens: 0,
+        output_tokens: output,
+        reasoning_output_tokens: 0,
+        total_tokens: input + output,
+      }),
+      first = tokens(7342, 79),
+      second = tokens(8330, 46);
+    const review = { session_id: "s", parent_thread_id: "s", thread_source: "guardian_review" },
+      context = (turn: string) => ({
+        type: "turn_context",
+        payload: { turn_id: turn, model: "m" },
+      }),
+      record = (response: string, usage: object) => ({
+        type: "token_usage_record",
+        payload: { root_turn_id: "turn", response_id: response, usage },
+      }),
+      count = (last: object, total: object) => ({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: { last_token_usage: last, total_token_usage: total },
+        },
+      });
+    const main = rollout("07-34-23-s", [
+      { type: "session_meta", payload: { id: "s", session_id: "s" } },
+    ]);
+    // One review answers; the next is interrupted before any reply, so it records no usage.
+    rollout("07-34-24-review", [
+      { type: "session_meta", payload: { id: "review", ...review } },
+      context("review-1"),
+      record("resp_review", first),
+      count(first, first),
+      context("review-2"),
+      { type: "event_msg", payload: { type: "turn_aborted", turn_id: "review-2" } },
+    ]);
+    // Codex then forks a new review thread. Its rollout opens with the old thread's history, its
+    // last token_count included, up to the ordinal where the new thread's own records begin.
+    const fork = [
+      {
+        type: "session_meta",
+        payload: { id: "next", ...review, subagent_history_start_ordinal: 5 },
+      },
+      { type: "compacted", payload: { message: "" } },
+      { type: "world_state", payload: {} },
+      context("review-1"),
+      count(first, first),
+      context("next-1"),
+      record("resp_next", second),
+      count(second, tokens(15672, 125)),
+    ];
+    rollout("07-36-33-next", fork.slice(0, 3));
+    registerTranscript(r, { ...scope, Turn: "" }, main, "unknown", "unknown");
+    recoverContext(r);
+    // A pass that ends inside the copied history goes on skipping it in the next.
+    rollout("07-36-33-next", fork.slice(3));
+    recoverContext(r);
+    expect(
+      usages(store)
+        .map((e) => [e.turnId, e.workId, e.usage.requestId ?? ""])
+        .sort(),
+    ).toEqual([
+      ["turn", work, tag],
+      ["turn", work, next],
+    ]);
   });
 });

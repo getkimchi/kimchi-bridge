@@ -1,8 +1,9 @@
-import { closeSync, fstatSync, openSync, readSync, readdirSync, statSync } from "node:fs";
-import { basename, isAbsolute, join } from "node:path";
+import { closeSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import {
   canonicalHash,
   canonicalTime,
+  integer,
   numberText,
   obj,
   opaque,
@@ -25,6 +26,10 @@ interface Transcript {
   scope: Scope;
   route: string;
   basis: string;
+  // A thread the Codex session started, such as an approval review.
+  thread?: string;
+  // Records a forked thread copied from its source, still to skip.
+  inherited?: number;
 }
 const wireInteger = (v: unknown) => {
   const text = numberText(v);
@@ -51,21 +56,28 @@ export function saveSourceVersion(r: Recorder, session: string, value: string) {
     .run(`source-version:${r.source}:${session}`, value);
 }
 
-export function saveTranscriptVersion(r: Recorder, session: string, path: string) {
+// A Codex rollout opens with its session_meta record.
+function sessionMeta(path: string): JsonObject | undefined {
   let fd: number | undefined;
   try {
     fd = openSync(path, "r");
-    const bytes = Buffer.alloc(4 * 1024 * 1024 + 1);
+    const bytes = Buffer.allocUnsafe(4 * 1024 * 1024 + 1);
     const count = readSync(fd, bytes, 0, bytes.length, 0),
       end = bytes.subarray(0, count).indexOf(10);
     if (end < 0 || end >= 4 * 1024 * 1024) return;
     const meta = parseJson(bytes.subarray(0, end).toString());
-    const v = str(obj(meta.payload), "cli_version");
-    if (str(meta, "type") === "session_meta" && v) saveSourceVersion(r, session, v);
-  } catch {
-    /* Native metadata is supplementary. */
+    return str(meta, "type") === "session_meta" ? obj(meta.payload) : undefined;
   } finally {
     if (fd !== undefined) closeSync(fd);
+  }
+}
+
+export function saveTranscriptVersion(r: Recorder, session: string, path: string) {
+  try {
+    const v = str(sessionMeta(path) ?? {}, "cli_version");
+    if (v) saveSourceVersion(r, session, v);
+  } catch {
+    /* Native metadata is supplementary. */
   }
 }
 
@@ -75,17 +87,87 @@ export function registerTranscript(
   path: string,
   observedRoute: string,
   basis: string,
+  thread = "",
 ) {
   if (!isAbsolute(path) || !path.endsWith(".jsonl")) throw new Error("invalid transcript path");
-  r.store.setMeta(
-    `transcript:${r.source}:${path}`,
-    stringifyJson({ path, scope: s, route: observedRoute || "unknown", basis: basis || "unknown" }),
-  );
+  const t: Transcript = {
+    path,
+    scope: s,
+    route: observedRoute || "unknown",
+    basis: basis || "unknown",
+  };
+  if (thread) t.thread = thread;
+  r.store.setMeta(`transcript:${r.source}:${path}`, stringifyJson(t));
+}
+
+/**
+ * Codex runs each approval review, like any thread a session starts, with a rollout of its own: in
+ * the folder of the day it began, named for that second. Its records name the session and the turn
+ * they served, so it is read as part of the session. No hook names it.
+ */
+function registerCodexThreads(r: Recorder) {
+  const now = new Date(),
+    today = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map((n) =>
+      String(n).padStart(2, "0"),
+    );
+  const listings = new Map<string, string[]>(),
+    metas = new Map<string, JsonObject>();
+  const list = (dir: string) => {
+    if (!listings.has(dir))
+      try {
+        listings.set(
+          dir,
+          readdirSync(dir).filter((n) => n.startsWith("rollout-") && n.endsWith(".jsonl")),
+        );
+      } catch {
+        listings.set(dir, []);
+      }
+    return listings.get(dir)!;
+  };
+  for (const { value } of r.store.db
+    .query("SELECT value FROM meta WHERE key LIKE 'transcript:codex:%'")
+    .all() as { value: string }[]) {
+    const t: Transcript = JSON.parse(value);
+    if (t.thread) continue;
+    // Threads begin after their session. Those begun in the second of the last one read are read again.
+    const key = `codex-threads:${t.scope.Session}`,
+      after = r.store.meta(key) || basename(t.path).slice(0, 27);
+    let last = after;
+    // A session still running after midnight starts its threads in the next day's folder.
+    for (const dir of new Set([
+      dirname(t.path),
+      join(dirname(dirname(dirname(dirname(t.path)))), ...today),
+    ]))
+      for (const name of list(dir)) {
+        const second = name.slice(0, 27);
+        if (second < after) continue;
+        if (second > last) last = second;
+        const path = join(dir, name);
+        if (r.store.meta(`transcript:codex:${path}`)) continue;
+        if (!metas.has(path))
+          try {
+            metas.set(path, sessionMeta(path) ?? {});
+          } catch {
+            metas.set(path, {});
+          }
+        const meta = metas.get(path)!,
+          thread = str(meta, "id");
+        if (str(meta, "session_id") === t.scope.Session && thread && thread !== t.scope.Session)
+          registerTranscript(r, { ...t.scope, Turn: "" }, path, t.route, t.basis, thread);
+      }
+    if (last !== after) r.store.setMeta(key, last);
+  }
 }
 
 export function recoverContext(r: Recorder, signal?: AbortSignal) {
   checkSignal(signal);
   if (r.source === "claude-code") discoverDesktopTranscripts(r, signal);
+  if (r.source === "codex")
+    try {
+      registerCodexThreads(r);
+    } catch {
+      r.store.diagnostic("codex_thread_scan_failed");
+    }
   const items = r.store.db
     .query("SELECT value FROM meta WHERE key LIKE ?")
     .all(`transcript:${r.source}:%`) as { value: string }[];
@@ -273,9 +355,18 @@ function timestamp(value: string): string {
 
 function consume(r: Recorder, t: Transcript, v: JsonObject) {
   const s = { ...t.scope };
+  if (t.inherited) {
+    t.inherited--;
+    return;
+  }
   if (r.source === "codex" && str(v, "type") === "session_meta") {
-    const value = str(obj(v.payload), "cli_version");
+    const p = obj(v.payload),
+      value = str(p, "cli_version");
     if (value) saveSourceVersion(r, s.Session, value);
+    // A forked thread, such as the review Codex starts after an interrupted one, opens with records
+    // copied from its source up to this ordinal, a token_count among them; they were read there.
+    const own = integer(p.subagent_history_start_ordinal) ?? 0;
+    if (own > 1) t.inherited = own - 1;
     return;
   }
   // Desktop app transcripts carry no session_meta; their api-request lines name
@@ -308,7 +399,7 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     if (str(v, "type") === "token_usage_record") {
       r.store.setMeta(
         `codex-response:${t.path}`,
-        stringifyJson([str(p, "response_id"), codexUsageKey(obj(p.usage))]),
+        stringifyJson([str(p, "response_id"), codexUsageKey(obj(p.usage)), str(p, "root_turn_id")]),
       );
       return;
     }
@@ -320,6 +411,11 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     }
     const info = obj(p.info);
     if (!hasObject(info.last_token_usage) || !hasObject(info.total_token_usage)) return;
+    // Only the record carrying this event's exact usage names its response, and the session turn it served.
+    const [recorded, key, root] = codexResponse(r.store.meta(`codex-response:${t.path}`));
+    const matched = key === codexUsageKey(obj(info.last_token_usage)),
+      response = matched ? recorded : "";
+    if (matched && root) s.Turn = root;
     const usage: Usage = {
       channel: "transcript",
       schema: "openai-responses-v1",
@@ -333,10 +429,13 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
       attemptsComplete: false,
       reportedModel: r.store.meta(`model:${t.path}`),
     };
-    const e = r.event(s, `token-count:${canonicalHash(info.total_token_usage)}`, r.workExact(s));
-    // Only the record carrying this event's exact usage names its response.
-    const [recorded, key] = codexResponse(r.store.meta(`codex-response:${t.path}`));
-    const response = key === codexUsageKey(obj(info.last_token_usage)) ? recorded : "";
+    // A thread's running totals restart from zero, so its events are named apart from the session's.
+    const totals = canonicalHash(info.total_token_usage);
+    const e = r.event(
+      s,
+      t.thread ? `token-count:${t.thread}:${totals}` : `token-count:${totals}`,
+      r.workExact(s),
+    );
     // The gateway's IDs for some models exceed an event's bound; they still find their tag.
     if (response && opaque(response)) usage.responseId = response;
     r.store.setMeta(`codex-response:${t.path}`, "");
@@ -356,7 +455,8 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
     raw = obj(m.usage),
     response = str(m, "id"),
     nativeRequest = str(v, "requestId");
-  if (!hasObject(m.usage) || !response) return;
+  // Claude Code writes <synthetic> replies itself, such as API errors; no model ran.
+  if (!hasObject(m.usage) || !response || str(m, "model") === "<synthetic>") return;
   const u: Usage = {
     channel: "transcript",
     responseId: response,
@@ -406,10 +506,16 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
   const turn = r.store.meta(`response-turn:${s.Session}:${response}`);
   if (turn) s.Turn = turn;
   if (s.Turn) {
-    work = r.workExact(s);
-    u.correlation = "native_transcript_prompt";
+    // A subagent's rows carry the main thread's current prompt, whose turn has no work for the agent: it keeps its own.
+    const exact = r.workExact(s);
+    if (exact || !work) {
+      work = exact;
+      u.correlation = "native_transcript_prompt";
+    }
   }
   const e = r.event(s, requestEntity(response, nativeRequest), work);
+  // A line read late, such as a resumed session's from before its transcript was registered, keeps its earlier work.
+  if (!work) e.workId = r.store.latest(e.entityId)?.workId ?? "";
   billingTag(r, e.entityId, u, response, nativeRequest);
   e.observeTime = observed;
   e.usage = u;
@@ -526,14 +632,14 @@ function codexUsageKey(usage: JsonObject): string {
     ].map((key) => usage[key] ?? null),
   );
 }
-function codexResponse(value: string): [string, string] {
+function codexResponse(value: string): [string, string, string] {
   try {
     const parsed = JSON.parse(value);
     return Array.isArray(parsed) && typeof parsed[0] === "string" && typeof parsed[1] === "string"
-      ? [parsed[0], parsed[1]]
-      : ["", ""];
+      ? [parsed[0], parsed[1], typeof parsed[2] === "string" ? parsed[2] : ""]
+      : ["", "", ""];
   } catch {
-    return ["", ""];
+    return ["", "", ""];
   }
 }
 export function telemetry(

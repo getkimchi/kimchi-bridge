@@ -68,6 +68,8 @@ interface TrackedCommit {
   CreatedAt: string;
   Found?: boolean;
   Merged?: boolean;
+  // API paths of the PRs or MRs last seen open, looked up by number when the commit no longer lists them.
+  Open?: string[];
 }
 const fields = (s: string) =>
   s
@@ -98,6 +100,7 @@ export function refTips(root: string): string[] | null {
 export function reconcileGit(r: Recorder, signal?: AbortSignal) {
   signal = withDeadline(8000, signal);
   checkSignal(signal);
+  seedOpen(r);
   // Kimchi looks up due commits at every agent end. Due lookups go first and skip the gate, which only
   // paces native-edit matching: Codex syncs only on hooks, and its Stop can follow the prompt's sync
   // by a few seconds.
@@ -119,12 +122,16 @@ export function reconcileGit(r: Recorder, signal?: AbortSignal) {
     .all(r.store.meta("git-pass-after")) as { key: string; value: string }[];
   if (!items.length) r.store.db.query("DELETE FROM meta WHERE key='git-pass-after'").run();
   const failures: unknown[] = [],
-    seen = new Set<string>();
+    seen = new Set<string>(),
+    // Like Kimchi, a pass asks for a repository's identity or a PR by number once.
+    answers = new Map<string, unknown>();
   for (const item of [...fresh, ...items]) {
     checkSignal(signal);
+    // The rotation moves past a due commit this pass already looked up; otherwise young commits, due on every
+    // pass, would keep it from reaching the edits before them.
+    if (!fresh.includes(item)) r.store.setMeta("git-pass-after", item.key);
     if (seen.has(item.key)) continue;
     seen.add(item.key);
-    if (!fresh.includes(item)) r.store.setMeta("git-pass-after", item.key);
     if (item.key.startsWith("tracked-commit:")) {
       const c: TrackedCommit = JSON.parse(item.value);
       // Kimchi's schedule: check a new commit at once, then after min(1 day, age/16); give up on
@@ -143,12 +150,13 @@ export function reconcileGit(r: Recorder, signal?: AbortSignal) {
       c.CheckedAt = new Date().toISOString();
       saveMeta(r, item.key, c);
       try {
-        const states = discoverPullRequests(r, c, signal);
+        const [states, open] = discoverPullRequests(r, c, answers, signal);
         if (states.length)
           saveMeta(r, item.key, {
             ...c,
             Found: true,
-            Merged: states.every((state) => state === "merged"),
+            Merged: states.every((state) => state === "merged") && !open.length,
+            Open: open,
           });
       } catch (e) {
         r.store.diagnostic("scm_lookup_incomplete");
@@ -193,11 +201,14 @@ function treeObject(
 }
 /**
  * Where Git runs for a scope: its folder, or once that is gone, the common dir of the repository that held it.
- * Claude Desktop removes a session's worktree (<repo>/.claude/worktrees/<name>) when the session is archived.
+ * Claude Desktop removes a session's worktree (<repo>/.claude/worktrees/<name>) when the session is archived; a
+ * worktree in another folder (git worktree add ../name) is found through the common dir captured with it.
  */
 function gitDir(s: Scope, signal?: AbortSignal): string {
   const root = rootOf(s);
   if (existsSync(root)) return root;
+  if (s.Common && existsSync(s.Common) && stableId("git-common-dir", s.Common) === s.Repo)
+    return s.Common;
   let dir = dirname(root);
   while (!existsSync(dir)) dir = dirname(dir);
   const common = gitContext(signal, dir, "rev-parse", "--path-format=absolute", "--git-common-dir");
@@ -382,8 +393,16 @@ export function scmEnvironment(repo: Repository): NodeJS.ProcessEnv {
     GLAB_SHOW_WHATS_NEW: "false",
   };
 }
-function scmApi(root: string, repo: Repository, path: string, signal?: AbortSignal): any {
+function scmApi(
+  root: string,
+  repo: Repository,
+  path: string,
+  signal?: AbortSignal,
+  answers?: Map<string, unknown>,
+): any {
   checkSignal(signal);
+  const key = `${repo.provider} ${repo.host} ${path}`;
+  if (answers?.has(key)) return answers.get(key);
   if (
     (repo.provider === "github" &&
       repo.host !== "github.com" &&
@@ -408,11 +427,14 @@ function scmApi(root: string, repo: Repository, path: string, signal?: AbortSign
     },
   );
   if (result.error || result.status !== 0) throw new Error("host-bound SCM lookup unavailable");
+  let value;
   try {
-    return parseJson(result.stdout);
+    value = parseJson(result.stdout);
   } catch {
     throw new Error("invalid SCM response");
   }
+  answers?.set(key, value);
+  return value;
 }
 export function providerId(v: unknown): string {
   const n = numberText(v);
@@ -557,15 +579,56 @@ export function pullRequest(source: Repository, v: JsonObject): [Repository, Pul
   }
   return [repo, p];
 }
-/** The states of the PRs or MRs that contain the commit. */
-function discoverPullRequests(r: Recorder, c: TrackedCommit, signal?: AbortSignal): string[] {
+/** Once: commits tracked before open PRs were kept get those their own links reached and the ledger last saw open. */
+function seedOpen(r: Recorder) {
+  if (r.store.meta("open-prs-seeded")) return;
+  const links = new Map<string, { repo: string; pr: string }[]>();
+  for (const l of r.store.db
+    .query(
+      `SELECT json_extract(CAST(body AS TEXT),'$.link.fromId') AS sha,json_extract(CAST(body AS TEXT),'$.sessionId') AS session,
+              json_extract(CAST(body AS TEXT),'$.repository.id') AS repo,json_extract(CAST(body AS TEXT),'$.link.toId') AS pr
+         FROM events WHERE kind='link' AND json_extract(CAST(body AS TEXT),'$.link.reason')='provider_commit_membership'`,
+    )
+    .all() as { sha: string; session: string; repo: string; pr: string }[]) {
+    const key = `${l.sha} ${l.session}`;
+    links.set(key, [...(links.get(key) ?? []), l]);
+  }
+  for (const item of r.store.db
+    .query(
+      "SELECT key,value FROM meta WHERE key LIKE 'tracked-commit:%' AND json_extract(value,'$.Open') IS NULL",
+    )
+    .all() as { key: string; value: string }[]) {
+    const c: TrackedCommit = JSON.parse(item.value),
+      open = new Set<string>();
+    for (const { repo, pr } of links.get(`${c.SHA} ${c.Scope.Session}`) ?? []) {
+      const e = r.store.latest(
+        r.event(c.Scope, `pull-request:${repo}:${pr}`, "", c.Source).entityId,
+      );
+      if (e?.pullRequest?.state === "open" && e.repository)
+        open.add(
+          e.repository.provider === "gitlab"
+            ? `projects/${e.repository.id}/merge_requests/${e.pullRequest.number}`
+            : `repos/${e.repository.name}/pulls/${e.pullRequest.number}`,
+        );
+    }
+    saveMeta(r, item.key, { ...c, Open: [...open] });
+  }
+  r.store.setMeta("open-prs-seeded", "1");
+}
+/** The states of the PRs or MRs that contain the commit, and the API paths of the open ones. */
+function discoverPullRequests(
+  r: Recorder,
+  c: TrackedCommit,
+  answers: Map<string, unknown>,
+  signal?: AbortSignal,
+): [string[], string[]] {
   const repo = c.Scope.Repository;
   if (!repo) throw new Error("SCM repository is unknown");
   const path =
     repo.provider === "gitlab"
       ? `projects/${encodeURIComponent(repo.name || "")}`
       : `repos/${repo.name}`;
-  const identity = scmApi(c.Scope.CWD, repo, path, signal),
+  const identity = scmApi(c.Scope.CWD, repo, path, signal, answers),
     id = providerId(identity.id);
   if (!id) throw new Error("SCM repository identity is missing");
   const name = str(identity, repo.provider === "gitlab" ? "path_with_namespace" : "full_name");
@@ -590,29 +653,58 @@ function discoverPullRequests(r: Recorder, c: TrackedCommit, signal?: AbortSigna
     repo.provider === "gitlab"
       ? `projects/${id}/repository/commits/${c.SHA}/merge_requests`
       : `${path}/commits/${c.SHA}/pulls`;
-  const states: string[] = [];
+  const states: string[] = [],
+    listed = new Set<string>(),
+    open = new Set<string>();
+  const report = (raw: unknown) => {
+    const [target, p] = pullRequest(repo, obj(raw)),
+      s = { ...c.Scope, Repository: target },
+      byNumber =
+        repo.provider === "gitlab"
+          ? `projects/${target.id}/merge_requests/${p.number}`
+          : `repos/${target.name}/pulls/${p.number}`;
+    states.push(p.state);
+    listed.add(byNumber);
+    if (p.state === "open") open.add(byNumber);
+    // Every commit of a PR reports it; without their turns, an unchanged PR is not uploaded again.
+    const event = r.event(
+      { ...s, Turn: "", Agent: "" },
+      `pull-request:${target.id}:${p.id}`,
+      "",
+      c.Source,
+    );
+    event.pullRequest = p;
+    r.store.observe(event);
+    const link = r.event(s, `commit-pr:${c.SHA}:${target.id}:${p.id}`, "", c.Source);
+    link.link = {
+      fromKind: "commit",
+      fromId: c.SHA,
+      toKind: "pull_request",
+      toId: p.id,
+      quality: "observed",
+      reason: "provider_commit_membership",
+    };
+    r.store.observe(link);
+  };
   for (let page = 1; page <= 5; page++) {
-    const prs = scmApi(c.Scope.CWD, repo, `${endpoint}?per_page=100&page=${page}`, signal);
+    const prs = scmApi(c.Scope.CWD, repo, `${endpoint}?per_page=100&page=${page}`, signal, answers);
     if (!Array.isArray(prs)) throw new Error("invalid SCM response");
-    for (const raw of prs) {
-      const [target, p] = pullRequest(repo, obj(raw)),
-        s = { ...c.Scope, Repository: target };
-      states.push(p.state);
-      const event = r.event(s, `pull-request:${target.id}:${p.id}`, "", c.Source);
-      event.pullRequest = p;
-      r.store.observe(event);
-      const link = r.event(s, `commit-pr:${c.SHA}:${target.id}:${p.id}`, "", c.Source);
-      link.link = {
-        fromKind: "commit",
-        fromId: c.SHA,
-        toKind: "pull_request",
-        toId: p.id,
-        quality: "observed",
-        reason: "provider_commit_membership",
-      };
-      r.store.observe(link);
+    for (const raw of prs) report(raw);
+    if (prs.length < 100) {
+      // GitHub lists only open PRs for a commit outside the default branch, so, as Kimchi does, a PR the
+      // commit no longer lists is looked up by number until it is seen closed or merged.
+      for (const known of c.Open ?? [])
+        if (!listed.has(known))
+          try {
+            report(scmApi(c.Scope.CWD, repo, known, signal, answers));
+          } catch (e) {
+            if (signal?.aborted) throw e;
+            // Asked again on the commit's schedule; one PR that cannot be read must not hold up the others.
+            r.store.diagnostic("scm_lookup_incomplete");
+            open.add(known);
+          }
+      return [states, [...open]];
     }
-    if (prs.length < 100) return states;
   }
   throw new Error("SCM pagination exceeds capture bound");
 }

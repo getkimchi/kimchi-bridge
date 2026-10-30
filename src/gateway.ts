@@ -500,6 +500,15 @@ export function claudeDesktop3pData(): string {
 }
 
 const DESKTOP_CONFIG_FILE = "claude_desktop_config.json";
+
+/**
+ * Claude Desktop runs only Anthropic models: for a gateway it drops every other model name with a warning, and any
+ * warning shows its "Configuration may need attention" banner. Kimchi names its Claude routes claude-* or anthropic/*.
+ */
+function isDesktopModel(name: string): boolean {
+  const slug = name.toLowerCase();
+  return slug.startsWith("claude-") || slug.startsWith("anthropic/");
+}
 const DESKTOP_MODE_KEY = "deploymentMode";
 const DESKTOP_LIBRARY_ENTRY = "Kimchi Gateway";
 
@@ -548,6 +557,9 @@ export function writeClaudeDesktopConfig(
 ): Desktop3pPrevious | null {
   const appData = claudeDesktopAppData();
   if (!appData) return null;
+  const claude = models.filter((m) => isDesktopModel(m.slug));
+  // Without a Claude model the app has nothing to run through the gateway: leave it as it is.
+  if (!claude.length) return null;
 
   const config = readDesktopConfig(appData);
   const previous: Desktop3pPrevious = {
@@ -597,7 +609,7 @@ export function writeClaudeDesktopConfig(
         inferenceCredentialKind: "static",
         // The app's connection test needs a model without discovery, which the
         // proxy does not serve; the fetched list is what Codex catalogs too.
-        inferenceModels: models.slice(0, 200).map((m) => ({ name: m.slug })),
+        inferenceModels: claude.slice(0, 200).map((m) => ({ name: m.slug })),
       },
       null,
       2,
@@ -607,8 +619,11 @@ export function writeClaudeDesktopConfig(
   return previous;
 }
 
-/** Follows a gateway port move so desktop sessions point at the live proxy. */
-export function rewriteClaudeDesktopPort(anthropicBaseUrl: string): void {
+/**
+ * Points desktop sessions at the live proxy after a port move, and drops the model names an older bridge wrote that
+ * the app rejects.
+ */
+export function rewriteClaudeDesktopConfig(anthropicBaseUrl: string): void {
   const appData = claudeDesktopAppData();
   if (!appData) return;
   const library = join(claudeDesktop3pData(), "configLibrary");
@@ -629,8 +644,14 @@ export function rewriteClaudeDesktopPort(anthropicBaseUrl: string): void {
   } catch {
     return;
   }
+  const before = JSON.stringify(config, null, 2) + "\n";
   config.inferenceGatewayBaseUrl = anthropicBaseUrl;
-  writeAtomic(path, JSON.stringify(config, null, 2) + "\n", 0o600);
+  if (Array.isArray(config.inferenceModels))
+    config.inferenceModels = config.inferenceModels.filter(
+      (model) => typeof model?.name === "string" && isDesktopModel(model.name),
+    );
+  const after = JSON.stringify(config, null, 2) + "\n";
+  if (after !== before) writeAtomic(path, after, 0o600);
 }
 
 /** Restores the desktop app to the mode and library it had before enable. */
@@ -1247,11 +1268,15 @@ export async function runDaemon(): Promise<void> {
     // The persisted port moved; repoint the CLI configs so new sessions follow.
     try {
       writeClaudeConfig(`http://127.0.0.1:${port}/anthropic`, PROXY_PLACEHOLDER);
-      rewriteClaudeDesktopPort(`http://127.0.0.1:${port}/anthropic`);
       log(`port moved to ${port}; CLI configs rewritten`);
     } catch (error) {
       log(`port moved to ${port} but CLI config rewrite failed: ${(error as Error).message}`);
     }
+  }
+  try {
+    rewriteClaudeDesktopConfig(`http://127.0.0.1:${port}/anthropic`);
+  } catch (error) {
+    log(`Claude Desktop config rewrite failed: ${(error as Error).message}`);
   }
   log(`gateway proxy listening on 127.0.0.1:${port} -> ${target.llmBase}`);
   // Poll for disable while running; SIGTERM also exits (default handler).
