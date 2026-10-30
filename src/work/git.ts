@@ -127,9 +127,11 @@ export function reconcileGit(r: Recorder, signal?: AbortSignal) {
     answers = new Map<string, unknown>();
   for (const item of [...fresh, ...items]) {
     checkSignal(signal);
+    // The rotation moves past a due commit this pass already looked up; otherwise young commits, due on every
+    // pass, would keep it from reaching the edits before them.
+    if (!fresh.includes(item)) r.store.setMeta("git-pass-after", item.key);
     if (seen.has(item.key)) continue;
     seen.add(item.key);
-    if (!fresh.includes(item)) r.store.setMeta("git-pass-after", item.key);
     if (item.key.startsWith("tracked-commit:")) {
       const c: TrackedCommit = JSON.parse(item.value);
       // Kimchi's schedule: check a new commit at once, then after min(1 day, age/16); give up on

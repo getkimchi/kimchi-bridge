@@ -1011,6 +1011,68 @@ test("native edits in a removed worktree outside its repository still match the 
   });
 });
 
+test("young commits due on every pass do not hold up native-edit matching", () => {
+  const { base, store, r } = fixture("claude-code");
+  const root = join(base, "repo"),
+    path = join(root, "file.txt");
+  mkdirSync(root);
+  for (const args of [
+    ["init", "--initial-branch=main"],
+    ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"],
+    ["config", "commit.gpgsign", "false"],
+    ["config", "core.hooksPath", "/dev/null"],
+  ])
+    git(root, ...args);
+  writeFileSync(path, "before\n");
+  git(root, "add", ".");
+  git(root, "commit", "-m", "baseline");
+  const e = {
+    session_id: "s",
+    turn_id: "turn",
+    cwd: root,
+    tool_use_id: "call",
+    tool_name: "Edit",
+    tool_input: { file_path: path, old_string: "before", new_string: "after" },
+  };
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
+  });
+  r.record({ stage: "PreToolUse", event: e });
+  writeFileSync(path, "after\n");
+  r.record({ stage: "PostToolUse", event: e });
+  git(root, "commit", "-am", "edit");
+  const sha = git(root, "rev-parse", "HEAD");
+  const change = (
+    store.db.query("SELECT key FROM meta WHERE key LIKE 'git-change:%'").get() as { key: string }
+  ).key;
+  // The pass has rotated up to the edit; after it sorts only a commit checked again on every pass, here one
+  // whose lookup fails at once.
+  store.setMeta("git-pass-after", change);
+  for (let pass = 0; pass < 3; pass++) {
+    store.setMeta(
+      "tracked-commit:young",
+      JSON.stringify({
+        Scope: { Session: "s" },
+        Source: "claude-code",
+        SHA: "0".repeat(40),
+        CreatedAt: new Date().toISOString(),
+      }),
+    );
+    try {
+      reconcileGit(r);
+    } catch {
+      // The young commit's lookup fails on every pass.
+    }
+  }
+  expect(latest(store, "link").link).toMatchObject({
+    toKind: "commit",
+    toId: sha,
+    reason: "file_revision",
+  });
+});
+
 test("route matching respects DNS boundaries", () => {
   const before = process.env.ANTHROPIC_BASE_URL;
   try {
