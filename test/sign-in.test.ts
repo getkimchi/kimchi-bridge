@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run as cli } from "../src/cli.ts";
+import { writeLoginProgress } from "../src/oauth.ts";
 import {
   IdentityError,
   credentialHash,
@@ -130,6 +132,26 @@ test("the session hint asks for a sign-in only when neither Kimchi nor the plugi
   kimchiFiles(undefined, {
     "kimchi-dev": { type: "oauth", access: "sso-token", orgId: randomUUID() },
   });
+  expect(await hint()).toBe("");
+});
+
+test("another program on the sign-in callback port is not a sign-in in progress", async () => {
+  const hint = async () => {
+    let text = "";
+    await cli(["hint"], undefined, (out) => {
+      text += out;
+    });
+    return text;
+  };
+  // Hold the port as another program would; if one already does, that serves as well.
+  const other = createServer();
+  await new Promise<void>((resolve) => {
+    other.once("error", () => resolve());
+    other.listen(8765, "127.0.0.1", () => resolve());
+  });
+  cleanups.push(() => other.close());
+  expect(await hint()).toContain("Kimchi is not signed in");
+  writeLoginProgress({ phase: "waiting", startedAt: Date.now() });
   expect(await hint()).toBe("");
 });
 
