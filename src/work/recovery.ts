@@ -1,5 +1,5 @@
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { closeSync, fstatSync, openSync, readSync, readdirSync, statSync } from "node:fs";
+import { basename, isAbsolute, join } from "node:path";
 import {
   canonicalHash,
   canonicalTime,
@@ -16,9 +16,9 @@ import {
   type Usage,
 } from "./protocol.ts";
 import { checkSignal } from "../platform.ts";
-import { gatewayPort, loadGatewayState } from "../gateway.ts";
+import { claudeDesktop3pData, gatewayPort, loadGatewayState } from "../gateway.ts";
 import { tagFor } from "../request-tags.ts";
-import type { Recorder, Scope } from "./capture.ts";
+import { repository, type Recorder, type Scope } from "./capture.ts";
 
 interface Transcript {
   path: string;
@@ -85,6 +85,7 @@ export function registerTranscript(
 
 export function recoverContext(r: Recorder, signal?: AbortSignal) {
   checkSignal(signal);
+  if (r.source === "claude-code") discoverDesktopTranscripts(r, signal);
   const items = r.store.db
     .query("SELECT value FROM meta WHERE key LIKE ?")
     .all(`transcript:${r.source}:%`) as { value: string }[];
@@ -99,6 +100,91 @@ export function recoverContext(r: Recorder, signal?: AbortSignal) {
     }
   }
   if (failures.length) throw new AggregateError(failures, "transcript recovery incomplete");
+}
+
+/**
+ * Claude Desktop's 3P sessions write transcripts under the app profile, but the
+ * app's security plugin pre-empts the classic hooks that would register their
+ * paths, and the app pins the env that gates the telemetry collector. The
+ * stable per-session layout is scanned instead: every jsonl under a session's
+ * .claude/projects is registered, its scope read from the transcript's own
+ * session metadata. Routes are castai because the 3P profile only runs through
+ * the gateway proxy.
+ */
+function discoverDesktopTranscripts(r: Recorder, signal?: AbortSignal): void {
+  checkSignal(signal);
+  const base = join(claudeDesktop3pData(), "local-agent-mode-sessions");
+  let sessions: string[];
+  try {
+    sessions = readdirSync(base, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(base, entry.name));
+  } catch {
+    return; /* Claude Desktop is not installed or has run no 3P session */
+  }
+  const cutoff = Date.now() - 45 * 86400_000;
+  for (const session of sessions) {
+    checkSignal(signal);
+    let files: string[];
+    try {
+      files = readdirSync(session, { recursive: true, encoding: "utf8" }) as unknown as string[];
+    } catch {
+      continue; /* this session kept no transcript */
+    }
+    for (const name of files) {
+      checkSignal(signal);
+      if (!name.endsWith(".jsonl") || !name.includes(".claude" + "/projects/")) continue;
+      const path = join(session, name);
+      if (basename(path) === "audit.jsonl") continue;
+      try {
+        if (statSync(path).mtimeMs < cutoff) continue; /* older than the upload window */
+      } catch {
+        continue;
+      }
+      const key = `transcript:${r.source}:${path}`;
+      if (r.store.meta(key)) continue; /* already registered */
+      const id = basename(path, ".jsonl");
+      const cwd = transcriptCwd(path);
+      const [root, repo, repoMeta] = cwd ? repository(cwd) : ["", "", undefined];
+      r.store.setMeta(
+        key,
+        stringifyJson({
+          path,
+          scope: {
+            Session: id,
+            Turn: "",
+            Agent: "",
+            CWD: cwd,
+            Root: root,
+            Repo: repo,
+            Repository: repoMeta,
+          },
+          route: "castai",
+          basis: "gateway",
+        }),
+      );
+    }
+  }
+}
+
+/** The working directory a transcript's session metadata names, if any. */
+function transcriptCwd(path: string): string {
+  try {
+    const fd = openSync(path, "r");
+    try {
+      const bytes = Buffer.alloc(64 * 1024);
+      const count = readSync(fd, bytes, 0, bytes.length, 0);
+      const end = bytes.subarray(0, count).indexOf(10);
+      if (end < 0) return "";
+      const meta = parseJson(bytes.subarray(0, end).toString());
+      if (str(meta, "type") !== "session_meta") return "";
+      return str(obj(meta.payload), "cwd");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
 }
 
 function recoverFile(r: Recorder, t: Transcript, signal?: AbortSignal) {
@@ -189,6 +275,13 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
   const s = { ...t.scope };
   if (r.source === "codex" && str(v, "type") === "session_meta") {
     const value = str(obj(v.payload), "cli_version");
+    if (value) saveSourceVersion(r, s.Session, value);
+    return;
+  }
+  // Desktop app transcripts carry no session_meta; their api-request lines name
+  // the bundled Claude Code version instead.
+  if (r.source === "claude-code" && str(v, "type") === "api-request") {
+    const value = str(v, "version");
     if (value) saveSourceVersion(r, s.Session, value);
     return;
   }
