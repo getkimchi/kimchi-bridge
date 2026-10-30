@@ -56,7 +56,8 @@ interface GitChange {
   Path: string;
   Before: string;
   After: string;
-  Refs: string[];
+  /** The blob of ref tips the edit saw (see refTips); older versions saved the list itself. */
+  Refs: string | string[];
   CreatedAt: string;
 }
 interface TrackedCommit {
@@ -80,10 +81,11 @@ export const rootOf = (s: Scope) => s.Root || s.CWD;
 export function saveMeta(r: Recorder, key: string, data: unknown) {
   r.store.setMeta(key, stringifyJson(data));
 }
+// Every tip, as Kimchi keeps them (file-transitions.ts referenceTips): company repositories have thousands of
+// branches and tags. Callers store each distinct set once, as a blob.
 export function refTips(root: string): string[] | null {
   try {
-    const refs = fields(git(root, "for-each-ref", "--format=%(objectname)", "--count=513"));
-    if (refs.length > 512) return null;
+    const refs = fields(git(root, "for-each-ref", "--format=%(objectname)"));
     try {
       refs.push(git(root, "rev-parse", "--verify", "HEAD"));
     } catch {
@@ -208,6 +210,8 @@ function gitDir(s: Scope, signal?: AbortSignal): string {
   if (stableId("git-common-dir", common) !== s.Repo) throw new Error("captured repository is gone");
   return common;
 }
+const tipsOf = (r: Recorder, refs: string | string[] | undefined) =>
+  typeof refs === "string" ? fields(r.store.blob(refs).toString()) : refs || [];
 function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortSignal) {
   const root = rootOf(c.Scope),
     dir = gitDir(c.Scope, signal),
@@ -216,8 +220,10 @@ function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortS
     after = fileObject(r, c.After, format);
   if (!within(root, c.Path)) throw new Error("file is outside its captured repository");
   const path = relative(root, c.Path);
+  // ponytail: tips go on the command line as in Kimchi; past about 24,000 tips (macOS ARG_MAX) Git cannot start
+  // and the edit stays unmatched. Pass them with --stdin if a repository that large shows up.
   let commits = fields(
-    gitContext(signal, dir, "rev-list", "--all", "--max-count=129", "--not", ...(c.Refs || [])),
+    gitContext(signal, dir, "rev-list", "--all", "--max-count=129", "--not", ...tipsOf(r, c.Refs)),
   );
   if (commits.length > 128) {
     r.store.diagnostic("git_history_bound");
@@ -225,7 +231,7 @@ function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortS
   }
   if (!commits.length) return;
   const befores = new Set([before]),
-    refs = new Set(c.Refs || []);
+    refs = new Set(tipsOf(r, c.Refs));
   // shortcut: inspect 128 prior file observations; raise the bound if longer chains must match.
   const previous = r.store.db
     .query(
@@ -260,7 +266,7 @@ function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortS
       break;
     hash = p.Before;
     befores.add(fileObject(r, hash, format));
-    for (const ref of p.Refs || []) refs.add(ref);
+    for (const ref of tipsOf(r, p.Refs)) refs.add(ref);
   }
   befores.delete(after);
   for (const sha of commits) {

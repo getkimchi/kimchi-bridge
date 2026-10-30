@@ -1,5 +1,6 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseShell } from "shell-quote";
 import type { fromMarkdown as parseMarkdown } from "mdast-util-from-markdown";
@@ -74,10 +75,34 @@ interface ToolState {
   started: string;
   category: string;
   native: boolean;
-  refTips?: string[];
+  /** The blob of the ref tips a native edit saw; older versions saved the list itself. */
+  refTips?: string | string[];
   refsKnown: boolean;
 }
 const emptyFile = (): FileState => ({ hash: "", exists: false, complete: false });
+
+const knownHost = (host: string) =>
+  ["github.com", "gitlab.com", process.env.GH_HOST, process.env.GITLAB_HOST].includes(host);
+const sshHosts = new Map<string, string>();
+/**
+ * The provider host an SSH alias stands for (~/.ssh/config: Host github-work, HostName github.com), read without
+ * connecting, as Kimchi resolves it (pull-request-status/provider-api.ts sshHostName).
+ */
+function sshHost(alias: string): string {
+  if (knownHost(alias) || alias.startsWith("-")) return alias;
+  let host = sshHosts.get(alias);
+  if (host === undefined) {
+    const config = spawnSync("ssh", ["-G", alias], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).stdout;
+    const line = (config ?? "").split("\n").find((l) => l.startsWith("hostname "));
+    host = line ? line.slice("hostname ".length).trim() : alias;
+    sshHosts.set(alias, host);
+  }
+  return knownHost(host) ? host : alias;
+}
 
 export function repository(cwd: string): [string, string, Repository | undefined] {
   try {
@@ -135,7 +160,7 @@ export function repository(cwd: string): [string, string, Repository | undefined
     if (url.password || url.search || url.hash || (url.protocol === "https:" && url.username))
       return [root, local, undefined];
     // An HTTPS remote's port belongs to the web host; an SSH remote's port does not.
-    host = url.protocol === "https:" ? url.host : url.hostname;
+    host = url.protocol === "https:" ? url.host : sshHost(url.hostname);
     name = url.pathname.slice(1);
     if (name.endsWith(".git")) name = name.slice(0, -4);
   } catch {
@@ -599,7 +624,16 @@ export class Recorder {
       } catch {
         this.store.diagnostic("git_trace_unavailable");
       }
-    const refs = category === "read" ? null : refTips(s.CWD);
+    // Only native edits are matched to commits. A large repository has thousands of tips, so a blob holds each
+    // distinct set once.
+    let refs: string | undefined;
+    if (native && category !== "read")
+      try {
+        const tips = refTips(s.CWD);
+        if (tips) refs = this.store.putBlob(Buffer.from(tips.join("\n")));
+      } catch {
+        this.store.diagnostic("git_refs_unavailable");
+      }
     const state: ToolState = {
       files: {},
       expected: {},
@@ -609,8 +643,8 @@ export class Recorder {
       started: new Date().toISOString(),
       category,
       native,
-      refTips: refs ?? undefined,
-      refsKnown: refs !== null,
+      refTips: refs,
+      refsKnown: refs !== undefined,
     };
     const deadline = Date.now() + 800;
     let bytes = 0;
@@ -783,7 +817,31 @@ export class Recorder {
   /** Commits made by this session's shell calls' own Git processes, as Kimchi records them. */
   traceCommits(s: Scope, call: string, work: string, started: string) {
     const dir = traceDir(this.source, s.Session);
-    for (const c of tracedCommits(join(dir, "events"), join(dir, "refs"))) {
+    // Without a logged call, only a Claude Code session's lone shell call claims a commit,
+    // and only one its own command made.
+    const busy =
+      this.source === "claude-code" &&
+      !!this.store.db
+        .query(
+          `SELECT 1 FROM tool_state t
+           LEFT JOIN meta m ON m.key=t.source||':'||t.session_id||':'||t.call_id||':done'
+           WHERE t.source=? AND t.session_id=? AND t.call_id<>? AND m.key IS NULL
+             AND json_extract(t.body,'$.category')='shell'
+             AND unixepoch(json_extract(t.body,'$.started')) > unixepoch()-21600
+           LIMIT 1`,
+        )
+        .get(this.source, s.Session, call);
+    let commits;
+    try {
+      commits = tracedCommits(join(dir, "events"), join(dir, "refs"));
+    } finally {
+      // Kimchi traces each shell call apart. A Claude Code session has one trace, so once no other shell call of
+      // the session runs, it is spent: otherwise every later hook rereads all the session's Git (a test suite
+      // writes tens of megabytes) and outlives its two-second limit, losing the commit.
+      if (this.source === "claude-code" && !busy)
+        for (const name of ["events", "refs"]) rmSync(join(dir, name), { force: true });
+    }
+    for (const c of commits) {
       let owner = work;
       if (c.call && c.call !== call) {
         // A call that returned before its command ended, such as unified exec polled later.
@@ -793,20 +851,11 @@ export class Recorder {
         if (!row) continue;
         owner = (JSON.parse(bodyText(row.body)) as ToolState).work;
       } else if (!c.call) {
-        // Without a logged call, only a Claude Code session's lone shell call claims a commit,
-        // and only one its own command made.
-        const busy = this.store.db
-          .query(
-            `SELECT 1 FROM tool_state t
-             LEFT JOIN meta m ON m.key=t.source||':'||t.session_id||':'||t.call_id||':done'
-             WHERE t.source=? AND t.session_id=? AND t.call_id<>? AND m.key IS NULL
-               AND json_extract(t.body,'$.category')='shell'
-               AND unixepoch(json_extract(t.body,'$.started')) > unixepoch()-21600
-             LIMIT 1`,
-          )
-          .get(this.source, s.Session, call);
         if (this.source !== "claude-code" || busy || c.time < Date.parse(started)) continue;
       }
+      // As in Kimchi, a commit in a repository already removed (a test's temporary one) is skipped; it must
+      // not stop the commits after it.
+      if (!existsSync(c.worktree)) continue;
       const [root, repo, identity] = repository(c.worktree);
       const key = `agent-commit:${stableId(repo, c.sha)}`;
       if (this.store.meta(key)) continue;
