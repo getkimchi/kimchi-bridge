@@ -3,6 +3,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import {
   canonicalHash,
   canonicalTime,
+  integer,
   numberText,
   obj,
   opaque,
@@ -27,6 +28,8 @@ interface Transcript {
   basis: string;
   // A thread the Codex session started, such as an approval review.
   thread?: string;
+  // Records a forked thread copied from its source, still to skip.
+  inherited?: number;
 }
 const wireInteger = (v: unknown) => {
   const text = numberText(v);
@@ -266,9 +269,18 @@ function timestamp(value: string): string {
 
 function consume(r: Recorder, t: Transcript, v: JsonObject) {
   const s = { ...t.scope };
+  if (t.inherited) {
+    t.inherited--;
+    return;
+  }
   if (r.source === "codex" && str(v, "type") === "session_meta") {
-    const value = str(obj(v.payload), "cli_version");
+    const p = obj(v.payload),
+      value = str(p, "cli_version");
     if (value) saveSourceVersion(r, s.Session, value);
+    // A forked thread, such as the review Codex starts after an interrupted one, opens with records
+    // copied from its source up to this ordinal, a token_count among them; they were read there.
+    const own = integer(p.subagent_history_start_ordinal) ?? 0;
+    if (own > 1) t.inherited = own - 1;
     return;
   }
   if (r.source === "claude-code" && !["user", "assistant"].includes(str(v, "type"))) return;

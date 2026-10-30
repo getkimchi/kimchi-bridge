@@ -1089,3 +1089,93 @@ test("a Codex approval review's calls count for the session turn that asked for 
     expect(store.meta(`transcript:codex:${other}`)).toBe("");
   });
 });
+
+test("a Codex review thread forked after an interrupted review does not report the call it copied", () => {
+  const { base, root, store, r, scope } = fixture();
+  withBridgeHome(base, () => {
+    r.record({
+      stage: "UserPromptSubmit",
+      event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "implement" },
+    });
+    const work = r.workExact(scope),
+      next = "22222222-2222-4333-8444-555555555555";
+    recordTag("resp_review", tag);
+    recordTag("resp_next", next);
+    const day = join(base, "codex", "sessions", "2026", "10", "30");
+    mkdirSync(day, { recursive: true });
+    const rollout = (name: string, lines: object[]) => {
+      const path = join(day, `rollout-2026-10-30T${name}.jsonl`);
+      appendFileSync(
+        path,
+        lines.map((line) => JSON.stringify({ timestamp: at, ...line })).join("\n") + "\n",
+      );
+      return path;
+    };
+    const tokens = (input: number, output: number) => ({
+        input_tokens: input,
+        cached_input_tokens: 0,
+        output_tokens: output,
+        reasoning_output_tokens: 0,
+        total_tokens: input + output,
+      }),
+      first = tokens(7342, 79),
+      second = tokens(8330, 46);
+    const review = { session_id: "s", parent_thread_id: "s", thread_source: "guardian_review" },
+      context = (turn: string) => ({
+        type: "turn_context",
+        payload: { turn_id: turn, model: "m" },
+      }),
+      record = (response: string, usage: object) => ({
+        type: "token_usage_record",
+        payload: { root_turn_id: "turn", response_id: response, usage },
+      }),
+      count = (last: object, total: object) => ({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: { last_token_usage: last, total_token_usage: total },
+        },
+      });
+    const main = rollout("07-34-23-s", [
+      { type: "session_meta", payload: { id: "s", session_id: "s" } },
+    ]);
+    // One review answers; the next is interrupted before any reply, so it records no usage.
+    rollout("07-34-24-review", [
+      { type: "session_meta", payload: { id: "review", ...review } },
+      context("review-1"),
+      record("resp_review", first),
+      count(first, first),
+      context("review-2"),
+      { type: "event_msg", payload: { type: "turn_aborted", turn_id: "review-2" } },
+    ]);
+    // Codex then forks a new review thread. Its rollout opens with the old thread's history, its
+    // last token_count included, up to the ordinal where the new thread's own records begin.
+    const fork = [
+      {
+        type: "session_meta",
+        payload: { id: "next", ...review, subagent_history_start_ordinal: 5 },
+      },
+      { type: "compacted", payload: { message: "" } },
+      { type: "world_state", payload: {} },
+      context("review-1"),
+      count(first, first),
+      context("next-1"),
+      record("resp_next", second),
+      count(second, tokens(15672, 125)),
+    ];
+    rollout("07-36-33-next", fork.slice(0, 3));
+    registerTranscript(r, { ...scope, Turn: "" }, main, "unknown", "unknown");
+    recoverContext(r);
+    // A pass that ends inside the copied history goes on skipping it in the next.
+    rollout("07-36-33-next", fork.slice(3));
+    recoverContext(r);
+    expect(
+      usages(store)
+        .map((e) => [e.turnId, e.workId, e.usage.requestId ?? ""])
+        .sort(),
+    ).toEqual([
+      ["turn", work, tag],
+      ["turn", work, next],
+    ]);
+  });
+});
