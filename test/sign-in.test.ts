@@ -33,6 +33,7 @@ const variables = [
   "KIMCHI_TELEMETRY_ENABLED",
 ];
 let previous: (string | undefined)[] = [];
+let previousConfigHome: string | undefined;
 const cleanups: (() => void)[] = [];
 beforeEach(() => {
   previous = variables.map((name) => process.env[name]);
@@ -41,10 +42,15 @@ beforeEach(() => {
   mkdirSync(join(kimchi, "harness"), { recursive: true });
   process.env.HOME = root;
   process.env.KIMCHI_BRIDGE_HOME = join(root, "reporting");
+  // Transcript recovery scans the config home for Claude Desktop 3P profiles.
+  previousConfigHome = process.env.KIMCHI_BRIDGE_CONFIG_HOME;
+  process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(root, "config-home");
   for (const name of variables.slice(3)) delete process.env[name];
   delete process.env.KIMCHI_API_KEY;
 });
 afterEach(() => {
+  if (previousConfigHome === undefined) delete process.env.KIMCHI_BRIDGE_CONFIG_HOME;
+  else process.env.KIMCHI_BRIDGE_CONFIG_HOME = previousConfigHome;
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
   rmSync(root, { recursive: true, force: true });
   variables.forEach((name, i) => {

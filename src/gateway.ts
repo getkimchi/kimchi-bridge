@@ -57,6 +57,7 @@ export interface GatewayState {
   previous?: {
     claude?: Record<string, string | null>;
     codexTopLevel?: Array<[string, string]>;
+    claudeDesktop?: Desktop3pPrevious;
   };
 }
 
@@ -165,13 +166,18 @@ function writeClaudeConfig(
   for (const key of CLAUDE_ENV_KEYS)
     previous[key] = typeof env[key] === "string" ? (env[key] as string) : null;
   // Empty ANTHROPIC_API_KEY keeps Claude Code on ANTHROPIC_AUTH_TOKEN.
+  // No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: the telemetry collector that
+  // feeds PR-cost usage attribution is beta-gated, and the desktop app's 3P
+  // Code sessions load these settings too.
   const pairs: Record<string, string> = {
     ANTHROPIC_BASE_URL: anthropicBaseUrl,
     ANTHROPIC_API_KEY: "",
     ANTHROPIC_AUTH_TOKEN: authToken,
-    CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
   };
   for (const [key, value] of Object.entries(pairs)) env[key] = value;
+  // A stale kill-switch from an older bridge would keep the beta-gated
+  // telemetry collector off; remove what we no longer set.
+  delete env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS;
   settings.env = env;
   writeJsonFile(path, settings);
   return previous;
@@ -442,6 +448,242 @@ function restoreCodexConfig(previous?: Array<[string, string]>): void {
     rmSync(codexCatalogPath(), { force: true });
   } catch {
     /* the catalog is ours to drop; ignore failures */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Claude Desktop (the app) — third-party inference mode
+//
+// The desktop app ignores ~/.claude/settings.json's env block: it spawns its
+// bundled Claude Code with its own pinned ANTHROPIC_BASE_URL. The supported
+// way to route it through the gateway is Claude Desktop's third-party (3P)
+// mode: a "deploymentMode": "3p" key in the main profile's
+// claude_desktop_config.json switches the app at launch, and the gateway
+// credentials live in a separate Claude-3p profile's configLibrary that the
+// in-app configuration window normally writes. The mode key cannot be set by
+// the configLibrary itself, so both are written here.
+// ---------------------------------------------------------------------------
+
+/** The main profile's userData dir (the 1P app's), or null when Claude Desktop is not installed. */
+export function claudeDesktopAppData(): string | null {
+  const home = homeDir();
+  const candidates =
+    process.platform === "darwin"
+      ? [join(home, "Library", "Application Support", "Claude")]
+      : process.platform === "win32"
+        ? [join(process.env.APPDATA ?? join(home, "AppData", "Roaming"), "Claude")]
+        : [join(process.env.XDG_CONFIG_HOME ?? join(home, ".config"), "Claude")];
+  for (const dir of candidates)
+    try {
+      readFileSync(join(dir, "config.json"));
+      return dir;
+    } catch {
+      /* try the next candidate */
+    }
+  return null;
+}
+
+/**
+ * The 3P profile's userData dir. Unlike the main dir it may not exist yet; the
+ * app creates it on first launch into 3P mode. Windows keeps it under
+ * %LOCALAPPDATA% while the main profile is %APPDATA%.
+ */
+export function claudeDesktop3pData(): string {
+  const home = homeDir();
+  if (process.platform === "win32")
+    return join(process.env.LOCALAPPDATA ?? join(home, "AppData", "Local"), "Claude-3p");
+  const base =
+    process.platform === "darwin"
+      ? join(home, "Library", "Application Support")
+      : (process.env.XDG_CONFIG_HOME ?? join(home, ".config"));
+  return join(base, "Claude-3p");
+}
+
+const DESKTOP_CONFIG_FILE = "claude_desktop_config.json";
+const DESKTOP_MODE_KEY = "deploymentMode";
+const DESKTOP_LIBRARY_ENTRY = "Kimchi Gateway";
+
+/** The configLibrary ids are lowercase UUIDs; the app rejects any other shape. */
+function isConfigId(value: unknown): value is string {
+  if (typeof value !== "string" || value.length !== 36) return false;
+  for (const c of value)
+    if (c !== "-" && !(c >= "0" && c <= "9") && !(c >= "a" && c <= "f")) return false;
+  return true;
+}
+
+export interface Desktop3pPrevious {
+  /** The deploymentMode value before enable, null when the key was absent. */
+  mode: string | null;
+  /** The applied config id before enable, null when none was applied. */
+  appliedId: string | null;
+  /** Whether our configLibrary entry was newly created (disable removes it). */
+  createdEntry: boolean;
+  /** The library file's id, so port rewrites and disable can find it. */
+  entryId: string;
+  /** A pre-existing entry's file content before enable overwrote it. */
+  entryContent?: string;
+}
+
+function readDesktopConfig(dir: string): Record<string, unknown> {
+  try {
+    const value = JSON.parse(readFileSync(join(dir, DESKTOP_CONFIG_FILE), "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new Error(`${DESKTOP_CONFIG_FILE} could not be parsed; fix or remove it first`);
+  }
+}
+
+/**
+ * Switches Claude Desktop into third-party inference mode through the local
+ * gateway proxy: persists the mode choice in the main profile and writes the
+ * gateway credentials into the 3P profile's configLibrary. The proxy does not
+ * serve Anthropic's model-list endpoint, so the fetched models are written as
+ * the app's explicit model list, which also skips discovery. Returns what
+ * `disable` restores, or null when the desktop app is not installed.
+ */
+export function writeClaudeDesktopConfig(
+  anthropicBaseUrl: string,
+  models: readonly GatewayModel[],
+): Desktop3pPrevious | null {
+  const appData = claudeDesktopAppData();
+  if (!appData) return null;
+
+  const config = readDesktopConfig(appData);
+  const previous: Desktop3pPrevious = {
+    mode:
+      typeof config[DESKTOP_MODE_KEY] === "string" ? (config[DESKTOP_MODE_KEY] as string) : null,
+    appliedId: null,
+    createdEntry: false,
+    entryId: "",
+  };
+  config[DESKTOP_MODE_KEY] = "3p";
+  writeAtomic(join(appData, DESKTOP_CONFIG_FILE), JSON.stringify(config, null, 2) + "\n", 0o644);
+
+  const library = join(claudeDesktop3pData(), "configLibrary");
+  mkdirSync(library, { recursive: true, mode: 0o700 });
+  let meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> } = {};
+  try {
+    meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+  } catch {
+    /* a missing or unreadable meta starts a fresh library */
+  }
+  const entries = Array.isArray(meta.entries) ? meta.entries : [];
+  const existing = entries.find((entry) => entry && entry.name === DESKTOP_LIBRARY_ENTRY);
+  if (isConfigId(existing?.id)) {
+    previous.entryId = existing.id;
+    try {
+      previous.entryContent = readFileSync(join(library, `${existing.id}.json`), "utf8");
+    } catch {
+      /* a missing entry file is one we are about to create */
+    }
+  } else {
+    previous.entryId = randomUUID();
+    previous.createdEntry = true;
+    entries.push({ id: previous.entryId, name: DESKTOP_LIBRARY_ENTRY });
+  }
+  previous.appliedId = isConfigId(meta.appliedId) ? meta.appliedId : null;
+  meta.appliedId = previous.entryId;
+  meta.entries = entries;
+  writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+  writeAtomic(
+    join(library, `${previous.entryId}.json`),
+    JSON.stringify(
+      {
+        inferenceProvider: "gateway",
+        inferenceGatewayBaseUrl: anthropicBaseUrl,
+        inferenceGatewayApiKey: PROXY_PLACEHOLDER,
+        inferenceGatewayAuthScheme: "bearer",
+        inferenceCredentialKind: "static",
+        // The app's connection test needs a model without discovery, which the
+        // proxy does not serve; the fetched list is what Codex catalogs too.
+        inferenceModels: models.slice(0, 200).map((m) => ({ name: m.slug })),
+      },
+      null,
+      2,
+    ) + "\n",
+    0o600,
+  );
+  return previous;
+}
+
+/** Follows a gateway port move so desktop sessions point at the live proxy. */
+export function rewriteClaudeDesktopPort(anthropicBaseUrl: string): void {
+  const appData = claudeDesktopAppData();
+  if (!appData) return;
+  const library = join(claudeDesktop3pData(), "configLibrary");
+  let meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> };
+  try {
+    meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+  } catch {
+    return; /* the desktop app was never configured */
+  }
+  const ours = (meta.entries ?? []).find(
+    (entry) => entry && entry.name === DESKTOP_LIBRARY_ENTRY && isConfigId(entry.id),
+  );
+  if (!ours || meta.appliedId !== ours.id) return;
+  const path = join(library, `${ours.id}.json`);
+  let config: Record<string, unknown>;
+  try {
+    config = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return;
+  }
+  config.inferenceGatewayBaseUrl = anthropicBaseUrl;
+  writeAtomic(path, JSON.stringify(config, null, 2) + "\n", 0o600);
+}
+
+/** Restores the desktop app to the mode and library it had before enable. */
+export function restoreClaudeDesktopConfig(previous?: Desktop3pPrevious): void {
+  const appData = claudeDesktopAppData();
+  if (!appData || !previous) return;
+  try {
+    const config = readDesktopConfig(appData);
+    if (config[DESKTOP_MODE_KEY] === "3p") {
+      if (previous.mode === null) delete config[DESKTOP_MODE_KEY];
+      else config[DESKTOP_MODE_KEY] = previous.mode;
+      writeAtomic(
+        join(appData, DESKTOP_CONFIG_FILE),
+        JSON.stringify(config, null, 2) + "\n",
+        0o644,
+      );
+    }
+  } catch {
+    /* the app data changed shape; leave the mode key alone */
+  }
+  try {
+    const library = join(claudeDesktop3pData(), "configLibrary");
+    if (previous.createdEntry) {
+      rmSync(join(library, `${previous.entryId}.json`), { force: true });
+      let meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> } = {};
+      try {
+        meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+      } catch {
+        return;
+      }
+      meta.entries = (meta.entries ?? []).filter((entry) => entry && entry.id !== previous.entryId);
+      if (previous.appliedId && meta.entries.some((entry) => entry.id === previous.appliedId))
+        meta.appliedId = previous.appliedId;
+      else if (meta.appliedId === previous.entryId) delete meta.appliedId;
+      writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+    } else if (previous.entryContent !== undefined) {
+      // A pre-existing entry we overwrote gets its original content and the
+      // library's applied pointer back.
+      writeAtomic(join(library, `${previous.entryId}.json`), previous.entryContent, 0o600);
+      try {
+        const meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> } =
+          JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+        if (meta.appliedId === previous.entryId) {
+          if (previous.appliedId) meta.appliedId = previous.appliedId;
+          else delete meta.appliedId;
+          writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+        }
+      } catch {
+        /* a library we cannot rewrite back is left as the app's */
+      }
+    }
+  } catch {
+    /* the 3P profile is the app's to keep once it has run; ignore failures */
   }
 }
 
@@ -781,6 +1023,54 @@ export function upstream():
   return llmBase ? { llmBase, organizationId: signIn.organizationId } : undefined;
 }
 
+const ANTHROPIC_MODELS_PATH = "/anthropic/v1/models";
+
+/**
+ * The proxy's own Anthropic-style model list, from the catalog `enable` wrote
+ * for Codex. The gateway upstream does not serve Anthropic's model endpoint,
+ * and Claude Desktop's connection test needs it; without entries in the
+ * desktop config it probes the endpoint directly.
+ */
+function anthropicModelsResponse(url: URL): Response | undefined {
+  if (
+    url.pathname !== ANTHROPIC_MODELS_PATH &&
+    !url.pathname.startsWith(`${ANTHROPIC_MODELS_PATH}/`)
+  )
+    return undefined;
+  let models: Array<{ id: string; display_name: string; type: string }> = [];
+  try {
+    const catalog: { models?: Array<{ slug: string; display_name?: string }> } = JSON.parse(
+      readFileSync(codexCatalogPath(), "utf8"),
+    );
+    models = (catalog.models ?? []).map((m) => ({
+      id: m.slug,
+      display_name: m.display_name || m.slug,
+      type: "model",
+    }));
+  } catch {
+    return new Response("model catalog unavailable; run kimchi-bridge gateway enable\n", {
+      status: 503,
+      headers: { "content-type": "text/plain" },
+    });
+  }
+  const requested = decodeURIComponent(url.pathname.slice(ANTHROPIC_MODELS_PATH.length + 1));
+  if (requested) {
+    const model = models.find((m) => m.id === requested);
+    return model
+      ? Response.json(model)
+      : new Response(`model: \`${requested}\` not found\n`, {
+          status: 404,
+          headers: { "content-type": "text/plain" },
+        });
+  }
+  return Response.json({
+    data: models,
+    first_id: models[0]?.id,
+    has_more: false,
+    last_id: models[models.length - 1]?.id,
+  });
+}
+
 export async function proxyRequest(request: Request, llmBase: string): Promise<Response> {
   const url = new URL(request.url);
   const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
@@ -904,6 +1194,13 @@ export async function runDaemon(): Promise<void> {
                 status: 401,
                 headers: { "content-type": "text/plain" },
               });
+            const models = anthropicModelsResponse(url);
+            if (models) {
+              log(
+                `${request.method} ${url.pathname} -> ${models.status} (local catalog) (${Date.now() - started}ms)`,
+              );
+              return models;
+            }
             const response = await proxyRequest(request, current.llmBase);
             log(
               `${request.method} ${url.pathname} -> ${response.status} (${Date.now() - started}ms)`,
@@ -950,6 +1247,7 @@ export async function runDaemon(): Promise<void> {
     // The persisted port moved; repoint the CLI configs so new sessions follow.
     try {
       writeClaudeConfig(`http://127.0.0.1:${port}/anthropic`, PROXY_PLACEHOLDER);
+      rewriteClaudeDesktopPort(`http://127.0.0.1:${port}/anthropic`);
       log(`port moved to ${port}; CLI configs rewritten`);
     } catch (error) {
       log(`port moved to ${port} but CLI config rewrite failed: ${(error as Error).message}`);
@@ -1033,6 +1331,15 @@ export async function enable(
     PROXY_PLACEHOLDER,
     models,
   );
+  // Claude Desktop ignores the CLI settings, so it is switched into its
+  // third-party mode pointing at the same proxy; null when it is not installed
+  // or its config cannot be written, which never blocks the CLI wiring.
+  let desktopPrevious: Desktop3pPrevious | null = null;
+  try {
+    desktopPrevious = writeClaudeDesktopConfig(`http://127.0.0.1:${port}/anthropic`, models);
+  } catch {
+    desktopPrevious = null;
+  }
 
   const state: GatewayState = {
     ...previousState,
@@ -1043,8 +1350,17 @@ export async function enable(
     // original values, so disable still restores what they had before.
     previous:
       previousState.enabled && previousState.previous
-        ? previousState.previous
-        : { claude: claudePrevious, ...(codexPrevious ? { codexTopLevel: codexPrevious } : {}) },
+        ? {
+            ...previousState.previous,
+            // The desktop snapshot is recomputed above, so re-enable keeps
+            // what disable would need to restore now, not the first enable's.
+            ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),
+          }
+        : {
+            claude: claudePrevious,
+            ...(codexPrevious ? { codexTopLevel: codexPrevious } : {}),
+            ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),
+          },
   };
   saveGatewayState(state);
 
@@ -1061,6 +1377,10 @@ export async function enable(
   }
   onMessage?.(`Gateway enabled through the local proxy (127.0.0.1:${port}).`);
   onMessage?.("Claude Code and Codex now send their model requests through Kimchi.");
+  if (desktopPrevious)
+    onMessage?.(
+      "Claude Desktop is configured for the same proxy; restart the Claude app to switch it over.",
+    );
   onMessage?.("Revert anytime with: kimchi-bridge gateway disable");
   return { mode: "proxy", port, daemon, service };
 }
@@ -1069,6 +1389,10 @@ export async function disable(onMessage?: (message: string) => void): Promise<vo
   const state = loadGatewayState();
   restoreClaudeConfig(state.previous?.claude);
   restoreCodexConfig(state.previous?.codexTopLevel);
+  if (state.previous?.claudeDesktop) {
+    restoreClaudeDesktopConfig(state.previous.claudeDesktop);
+    onMessage?.("Restart the Claude app to leave third-party mode.");
+  }
   stop();
   saveGatewayState({ ...state, enabled: false, previous: undefined });
   onMessage?.("Gateway disabled. Claude Code and Codex use their own providers again.");
