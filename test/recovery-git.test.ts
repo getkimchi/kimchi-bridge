@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -595,6 +596,23 @@ for (const source of ["claude-code", "codex"]) {
     }
   });
 }
+
+test("a person's commit of native edits is matched in a repository with more than 512 refs", () => {
+  const { root, store, r, edit, commit } = gitFixture("claude-code");
+  // Company repositories have hundreds to thousands of branches and tags (getkimchi/kimchi about 1,000).
+  const head = git(root, "rev-parse", "HEAD");
+  execFileSync("git", ["-C", root, "update-ref", "--stdin"], {
+    input: Array.from({ length: 600 }, (_, i) => `create refs/tags/t${i} ${head}\n`).join(""),
+  });
+  edit("before", "after");
+  const sha = commit();
+  reconcileGit(r);
+  expect(latest(store, "link").link).toMatchObject({
+    toKind: "commit",
+    toId: sha,
+    reason: "file_revision",
+  });
+});
 
 test("Git composes native edits across turns and intervening reads", () => {
   const { root, path, store, r, edit, commit } = gitFixture("claude-code");

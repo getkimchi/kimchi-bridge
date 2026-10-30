@@ -74,7 +74,8 @@ interface ToolState {
   started: string;
   category: string;
   native: boolean;
-  refTips?: string[];
+  /** The blob of the ref tips a native edit saw; older versions saved the list itself. */
+  refTips?: string | string[];
   refsKnown: boolean;
 }
 const emptyFile = (): FileState => ({ hash: "", exists: false, complete: false });
@@ -597,7 +598,16 @@ export class Recorder {
       } catch {
         this.store.diagnostic("git_trace_unavailable");
       }
-    const refs = category === "read" ? null : refTips(s.CWD);
+    // Only native edits are matched to commits. A large repository has thousands of tips, so a blob holds each
+    // distinct set once.
+    let refs: string | undefined;
+    if (native && category !== "read")
+      try {
+        const tips = refTips(s.CWD);
+        if (tips) refs = this.store.putBlob(Buffer.from(tips.join("\n")));
+      } catch {
+        this.store.diagnostic("git_refs_unavailable");
+      }
     const state: ToolState = {
       files: {},
       expected: {},
@@ -607,8 +617,8 @@ export class Recorder {
       started: new Date().toISOString(),
       category,
       native,
-      refTips: refs ?? undefined,
-      refsKnown: refs !== null,
+      refTips: refs,
+      refsKnown: refs !== undefined,
     };
     const deadline = Date.now() + 800;
     let bytes = 0;
