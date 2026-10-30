@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { appendFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Recorder, repository, type Scope } from "../src/work/capture.ts";
 import {
   git,
@@ -14,7 +14,7 @@ import {
 } from "../src/work/git.ts";
 import { recordTag } from "../src/request-tags.ts";
 import { Store } from "../src/work/ledger.ts";
-import { parseJson, stableId } from "../src/work/protocol.ts";
+import { parseJson, stableId, str } from "../src/work/protocol.ts";
 import {
   claudeUsage,
   openAiUsage,
@@ -1009,5 +1009,83 @@ test("a Codex response ID too long for an event still names its billing tag", ()
     const [call] = usages(store);
     expect(call.usage).toMatchObject({ requestId: tag, observedRoute: "castai" });
     expect(call.usage.responseId).toBeUndefined();
+  });
+});
+
+test("a Codex approval review's calls count for the session turn that asked for it", () => {
+  const { base, root, store, r, scope } = fixture();
+  withBridgeHome(base, () => {
+    r.record({
+      stage: "UserPromptSubmit",
+      event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "implement" },
+    });
+    const work = r.workExact(scope);
+    recordTag("resp_review", tag);
+    recordTag("resp_late", "22222222-2222-4333-8444-555555555555");
+    // Codex keeps rollouts in sessions/YYYY/MM/DD, named for the second each thread began.
+    const sessions = join(base, "codex", "sessions"),
+      now = new Date(),
+      today = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map((n) =>
+        String(n).padStart(2, "0"),
+      );
+    const usage = {
+      input_tokens: 15006,
+      cached_input_tokens: 5248,
+      output_tokens: 10,
+      reasoning_output_tokens: 0,
+      total_tokens: 15016,
+    };
+    const rollout = (day: string[], name: string, meta: object, response: string) => {
+      const path = join(sessions, ...day, `rollout-${name}.jsonl`),
+        turn = `${str(meta, "id")}-turn`;
+      mkdirSync(dirname(path), { recursive: true });
+      const lines = [
+        { type: "session_meta", payload: meta },
+        { type: "turn_context", payload: { turn_id: turn, model: "m" } },
+        {
+          type: "token_usage_record",
+          payload: { turn_id: turn, root_turn_id: "turn", response_id: response, usage },
+        },
+        {
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: { last_token_usage: usage, total_token_usage: usage },
+          },
+        },
+      ];
+      writeFileSync(
+        path,
+        lines.map((line) => JSON.stringify({ timestamp: at, ...line })).join("\n") + "\n",
+      );
+      return path;
+    };
+    const day = ["2026", "10", "23"],
+      review = { session_id: "s", parent_thread_id: "s", thread_source: "guardian_review" };
+    const main = rollout(day, "2026-10-23T12-00-00-s", { id: "s", session_id: "s" }, "resp_main");
+    rollout(day, "2026-10-23T12-00-05-review", { id: "review", ...review }, "resp_review");
+    const other = rollout(
+      day,
+      "2026-10-23T12-00-06-other",
+      { id: "other", session_id: "other" },
+      "resp_other",
+    );
+    // A review after midnight lands in the next day's folder.
+    rollout(today, `${today.join("-")}T00-00-01-late`, { id: "late", ...review }, "resp_late");
+    // The bridge learns of the session after its review began; it still finds the review.
+    registerTranscript(r, { ...scope, Turn: "" }, main, "unknown", "unknown");
+    recoverContext(r);
+    recoverContext(r);
+    const calls = usages(store);
+    // Each review's totals equal the session's here; each still counts once, as a call of its own.
+    expect(new Set(calls.map((e) => e.entityId)).size).toBe(3);
+    expect(
+      calls.map((e) => [e.sessionId, e.turnId, e.workId, e.usage.requestId ?? ""]).sort(),
+    ).toEqual([
+      ["s", "turn", work, ""],
+      ["s", "turn", work, tag],
+      ["s", "turn", work, "22222222-2222-4333-8444-555555555555"],
+    ]);
+    expect(store.meta(`transcript:codex:${other}`)).toBe("");
   });
 });
