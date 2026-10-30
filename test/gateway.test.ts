@@ -232,7 +232,9 @@ test("enable in proxy mode writes proxy URLs and never a real credential into th
   expect(claude.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8766/anthropic");
   expect(claude.env.ANTHROPIC_API_KEY).toBe("");
   expect(claude.env.ANTHROPIC_AUTH_TOKEN).toBe("kimchi-gateway");
-  expect(claude.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBe("1");
+  // The beta kill-switch is deliberately not written: the telemetry collector
+  // that feeds PR-cost usage attribution is beta-gated.
+  expect(claude.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBeUndefined();
   const codex = readFileSync(codexConfigPath(), "utf8");
   expect(codex).toContain('base_url = "http://127.0.0.1:8766/openai/v1"');
   expect(codex).not.toContain("id-token");

@@ -837,12 +837,18 @@ test("an HTTPS remote keeps its port; an SSH remote's port is not the web host's
 
 function withBridgeHome<T>(base: string, run: () => T): T {
   const previous = process.env.KIMCHI_BRIDGE_HOME;
+  const previousConfig = process.env.KIMCHI_BRIDGE_CONFIG_HOME;
   process.env.KIMCHI_BRIDGE_HOME = join(base, "bridge");
+  // The desktop transcript discovery reads the config home; keep the real
+  // Claude Desktop profile out of these tests' stores.
+  process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(base, "config-home");
   try {
     return run();
   } finally {
     if (previous === undefined) delete process.env.KIMCHI_BRIDGE_HOME;
     else process.env.KIMCHI_BRIDGE_HOME = previous;
+    if (previousConfig === undefined) delete process.env.KIMCHI_BRIDGE_CONFIG_HOME;
+    else process.env.KIMCHI_BRIDGE_CONFIG_HOME = previousConfig;
   }
 }
 function usages(store: Store) {
