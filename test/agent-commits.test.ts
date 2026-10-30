@@ -342,7 +342,49 @@ test("a call's commit counts even after commits in a repository its command alre
   rmSync(scratch.root, { recursive: true, force: true });
   writeFileSync(join(g.root, "f"), "2\n");
   g.traced("", "commit", "-q", "-am", "two");
+  // DEBUG (temporary): keep the trace the hook deletes, and print it if no commit is recorded.
+  const keep = temp();
+  for (const name of ["events", "refs"])
+    try {
+      writeFileSync(join(keep, name), readFileSync(join(g.trace, name)));
+    } catch {}
   hook("PostToolUse", shell("toolu_1"));
+  if (!latest(store, "commit")) {
+    const wanted = ['"start"', '"exit"', '"cmd_name"', '"def_repo"', '"def_param"'];
+    console.error(
+      "DEBUG-FLAKE parsed",
+      JSON.stringify(tracedCommits(join(keep, "events"), join(keep, "refs"))),
+    );
+    console.error(
+      "DEBUG-FLAKE diagnostics",
+      JSON.stringify(store.db.query("SELECT * FROM diagnostics").all()),
+    );
+    console.error(
+      "DEBUG-FLAKE tool_state",
+      JSON.stringify(
+        store.db
+          .query("SELECT call_id, body FROM tool_state")
+          .all()
+          .map((r: any) => [r.call_id, String(r.body).slice(0, 300)]),
+      ),
+    );
+    console.error(
+      "DEBUG-FLAKE events\n" +
+        readFileSync(join(keep, "events"), "utf8")
+          .split("\n")
+          .filter((l) => wanted.some((w) => l.includes(`"event":${w}`)))
+          .join("\n"),
+    );
+    console.error(
+      "DEBUG-FLAKE refs\n" +
+        readFileSync(join(keep, "refs"), "utf8")
+          .split("\n")
+          .filter((l) =>
+            ["transaction", "finish", "HEAD ", "refs/heads"].some((w) => l.includes(w)),
+          )
+          .join("\n"),
+    );
+  }
   expect(latest(store, "commit").commit.id).toBe(g.plain("rev-parse", "HEAD"));
 });
 
