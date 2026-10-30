@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { delimiter, dirname, join, relative } from "node:path";
 import {
   canonicalTime,
   gitId,
@@ -357,8 +357,15 @@ export function scmEnvironment(repo: Repository): NodeJS.ProcessEnv {
         break;
       }
   }
+  // Claude Desktop starts a session without the login shell's PATH when reading it times out, and Homebrew puts
+  // gh and glab outside the system PATH.
+  const path = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  if (process.platform === "darwin")
+    for (const dir of ["/opt/homebrew/bin", "/usr/local/bin"])
+      if (!path.includes(dir)) path.push(dir);
   return {
     ...env,
+    PATH: path.join(delimiter),
     GH_PROMPT_DISABLED: "1",
     GH_NO_UPDATE_NOTIFIER: "1",
     GH_TELEMETRY: "false",

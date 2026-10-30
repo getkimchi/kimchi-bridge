@@ -367,6 +367,22 @@ test("SCM IDs remain exact, target repository owns fork PRs and credentials stay
   expect(issueKeys("A-1", "title")).toEqual([{ key: "A-1", source: "title" }]);
 });
 
+test.if(process.platform === "darwin")(
+  "gh and glab are found where Homebrew installs them when a session starts without the shell's PATH",
+  () => {
+    const repo = { provider: "github", host: "github.com", name: "testOrg/widgets", id: "name:x" };
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = "/usr/bin:/bin";
+      expect(scmEnvironment(repo).PATH).toBe("/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin");
+      process.env.PATH = "/opt/homebrew/bin:/usr/bin";
+      expect(scmEnvironment(repo).PATH).toBe("/opt/homebrew/bin:/usr/bin:/usr/local/bin");
+    } finally {
+      process.env.PATH = previous;
+    }
+  },
+);
+
 test("native int64 usage readers preserve decimal identity before bounded event validation", () => {
   const raw = parseJson(
     '{"input_tokens":9007199254740993,"output_tokens":1e3,"cache_read_input_tokens":-0}',
