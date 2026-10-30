@@ -803,6 +803,109 @@ test("PR refresh revises lifecycle while retaining one exact commit membership l
   ).toBe(1);
 });
 
+// Claude Desktop runs a session in a worktree under <repo>/.claude/worktrees and removes it when the session is
+// archived, often before the session's PR is opened.
+test("a commit still finds its PR after its session's worktree is removed", () => {
+  const { base, root, store, r, scope } = fixture();
+  writeFileSync(
+    join(root, "gh"),
+    '#!/bin/sh\ncase "$*" in\n *commits/*) /bin/cat "$SCM_FIXTURE_ROOT/pulls.json" ;;\n *) /bin/cat "$SCM_FIXTURE_ROOT/repo.json" ;;\nesac\n',
+    { mode: 0o700 },
+  );
+  const priorPath = process.env.PATH,
+    priorFixture = process.env.SCM_FIXTURE_ROOT;
+  process.env.PATH = `${root}:${priorPath}`;
+  process.env.SCM_FIXTURE_ROOT = root;
+  cleanups.push(() => {
+    process.env.PATH = priorPath;
+    if (priorFixture === undefined) delete process.env.SCM_FIXTURE_ROOT;
+    else process.env.SCM_FIXTURE_ROOT = priorFixture;
+  });
+  const repo = {
+    id: 55,
+    full_name: "testOrg/widgets",
+    html_url: "https://github.com/testOrg/widgets",
+  };
+  writeFileSync(join(root, "repo.json"), JSON.stringify(repo));
+  writeFileSync(
+    join(root, "pulls.json"),
+    JSON.stringify([
+      {
+        id: 42,
+        number: 7,
+        html_url: "https://github.com/testOrg/widgets/pull/7",
+        state: "open",
+        title: "Widgets",
+        base: { repo },
+      },
+    ]),
+  );
+  const worktree = join(base, "removed-worktree"),
+    sha = "a".repeat(40);
+  saveMeta(r, `tracked-commit:${stableId(scope.Repo, sha)}`, {
+    Scope: {
+      ...scope,
+      CWD: worktree,
+      Root: worktree,
+      Repository: { provider: "github", host: "github.com", id: "name:x", name: "testOrg/widgets" },
+    },
+    Source: "claude-code",
+    SHA: sha,
+    CreatedAt: new Date().toISOString(),
+  });
+  reconcileGit(new Recorder(store, "collector", r.device));
+  expect(latest(store, "pull_request").pullRequest).toMatchObject({ number: 7, state: "open" });
+  expect(latest(store, "link").link).toMatchObject({
+    fromId: sha,
+    reason: "provider_commit_membership",
+  });
+});
+
+test("native edits in a removed worktree still match the commit made from them", () => {
+  const { base, store, r } = fixture("claude-code");
+  const main = join(base, "repo"),
+    worktree = join(main, ".claude", "worktrees", "w"),
+    path = join(worktree, "file.txt");
+  mkdirSync(main);
+  for (const args of [
+    ["init", "--initial-branch=main"],
+    ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"],
+    ["config", "commit.gpgsign", "false"],
+    ["config", "core.hooksPath", "/dev/null"],
+  ])
+    git(main, ...args);
+  writeFileSync(join(main, "file.txt"), "before\n");
+  git(main, "add", ".");
+  git(main, "commit", "-m", "baseline");
+  git(main, "worktree", "add", "-b", "w", worktree);
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: worktree, prompt: "edit" },
+  });
+  const e = {
+    session_id: "s",
+    turn_id: "turn",
+    cwd: worktree,
+    tool_use_id: "call",
+    tool_name: "Edit",
+    tool_input: { file_path: path, old_string: "before", new_string: "after" },
+  };
+  r.record({ stage: "PreToolUse", event: e });
+  writeFileSync(path, "after\n");
+  r.record({ stage: "PostToolUse", event: e });
+  // A person commits the edit and the session is archived before the next pass.
+  git(worktree, "commit", "-am", "edit");
+  const sha = git(worktree, "rev-parse", "HEAD");
+  git(main, "worktree", "remove", worktree);
+  reconcileGit(r);
+  expect(latest(store, "link").link).toMatchObject({
+    toKind: "commit",
+    toId: sha,
+    reason: "file_revision",
+  });
+});
+
 test("route matching respects DNS boundaries", () => {
   const before = process.env.ANTHROPIC_BASE_URL;
   try {
