@@ -966,6 +966,51 @@ test("native edits in a removed worktree still match the commit made from them",
   });
 });
 
+test("native edits in a removed worktree outside its repository still match the commit made from them", () => {
+  const { base, store, r } = fixture("claude-code");
+  const main = join(base, "repo"),
+    worktree = join(base, "repo-feature"),
+    path = join(worktree, "file.txt");
+  mkdirSync(main);
+  for (const args of [
+    ["init", "--initial-branch=main"],
+    ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"],
+    ["config", "commit.gpgsign", "false"],
+    ["config", "core.hooksPath", "/dev/null"],
+  ])
+    git(main, ...args);
+  writeFileSync(join(main, "file.txt"), "before\n");
+  git(main, "add", ".");
+  git(main, "commit", "-m", "baseline");
+  // git worktree add ../repo-feature: no folder above the worktree holds the repository.
+  git(main, "worktree", "add", "-b", "feature", worktree);
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: worktree, prompt: "edit" },
+  });
+  const e = {
+    session_id: "s",
+    turn_id: "turn",
+    cwd: worktree,
+    tool_use_id: "call",
+    tool_name: "Edit",
+    tool_input: { file_path: path, old_string: "before", new_string: "after" },
+  };
+  r.record({ stage: "PreToolUse", event: e });
+  writeFileSync(path, "after\n");
+  r.record({ stage: "PostToolUse", event: e });
+  git(worktree, "commit", "-am", "edit");
+  const sha = git(worktree, "rev-parse", "HEAD");
+  git(main, "worktree", "remove", worktree);
+  reconcileGit(r);
+  expect(latest(store, "link").link).toMatchObject({
+    toKind: "commit",
+    toId: sha,
+    reason: "file_revision",
+  });
+});
+
 test("route matching respects DNS boundaries", () => {
   const before = process.env.ANTHROPIC_BASE_URL;
   try {

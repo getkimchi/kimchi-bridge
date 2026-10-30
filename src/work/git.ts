@@ -199,11 +199,14 @@ function treeObject(
 }
 /**
  * Where Git runs for a scope: its folder, or once that is gone, the common dir of the repository that held it.
- * Claude Desktop removes a session's worktree (<repo>/.claude/worktrees/<name>) when the session is archived.
+ * Claude Desktop removes a session's worktree (<repo>/.claude/worktrees/<name>) when the session is archived; a
+ * worktree in another folder (git worktree add ../name) is found through the common dir captured with it.
  */
 function gitDir(s: Scope, signal?: AbortSignal): string {
   const root = rootOf(s);
   if (existsSync(root)) return root;
+  if (s.Common && existsSync(s.Common) && stableId("git-common-dir", s.Common) === s.Repo)
+    return s.Common;
   let dir = dirname(root);
   while (!existsSync(dir)) dir = dirname(dir);
   const common = gitContext(signal, dir, "rev-parse", "--path-format=absolute", "--git-common-dir");

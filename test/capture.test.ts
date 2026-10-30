@@ -97,7 +97,12 @@ test("repository discovery preserves native Git roots and common identities for 
   for (const cwd of [root, subdir, linked, linkedSubdir, unborn, trailing]) {
     const expectedRoot = git(cwd, "rev-parse", "--show-toplevel"),
       common = git(expectedRoot, "rev-parse", "--path-format=absolute", "--git-common-dir");
-    expect(repository(cwd)).toEqual([expectedRoot, stableId("git-common-dir", common), undefined]);
+    expect(repository(cwd)).toEqual([
+      expectedRoot,
+      stableId("git-common-dir", common),
+      undefined,
+      common,
+    ]);
   }
   expect(repository(linked)[1]).toBe(repository(root)[1]);
   const nonGit = join(base, "not a repository"),

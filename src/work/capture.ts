@@ -60,6 +60,8 @@ export interface Scope {
   Root: string;
   Repo: string;
   Repository?: Repository;
+  // The repository's common Git dir: a worktree in another folder has no repository among its parents once removed.
+  Common?: string;
 }
 interface FileState {
   hash: string;
@@ -104,7 +106,7 @@ function sshHost(alias: string): string {
   return knownHost(host) ? host : alias;
 }
 
-export function repository(cwd: string): [string, string, Repository | undefined] {
+export function repository(cwd: string): [string, string, Repository | undefined, string?] {
   try {
     cwd = realpathSync(cwd);
   } catch {
@@ -156,18 +158,18 @@ export function repository(cwd: string): [string, string, Repository | undefined
     }
     const url = new URL(remote);
     if (url.protocol !== "https:" && !(url.protocol === "ssh:" && url.username === "git"))
-      return [root, local, undefined];
+      return [root, local, undefined, common];
     if (url.password || url.search || url.hash || (url.protocol === "https:" && url.username))
-      return [root, local, undefined];
+      return [root, local, undefined, common];
     // An HTTPS remote's port belongs to the web host; an SSH remote's port does not.
     host = url.protocol === "https:" ? url.host : sshHost(url.hostname);
     name = url.pathname.slice(1);
     if (name.endsWith(".git")) name = name.slice(0, -4);
   } catch {
-    return [root, local, undefined];
+    return [root, local, undefined, common];
   }
   if (!host || !name || ["\r", "\n", "@", "?", "#"].some((char) => (host + name).includes(char)))
-    return [root, local, undefined];
+    return [root, local, undefined, common];
   return [
     root,
     local,
@@ -180,6 +182,7 @@ export function repository(cwd: string): [string, string, Repository | undefined
       id: `name:${digest(name.toLowerCase())}`,
       name,
     },
+    common,
   ];
 }
 
@@ -489,7 +492,7 @@ export class Recorder {
     } catch {
       /* Preserve native cwd. */
     }
-    [s.Root, s.Repo, s.Repository] = repository(s.CWD);
+    [s.Root, s.Repo, s.Repository, s.Common] = repository(s.CWD);
     if (n.version) saveSourceVersion(this, s.Session, n.version);
     if (str(e, "transcript_path") && this.source === "codex")
       saveTranscriptVersion(this, s.Session, str(e, "transcript_path"));
@@ -856,14 +859,14 @@ export class Recorder {
       // As in Kimchi, a commit in a repository already removed (a test's temporary one) is skipped; it must
       // not stop the commits after it.
       if (!existsSync(c.worktree)) continue;
-      const [root, repo, identity] = repository(c.worktree);
+      const [root, repo, identity, common] = repository(c.worktree);
       const key = `agent-commit:${stableId(repo, c.sha)}`;
       if (this.store.meta(key)) continue;
       // ponytail: a rebased or picked copy follows any commit this ledger traced; Kimchi requires
       // the original to belong to the same work.
       if (c.rewrittenFrom && !this.store.meta(`agent-commit:${stableId(repo, c.rewrittenFrom)}`))
         continue;
-      const scope = { ...s, Root: root, Repo: repo, Repository: identity };
+      const scope = { ...s, Root: root, Repo: repo, Repository: identity, Common: common };
       const parents = commitParents(root, c.sha);
       recordCommit(this, scope, owner, this.source, c.sha, parents, "observed", "agent_commit");
       this.store.setMeta(key, "1");
