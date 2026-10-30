@@ -102,15 +102,15 @@ function localTimeInProcess(time: string, p: GitProcess): number | undefined {
 const within = (p: GitProcess, ancestor: GitProcess) =>
   p === ancestor || p.sid.startsWith(`${ancestor.sid}/`);
 
-// Nested Git processes (hooks, sequencer commits) own the moment; unrelated concurrent ones make it
-// ambiguous. Housekeeping controllers never move HEAD.
-function ownerAt(time: string, running: GitProcess[]): GitProcess | undefined {
-  const candidates = running.filter(
-    (p) =>
-      p.command !== "maintenance" &&
-      p.command !== "gc" &&
-      localTimeInProcess(time, p) !== undefined,
-  );
+// Of the processes running at a ref move whose command could make it, nested ones (hooks, sequencer
+// commits) own the moment; unrelated ones make it ambiguous. Codex sessions share one trace, so
+// another session's status, fetch or push is often running too; it cannot move this HEAD.
+function ownerAt(
+  time: string,
+  running: GitProcess[],
+  could: (p: GitProcess) => boolean,
+): GitProcess | undefined {
+  const candidates = running.filter((p) => could(p) && localTimeInProcess(time, p) !== undefined);
   return candidates.find((p) => candidates.every((other) => within(p, other)));
 }
 
@@ -184,23 +184,27 @@ export function tracedCommits(trace: string, refs: string): TracedCommit[] {
     if (content === "transaction {") pending = undefined;
     const update = refUpdate(content);
     if (update && (update.ref === "CHERRY_PICK_HEAD" || update.ref === "REBASE_HEAD")) {
-      const owner = ownerAt(time, running);
+      const owner = ownerAt(time, running, (p) =>
+        ["rebase", "cherry-pick"].includes(p.command ?? ""),
+      );
       replayed =
         owner && [...update.sha].some((c) => c !== "0") ? { sha: update.sha, owner } : undefined;
     }
     if (update?.ref === "HEAD") {
-      const owner = ownerAt(time, running);
-      const commit = headCommit(
-        update.sha,
-        update.message,
-        owner,
-        replayed && owner && within(owner, replayed.owner) ? replayed.sha : undefined,
-      );
+      const commitBy = (p: GitProcess | undefined) =>
+        headCommit(
+          update.sha,
+          update.message,
+          p,
+          replayed && p && within(p, replayed.owner) ? replayed.sha : undefined,
+        );
+      const owner = ownerAt(time, running, (p) => commitBy(p) !== undefined);
+      const commit = commitBy(owner);
       pending = commit && owner ? { ...commit, owner } : undefined;
       if (commit?.rewrittenFrom) replayed = undefined;
     }
     if (!content.startsWith("finish: ")) continue;
-    if (pending && content === "finish: 0" && ownerAt(time, running) === pending.owner)
+    if (pending && content === "finish: 0" && localTimeInProcess(time, pending.owner) !== undefined)
       commits.push({
         sha: pending.sha,
         worktree: pending.owner.worktree!,
