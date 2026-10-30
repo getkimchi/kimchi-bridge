@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { lstatSync, readdirSync, unlinkSync } from "node:fs";
-import { join, relative } from "node:path";
+import { existsSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, dirname, join, relative } from "node:path";
 import {
   canonicalTime,
   gitId,
@@ -194,15 +195,29 @@ function treeObject(
     throw new Error("not an ordinary file blob");
   return parts[2]!;
 }
+/**
+ * Where Git runs for a scope: its folder, or once that is gone, the common dir of the repository that held it.
+ * Claude Desktop removes a session's worktree (<repo>/.claude/worktrees/<name>) when the session is archived.
+ */
+function gitDir(s: Scope, signal?: AbortSignal): string {
+  const root = rootOf(s);
+  if (existsSync(root)) return root;
+  let dir = dirname(root);
+  while (!existsSync(dir)) dir = dirname(dir);
+  const common = gitContext(signal, dir, "rev-parse", "--path-format=absolute", "--git-common-dir");
+  if (stableId("git-common-dir", common) !== s.Repo) throw new Error("captured repository is gone");
+  return common;
+}
 function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortSignal) {
   const root = rootOf(c.Scope),
-    format = gitContext(signal, root, "rev-parse", "--show-object-format");
+    dir = gitDir(c.Scope, signal),
+    format = gitContext(signal, dir, "rev-parse", "--show-object-format");
   const before = fileObject(r, c.Before, format),
     after = fileObject(r, c.After, format);
   if (!within(root, c.Path)) throw new Error("file is outside its captured repository");
   const path = relative(root, c.Path);
   let commits = fields(
-    gitContext(signal, root, "rev-list", "--all", "--max-count=129", "--not", ...(c.Refs || [])),
+    gitContext(signal, dir, "rev-list", "--all", "--max-count=129", "--not", ...(c.Refs || [])),
   );
   if (commits.length > 128) {
     r.store.diagnostic("git_history_bound");
@@ -251,19 +266,19 @@ function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortS
   for (const sha of commits) {
     checkSignal(signal);
     if (!gitId(sha)) throw new Error("invalid commit identity");
-    if (treeObject(signal, root, sha, path) !== after) continue;
-    const parents = fields(gitContext(signal, root, "show", "--format=%P", "--no-patch", sha));
+    if (treeObject(signal, dir, sha, path) !== after) continue;
+    const parents = fields(gitContext(signal, dir, "show", "--format=%P", "--no-patch", sha));
     let matched = parents.length === 0 && befores.has(""),
       direct = parents.length === 0 && before === "";
     for (const parent of parents) {
-      const object = treeObject(signal, root, parent, path);
+      const object = treeObject(signal, dir, parent, path);
       if (befores.has(object)) matched = true;
       if (object === before) direct = true;
     }
     if (!matched) continue;
     if (
       !direct &&
-      gitContext(signal, root, "rev-list", "--max-count=1", sha, "--not", ...refs) !== sha
+      gitContext(signal, dir, "rev-list", "--max-count=1", sha, "--not", ...refs) !== sha
     )
       continue;
     // A traced agent commit already has stronger evidence; recording it again would flip revisions.
@@ -348,8 +363,15 @@ export function scmEnvironment(repo: Repository): NodeJS.ProcessEnv {
         break;
       }
   }
+  // Claude Desktop starts a session without the login shell's PATH when reading it times out, and Homebrew puts
+  // gh and glab outside the system PATH.
+  const path = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  if (process.platform === "darwin")
+    for (const dir of ["/opt/homebrew/bin", "/usr/local/bin"])
+      if (!path.includes(dir)) path.push(dir);
   return {
     ...env,
+    PATH: path.join(delimiter),
     GH_PROMPT_DISABLED: "1",
     GH_NO_UPDATE_NOTIFIER: "1",
     GH_TELEMETRY: "false",
@@ -383,7 +405,8 @@ function scmApi(
     repo.provider === "github" ? "gh" : "glab",
     ["api", "--hostname", repo.host, "--method", "GET", path],
     {
-      cwd: root,
+      // A lookup needs no checkout, and the session's folder may be gone (see gitDir).
+      cwd: existsSync(root) ? root : homedir(),
       env: scmEnvironment(repo),
       timeout: remainingTime(signal, 5000),
       maxBuffer: 4 * 1024 * 1024,
