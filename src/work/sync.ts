@@ -131,21 +131,29 @@ export async function sync(k: SignIn, signal?: AbortSignal): Promise<void> {
       } catch {
         s.diagnostic("inactive_account_recovery_failed");
       }
+      // False when an upload failed: the batch then waits for the next pass.
+      const deliver = async () => {
+        for (let i = 0; i < 10 && !signal?.aborted; i++) {
+          checkSignal(signal);
+          try {
+            if (!(await flush(s, c, k, signal))) break;
+          } catch {
+            s.diagnostic("delivery_pending");
+            return false;
+          }
+        }
+        return true;
+      };
+      // Upload what is captured before the Git pass: its PR lookups can use up the whole deadline
+      // with many repositories, and then nothing was ever uploaded. Its links go out after it or next pass.
+      const delivered = await deliver();
       checkSignal(signal);
       try {
         new Recorder(s, "collector", device).reconcileGit(signal);
       } catch {
         s.diagnostic("git_reconciliation_incomplete");
       }
-      for (let i = 0; i < 10 && !signal?.aborted; i++) {
-        checkSignal(signal);
-        try {
-          if (!(await flush(s, c, k, signal))) break;
-        } catch {
-          s.diagnostic("delivery_pending");
-          break;
-        }
-      }
+      if (delivered) await deliver();
       if (!signal?.aborted) {
         checkSignal(signal);
         try {
