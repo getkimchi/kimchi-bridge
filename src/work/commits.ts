@@ -243,12 +243,30 @@ export function claudeTraceEnv(session: string): string {
 
 const BEGIN = "# kimchi-bridge: begin (traces agent commits for PR attribution)";
 const END = "# kimchi-bridge: end";
+const traceKeys = Object.keys(traceVariables("", ""));
+// Codex appends its own tables, such as folder and hook trust, at the end of the file, so they land
+// inside the markers when the block is last. Only the bridge's own lines go; without hook trust,
+// Codex runs none of the bridge's hooks.
 function withoutBlock(text: string): string {
   const start = text.indexOf(BEGIN),
     end = start < 0 ? -1 : text.indexOf(END, start);
   if (end < 0) return text;
+  const inside = text
+    .slice(start + BEGIN.length, end)
+    .split("\n")
+    .filter((line) => !traceKeys.some((key) => line.startsWith(`${key} = `)));
+  // The table's header stays while settings of someone else's remain under it.
+  const header = inside.indexOf("[shell_environment_policy.set]");
+  if (header >= 0) {
+    let next = header + 1;
+    while (next < inside.length && !inside[next]!.startsWith("[")) next++;
+    if (inside.slice(header + 1, next).every((line) => !line.trim()))
+      inside.splice(header, next - header);
+  }
   const before = text.slice(0, start).trimEnd(),
-    after = text.slice(end + END.length).trimStart();
+    after = [inside.join("\n").trim(), text.slice(end + END.length).trim()]
+      .filter(Boolean)
+      .join("\n\n");
   return [before, after].filter(Boolean).join("\n\n") + (before || after ? "\n" : "");
 }
 
