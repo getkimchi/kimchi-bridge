@@ -97,6 +97,7 @@ export function refTips(root: string): string[] | null {
 export function reconcileGit(r: Recorder, signal?: AbortSignal) {
   signal = withDeadline(8000, signal);
   checkSignal(signal);
+  seedOpen(r);
   // Kimchi looks up due commits at every agent end. Due lookups go first and skip the gate, which only
   // paces native-edit matching: Codex syncs only on hooks, and its Stop can follow the prompt's sync
   // by a few seconds.
@@ -149,7 +150,7 @@ export function reconcileGit(r: Recorder, signal?: AbortSignal) {
           saveMeta(r, item.key, {
             ...c,
             Found: true,
-            Merged: states.every((state) => state === "merged"),
+            Merged: states.every((state) => state === "merged") && !open.length,
             Open: open,
           });
       } catch (e) {
@@ -544,6 +545,42 @@ export function pullRequest(source: Repository, v: JsonObject): [Repository, Pul
   }
   return [repo, p];
 }
+/** Once: commits tracked before open PRs were kept get those their own links reached and the ledger last saw open. */
+function seedOpen(r: Recorder) {
+  if (r.store.meta("open-prs-seeded")) return;
+  const links = new Map<string, { repo: string; pr: string }[]>();
+  for (const l of r.store.db
+    .query(
+      `SELECT json_extract(CAST(body AS TEXT),'$.link.fromId') AS sha,json_extract(CAST(body AS TEXT),'$.sessionId') AS session,
+              json_extract(CAST(body AS TEXT),'$.repository.id') AS repo,json_extract(CAST(body AS TEXT),'$.link.toId') AS pr
+         FROM events WHERE kind='link' AND json_extract(CAST(body AS TEXT),'$.link.reason')='provider_commit_membership'`,
+    )
+    .all() as { sha: string; session: string; repo: string; pr: string }[]) {
+    const key = `${l.sha} ${l.session}`;
+    links.set(key, [...(links.get(key) ?? []), l]);
+  }
+  for (const item of r.store.db
+    .query(
+      "SELECT key,value FROM meta WHERE key LIKE 'tracked-commit:%' AND json_extract(value,'$.Open') IS NULL",
+    )
+    .all() as { key: string; value: string }[]) {
+    const c: TrackedCommit = JSON.parse(item.value),
+      open = new Set<string>();
+    for (const { repo, pr } of links.get(`${c.SHA} ${c.Scope.Session}`) ?? []) {
+      const e = r.store.latest(
+        r.event(c.Scope, `pull-request:${repo}:${pr}`, "", c.Source).entityId,
+      );
+      if (e?.pullRequest?.state === "open" && e.repository)
+        open.add(
+          e.repository.provider === "gitlab"
+            ? `projects/${e.repository.id}/merge_requests/${e.pullRequest.number}`
+            : `repos/${e.repository.name}/pulls/${e.pullRequest.number}`,
+        );
+    }
+    saveMeta(r, item.key, { ...c, Open: [...open] });
+  }
+  r.store.setMeta("open-prs-seeded", "1");
+}
 /** The states of the PRs or MRs that contain the commit, and the API paths of the open ones. */
 function discoverPullRequests(
   r: Recorder,
@@ -623,7 +660,15 @@ function discoverPullRequests(
       // GitHub lists only open PRs for a commit outside the default branch, so, as Kimchi does, a PR the
       // commit no longer lists is looked up by number until it is seen closed or merged.
       for (const known of c.Open ?? [])
-        if (!listed.has(known)) report(scmApi(c.Scope.CWD, repo, known, signal, answers));
+        if (!listed.has(known))
+          try {
+            report(scmApi(c.Scope.CWD, repo, known, signal, answers));
+          } catch (e) {
+            if (signal?.aborted) throw e;
+            // Asked again on the commit's schedule; one PR that cannot be read must not hold up the others.
+            r.store.diagnostic("scm_lookup_incomplete");
+            open.add(known);
+          }
       return [states, [...open]];
     }
   }

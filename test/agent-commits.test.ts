@@ -541,6 +541,46 @@ test("a PR closed and re-created from its branch is seen closed, and the new PR 
   expect(pass()).toEqual([identity, commit(sha)]);
 });
 
+test("a commit tracked before open PRs were kept finds them in its own links", () => {
+  const { store, identity, reply, commit, byNumber, pull, track, pass } = scm("github");
+  const sha = "c".repeat(40);
+  track(sha);
+  reply(commit(sha), [pull(45)]);
+  pass();
+  // As an earlier version saved it: the PR was reported open, but the commit kept no list.
+  store.db
+    .query("UPDATE meta SET value=json_remove(value,'$.Open') WHERE key LIKE 'tracked-commit:%'")
+    .run();
+  store.db.query("DELETE FROM meta WHERE key='open-prs-seeded'").run();
+  reply(commit(sha), [pull(46)]);
+  reply(byNumber(45), pull(45, "closed"));
+  expect(pass()).toEqual([identity, commit(sha), byNumber(45)]);
+  const states = (
+    store.db.query("SELECT body FROM events WHERE kind='pull_request'").all() as any[]
+  )
+    .map((row) => JSON.parse(Buffer.from(row.body).toString()).pullRequest)
+    .map((p) => `${p.number} ${p.state}`);
+  expect(states).toEqual(["45 open", "46 open", "45 closed"]);
+});
+
+test("a PR that cannot be read by number does not hold up the commit's other PRs", () => {
+  const { store, identity, reply, commit, byNumber, pull, track, pass } = scm("github");
+  const sha = "d".repeat(40);
+  track(sha);
+  reply(commit(sha), [pull(45)]);
+  pass();
+  // #45 can no longer be read (deleted, say); the commit now lists the merged #46.
+  reply(commit(sha), [pull(46, "merged")]);
+  expect(pass()).toEqual([identity, commit(sha), byNumber(45)]);
+  const saved = () => JSON.parse(store.meta(`tracked-commit:${stableId("local:x", sha)}`));
+  // Not merged while #45 is unknown, so the commit asks again on its schedule.
+  expect(saved()).toMatchObject({ Found: true, Merged: false, Open: [byNumber(45)] });
+  expect(latest(store, "pull_request").pullRequest).toMatchObject({ number: 46, state: "merged" });
+  reply(byNumber(45), pull(45, "closed"));
+  expect(pass()).toEqual([identity, commit(sha), byNumber(45)]);
+  expect(saved()).toMatchObject({ Merged: false, Open: [] });
+});
+
 for (const provider of ["github", "gitlab"] as const)
   test(`a ${provider} merge is learned by number when the commit no longer lists it; lookups then stop`, () => {
     const { store, identity, reply, commit, byNumber, pull, track, pass } = scm(provider);
