@@ -13,7 +13,13 @@ import { parseJson, type Batch } from "../src/work/protocol.ts";
 import { sync } from "../src/work/sync.ts";
 
 let root: string;
-const variables = ["KIMCHI_BRIDGE_HOME", "KIMCHI_API_KEY", "HOME", "KIMCHI_REMOTE_ENDPOINT", "KIMCHI_BRIDGE_CONFIG_HOME"];
+const variables = [
+  "KIMCHI_BRIDGE_HOME",
+  "KIMCHI_API_KEY",
+  "HOME",
+  "KIMCHI_REMOTE_ENDPOINT",
+  "KIMCHI_BRIDGE_CONFIG_HOME",
+];
 let previous: (string | undefined)[] = [];
 const cleanups: (() => void)[] = [];
 beforeEach(() => {

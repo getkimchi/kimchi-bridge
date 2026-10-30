@@ -495,7 +495,7 @@ export function claudeDesktop3pData(): string {
   const base =
     process.platform === "darwin"
       ? join(home, "Library", "Application Support")
-      : process.env.XDG_CONFIG_HOME ?? join(home, ".config");
+      : (process.env.XDG_CONFIG_HOME ?? join(home, ".config"));
   return join(base, "Claude-3p");
 }
 
@@ -551,7 +551,8 @@ export function writeClaudeDesktopConfig(
 
   const config = readDesktopConfig(appData);
   const previous: Desktop3pPrevious = {
-    mode: typeof config[DESKTOP_MODE_KEY] === "string" ? (config[DESKTOP_MODE_KEY] as string) : null,
+    mode:
+      typeof config[DESKTOP_MODE_KEY] === "string" ? (config[DESKTOP_MODE_KEY] as string) : null,
     appliedId: null,
     createdEntry: false,
     entryId: "",
@@ -641,7 +642,11 @@ export function restoreClaudeDesktopConfig(previous?: Desktop3pPrevious): void {
     if (config[DESKTOP_MODE_KEY] === "3p") {
       if (previous.mode === null) delete config[DESKTOP_MODE_KEY];
       else config[DESKTOP_MODE_KEY] = previous.mode;
-      writeAtomic(join(appData, DESKTOP_CONFIG_FILE), JSON.stringify(config, null, 2) + "\n", 0o644);
+      writeAtomic(
+        join(appData, DESKTOP_CONFIG_FILE),
+        JSON.stringify(config, null, 2) + "\n",
+        0o644,
+      );
     }
   } catch {
     /* the app data changed shape; leave the mode key alone */
@@ -656,9 +661,7 @@ export function restoreClaudeDesktopConfig(previous?: Desktop3pPrevious): void {
       } catch {
         return;
       }
-      meta.entries = (meta.entries ?? []).filter(
-        (entry) => entry && entry.id !== previous.entryId,
-      );
+      meta.entries = (meta.entries ?? []).filter((entry) => entry && entry.id !== previous.entryId);
       if (previous.appliedId && meta.entries.some((entry) => entry.id === previous.appliedId))
         meta.appliedId = previous.appliedId;
       else if (meta.appliedId === previous.entryId) delete meta.appliedId;
@@ -666,11 +669,7 @@ export function restoreClaudeDesktopConfig(previous?: Desktop3pPrevious): void {
     } else if (previous.entryContent !== undefined) {
       // A pre-existing entry we overwrote gets its original content and the
       // library's applied pointer back.
-      writeAtomic(
-        join(library, `${previous.entryId}.json`),
-        previous.entryContent,
-        0o600,
-      );
+      writeAtomic(join(library, `${previous.entryId}.json`), previous.entryContent, 0o600);
       try {
         const meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> } =
           JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
@@ -687,8 +686,6 @@ export function restoreClaudeDesktopConfig(previous?: Desktop3pPrevious): void {
     /* the 3P profile is the app's to keep once it has run; ignore failures */
   }
 }
-
-
 
 // ---------------------------------------------------------------------------
 // OS-level persistence (best effort)

@@ -150,7 +150,15 @@ function discoverDesktopTranscripts(r: Recorder, signal?: AbortSignal): void {
         key,
         stringifyJson({
           path,
-          scope: { Session: id, Turn: "", Agent: "", CWD: cwd, Root: root, Repo: repo, Repository: repoMeta },
+          scope: {
+            Session: id,
+            Turn: "",
+            Agent: "",
+            CWD: cwd,
+            Root: root,
+            Repo: repo,
+            Repository: repoMeta,
+          },
           route: "castai",
           basis: "gateway",
         }),
