@@ -408,6 +408,41 @@ test("Codex's trace environment joins its user config safely and leaves cleanly"
   expect(read().shell_environment_policy.set.GIT_TRACE2_ENV_VARS).toBe("CODEX_TOOL_CALL_ID");
 });
 
+test("settings Codex appends inside the trace block survive a reinstall and its removal", () => {
+  setEnv("KIMCHI_BRIDGE_HOME", temp());
+  const home = temp(),
+    path = join(home, "config.toml");
+  const read = () => Bun.TOML.parse(readFileSync(path, "utf8")) as any;
+  writeFileSync(path, 'model = "lab"\n');
+  expect(codexTraceConfig(true, home)).toBe(true);
+  // Codex appends new tables at the end of the file, before the block's last line, as it saves trust.
+  const hook = "kimchi-work@kimchi-bridge:hooks/hooks.json:stop:0:0";
+  const codex = `[projects."/work"]\ntrust_level = "trusted"\n\n[hooks.state."${hook}"]\ntrusted_hash = "sha256:1"\n\n`;
+  const text = readFileSync(path, "utf8"),
+    end = text.indexOf("# kimchi-bridge: end");
+  writeFileSync(path, text.slice(0, end) + codex + text.slice(end));
+  const kept = {
+    projects: { "/work": { trust_level: "trusted" } },
+    hooks: { state: { [hook]: { trusted_hash: "sha256:1" } } },
+  };
+  expect(codexTraceConfig(true, home)).toBe(true);
+  expect(read()).toMatchObject(kept);
+  expect(read().shell_environment_policy.set.GIT_TRACE2_ENV_VARS).toBe("CODEX_TOOL_CALL_ID");
+  expect(codexTraceConfig(false, home)).toBe(true);
+  expect(read()).toEqual({ model: "lab", ...kept });
+  // A setting someone adds under the bridge's table keeps the table when the bridge leaves.
+  expect(codexTraceConfig(true, home)).toBe(true);
+  writeFileSync(
+    path,
+    readFileSync(path, "utf8").replace(
+      "[shell_environment_policy.set]\n",
+      '[shell_environment_policy.set]\nFOO = "1"\n',
+    ),
+  );
+  expect(codexTraceConfig(false, home)).toBe(true);
+  expect(read().shell_environment_policy).toEqual({ set: { FOO: "1" } });
+});
+
 test("Claude Code's session environment names its own trace directory", () => {
   setEnv("KIMCHI_BRIDGE_HOME", temp());
   const dir = traceDir("claude-code", "s");
