@@ -314,10 +314,16 @@ function consume(r: Recorder, t: Transcript, v: JsonObject) {
   const turn = r.store.meta(`response-turn:${s.Session}:${response}`);
   if (turn) s.Turn = turn;
   if (s.Turn) {
-    work = r.workExact(s);
-    u.correlation = "native_transcript_prompt";
+    // A subagent's rows carry the main thread's current prompt, whose turn has no work for the agent: it keeps its own.
+    const exact = r.workExact(s);
+    if (exact || !work) {
+      work = exact;
+      u.correlation = "native_transcript_prompt";
+    }
   }
   const e = r.event(s, requestEntity(response, nativeRequest), work);
+  // A line read late, such as a resumed session's from before its transcript was registered, keeps its earlier work.
+  if (!work) e.workId = r.store.latest(e.entityId)?.workId ?? "";
   billingTag(r, e.entityId, u, response, nativeRequest);
   e.observeTime = observed;
   e.usage = u;
