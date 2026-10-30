@@ -186,6 +186,36 @@ test("configure sets only OTLP export, keeps the disable state, and refuses keys
   await expect(cli(["frobnicate"])).rejects.toThrow("unknown command");
 });
 
+test("a Claude Code command hook registers its transcript and prompt like the mod's classic hook did", async () => {
+  saveConfig({});
+  const transcript = join(root, "claude.jsonl");
+  writeFileSync(transcript, "", { mode: 0o600 });
+  let output = "";
+  await cli(
+    ["hook", "claude-code"],
+    stdin({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "claude-session",
+      cwd: root,
+      prompt_id: "prompt",
+      prompt: "fixture",
+      transcript_path: transcript,
+    }),
+    (text) => {
+      output += text;
+    },
+  );
+  // UserPromptSubmit adds a command hook's output to Claude's context.
+  expect(output).toBe("");
+  const s = new Store(stateDir({}));
+  try {
+    expect(parseJson(s.meta(`transcript:claude-code:${transcript}`)).path).toBe(transcript);
+    expect(s.meta("pending-prompt:claude-session")).toBe("prompt");
+  } finally {
+    s.close();
+  }
+});
+
 test("hook stores synchronously without spawning a worker and session stays in its original account", async () => {
   let output = "";
   const payload = {
