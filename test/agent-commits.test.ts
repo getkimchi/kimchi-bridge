@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Recorder } from "../src/work/capture.ts";
 import {
   claudeTraceEnv,
@@ -419,6 +419,166 @@ test("a due commit is looked up right after another pass; nothing due waits for 
   // An hour old: due every 225 s (age/16).
   expect(looked(1000)).toBe(false);
   expect(looked(300_000)).toBe(true);
+});
+
+// A fake gh or glab that answers each API path from <home>/api/<path>.json and logs the paths asked for.
+function scm(provider: "github" | "gitlab") {
+  const home = temp(),
+    bin = join(home, "bin"),
+    gitlab = provider === "gitlab";
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, gitlab ? "glab" : "gh"),
+    `#!/bin/sh\necho "$6" >> "${home}/calls"\nexec /bin/cat "${home}/api/$6.json"\n`,
+    { mode: 0o700 },
+  );
+  setEnv("PATH", `${bin}:${process.env.PATH}`);
+  const reply = (path: string, body: unknown) => {
+    const file = join(home, "api", `${path}.json`);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(body));
+  };
+  const identity = gitlab ? "projects/testOrg%2Fwidgets" : "repos/testOrg/widgets";
+  reply(
+    identity,
+    gitlab
+      ? {
+          id: 22,
+          path_with_namespace: "testOrg/widgets",
+          web_url: "https://gitlab.com/testOrg/widgets",
+        }
+      : { id: 5, full_name: "testOrg/widgets", html_url: "https://github.com/testOrg/widgets" },
+  );
+  const store = new Store(join(home, "ledger"));
+  cleanups.push(() => store.close());
+  const r = new Recorder(store, "codex", store.deviceId());
+  const at = "2026-10-30T10:00:00Z";
+  return {
+    store,
+    identity,
+    reply,
+    commit: (sha: string) =>
+      gitlab
+        ? `projects/22/repository/commits/${sha}/merge_requests?per_page=100&page=1`
+        : `repos/testOrg/widgets/commits/${sha}/pulls?per_page=100&page=1`,
+    byNumber: (n: number) =>
+      gitlab ? `projects/22/merge_requests/${n}` : `repos/testorg/widgets/pulls/${n}`,
+    pull: (n: number, state: "open" | "closed" | "merged" = "open") => ({
+      id: n * 10,
+      title: "Widgets",
+      closed_at: state === "open" ? null : at,
+      merged_at: state === "merged" ? at : null,
+      ...(gitlab
+        ? {
+            iid: n,
+            web_url: `https://gitlab.com/testOrg/widgets/-/merge_requests/${n}`,
+            state: state === "open" ? "opened" : state,
+            target_project_id: 22,
+          }
+        : {
+            number: n,
+            html_url: `https://github.com/testOrg/widgets/pull/${n}`,
+            state: state === "open" ? "open" : "closed",
+            base: { repo: { id: 5, full_name: "testOrg/widgets" } },
+          }),
+    }),
+    track: (sha: string, turn = "t") =>
+      saveMeta(r, `tracked-commit:${stableId("local:x", sha)}`, {
+        Scope: {
+          Session: "s",
+          Turn: turn,
+          Agent: "",
+          CWD: home,
+          Root: home,
+          Repo: "local:x",
+          Repository: { provider, host: `${provider}.com`, id: "name:x", name: "testOrg/widgets" },
+        },
+        Source: "codex",
+        SHA: sha,
+        CreatedAt: new Date(Date.now() - 3600_000).toISOString(),
+        CheckedAt: "0001-01-01T00:00:00Z",
+      }),
+    // One pass with every tracked commit due; the API paths it asked for.
+    pass: () => {
+      store.db
+        .query(
+          "UPDATE meta SET value=json_set(value,'$.CheckedAt','0001-01-01T00:00:00Z') WHERE key LIKE 'tracked-commit:%'",
+        )
+        .run();
+      rmSync(join(home, "calls"), { force: true });
+      reconcileGit(r);
+      return existsSync(join(home, "calls"))
+        ? readFileSync(join(home, "calls"), "utf8").split("\n").filter(Boolean)
+        : [];
+    },
+  };
+}
+
+test("a PR closed and re-created from its branch is seen closed, and the new PR is linked", () => {
+  const { store, identity, reply, commit, byNumber, pull, track, pass } = scm("github");
+  const sha = "a".repeat(40);
+  track(sha);
+  reply(commit(sha), [pull(45)]);
+  expect(pass()).toEqual([identity, commit(sha)]);
+  // #45 closes without merging and #46 opens from the same branch: GitHub lists only open PRs for a
+  // commit outside the default branch, so #45 is looked up by number.
+  reply(commit(sha), [pull(46)]);
+  reply(byNumber(45), pull(45, "closed"));
+  expect(pass()).toEqual([identity, commit(sha), byNumber(45)]);
+  const events = (kind: string) =>
+    (store.db.query("SELECT body FROM events WHERE kind=? ORDER BY rowid").all(kind) as any[]).map(
+      (row) => JSON.parse(Buffer.from(row.body).toString()),
+    );
+  // Each PR's latest state.
+  expect(
+    Object.fromEntries(
+      events("pull_request").map((e) => [e.pullRequest.number, e.pullRequest.state]),
+    ),
+  ).toEqual({ 45: "closed", 46: "open" });
+  expect(latest(store, "pull_request").pullRequest.closeTime).toBe("2026-10-30T10:00:00Z");
+  expect(events("link").map((e) => e.link.toId)).toEqual(["450", "460"]);
+  // A closed PR is not refreshed again; the commit's own lookup still runs.
+  expect(pass()).toEqual([identity, commit(sha)]);
+});
+
+for (const provider of ["github", "gitlab"] as const)
+  test(`a ${provider} merge is learned by number when the commit no longer lists it; lookups then stop`, () => {
+    const { store, identity, reply, commit, byNumber, pull, track, pass } = scm(provider);
+    const sha = "b".repeat(40);
+    track(sha);
+    reply(commit(sha), [pull(7)]);
+    pass();
+    reply(commit(sha), []);
+    reply(byNumber(7), pull(7, "merged"));
+    expect(pass()).toEqual([identity, commit(sha), byNumber(7)]);
+    expect(latest(store, "pull_request").pullRequest).toMatchObject({
+      number: 7,
+      state: "merged",
+      mergeTime: "2026-10-30T10:00:00Z",
+    });
+    expect(count(store, "pull_request")).toBe(2);
+    expect(pass()).toEqual([]);
+  });
+
+test("a pass asks for the repository once, and a PR is uploaded again only when it changes", () => {
+  const { store, identity, reply, commit, byNumber, pull, track, pass } = scm("github");
+  // Three commits of one PR, made in different turns of one session.
+  const shas = ["1", "2", "3"].map((digit) => digit.repeat(40)),
+    lookups = [identity, ...shas.map(commit)].sort();
+  for (const [i, sha] of shas.entries()) {
+    track(sha, `turn-${i}`);
+    reply(commit(sha), [pull(7)]);
+  }
+  expect(pass().sort()).toEqual(lookups);
+  pass();
+  expect(count(store, "pull_request")).toBe(1);
+  // The PR closes: every commit stops listing it, and one lookup by number serves the whole pass.
+  for (const sha of shas) reply(commit(sha), []);
+  reply(byNumber(7), pull(7, "closed"));
+  expect(pass().sort()).toEqual([...lookups, byNumber(7)].sort());
+  expect(count(store, "pull_request")).toBe(2);
+  expect(pass().sort()).toEqual(lookups);
+  expect(count(store, "pull_request")).toBe(2);
 });
 
 test("Codex's trace environment joins its user config safely and leaves cleanly", () => {
