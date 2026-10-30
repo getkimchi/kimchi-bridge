@@ -972,6 +972,30 @@ test("an HTTPS remote keeps its port; an SSH remote's port is not the web host's
   expect(host("git@github.com:team/repo.git")).toBe("github.com");
 });
 
+test("an SSH host alias names its provider through ssh's own config, as Kimchi resolves it", () => {
+  const { base, root } = fixture();
+  git(root, "init", "--initial-branch=main");
+  // ~/.ssh/config: Host github-work, HostName github.com. The fake answers `ssh -G` as OpenSSH prints it.
+  const bin = join(base, "bin");
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "ssh"),
+    '#!/bin/sh\n[ "$*" = "-G github-work" ] && printf "user git\\nhostname github.com\\nport 22\\n"\n',
+    { mode: 0o700 },
+  );
+  const prior = process.env.PATH;
+  process.env.PATH = `${bin}:${prior}`;
+  cleanups.push(() => {
+    process.env.PATH = prior;
+  });
+  git(root, "remote", "add", "origin", "git@github-work:testOrg/widgets.git");
+  expect(repository(root)[2]).toMatchObject({
+    provider: "github",
+    host: "github.com",
+    name: "testOrg/widgets",
+  });
+});
+
 function withBridgeHome<T>(base: string, run: () => T): T {
   const previous = process.env.KIMCHI_BRIDGE_HOME;
   process.env.KIMCHI_BRIDGE_HOME = join(base, "bridge");

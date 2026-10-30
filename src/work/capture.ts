@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -80,6 +81,29 @@ interface ToolState {
 }
 const emptyFile = (): FileState => ({ hash: "", exists: false, complete: false });
 
+const knownHost = (host: string) =>
+  ["github.com", "gitlab.com", process.env.GH_HOST, process.env.GITLAB_HOST].includes(host);
+const sshHosts = new Map<string, string>();
+/**
+ * The provider host an SSH alias stands for (~/.ssh/config: Host github-work, HostName github.com), read without
+ * connecting, as Kimchi resolves it (pull-request-status/provider-api.ts sshHostName).
+ */
+function sshHost(alias: string): string {
+  if (knownHost(alias) || alias.startsWith("-")) return alias;
+  let host = sshHosts.get(alias);
+  if (host === undefined) {
+    const config = spawnSync("ssh", ["-G", alias], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).stdout;
+    const line = (config ?? "").split("\n").find((l) => l.startsWith("hostname "));
+    host = line ? line.slice("hostname ".length).trim() : alias;
+    sshHosts.set(alias, host);
+  }
+  return knownHost(host) ? host : alias;
+}
+
 export function repository(cwd: string): [string, string, Repository | undefined] {
   try {
     cwd = realpathSync(cwd);
@@ -136,7 +160,7 @@ export function repository(cwd: string): [string, string, Repository | undefined
     if (url.password || url.search || url.hash || (url.protocol === "https:" && url.username))
       return [root, local, undefined];
     // An HTTPS remote's port belongs to the web host; an SSH remote's port does not.
-    host = url.protocol === "https:" ? url.host : url.hostname;
+    host = url.protocol === "https:" ? url.host : sshHost(url.hostname);
     name = url.pathname.slice(1);
     if (name.endsWith(".git")) name = name.slice(0, -4);
   } catch {
