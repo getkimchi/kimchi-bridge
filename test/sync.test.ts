@@ -292,3 +292,53 @@ test("CSV export guards formulas and status never outputs reporting credentials"
   expect(output).not.toContain("synthetic-private-key");
   expect(JSON.parse(output)).toMatchObject({ kimchiSignedIn: true, reportingVerified: true });
 });
+
+test("a Git pass that uses up the deadline does not keep captured events from uploading", async () => {
+  const actor = randomUUID(),
+    org = randomUUID();
+  const bodies: string[] = [];
+  const apiUrl = server(async (req) => {
+    if (new URL(req.url).pathname.endsWith("api-keys:verify"))
+      return Response.json({ organizationId: org, userId: actor });
+    bodies.push(await req.text());
+    const batch = parseJson(bodies.at(-1)!).batch as Batch;
+    return Response.json({
+      batchId: batch.id,
+      receipts: batch.events.map((e) => ({ id: e.id, revision: e.revision, status: "accepted" })),
+    });
+  });
+  const k = { apiUrl, token: "synthetic-key" };
+  const c = await authenticate(k);
+  saveConfig(c);
+  const s = new Store(stateDir(c));
+  let now = Date.now();
+  const clock = spyOn(Date, "now").mockImplementation(() => now);
+  // Many repositories' PR lookups: the Git pass alone outlasts the sync's whole time budget.
+  const git = spyOn(Recorder.prototype, "reconcileGit").mockImplementation(() => {
+    now += 9000;
+  });
+  try {
+    const path = join(root, "rollout.jsonl");
+    writeFileSync(path, "", { mode: 0o600 });
+    await new Recorder(s, "codex", s.deviceId()).record({
+      stage: "UserPromptSubmit",
+      version: "test",
+      event: {
+        session_id: "s",
+        turn_id: "t",
+        cwd: root,
+        prompt: "New work: fixture",
+        transcript_path: path,
+      },
+    });
+    expect(s.status().pending).toBe(1);
+    await expect(sync(k)).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(git).toHaveBeenCalledTimes(1);
+    expect(bodies.length).toBe(1);
+    expect(s.status().pending).toBe(0);
+  } finally {
+    git.mockRestore();
+    clock.mockRestore();
+    s.close();
+  }
+});
