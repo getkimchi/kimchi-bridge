@@ -13,13 +13,15 @@ import { parseJson, type Batch } from "../src/work/protocol.ts";
 import { sync } from "../src/work/sync.ts";
 
 let root: string;
-const variables = ["KIMCHI_BRIDGE_HOME", "KIMCHI_API_KEY", "HOME", "KIMCHI_REMOTE_ENDPOINT"];
+const variables = ["KIMCHI_BRIDGE_HOME", "KIMCHI_API_KEY", "HOME", "KIMCHI_REMOTE_ENDPOINT", "KIMCHI_BRIDGE_CONFIG_HOME"];
 let previous: (string | undefined)[] = [];
 const cleanups: (() => void)[] = [];
 beforeEach(() => {
   previous = variables.map((name) => process.env[name]);
   root = mkdtempSync(join(tmpdir(), "kimchi-sync-"));
   process.env.KIMCHI_BRIDGE_HOME = root;
+  // Transcript recovery scans the config home for Claude Desktop 3P profiles.
+  process.env.KIMCHI_BRIDGE_CONFIG_HOME = root;
   // Kimchi's sign-in is read from this HOME, never the developer's.
   process.env.HOME = root;
   delete process.env.KIMCHI_API_KEY;

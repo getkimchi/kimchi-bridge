@@ -33,9 +33,14 @@ function fixture(source = "codex") {
   const base = mkdtempSync(join(tmpdir(), "pr-cost-recovery-"));
   const root = join(base, "project");
   mkdirSync(root);
+  // Transcript recovery scans the config home for Claude Desktop's 3P
+  // profile; keep this machine's real profile out of the fixture store.
+  const previousConfig = process.env.KIMCHI_BRIDGE_CONFIG_HOME;
+  if (previousConfig === undefined) process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(base, "config-home");
   const store = new Store(join(base, "state"));
   const r = new Recorder(store, source, store.deviceId());
   cleanups.push(() => {
+    if (previousConfig === undefined) delete process.env.KIMCHI_BRIDGE_CONFIG_HOME;
     store.close();
     rmSync(base, { recursive: true, force: true });
   });
