@@ -134,6 +134,7 @@ const CLAUDE_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+  "CLAUDE_CODE_AUTO_MODE_SERVER",
 ] as const;
 
 function readJsonFile(path: string): Record<string, unknown> {
@@ -169,10 +170,14 @@ function writeClaudeConfig(
   // No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: the telemetry collector that
   // feeds PR-cost usage attribution is beta-gated, and the desktop app's 3P
   // Code sessions load these settings too.
+  // Auto mode asks Anthropic's server to run its classifier checks inside the model requests, which no model behind
+  // the Kimchi gateway does; Claude Code then holds the first checked action behind a notice. Off, it makes its own
+  // classifier requests, as it always has.
   const pairs: Record<string, string> = {
     ANTHROPIC_BASE_URL: anthropicBaseUrl,
     ANTHROPIC_API_KEY: "",
     ANTHROPIC_AUTH_TOKEN: authToken,
+    CLAUDE_CODE_AUTO_MODE_SERVER: "0",
   };
   for (const [key, value] of Object.entries(pairs)) env[key] = value;
   // A stale kill-switch from an older bridge would keep the beta-gated
@@ -181,6 +186,27 @@ function writeClaudeConfig(
   settings.env = env;
   writeJsonFile(path, settings);
   return previous;
+}
+
+/** Gives Claude Code's auto-mode setting to a gateway enabled before it existed; disable removes it again. */
+export function ensureClaudeAutoMode(): void {
+  const state = loadGatewayState();
+  if (state.enabled !== true || state.mode !== "proxy") return;
+  const path = claudeSettingsPath();
+  const settings = readJsonFile(path);
+  const env =
+    settings.env && typeof settings.env === "object" && !Array.isArray(settings.env)
+      ? (settings.env as Record<string, unknown>)
+      : {};
+  if (typeof env.CLAUDE_CODE_AUTO_MODE_SERVER === "string") return;
+  env.CLAUDE_CODE_AUTO_MODE_SERVER = "0";
+  settings.env = env;
+  writeJsonFile(path, settings);
+  state.previous = {
+    ...state.previous,
+    claude: { CLAUDE_CODE_AUTO_MODE_SERVER: null, ...state.previous?.claude },
+  };
+  saveGatewayState(state);
 }
 
 function restoreClaudeConfig(previous?: Record<string, string | null>): void {
@@ -1183,9 +1209,19 @@ export async function runDaemon(): Promise<void> {
   for (let offset = 0; offset <= PORT_SCAN_SPAN; offset++) {
     const candidate = preferred + offset;
     if ((await health(candidate)).ok) {
-      // Our daemon is already listening; nothing to do.
-      log(`daemon already running on ${candidate}`);
-      return;
+      // Our daemon is already listening, often the one `gateway enable` starts before it registers the service.
+      // launchd restarts its job 10 s after every exit, so the service waits for that daemon and then takes the port.
+      if (process.env.XPC_SERVICE_NAME !== SERVICE_LABEL) {
+        log(`daemon already running on ${candidate}`);
+        return;
+      }
+      log(`daemon already running on ${candidate}; the service waits for it`);
+      // KIMCHI_BRIDGE_SERVICE_WAIT_MS is a test seam.
+      const wait = Number(process.env.KIMCHI_BRIDGE_SERVICE_WAIT_MS) || 30_000;
+      while ((await health(candidate)).ok) {
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        if (loadGatewayState().enabled === false) return;
+      }
     }
     try {
       server = Bun.serve({

@@ -11,6 +11,7 @@ import {
   codexConfigPath,
   disable,
   enable,
+  ensureClaudeAutoMode,
   gatewayPort,
   gatewayStatePath,
   health,
@@ -19,6 +20,7 @@ import {
   proxyRequest,
   resolveMainModel,
   rewriteClaudeDesktopConfig,
+  runDaemon,
   saveGatewayState,
   status,
   stripCodexToml,
@@ -243,6 +245,8 @@ test("enable in proxy mode writes proxy URLs and never a real credential into th
   // The beta kill-switch is deliberately not written: the telemetry collector
   // that feeds PR-cost usage attribution is beta-gated.
   expect(claude.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBeUndefined();
+  // No model behind the gateway runs auto mode's server-side checks, so Claude Code makes its own classifier calls.
+  expect(claude.env.CLAUDE_CODE_AUTO_MODE_SERVER).toBe("0");
   const codex = readFileSync(codexConfigPath(), "utf8");
   expect(codex).toContain('base_url = "http://127.0.0.1:8766/openai/v1"');
   expect(codex).not.toContain("id-token");
@@ -416,6 +420,7 @@ test("disable restores pre-existing values, removes the catalog, and stops the p
   expect(claude.env.ANTHROPIC_BASE_URL).toBe("https://old-gateway.example");
   expect(claude.env.ANTHROPIC_CUSTOM).toBe("keep");
   expect(claude.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  expect(claude.env.CLAUDE_CODE_AUTO_MODE_SERVER).toBeUndefined();
   expect(claude.other).toBe(true);
   const codex = readFileSync(codexConfigPath(), "utf8");
   expect(codex).toContain('model = "gpt-5"');
@@ -423,6 +428,74 @@ test("disable restores pre-existing values, removes the catalog, and stops the p
   expect(codex).toContain("[features]");
   expect(existsSync(codexCatalogPath())).toBe(false);
   expect(loadGatewayState().enabled).toBe(false);
+});
+
+test("a gateway enabled before the auto-mode setting gets it once, and disable removes it again", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  oauthCredential();
+  await enable(oauthSignIn);
+  // As an older bridge left it: no auto-mode setting and no earlier value recorded for it.
+  const settings = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
+  delete settings.env.CLAUDE_CODE_AUTO_MODE_SERVER;
+  writeFileSync(claudeSettingsPath(), JSON.stringify(settings));
+  const state = loadGatewayState();
+  delete state.previous?.claude?.CLAUDE_CODE_AUTO_MODE_SERVER;
+  saveGatewayState(state);
+  ensureClaudeAutoMode();
+  ensureClaudeAutoMode();
+  expect(
+    JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env.CLAUDE_CODE_AUTO_MODE_SERVER,
+  ).toBe("0");
+  await disable();
+  const after = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
+  expect(after.env.CLAUDE_CODE_AUTO_MODE_SERVER).toBeUndefined();
+  expect(after.env.ANTHROPIC_BASE_URL).toBeUndefined();
+});
+
+test("the auto-mode setting is added only through the proxy, and a person's own value stays", () => {
+  mkdirSync(join(root, "home", ".claude"), { recursive: true });
+  writeFileSync(claudeSettingsPath(), JSON.stringify({ env: {} }));
+  ensureClaudeAutoMode();
+  expect(
+    JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env.CLAUDE_CODE_AUTO_MODE_SERVER,
+  ).toBeUndefined();
+  saveGatewayState({ enabled: true, mode: "proxy", port: 8766 });
+  writeFileSync(
+    claudeSettingsPath(),
+    JSON.stringify({ env: { CLAUDE_CODE_AUTO_MODE_SERVER: "1" } }),
+  );
+  ensureClaudeAutoMode();
+  expect(
+    JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env.CLAUDE_CODE_AUTO_MODE_SERVER,
+  ).toBe("1");
+});
+
+test("the launchd service waits while another daemon holds the port instead of exiting into a restart", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  oauthCredential();
+  const fake = server((request) =>
+    new URL(request.url).pathname === "/healthz"
+      ? Response.json({ ok: true, service: "kimchi-bridge-gateway", pid: 42 })
+      : new Response("no", { status: 404 }),
+  );
+  saveGatewayState({ enabled: true, mode: "proxy", port: Number(new URL(fake).port) });
+  // A daemon started any other way, such as from a hook, leaves at once.
+  await runDaemon();
+  process.env.XPC_SERVICE_NAME = "dev.kimchi.bridge.gateway";
+  process.env.KIMCHI_BRIDGE_SERVICE_WAIT_MS = "20";
+  cleanups.push(() => {
+    delete process.env.XPC_SERVICE_NAME;
+    delete process.env.KIMCHI_BRIDGE_SERVICE_WAIT_MS;
+  });
+  let settled = false;
+  const run = runDaemon().then(() => {
+    settled = true;
+  });
+  await Bun.sleep(200);
+  expect(settled).toBe(false);
+  saveGatewayState({ ...loadGatewayState(), enabled: false });
+  await run;
+  expect(settled).toBe(true);
 });
 
 test("proxyRequest injects the fresh bearer and org header, passes the body, and retries once on 401", async () => {

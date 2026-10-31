@@ -363,6 +363,11 @@ export async function run(
         .catch((error: unknown) =>
           output(`Gateway kept its direct connection: ${(error as Error).message}\n`),
         );
+    try {
+      gateway.ensureClaudeAutoMode();
+    } catch {
+      /* Claude Code's settings could not be read; the next activate retries. */
+    }
     return;
   }
   if (command === "codex-trace") {
