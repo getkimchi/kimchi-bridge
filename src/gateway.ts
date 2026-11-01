@@ -33,7 +33,7 @@ import {
   saveCredential,
   seedFromKimchi,
 } from "./oauth.ts";
-import { billingTags, readResponseId, recordTag } from "./request-tags.ts";
+import { billingTags, noteSideCall, readResponseId, recordTag } from "./request-tags.ts";
 
 const DEFAULT_PORT = 8766;
 const PORT_SCAN_SPAN = 10;
@@ -135,6 +135,9 @@ const CLAUDE_ENV_KEYS = [
   "ANTHROPIC_AUTH_TOKEN",
   "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
   "CLAUDE_CODE_AUTO_MODE_SERVER",
+  "CLAUDE_CODE_AUTO_MODE_MODEL",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 ] as const;
 
 function readJsonFile(path: string): Record<string, unknown> {
@@ -156,6 +159,7 @@ function writeJsonFile(path: string, value: Record<string, unknown>): void {
 function writeClaudeConfig(
   anthropicBaseUrl: string,
   authToken: string,
+  modelEnv: Record<string, string> = {},
 ): Record<string, string | null> {
   const path = claudeSettingsPath();
   const settings = readJsonFile(path);
@@ -180,6 +184,9 @@ function writeClaudeConfig(
     CLAUDE_CODE_AUTO_MODE_SERVER: "0",
   };
   for (const [key, value] of Object.entries(pairs)) env[key] = value;
+  // A person's own model choice stays.
+  for (const [key, value] of Object.entries(modelEnv))
+    if (typeof env[key] !== "string") env[key] = value;
   // A stale kill-switch from an older bridge would keep the beta-gated
   // telemetry collector off; remove what we no longer set.
   delete env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS;
@@ -334,6 +341,24 @@ export function resolveMainModel(models: readonly GatewayModel[]): GatewayModel 
   if (preferred) return preferred;
   const vision = serverless.find((m) => (m.input_modalities ?? []).includes("image"));
   return vision ?? serverless[0] ?? models[0];
+}
+
+// The small model Kimchi's own checks use. It answers within the 64 tokens Claude Code's auto-mode check allows, which
+// the models that reason first spend before they reply.
+const CLAUDE_SMALL_MODEL = "deepseek-v4-flash-0731";
+
+/**
+ * Claude Code asks for Claude models by default, and an organization without Claude routes answers those with 400: the
+ * first prompt fails, and so does every auto-mode check. Such an organization gets the models it has.
+ */
+function claudeModelEnv(models: readonly GatewayModel[]): Record<string, string> {
+  if (!models.length || models.some((model) => isClaudeModel(model.slug))) return {};
+  const env: Record<string, string> = { ANTHROPIC_MODEL: resolveMainModel(models).slug };
+  if (models.some((model) => model.slug === CLAUDE_SMALL_MODEL)) {
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = CLAUDE_SMALL_MODEL;
+    env.CLAUDE_CODE_AUTO_MODE_MODEL = CLAUDE_SMALL_MODEL;
+  }
+  return env;
 }
 
 export async function fetchModels(
@@ -531,7 +556,7 @@ const DESKTOP_CONFIG_FILE = "claude_desktop_config.json";
  * Claude Desktop runs only Anthropic models: for a gateway it drops every other model name with a warning, and any
  * warning shows its "Configuration may need attention" banner. Kimchi names its Claude routes claude-* or anthropic/*.
  */
-function isDesktopModel(name: string): boolean {
+function isClaudeModel(name: string): boolean {
   const slug = name.toLowerCase();
   return slug.startsWith("claude-") || slug.startsWith("anthropic/");
 }
@@ -583,7 +608,7 @@ export function writeClaudeDesktopConfig(
 ): Desktop3pPrevious | null {
   const appData = claudeDesktopAppData();
   if (!appData) return null;
-  const claude = models.filter((m) => isDesktopModel(m.slug));
+  const claude = models.filter((m) => isClaudeModel(m.slug));
   // Without a Claude model the app has nothing to run through the gateway: leave it as it is.
   if (!claude.length) return null;
 
@@ -674,7 +699,7 @@ export function rewriteClaudeDesktopConfig(anthropicBaseUrl: string): void {
   config.inferenceGatewayBaseUrl = anthropicBaseUrl;
   if (Array.isArray(config.inferenceModels))
     config.inferenceModels = config.inferenceModels.filter(
-      (model) => typeof model?.name === "string" && isDesktopModel(model.name),
+      (model) => typeof model?.name === "string" && isClaudeModel(model.name),
     );
   const after = JSON.stringify(config, null, 2) + "\n";
   if (after !== before) writeAtomic(path, after, 0o600);
@@ -1188,6 +1213,16 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
   }
   let reply = response.body;
   const tagged = requestId;
+  // Claude Code reports a call with the request ID its reply carried, and its title requests reach no transcript, so
+  // the tag makes that report name the call's bill. Auto mode's checks are in neither; the proxy notes those itself.
+  if (tagged) headers.set("request-id", tagged);
+  if (tagged && response.ok) {
+    try {
+      noteSideCall(request.headers, json, tagged);
+    } catch (error) {
+      log(`side call not recorded: ${(error as Error).message}`);
+    }
+  }
   if (tagged && response.ok && reply) {
     // Transcripts name a call by its response ID, so remember which tag that response's request carried.
     const [client, copy] = reply.tee();
@@ -1386,7 +1421,11 @@ export async function enable(
 
   // Fetch the model list first: a failure leaves nothing written.
   const models = await fetchModels(llmBase, modelHeaders);
-  const claudePrevious = writeClaudeConfig(`http://127.0.0.1:${port}/anthropic`, PROXY_PLACEHOLDER);
+  const claudePrevious = writeClaudeConfig(
+    `http://127.0.0.1:${port}/anthropic`,
+    PROXY_PLACEHOLDER,
+    claudeModelEnv(models),
+  );
   const codexPrevious = writeCodexConfig(
     `http://127.0.0.1:${port}/openai/v1`,
     PROXY_PLACEHOLDER,
@@ -1413,6 +1452,8 @@ export async function enable(
       previousState.enabled && previousState.previous
         ? {
             ...previousState.previous,
+            // A key this version added still goes back to what it was before this enable.
+            claude: { ...claudePrevious, ...previousState.previous.claude },
             // The desktop snapshot is recomputed above, so re-enable keeps
             // what disable would need to restore now, not the first enable's.
             ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),

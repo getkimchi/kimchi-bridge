@@ -13,7 +13,7 @@ import {
   saveMeta,
   scmEnvironment,
 } from "../src/work/git.ts";
-import { recordTag } from "../src/request-tags.ts";
+import { noteSideCall, recordTag, sideCalls } from "../src/request-tags.ts";
 import { Store } from "../src/work/ledger.ts";
 import { parseJson, stableId, str } from "../src/work/protocol.ts";
 import {
@@ -1151,6 +1151,25 @@ function usages(store: Store) {
   ).map((row) => JSON.parse(Buffer.from(row.body).toString()));
 }
 const tag = "11111111-2222-4333-8444-555555555555";
+
+test("a billed call Claude Code's transcript leaves out is reported once, in its session", () => {
+  const { base, root, store, r, scope } = fixture("claude-code");
+  withBridgeHome(base, () => {
+    const path = join(root, "claude.jsonl");
+    writeFileSync(path, "");
+    registerTranscript(r, scope, path, "castai", "unknown");
+    const check = { model: "check-model", tools: [] };
+    noteSideCall(new Headers({ "x-claude-code-session-id": scope.Session }), check, tag);
+    noteSideCall(new Headers({ "x-claude-code-session-id": "other" }), check, "other-call");
+    recoverContext(r);
+    recoverContext(r);
+    expect(usages(store).map((event) => event.usage)).toMatchObject([
+      { requestId: tag, reportedModel: "check-model", observedRoute: "castai" },
+    ]);
+    expect(sideCalls(scope.Session)).toEqual([]);
+    expect(sideCalls("other")).toHaveLength(1);
+  });
+});
 
 test("a Claude call the proxy tagged uploads its billing tag as requestId on the gateway route", () => {
   const { base, root, store, r, scope } = fixture("claude-code");

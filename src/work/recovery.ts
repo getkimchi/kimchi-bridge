@@ -18,7 +18,7 @@ import {
 } from "./protocol.ts";
 import { checkSignal } from "../platform.ts";
 import { claudeDesktop3pData, gatewayPort, loadGatewayState } from "../gateway.ts";
-import { tagFor } from "../request-tags.ts";
+import { settleSideCall, sideCalls, tagFor } from "../request-tags.ts";
 import { repository, type Recorder, type Scope } from "./capture.ts";
 
 interface Transcript {
@@ -175,13 +175,28 @@ export function recoverContext(r: Recorder, signal?: AbortSignal) {
   for (const item of items) {
     checkSignal(signal);
     try {
-      recoverFile(r, JSON.parse(item.value), signal);
+      const transcript: Transcript = JSON.parse(item.value);
+      recoverFile(r, transcript, signal);
+      if (r.source === "claude-code") recoverSideCalls(r, transcript);
     } catch (e) {
       r.store.diagnostic("transcript_recovery_failed");
       failures.push(e);
     }
   }
   if (failures.length) throw new AggregateError(failures, "transcript recovery incomplete");
+}
+
+/** Reports the session's billed calls its transcript leaves out, in the shape of Claude Code's own request report. */
+function recoverSideCalls(r: Recorder, t: Transcript) {
+  for (const call of sideCalls(t.scope.Session)) {
+    const attributes = {
+      request_id: call.requestId,
+      model: call.model,
+      "event.timestamp": call.at,
+    };
+    telemetry(r, t.scope, { event: "api_request", attributes }, t.route, t.basis);
+    settleSideCall(call.requestId);
+  }
 }
 
 /**

@@ -2,7 +2,16 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { billingTags, readResponseId, recordTag, responseId, tagFor } from "../src/request-tags.ts";
+import {
+  billingTags,
+  noteSideCall,
+  readResponseId,
+  recordTag,
+  responseId,
+  settleSideCall,
+  sideCalls,
+  tagFor,
+} from "../src/request-tags.ts";
 
 let root = "";
 let previousRoot: string | undefined;
@@ -91,4 +100,22 @@ test("tags are recorded per response, expire, and lookups never create the store
   recordTag("msg_new", "new");
   expect(tagFor("msg_old")).toBeUndefined();
   expect(tagFor("msg_new")).toBe("new");
+});
+
+test("only Claude Code's calls without tools are noted, each until it is settled", () => {
+  const claude = new Headers({ "x-claude-code-session-id": "session" });
+  const tool = { name: "Bash" };
+  noteSideCall(claude, { model: "check", tools: [] }, "a", 1_000_000);
+  noteSideCall(claude, { model: "title" }, "b", 1_000_000);
+  noteSideCall(claude, { model: "main", tools: [tool] }, "c");
+  noteSideCall(new Headers(), { model: "codex", tools: [] }, "d");
+  noteSideCall(claude, undefined, "e");
+  expect(sideCalls("session").map((call) => [call.requestId, call.model])).toEqual([
+    ["a", "check"],
+    ["b", "title"],
+  ]);
+  expect(sideCalls("session")[0]!.at).toBe(new Date(1_000_000).toISOString());
+  expect(sideCalls("another")).toEqual([]);
+  settleSideCall("a");
+  expect(sideCalls("session").map((call) => call.requestId)).toEqual(["b"]);
 });

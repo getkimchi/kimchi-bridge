@@ -103,9 +103,10 @@ function kimchiKey(apiKey: string, region = "us") {
   );
 }
 
-function modelsEndpoint(): string {
+function modelsEndpoint(listed = models): string {
   return server((request) => {
-    if (new URL(request.url).pathname === "/v1/models/metadata") return Response.json({ models });
+    if (new URL(request.url).pathname === "/v1/models/metadata")
+      return Response.json({ models: listed });
     return new Response("not found", { status: 404 });
   });
 }
@@ -470,6 +471,43 @@ test("the auto-mode setting is added only through the proxy, and a person's own 
   ).toBe("1");
 });
 
+test("an organization without Claude routes gets Claude Code the models it has, until disable", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "deepseek-v4-flash-0731", is_serverless: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("deepseek-v4-flash-0731");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4-flash-0731");
+  await disable();
+  expect(env().ANTHROPIC_MODEL).toBeUndefined();
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+});
+
+test("Claude routes keep Claude Code's own models, and a person's model stays", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "claude-sonnet-5", is_serverless: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBeUndefined();
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+  await disable();
+
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  writeFileSync(claudeSettingsPath(), JSON.stringify({ env: { ANTHROPIC_MODEL: "glm-5.3" } }));
+  await enable(oauthSignIn);
+  expect(env().ANTHROPIC_MODEL).toBe("glm-5.3");
+  await disable();
+  expect(env().ANTHROPIC_MODEL).toBe("glm-5.3");
+});
+
 test("the launchd service waits while another daemon holds the port instead of exiting into a restart", async () => {
   process.env.KIMCHI_BASE_URL = modelsEndpoint();
   oauthCredential();
@@ -754,6 +792,8 @@ test("the proxy forwards an API-key sign-in with its key and tags its requests",
   expect(auth).toBe("Bearer castai_v1_key");
   expect(String(tags).startsWith("kimchi-request:")).toBe(true);
   expect(await recorded("resp_key")).toBe(String(tags).slice("kimchi-request:".length));
+  // Claude Code reports the call under this ID, which is how a call no transcript records finds its bill.
+  expect(response.headers.get("request-id")).toBe(String(tags).slice("kimchi-request:".length));
 });
 
 test("a retried request carries a fresh billing tag, as in Kimchi", async () => {
