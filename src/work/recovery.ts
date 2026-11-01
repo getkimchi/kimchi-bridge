@@ -298,11 +298,18 @@ function recoverFile(r: Recorder, t: Transcript, signal?: AbortSignal) {
     let offset = Number(
       (r.store.db.query("SELECT offset FROM cursors WHERE path=?").get(t.path) as any)?.offset ?? 0,
     );
-    if (info.size < offset) {
+    // Claude Code rewrites a transcript's tail in place, as when a retried tool call still fails to
+    // parse, which can leave the cursor past the end or inside a line. Reading from the start
+    // repeats nothing: the ledger keeps one copy of an unchanged record.
+    const before = Buffer.alloc(1);
+    if (
+      info.size < offset ||
+      (offset && readSync(fd, before, 0, 1, offset - 1) && before[0] !== 10)
+    ) {
       r.store.diagnostic("transcript_truncated");
-      throw new Error("transcript was truncated");
+      offset = 0;
     }
-    const context = r.store.meta(`cursor-context:${t.path}`);
+    const context = offset ? r.store.meta(`cursor-context:${t.path}`) : "";
     if (context) {
       try {
         t = JSON.parse(context);

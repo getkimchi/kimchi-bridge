@@ -527,6 +527,39 @@ test("batched recovery commits the valid prefix and resumes without another char
   expect((store.db.query("PRAGMA synchronous").get() as any).synchronous).toBe(2);
 });
 
+test("a transcript rewritten under its cursor is read again without another charge", () => {
+  const { root, store, r, scope } = fixture("claude-code");
+  const path = join(root, "rewritten.jsonl");
+  registerTranscript(r, scope, path, "provider-api", "unknown");
+  const taken = JSON.stringify({ type: "progress", note: "rewritten away" }) + "\n";
+  const reply = (i: number) =>
+    JSON.stringify({
+      timestamp: at,
+      type: "assistant",
+      requestId: `req_${i}`,
+      message: {
+        id: `msg_${i}`,
+        model: "claude-sonnet-4-6",
+        usage: { input_tokens: i, output_tokens: 1 },
+      },
+    }) + "\n";
+  const calls = () =>
+    (store.db.query("SELECT count(*) AS n FROM events WHERE kind='usage'").get() as any).n;
+  writeFileSync(path, taken + reply(1) + reply(2));
+  recoverContext(r);
+  expect(calls()).toBe(2);
+  // Claude Code rewrote the file, so the cursor now sits inside a reply.
+  writeFileSync(path, reply(1) + reply(2) + reply(3) + reply(4));
+  recoverContext(r);
+  expect(calls()).toBe(4);
+  // And the same when the file ends before the cursor.
+  writeFileSync(path, reply(1));
+  recoverContext(r);
+  appendFileSync(path, reply(5));
+  recoverContext(r);
+  expect(calls()).toBe(5);
+});
+
 test("Git revisits a late commit and excludes the old identical revision", () => {
   const { root, store, r } = fixture();
   git(root, "init", "--initial-branch=main");
