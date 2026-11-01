@@ -106,10 +106,15 @@ export function registerTranscript(
  * they served, so it is read as part of the session. No hook names it.
  */
 function registerCodexThreads(r: Recorder) {
+  const two = (n: number) => String(n).padStart(2, "0"),
+    day = (d: Date) => [d.getFullYear(), d.getMonth() + 1, d.getDate()].map(two),
+    time = (d: Date) => [d.getHours(), d.getMinutes(), d.getSeconds()].map(two).join("-");
   const now = new Date(),
-    today = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map((n) =>
-      String(n).padStart(2, "0"),
-    );
+    today = day(now);
+  // Codex names a rollout when its thread starts but creates the file at the first save, up to 36 s
+  // later in the lab, so a file with an older name can still appear after newer ones.
+  const old = new Date(now.getTime() - 10 * 60 * 1000),
+    settled = `rollout-${day(old).join("-")}T${time(old)}`;
   const listings = new Map<string, string[]>(),
     metas = new Map<string, JsonObject>();
   const list = (dir: string) => {
@@ -141,7 +146,7 @@ function registerCodexThreads(r: Recorder) {
       for (const name of list(dir)) {
         const second = name.slice(0, 27);
         if (second < after) continue;
-        if (second > last) last = second;
+        if (second > last && second < settled) last = second;
         const path = join(dir, name);
         if (r.store.meta(`transcript:codex:${path}`)) continue;
         if (!metas.has(path))

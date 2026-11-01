@@ -1419,6 +1419,17 @@ test("a Codex approval review's calls count for the session turn that asked for 
       ["s", "turn", work, "22222222-2222-4333-8444-555555555555"],
     ]);
     expect(store.meta(`transcript:codex:${other}`)).toBe("");
+    // Codex creates a rollout at its thread's first save, so a review can appear after a newer file.
+    const secondsAgo = (seconds: number) => {
+      const d = new Date(Date.now() - seconds * 1000),
+        two = (n: number) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}T${two(d.getHours())}-${two(d.getMinutes())}-${two(d.getSeconds())}`;
+    };
+    rollout(today, `${secondsAgo(30)}-newer`, { id: "newer", session_id: "other" }, "resp_newer");
+    recoverContext(r);
+    rollout(today, `${secondsAgo(60)}-slow`, { id: "slow", ...review }, "resp_slow");
+    recoverContext(r);
+    expect(new Set(usages(store).map((e) => e.entityId)).size).toBe(4);
   });
 });
 
