@@ -656,6 +656,121 @@ test("Claude routes keep Claude Code's own models, and a person's model stays", 
   expect(env().ANTHROPIC_MODEL).toBe("glm-5.3");
 });
 
+test("re-enable after the org gains Claude routes removes the bridge's model choice", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "deepseek-v4-flash-0731", is_serverless: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
+  // The organization adds Claude routes; a second sign-in runs enable again.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "claude-sonnet-5", is_serverless: false },
+  ]);
+  await enable(oauthSignIn);
+  expect(env().ANTHROPIC_MODEL).toBeUndefined();
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+  expect(env().ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8766/anthropic");
+  expect(loadGatewayState().wrote?.claude).toEqual({});
+  await disable();
+  expect(env().ANTHROPIC_BASE_URL).toBeUndefined();
+  expect(loadGatewayState().wrote).toBeUndefined();
+});
+
+test("re-enable after the model list changes updates the bridge's choice, not the person's", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "deepseek-v4-flash-0731", is_serverless: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  // The person makes the background model their own while the gateway runs.
+  const settings = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
+  settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = "glm-4.7-flash";
+  writeFileSync(claudeSettingsPath(), JSON.stringify(settings));
+  // The main model and the small model both change.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    models[1],
+    { ...models[1], slug: "glm-5.3-air", reasoning: false },
+  ]);
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBe("kimi-k2.6");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("glm-5.3-air");
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("glm-4.7-flash");
+  expect(loadGatewayState().wrote?.claude).toEqual({
+    ANTHROPIC_MODEL: "kimi-k2.6",
+    CLAUDE_CODE_AUTO_MODE_MODEL: "glm-5.3-air",
+  });
+});
+
+test("a non-reasoning model is chosen for auto mode when the preferred one is missing", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "glm-5.3-air", reasoning: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("glm-5.3-air");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("glm-5.3-air");
+  // Every serverless model reasons: no model is forced on the background checks.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  await enable(oauthSignIn);
+  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+});
+
+test("an existing proxy user gets the models when the daemon starts", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "deepseek-v4-flash-0731", is_serverless: false },
+  ]);
+  oauthCredential();
+  // As an older bridge left the gateway: wired to a proxy, but with no model choice and no record of one.
+  const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("x") });
+  const port = probe.port;
+  probe.stop(true);
+  process.env.KIMCHI_GATEWAY_PORT = String(port);
+  process.env.KIMCHI_BRIDGE_DISABLE_POLL_MS = "20";
+  cleanups.push(() => {
+    process.env.KIMCHI_GATEWAY_PORT = "";
+    delete process.env.KIMCHI_BRIDGE_DISABLE_POLL_MS;
+  });
+  saveGatewayState({ enabled: true, mode: "proxy", port });
+  mkdirSync(join(root, "home", ".claude"), { recursive: true });
+  writeFileSync(
+    claudeSettingsPath(),
+    JSON.stringify({
+      env: {
+        ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}/anthropic`,
+        ANTHROPIC_API_KEY: "",
+        ANTHROPIC_AUTH_TOKEN: "kimchi-gateway",
+        CLAUDE_CODE_AUTO_MODE_SERVER: "0",
+      },
+    }),
+  );
+  const run = runDaemon();
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  for (let i = 0; i < 500 && env().ANTHROPIC_MODEL === undefined; i++) await Bun.sleep(10);
+  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("deepseek-v4-flash-0731");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4-flash-0731");
+  expect(loadGatewayState().wrote?.claude).toEqual({
+    ANTHROPIC_MODEL: "minimax-m3",
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek-v4-flash-0731",
+    CLAUDE_CODE_AUTO_MODE_MODEL: "deepseek-v4-flash-0731",
+  });
+  saveGatewayState({ ...loadGatewayState(), enabled: false });
+  await run;
+});
+
 test("the launchd service waits while another daemon holds the port instead of exiting into a restart", async () => {
   process.env.KIMCHI_BASE_URL = modelsEndpoint();
   oauthCredential();
