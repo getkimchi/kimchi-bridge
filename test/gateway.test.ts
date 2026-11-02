@@ -34,6 +34,7 @@ import {
   stripCodexToml,
   writeClaudeDesktopConfig,
   type GatewayModel,
+  type GatewayState,
 } from "../src/gateway.ts";
 import { credentialPath, saveCredential } from "../src/oauth.ts";
 import type { SignIn } from "../src/kimchi.ts";
@@ -654,6 +655,213 @@ test("Claude routes keep Claude Code's own models, and a person's model stays", 
   expect(env().ANTHROPIC_MODEL).toBe("glm-5.3");
   await disable();
   expect(env().ANTHROPIC_MODEL).toBe("glm-5.3");
+});
+
+test("re-enable after the org gains Claude routes removes the bridge's model choice", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "deepseek-v4-flash-0731", is_serverless: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
+  // The organization adds Claude routes; a second sign-in runs enable again.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "claude-sonnet-5", is_serverless: false },
+  ]);
+  await enable(oauthSignIn);
+  expect(env().ANTHROPIC_MODEL).toBeUndefined();
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+  expect(env().ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8766/anthropic");
+  expect(loadGatewayState().wrote?.claude).toEqual({});
+  await disable();
+  expect(env().ANTHROPIC_BASE_URL).toBeUndefined();
+  expect(loadGatewayState().wrote).toBeUndefined();
+});
+
+test("re-enable after the model list changes updates the bridge's choice, not the person's", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "deepseek-v4-flash-0731", is_serverless: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  // The person makes the background model their own while the gateway runs.
+  const settings = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
+  settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = "glm-4.7-flash";
+  writeFileSync(claudeSettingsPath(), JSON.stringify(settings));
+  // The main model and the small model both change.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    models[1],
+    { ...models[1], slug: "deepseek-v4.1-flash-1017", is_serverless: false },
+  ]);
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBe("kimi-k2.6");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4.1-flash-1017");
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("glm-4.7-flash");
+  expect(loadGatewayState().wrote?.claude).toEqual({
+    ANTHROPIC_MODEL: "kimi-k2.6",
+    CLAUDE_CODE_AUTO_MODE_MODEL: "deepseek-v4.1-flash-1017",
+  });
+});
+
+test("the small model is one known to answer directly, never just any model that does not reason", async () => {
+  // Like the gateway's embedding models: marked as not reasoning, and answering no chat request.
+  const embedding = {
+    ...models[1],
+    slug: "bge-m3",
+    reasoning: false,
+    limits: { context_window: 8192, max_output_tokens: 0 },
+  };
+  const known = (slug: string) => ({ ...models[1], slug, is_serverless: false });
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    embedding,
+    known("deepseek-v4.1-flash-1017"),
+    known("deepseek-v4-flash-0731"),
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  // The bridge's order decides, not the list's.
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4-flash-0731");
+  // Kimchi's own small model leaves the list: the second known one takes over.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    embedding,
+    known("deepseek-v4.1-flash-1017"),
+  ]);
+  await enable(oauthSignIn);
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("deepseek-v4.1-flash-1017");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4.1-flash-1017");
+  // Neither is listed: no model goes on the background checks.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([...models, embedding]);
+  await enable(oauthSignIn);
+  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+});
+
+const claudeEnv = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env ?? {};
+/**
+ * Starts the daemon over CLI settings an older bridge wired to its proxy, with no model choice, and
+ * waits until it writes a main model. `stopDaemon` stops it and drops its pid: it ran in this test's
+ * process, which a separate daemon that exited would not leave for disable to signal.
+ */
+async function daemonOverOlderWiring(previous?: GatewayState["previous"]) {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "deepseek-v4-flash-0731", is_serverless: false },
+  ]);
+  oauthCredential();
+  const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("x") });
+  const port = probe.port;
+  probe.stop(true);
+  process.env.KIMCHI_GATEWAY_PORT = String(port);
+  process.env.KIMCHI_BRIDGE_DISABLE_POLL_MS = "20";
+  cleanups.push(() => {
+    process.env.KIMCHI_GATEWAY_PORT = "";
+    delete process.env.KIMCHI_BRIDGE_DISABLE_POLL_MS;
+  });
+  saveGatewayState({ enabled: true, mode: "proxy", port, ...(previous ? { previous } : {}) });
+  mkdirSync(join(root, "home", ".claude"), { recursive: true });
+  writeFileSync(
+    claudeSettingsPath(),
+    JSON.stringify({
+      env: {
+        ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}/anthropic`,
+        ANTHROPIC_API_KEY: "",
+        ANTHROPIC_AUTH_TOKEN: "kimchi-gateway",
+        CLAUDE_CODE_AUTO_MODE_SERVER: "0",
+      },
+    }),
+  );
+  const run = runDaemon();
+  for (let i = 0; i < 500 && claudeEnv().ANTHROPIC_MODEL === undefined; i++) await Bun.sleep(10);
+  const stopDaemon = async () => {
+    saveGatewayState({ ...loadGatewayState(), enabled: false });
+    await run;
+    saveGatewayState({ ...loadGatewayState(), pid: undefined });
+  };
+  return { stopDaemon };
+}
+// The snapshot an rc.19 or older bridge's enable took, plus the auto-mode key a later upgrade added:
+// it has no model keys, so disable restores none of them.
+const rc19Snapshot = {
+  ANTHROPIC_BASE_URL: null,
+  ANTHROPIC_API_KEY: null,
+  ANTHROPIC_AUTH_TOKEN: null,
+  CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: null,
+  CLAUDE_CODE_AUTO_MODE_SERVER: null,
+};
+
+test("an existing proxy user gets the models when the daemon starts", async () => {
+  // As an older bridge left the gateway: wired to a proxy, but with no model choice and no record of one.
+  const { stopDaemon } = await daemonOverOlderWiring();
+  expect(claudeEnv().ANTHROPIC_MODEL).toBe("minimax-m3");
+  expect(claudeEnv().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("deepseek-v4-flash-0731");
+  expect(claudeEnv().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4-flash-0731");
+  expect(loadGatewayState().wrote?.claude).toEqual({
+    ANTHROPIC_MODEL: "minimax-m3",
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek-v4-flash-0731",
+    CLAUDE_CODE_AUTO_MODE_MODEL: "deepseek-v4-flash-0731",
+  });
+  await stopDaemon();
+});
+
+test("disable removes the models the daemon gave a gateway an rc.19 bridge enabled", async () => {
+  const { stopDaemon } = await daemonOverOlderWiring({ claude: rc19Snapshot });
+  expect(claudeEnv().ANTHROPIC_MODEL).toBe("minimax-m3");
+  await stopDaemon();
+  await disable();
+  // Claude Code is back on the person's own provider: no Kimchi model may be left behind.
+  expect(claudeEnv()).toEqual({});
+});
+
+test("re-enable removes the models an rc.21 bridge wrote once the org gains Claude routes", async () => {
+  oauthCredential();
+  // rc.21 snapshotted the model keys as absent, wrote them, and kept no record of writing them.
+  saveGatewayState({
+    enabled: true,
+    mode: "proxy",
+    port: 8766,
+    previous: {
+      claude: {
+        ...rc19Snapshot,
+        CLAUDE_CODE_AUTO_MODE_MODEL: null,
+        ANTHROPIC_MODEL: null,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: null,
+      },
+    },
+  });
+  mkdirSync(join(root, "home", ".claude"), { recursive: true });
+  writeFileSync(
+    claudeSettingsPath(),
+    JSON.stringify({
+      env: {
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:8766/anthropic",
+        ANTHROPIC_API_KEY: "",
+        ANTHROPIC_AUTH_TOKEN: "kimchi-gateway",
+        CLAUDE_CODE_AUTO_MODE_SERVER: "0",
+        ANTHROPIC_MODEL: "minimax-m3",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek-v4-flash-0731",
+        CLAUDE_CODE_AUTO_MODE_MODEL: "deepseek-v4-flash-0731",
+      },
+    }),
+  );
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "claude-sonnet-5", is_serverless: false },
+  ]);
+  await enable(oauthSignIn);
+  expect(claudeEnv().ANTHROPIC_MODEL).toBeUndefined();
+  expect(claudeEnv().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
+  expect(claudeEnv().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+  expect(claudeEnv().ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8766/anthropic");
 });
 
 test("the launchd service waits while another daemon holds the port instead of exiting into a restart", async () => {

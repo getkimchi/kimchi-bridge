@@ -59,6 +59,8 @@ export interface GatewayState {
     codexTopLevel?: Array<[string, string]>;
     claudeDesktop?: Desktop3pPrevious;
   };
+  /** The env values the bridge last wrote into the CLI configs, so later writes replace only its own. */
+  wrote?: { claude?: Record<string, string> };
 }
 
 // ---------------------------------------------------------------------------
@@ -156,11 +158,54 @@ function writeJsonFile(path: string, value: Record<string, unknown>): void {
   writeAtomic(path, JSON.stringify(value, null, 2) + "\n", 0o644);
 }
 
+/**
+ * Applies the bridge's model choice to Claude Code's env. A key the choice sets is (re)written
+ * when it is absent or still holds the bridge's own recorded value, a key the bridge wrote that
+ * the choice no longer sets is removed, and every other value stays, because the person set it.
+ * Returns the keys the bridge now owns.
+ */
+const CLAUDE_MODEL_KEYS = [
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "CLAUDE_CODE_AUTO_MODE_MODEL",
+];
+function applyClaudeModelEnv(
+  env: Record<string, unknown>,
+  modelEnv: Record<string, string>,
+  wrote?: Record<string, string>,
+  snapshot?: Record<string, string | null>,
+): Record<string, string> {
+  // rc.20 and rc.21 wrote the model keys without recording it: until a record exists, a key the enable
+  // snapshot says was absent is the bridge's.
+  if (!wrote && snapshot) {
+    wrote = {};
+    for (const key of CLAUDE_MODEL_KEYS) {
+      const current = env[key];
+      if (snapshot[key] === null && typeof current === "string") wrote[key] = current;
+    }
+  }
+  const written: Record<string, string> = {};
+  for (const [key, value] of Object.entries(modelEnv)) {
+    const current = env[key];
+    if (typeof current === "string" && current !== wrote?.[key]) continue;
+    env[key] = value;
+    written[key] = value;
+  }
+  for (const [key, value] of Object.entries(wrote ?? {})) {
+    const current = env[key];
+    if (modelEnv[key] !== undefined || current !== value) continue;
+    delete env[key];
+  }
+  return written;
+}
+
 function writeClaudeConfig(
   anthropicBaseUrl: string,
   authToken: string,
   modelEnv: Record<string, string> = {},
-): Record<string, string | null> {
+  wrote?: Record<string, string>,
+  snapshot?: Record<string, string | null>,
+): { previous: Record<string, string | null>; wrote: Record<string, string> } {
   const path = claudeSettingsPath();
   const settings = readJsonFile(path);
   const env =
@@ -184,15 +229,13 @@ function writeClaudeConfig(
     CLAUDE_CODE_AUTO_MODE_SERVER: "0",
   };
   for (const [key, value] of Object.entries(pairs)) env[key] = value;
-  // A person's own model choice stays.
-  for (const [key, value] of Object.entries(modelEnv))
-    if (typeof env[key] !== "string") env[key] = value;
+  const written = applyClaudeModelEnv(env, modelEnv, wrote, snapshot);
   // A stale kill-switch from an older bridge would keep the beta-gated
   // telemetry collector off; remove what we no longer set.
   delete env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS;
   settings.env = env;
   writeJsonFile(path, settings);
-  return previous;
+  return { previous, wrote: written };
 }
 
 /** Gives Claude Code's auto-mode setting to a gateway enabled before it existed; disable removes it again. */
@@ -230,6 +273,51 @@ function restoreClaudeConfig(previous?: Record<string, string | null>): void {
   }
   settings.env = env;
   writeJsonFile(path, settings);
+}
+
+/**
+ * Brings Claude Code's model env up to date when the daemon starts, for gateways an older bridge
+ * enabled or has left stale: an organization without Claude routes gets the models it has, and a
+ * choice an earlier list wrote is replaced or removed as the list changes. Only the bridge's own
+ * wiring is touched, as the desktop rewrite: settings without it, and values the person set, stay.
+ */
+async function refreshClaudeModelEnv(
+  llmBase: string,
+  headers: Record<string, string>,
+): Promise<void> {
+  const models = await fetchModels(llmBase, headers);
+  const state = loadGatewayState();
+  const path = claudeSettingsPath();
+  const settings = readJsonFile(path);
+  const env =
+    settings.env && typeof settings.env === "object" && !Array.isArray(settings.env)
+      ? (settings.env as Record<string, unknown>)
+      : {};
+  if (env.ANTHROPIC_AUTH_TOKEN !== PROXY_PLACEHOLDER) return;
+  const before = JSON.stringify(settings);
+  const known = state.previous?.claude ?? {};
+  const wrote = applyClaudeModelEnv(env, claudeModelEnv(models), state.wrote?.claude, known);
+  settings.env = env;
+  if (JSON.stringify(settings) !== before) writeJsonFile(path, settings);
+  // Saved over the state as it is now, so a disable since the daemon started is not undone.
+  const current = loadGatewayState();
+  if (current.enabled === false) return;
+  // A key an older bridge's enable didn't snapshot goes back to absent on disable, as ensureClaudeAutoMode's does.
+  const snapshot = current.previous?.claude ?? {};
+  const added = Object.keys(wrote).filter((key) => !(key in snapshot));
+  if (added.length || JSON.stringify(wrote) !== JSON.stringify(current.wrote?.claude ?? {}))
+    saveGatewayState({
+      ...current,
+      wrote: { ...current.wrote, claude: wrote },
+      ...(added.length
+        ? {
+            previous: {
+              ...current.previous,
+              claude: { ...snapshot, ...Object.fromEntries(added.map((key) => [key, null])) },
+            },
+          }
+        : {}),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -343,20 +431,24 @@ export function resolveMainModel(models: readonly GatewayModel[]): GatewayModel 
   return vision ?? serverless[0] ?? models[0];
 }
 
-// The small model Kimchi's own checks use. It answers within the 64 tokens Claude Code's auto-mode check allows, which
-// the models that reason first spend before they reply.
-const CLAUDE_SMALL_MODEL = "deepseek-v4-flash-0731";
+// The small models known to answer Claude Code's auto-mode check directly, in order; Kimchi's own checks use the first.
+// Each replies well within the 64 tokens the check allows. The model list can't tell which models do: some that can
+// switch thinking off still think first and spend the budget, and the ones marked as not reasoning are embedding and
+// test models that answer no chat request. So the models are named.
+const CLAUDE_SMALL_MODELS = ["deepseek-v4-flash-0731", "deepseek-v4.1-flash-1017"];
 
 /**
  * Claude Code asks for Claude models by default, and an organization without Claude routes answers those with 400: the
- * first prompt fails, and so does every auto-mode check. Such an organization gets the models it has.
+ * first prompt fails, and so does every auto-mode check. Such an organization gets the models it has: the main one for
+ * prompts, and for the background checks the first known small model it lists, else none.
  */
 function claudeModelEnv(models: readonly GatewayModel[]): Record<string, string> {
   if (!models.length || models.some((model) => isClaudeModel(model.slug))) return {};
   const env: Record<string, string> = { ANTHROPIC_MODEL: resolveMainModel(models).slug };
-  if (models.some((model) => model.slug === CLAUDE_SMALL_MODEL)) {
-    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = CLAUDE_SMALL_MODEL;
-    env.CLAUDE_CODE_AUTO_MODE_MODEL = CLAUDE_SMALL_MODEL;
+  const small = CLAUDE_SMALL_MODELS.find((slug) => models.some((model) => model.slug === slug));
+  if (small) {
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = small;
+    env.CLAUDE_CODE_AUTO_MODE_MODEL = small;
   }
   return env;
 }
@@ -1400,10 +1492,21 @@ export async function runDaemon(): Promise<void> {
   } catch (error) {
     log(`Claude Desktop config rewrite failed: ${(error as Error).message}`);
   }
+  try {
+    const credential = loadCredential();
+    await refreshClaudeModelEnv(
+      target.llmBase,
+      credential ? gatewayHeaders(await ensureFresh()) : keyHeaders(kimchiSignIn()),
+    );
+  } catch (error) {
+    log(`Claude Code model env refresh failed: ${(error as Error).message}`);
+  }
   log(`gateway proxy listening on 127.0.0.1:${port} -> ${target.llmBase}`);
   // Poll for disable while running; SIGTERM also exits (default handler).
+  // KIMCHI_BRIDGE_DISABLE_POLL_MS is a test seam.
+  const poll = Number(process.env.KIMCHI_BRIDGE_DISABLE_POLL_MS) || 10_000;
   for (;;) {
-    await new Promise((resolve) => setTimeout(resolve, 10_000));
+    await new Promise((resolve) => setTimeout(resolve, poll));
     try {
       if (loadGatewayState().enabled === false) {
         log("disabled; shutting down");
@@ -1472,10 +1575,12 @@ export async function enable(
 
   // Fetch the model list first: a failure leaves nothing written.
   const models = await fetchModels(llmBase, modelHeaders);
-  const claudePrevious = writeClaudeConfig(
+  const claude = writeClaudeConfig(
     `http://127.0.0.1:${port}/anthropic`,
     PROXY_PLACEHOLDER,
     claudeModelEnv(models),
+    previousState.wrote?.claude,
+    previousState.enabled ? previousState.previous?.claude : undefined,
   );
   const codexPrevious = writeCodexConfig(
     `http://127.0.0.1:${port}/openai/v1`,
@@ -1501,6 +1606,8 @@ export async function enable(
     enabled: true,
     mode: "proxy",
     port,
+    // What this enable left in the settings, so a later one replaces only its own choice.
+    wrote: { ...previousState.wrote, claude: claude.wrote },
     // Re-enabling over our own settings (a direct-mode upgrade) keeps the user's
     // original values, so disable still restores what they had before.
     previous:
@@ -1508,7 +1615,7 @@ export async function enable(
         ? {
             ...previousState.previous,
             // A key this version added still goes back to what it was before this enable.
-            claude: { ...claudePrevious, ...previousState.previous.claude },
+            claude: { ...claude.previous, ...previousState.previous.claude },
             // Re-enabling over the bridge's own desktop wiring keeps the
             // first enable's snapshot: the recomputed one would record the
             // bridge's 3P mode and entry as the person's, so disable would
@@ -1518,7 +1625,7 @@ export async function enable(
               : {}),
           }
         : {
-            claude: claudePrevious,
+            claude: claude.previous,
             ...(codexPrevious ? { codexTopLevel: codexPrevious } : {}),
             ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),
           },
@@ -1555,7 +1662,8 @@ export async function disable(onMessage?: (message: string) => void): Promise<vo
     onMessage?.("Restart the Claude app to leave third-party mode.");
   }
   stop();
-  saveGatewayState({ ...state, enabled: false, previous: undefined });
+  // The bridge owns no model keys anymore once its wiring is restored.
+  saveGatewayState({ ...state, enabled: false, previous: undefined, wrote: undefined });
   onMessage?.("Gateway disabled. Claude Code and Codex use their own providers again.");
 }
 
