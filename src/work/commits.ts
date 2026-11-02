@@ -32,6 +32,11 @@ interface GitProcess {
   end?: number;
   /** The process's exit code, from trace2's exit event. */
   code?: number;
+  /**
+   * The signal that ended the process, such as SIGPIPE from a closed pipe or a timeout's SIGTERM;
+   * such a process logs no exit event.
+   */
+  signal?: number;
   command?: string;
   worktree?: string;
   call?: string;
@@ -86,6 +91,7 @@ function processes(trace: string): GitProcess[] {
       p.end = instant(event.time);
       if (typeof event.code === "number") p.code = event.code;
     }
+    if (event.event === "signal") p.signal = typeof event.signo === "number" ? event.signo : 0;
   }
   return [...byId.values()];
 }
@@ -183,9 +189,16 @@ function headCommit(
     return { sha };
 }
 
-/** Commits whose ref transaction one traced Git process owned and finished successfully. */
-export function tracedCommits(trace: string, refs: string): TracedCommit[] {
-  const running = processes(trace);
+// Commands whose run can still end in a commit headCommit counts; `pull` merges or rebases in a child.
+const COMMITTING = new Set(["commit", "merge", "rebase", "cherry-pick", "revert", "pull"]);
+
+/** A trace's state: the commits it proves, and whether a Git process may still write into it. */
+export function traceState(
+  events: string,
+  refs: string,
+  now = Date.now(),
+): { commits: TracedCommit[]; unfinished: boolean } {
+  const running = processes(events);
   const commits: TracedCommit[] = [];
   type Pending = { sha: string; rewrittenFrom?: string; owner: GitProcess };
   const commitOf = (p: Pending): TracedCommit => ({
@@ -268,7 +281,26 @@ export function tracedCommits(trace: string, refs: string): TracedCommit[] {
       !commits.some((c) => c.sha === p.sha && c.worktree === p.owner.worktree)
     )
       commits.push(commitOf(p));
-  return commits;
+  return {
+    commits,
+    // A command can outlive its shell call (unified exec), so its Git has no exit event yet and its
+    // commit is still to come. Only a run that can still end in a commit holds the trace: a piped
+    // `git log` its reader cut off, or a daemon, never commits. A Git a signal ended writes nothing
+    // more, and one killed before it logged anything would hold the trace forever, so only a process
+    // started in the last ten minutes counts — the window a quiet trace survives pruneTraces.
+    unfinished: running.some(
+      (p) =>
+        p.end === undefined &&
+        p.signal === undefined &&
+        (p.command === undefined || COMMITTING.has(p.command)) &&
+        p.start > (now - 600_000) * 1000,
+    ),
+  };
+}
+
+/** Commits whose ref transaction one traced Git process owned and finished successfully. */
+export function tracedCommits(trace: string, refs: string): TracedCommit[] {
+  return traceState(trace, refs).commits;
 }
 
 // Where an agent shell's Git trace goes. Claude Code sets it per session through CLAUDE_ENV_FILE;
@@ -302,9 +334,12 @@ const traceKeys = Object.keys(traceVariables("", ""));
 // inside the markers when the block is last. Only the bridge's own lines go; without hook trust,
 // Codex runs none of the bridge's hooks.
 function withoutBlock(text: string): string {
-  const start = text.indexOf(BEGIN),
-    end = start < 0 ? -1 : text.indexOf(END, start);
-  if (end < 0) return text;
+  const start = text.indexOf(BEGIN);
+  if (start < 0) return text;
+  const marker = text.indexOf(END, start);
+  // A block that lost its end marker (a truncated file, a manual edit) still ends at the file's end,
+  // so a re-enable repairs the config instead of refusing over the stale table it left behind.
+  const end = marker >= 0 ? marker : text.length;
   const inside = text
     .slice(start + BEGIN.length, end)
     .split("\n")
@@ -318,9 +353,8 @@ function withoutBlock(text: string): string {
       inside.splice(header, next - header);
   }
   const before = text.slice(0, start).trimEnd(),
-    after = [inside.join("\n").trim(), text.slice(end + END.length).trim()]
-      .filter(Boolean)
-      .join("\n\n");
+    tail = marker >= 0 ? marker + END.length : text.length,
+    after = [inside.join("\n").trim(), text.slice(tail).trim()].filter(Boolean).join("\n\n");
   return [before, after].filter(Boolean).join("\n\n") + (before || after ? "\n" : "");
 }
 
