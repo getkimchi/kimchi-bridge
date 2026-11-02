@@ -705,10 +705,33 @@ export function rewriteClaudeDesktopConfig(anthropicBaseUrl: string): void {
   if (after !== before) writeAtomic(path, after, 0o600);
 }
 
+/**
+ * Whether a configLibrary entry's content is the bridge's own wiring: every
+ * bridge version keyed its entry with the proxy placeholder. No content means
+ * the entry's file was missing at enable, so nothing of the person's is left.
+ */
+function bridgeWiring(content: string | undefined): boolean {
+  if (content === undefined) return true;
+  try {
+    return JSON.parse(content)?.inferenceGatewayApiKey === PROXY_PLACEHOLDER;
+  } catch {
+    return false;
+  }
+}
+
 /** Restores the desktop app to the mode and library it had before enable. */
-export function restoreClaudeDesktopConfig(previous?: Desktop3pPrevious): void {
+export function restoreClaudeDesktopConfig(saved?: Desktop3pPrevious): void {
   const appData = claudeDesktopAppData();
-  if (!appData || !previous) return;
+  if (!appData || !saved) return;
+  // An older bridge's second enable saved its own wiring as the person's
+  // setup: the bridge's entry, with the bridge's content, as the applied one.
+  // Nothing of the person's setup is left in such a snapshot, so disable
+  // restores the app default, as for an entry the bridge created. A "Kimchi
+  // Gateway" entry of the person's own has other content and comes back.
+  const previous: Desktop3pPrevious =
+    saved.appliedId === saved.entryId && bridgeWiring(saved.entryContent)
+      ? { mode: null, appliedId: null, createdEntry: true, entryId: saved.entryId }
+      : saved;
   try {
     const config = readDesktopConfig(appData);
     if (config[DESKTOP_MODE_KEY] === "3p") {
@@ -757,6 +780,34 @@ export function restoreClaudeDesktopConfig(previous?: Desktop3pPrevious): void {
   } catch {
     /* the 3P profile is the app's to keep once it has run; ignore failures */
   }
+}
+
+/**
+ * Whether Claude Desktop is in third-party mode with the bridge's own
+ * configLibrary entry applied. Enable reads this before it rewrites the
+ * desktop config: afterwards the entry is always the bridge's, so a true
+ * result here means a previous enable, not the person, put the app in this
+ * state.
+ */
+function desktopShowsOwnEntry(): boolean {
+  const appData = claudeDesktopAppData();
+  if (!appData) return false;
+  let mode: unknown;
+  try {
+    mode = readDesktopConfig(appData)[DESKTOP_MODE_KEY];
+  } catch {
+    return false;
+  }
+  if (mode !== "3p") return false;
+  let meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> };
+  try {
+    const library = join(claudeDesktop3pData(), "configLibrary", "_meta.json");
+    meta = JSON.parse(readFileSync(library, "utf8"));
+  } catch {
+    return false; /* the desktop app was never configured through the library */
+  }
+  const ours = (meta.entries ?? []).find((entry) => entry?.name === DESKTOP_LIBRARY_ENTRY);
+  return isConfigId(meta.appliedId) && meta.appliedId === ours?.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,6 +1485,10 @@ export async function enable(
   // Claude Desktop ignores the CLI settings, so it is switched into its
   // third-party mode pointing at the same proxy; null when it is not installed
   // or its config cannot be written, which never blocks the CLI wiring.
+  // Read before the write: afterwards the desktop always shows the bridge's
+  // entry, so only this earlier look tells a re-enable over the bridge's own
+  // wiring from a first enable.
+  const desktopOurs = desktopShowsOwnEntry();
   let desktopPrevious: Desktop3pPrevious | null = null;
   try {
     desktopPrevious = writeClaudeDesktopConfig(`http://127.0.0.1:${port}/anthropic`, models);
@@ -1454,9 +1509,13 @@ export async function enable(
             ...previousState.previous,
             // A key this version added still goes back to what it was before this enable.
             claude: { ...claudePrevious, ...previousState.previous.claude },
-            // The desktop snapshot is recomputed above, so re-enable keeps
-            // what disable would need to restore now, not the first enable's.
-            ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),
+            // Re-enabling over the bridge's own desktop wiring keeps the
+            // first enable's snapshot: the recomputed one would record the
+            // bridge's 3P mode and entry as the person's, so disable would
+            // leave Claude Desktop in third-party mode on a stopped proxy.
+            ...(desktopPrevious && !(desktopOurs && previousState.previous.claudeDesktop)
+              ? { claudeDesktop: desktopPrevious }
+              : {}),
           }
         : {
             claude: claudePrevious,
