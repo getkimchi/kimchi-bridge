@@ -1481,6 +1481,36 @@ test("a Codex approval review's calls count for the session turn that asked for 
   });
 });
 
+test("a Codex thread begun on a day no sync ran is found, within the latest 32 days", () => {
+  const { base, store, r, scope } = fixture();
+  withBridgeHome(base, () => {
+    const sessions = join(base, "codex", "sessions");
+    const rollout = (daysAgo: number, id: string, meta: object) => {
+      const d = new Date();
+      d.setHours(12, 0, 0, 0);
+      d.setDate(d.getDate() - daysAgo);
+      const day = [d.getFullYear(), d.getMonth() + 1, d.getDate()].map((n) =>
+          String(n).padStart(2, "0"),
+        ),
+        path = join(sessions, ...day, `rollout-${day.join("-")}T12-00-00-${id}.jsonl`);
+      mkdirSync(dirname(path), { recursive: true });
+      const line = { timestamp: at, type: "session_meta", payload: meta };
+      writeFileSync(path, JSON.stringify(line) + "\n");
+      return path;
+    };
+    const review = { session_id: "s", parent_thread_id: "s", thread_source: "guardian_review" };
+    const main = rollout(40, "s", { id: "s", session_id: "s" });
+    // Neither the session's day nor today: the machine slept, or no sync ran that day.
+    const missed = rollout(5, "missed", { id: "missed", ...review }),
+      tooOld = rollout(35, "old", { id: "old", ...review });
+    registerTranscript(r, { ...scope, Turn: "" }, main, "unknown", "unknown");
+    recoverContext(r);
+    expect(JSON.parse(store.meta(`transcript:codex:${missed}`)).thread).toBe("missed");
+    // Besides the session's own folder, only the latest 32 day folders are listed.
+    expect(store.meta(`transcript:codex:${tooOld}`)).toBe("");
+  });
+});
+
 test("a Codex review thread forked after an interrupted review does not report the call it copied", () => {
   const { base, root, store, r, scope } = fixture();
   withBridgeHome(base, () => {

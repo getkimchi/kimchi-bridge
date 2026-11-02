@@ -61,9 +61,17 @@ function sessionMeta(path: string): JsonObject | undefined {
   let fd: number | undefined;
   try {
     fd = openSync(path, "r");
+    // Only the first line is needed: read until it ends, not the whole bound of every rollout.
     const bytes = Buffer.allocUnsafe(4 * 1024 * 1024 + 1);
-    const count = readSync(fd, bytes, 0, bytes.length, 0),
-      end = bytes.subarray(0, count).indexOf(10);
+    let count = 0,
+      end = -1;
+    while (end < 0 && count < bytes.length) {
+      const read = readSync(fd, bytes, count, Math.min(64 * 1024, bytes.length - count), count);
+      if (!read) break;
+      const newline = bytes.subarray(count, count + read).indexOf(10);
+      if (newline >= 0) end = count + newline;
+      count += read;
+    }
     if (end < 0 || end >= 4 * 1024 * 1024) return;
     const meta = parseJson(bytes.subarray(0, end).toString());
     return str(meta, "type") === "session_meta" ? obj(meta.payload) : undefined;
@@ -100,23 +108,37 @@ export function registerTranscript(
   r.store.setMeta(`transcript:${r.source}:${path}`, stringifyJson(t));
 }
 
+const two = (n: number) => String(n).padStart(2, "0");
+// A date's local day, as Codex names its folders: YYYY, MM, DD.
+const localDay = (d: Date) => [d.getFullYear(), d.getMonth() + 1, d.getDate()].map(two);
+
+/** The day folders under `sessions` from `from` (YYYY-MM-DD) through `to`: at most the latest `cap`. */
+function dayFolders(sessions: string, from: string, to: Date, cap = 32): string[] {
+  const last = new Date(to.getFullYear(), to.getMonth(), to.getDate()),
+    earliest = new Date(last.getFullYear(), last.getMonth(), last.getDate() - (cap - 1)),
+    first = new Date(+from.slice(0, 4), +from.slice(5, 7) - 1, +from.slice(8, 10));
+  const folders: string[] = [];
+  const day = Number.isNaN(first.getTime()) || first < earliest ? earliest : first;
+  for (; day <= last; day.setDate(day.getDate() + 1))
+    folders.push(join(sessions, ...localDay(day)));
+  return folders;
+}
+
 /**
  * Codex runs each approval review, like any thread a session starts, with a rollout of its own: in
  * the folder of the day it began, named for that second. Its records name the session and the turn
  * they served, so it is read as part of the session. No hook names it.
  */
 function registerCodexThreads(r: Recorder) {
-  const two = (n: number) => String(n).padStart(2, "0"),
-    day = (d: Date) => [d.getFullYear(), d.getMonth() + 1, d.getDate()].map(two),
-    time = (d: Date) => [d.getHours(), d.getMinutes(), d.getSeconds()].map(two).join("-");
-  const now = new Date(),
-    today = day(now);
+  const time = (d: Date) => [d.getHours(), d.getMinutes(), d.getSeconds()].map(two).join("-");
+  const now = new Date();
   // Codex names a rollout when its thread starts but creates the file at the first save, up to 36 s
   // later in the lab, so a file with an older name can still appear after newer ones.
   const old = new Date(now.getTime() - 10 * 60 * 1000),
-    settled = `rollout-${day(old).join("-")}T${time(old)}`;
+    settled = `rollout-${localDay(old).join("-")}T${time(old)}`;
   const listings = new Map<string, string[]>(),
-    metas = new Map<string, JsonObject>();
+    metas = new Map<string, JsonObject>(),
+    registered = new Map<string, boolean>();
   const list = (dir: string) => {
     if (!listings.has(dir))
       try {
@@ -138,17 +160,17 @@ function registerCodexThreads(r: Recorder) {
     const key = `codex-threads:${t.scope.Session}`,
       after = r.store.meta(key) || basename(t.path).slice(0, 27);
     let last = after;
-    // A session still running after midnight starts its threads in the next day's folder.
-    for (const dir of new Set([
-      dirname(t.path),
-      join(dirname(dirname(dirname(dirname(t.path)))), ...today),
-    ]))
+    // A thread's rollout sits in the folder of the day it began. A session can run past midnight and a
+    // sync can miss whole days, so every day from the last one read through today is listed.
+    const sessions = dirname(dirname(dirname(dirname(t.path))));
+    for (const dir of new Set([dirname(t.path), ...dayFolders(sessions, after.slice(8, 18), now)]))
       for (const name of list(dir)) {
         const second = name.slice(0, 27);
         if (second < after) continue;
         if (second > last && second < settled) last = second;
         const path = join(dir, name);
-        if (r.store.meta(`transcript:codex:${path}`)) continue;
+        if (!registered.has(path)) registered.set(path, !!r.store.meta(`transcript:codex:${path}`));
+        if (registered.get(path)) continue;
         if (!metas.has(path))
           try {
             metas.set(path, sessionMeta(path) ?? {});
@@ -157,8 +179,10 @@ function registerCodexThreads(r: Recorder) {
           }
         const meta = metas.get(path)!,
           thread = str(meta, "id");
-        if (str(meta, "session_id") === t.scope.Session && thread && thread !== t.scope.Session)
+        if (str(meta, "session_id") === t.scope.Session && thread && thread !== t.scope.Session) {
           registerTranscript(r, { ...t.scope, Turn: "" }, path, t.route, t.basis, thread);
+          registered.set(path, true);
+        }
       }
     if (last !== after) r.store.setMeta(key, last);
   }
