@@ -736,9 +736,7 @@ test("shell tool calls do not open the repository inventory", () => {
   const shell = { tool: "Bash", toolCallId: "sh", command: "ls" };
   record("tool.before", shell);
   record("tool.after", shell);
-  const rows = store.db
-    .query("SELECT COUNT(*) AS n FROM blobs")
-    .get() as { n: number };
+  const rows = store.db.query("SELECT COUNT(*) AS n FROM blobs").get() as { n: number };
   expect(rows.n).toBe(0);
   expect(events(store, "file")).toHaveLength(0);
   store.close();
