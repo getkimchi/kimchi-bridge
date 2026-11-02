@@ -37,6 +37,24 @@ export const TRACE_VARIABLES = [
   "GIT_TRACE",
 ];
 function gitContext(signal: AbortSignal | undefined, cwd: string, ...args: string[]): string {
+  return gitProcess(signal, cwd, args, undefined);
+}
+// For arguments that can exceed the operating system's command-line limit (macOS ARG_MAX): revision
+// tips travel over stdin as `^<tip>` lines instead of `--not` words (see matchCommits).
+function gitInput(
+  signal: AbortSignal | undefined,
+  cwd: string,
+  input: string,
+  ...args: string[]
+): string {
+  return gitProcess(signal, cwd, args, input);
+}
+function gitProcess(
+  signal: AbortSignal | undefined,
+  cwd: string,
+  args: string[],
+  input: string | undefined,
+): string {
   checkSignal(signal);
   const env = { ...process.env };
   for (const key of [
@@ -56,7 +74,8 @@ function gitContext(signal: AbortSignal | undefined, cwd: string, ...args: strin
     env,
     timeout: remainingTime(signal, 2000),
     maxBuffer: 8 << 20,
-    stdio: ["ignore", "pipe", "ignore"],
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
+    input,
   });
   checkSignal(signal);
   let text = out.toString();
@@ -234,6 +253,10 @@ function gitDir(s: Scope, signal?: AbortSignal): string {
 }
 const tipsOf = (r: Recorder, refs: string | string[] | undefined) =>
   typeof refs === "string" ? fields(r.store.blob(refs).toString()) : refs || [];
+// Excluded tips go through stdin as `^<tip>` lines: past about 24,000 of them the command line
+// exceeds the operating system's limit (macOS ARG_MAX), Git cannot start, and the edit stays
+// unmatched. On Git 2.50 and 2.54 stdin exclusion selects the same commits as `--not`.
+const exclusions = (tips: Iterable<string>) => [...tips].map((tip) => `^${tip}`).join("\n");
 function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortSignal) {
   const root = rootOf(c.Scope),
     dir = gitDir(c.Scope, signal),
@@ -242,10 +265,16 @@ function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortS
     after = fileObject(r, c.After, format);
   if (!within(root, c.Path)) throw new Error("file is outside its captured repository");
   const path = relative(root, c.Path);
-  // ponytail: tips go on the command line as in Kimchi; past about 24,000 tips (macOS ARG_MAX) Git cannot start
-  // and the edit stays unmatched. Pass them with --stdin if a repository that large shows up.
   let commits = fields(
-    gitContext(signal, dir, "rev-list", "--all", "--max-count=129", "--not", ...tipsOf(r, c.Refs)),
+    gitInput(
+      signal,
+      dir,
+      exclusions(tipsOf(r, c.Refs)),
+      "rev-list",
+      "--all",
+      "--max-count=129",
+      "--stdin",
+    ),
   );
   if (commits.length > 128) {
     r.store.diagnostic("git_history_bound");
@@ -306,7 +335,7 @@ function matchCommits(r: Recorder, c: GitChange, change: string, signal?: AbortS
     if (!matched) continue;
     if (
       !direct &&
-      gitContext(signal, dir, "rev-list", "--max-count=1", sha, "--not", ...refs) !== sha
+      gitInput(signal, dir, exclusions(refs), "rev-list", "--max-count=1", sha, "--stdin") !== sha
     )
       continue;
     // A traced agent commit already has stronger evidence; recording it again would flip revisions.

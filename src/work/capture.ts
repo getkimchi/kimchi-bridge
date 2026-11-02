@@ -159,8 +159,15 @@ export function repository(cwd: string): [string, string, Repository | undefined
     const url = new URL(remote);
     if (url.protocol !== "https:" && !(url.protocol === "ssh:" && url.username === "git"))
       return [root, local, undefined, common];
-    if (url.password || url.search || url.hash || (url.protocol === "https:" && url.username))
+    if (url.search || url.hash || (url.protocol === "ssh:" && url.password))
       return [root, local, undefined, common];
+    // An HTTPS remote rewritten to carry a username or password (url.<base>.insteadOf) keeps its
+    // repository identity: the credentials are dropped here, never stored or uploaded, while a query
+    // string or fragment still leaves no identity. An SSH remote still needs the "git" user.
+    if (url.protocol === "https:") {
+      url.username = "";
+      url.password = "";
+    }
     // An HTTPS remote's port belongs to the web host; an SSH remote's port does not.
     host = url.protocol === "https:" ? url.host : sshHost(url.hostname);
     name = url.pathname.slice(1);
@@ -629,12 +636,14 @@ export class Recorder {
         this.store.diagnostic("git_trace_unavailable");
       }
     // Only native edits are matched to commits. A large repository has thousands of tips, so a blob holds each
-    // distinct set once.
+    // distinct set once. A ref list Git could not read (for example a slow for-each-ref) is reported, not
+    // silently treated as an empty one.
     let refs: string | undefined;
     if (native && category !== "read")
       try {
         const tips = refTips(s.CWD);
         if (tips) refs = this.store.putBlob(Buffer.from(tips.join("\n")));
+        else this.store.diagnostic("git_refs_unavailable");
       } catch {
         this.store.diagnostic("git_refs_unavailable");
       }
