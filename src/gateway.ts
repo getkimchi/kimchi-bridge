@@ -164,11 +164,26 @@ function writeJsonFile(path: string, value: Record<string, unknown>): void {
  * the choice no longer sets is removed, and every other value stays, because the person set it.
  * Returns the keys the bridge now owns.
  */
+const CLAUDE_MODEL_KEYS = [
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "CLAUDE_CODE_AUTO_MODE_MODEL",
+];
 function applyClaudeModelEnv(
   env: Record<string, unknown>,
   modelEnv: Record<string, string>,
   wrote?: Record<string, string>,
+  snapshot?: Record<string, string | null>,
 ): Record<string, string> {
+  // rc.20 and rc.21 wrote the model keys without recording it: until a record exists, a key the enable
+  // snapshot says was absent is the bridge's.
+  if (!wrote && snapshot) {
+    wrote = {};
+    for (const key of CLAUDE_MODEL_KEYS) {
+      const current = env[key];
+      if (snapshot[key] === null && typeof current === "string") wrote[key] = current;
+    }
+  }
   const written: Record<string, string> = {};
   for (const [key, value] of Object.entries(modelEnv)) {
     const current = env[key];
@@ -189,6 +204,7 @@ function writeClaudeConfig(
   authToken: string,
   modelEnv: Record<string, string> = {},
   wrote?: Record<string, string>,
+  snapshot?: Record<string, string | null>,
 ): { previous: Record<string, string | null>; wrote: Record<string, string> } {
   const path = claudeSettingsPath();
   const settings = readJsonFile(path);
@@ -213,7 +229,7 @@ function writeClaudeConfig(
     CLAUDE_CODE_AUTO_MODE_SERVER: "0",
   };
   for (const [key, value] of Object.entries(pairs)) env[key] = value;
-  const written = applyClaudeModelEnv(env, modelEnv, wrote);
+  const written = applyClaudeModelEnv(env, modelEnv, wrote, snapshot);
   // A stale kill-switch from an older bridge would keep the beta-gated
   // telemetry collector off; remove what we no longer set.
   delete env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS;
@@ -279,11 +295,29 @@ async function refreshClaudeModelEnv(
       : {};
   if (env.ANTHROPIC_AUTH_TOKEN !== PROXY_PLACEHOLDER) return;
   const before = JSON.stringify(settings);
-  const wrote = applyClaudeModelEnv(env, claudeModelEnv(models), state.wrote?.claude);
+  const known = state.previous?.claude ?? {};
+  const wrote = applyClaudeModelEnv(env, claudeModelEnv(models), state.wrote?.claude, known);
   settings.env = env;
   if (JSON.stringify(settings) !== before) writeJsonFile(path, settings);
-  if (JSON.stringify(wrote) !== JSON.stringify(state.wrote?.claude ?? {}))
-    saveGatewayState({ ...state, wrote: { ...state.wrote, claude: wrote } });
+  // Saved over the state as it is now, so a disable since the daemon started is not undone.
+  const current = loadGatewayState();
+  if (current.enabled === false) return;
+  // A key an older bridge's enable didn't snapshot goes back to absent on disable, as ensureClaudeAutoMode's does.
+  const snapshot = current.previous?.claude ?? {};
+  const added = Object.keys(wrote).filter((key) => !(key in snapshot));
+  if (added.length || JSON.stringify(wrote) !== JSON.stringify(current.wrote?.claude ?? {}))
+    saveGatewayState({
+      ...current,
+      wrote: { ...current.wrote, claude: wrote },
+      ...(added.length
+        ? {
+            previous: {
+              ...current.previous,
+              claude: { ...snapshot, ...Object.fromEntries(added.map((key) => [key, null])) },
+            },
+          }
+        : {}),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +444,7 @@ const CLAUDE_SMALL_MODEL = "deepseek-v4-flash-0731";
 function claudeModelEnv(models: readonly GatewayModel[]): Record<string, string> {
   if (!models.length || models.some((model) => isClaudeModel(model.slug))) return {};
   const env: Record<string, string> = { ANTHROPIC_MODEL: resolveMainModel(models).slug };
+  // Models carry no size: without Kimchi's own small model, the list's order picks among those that don't reason.
   const small =
     models.find((model) => model.slug === CLAUDE_SMALL_MODEL) ??
     models.find((model) => model.is_serverless && model.reasoning === false);
@@ -1547,6 +1582,7 @@ export async function enable(
     PROXY_PLACEHOLDER,
     claudeModelEnv(models),
     previousState.wrote?.claude,
+    previousState.enabled ? previousState.previous?.claude : undefined,
   );
   const codexPrevious = writeCodexConfig(
     `http://127.0.0.1:${port}/openai/v1`,
