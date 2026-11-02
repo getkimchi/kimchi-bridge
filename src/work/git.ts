@@ -25,22 +25,26 @@ import type { Recorder, Scope } from "./capture.ts";
 export function git(cwd: string, ...args: string[]): string {
   return gitContext(undefined, cwd, ...args);
 }
+// The trace variables the bridge's own Git must not inherit: GIT_TRACE_REFS breaks a
+// `git branch <name> <sha>` (Git 2.50.1 and 2.54.0) and the trace2 variables write into an agent's
+// trace, which the harness or a shell may have exported. The test preload clears the same list.
+export const TRACE_VARIABLES = [
+  "GIT_TRACE_REFS",
+  "GIT_TRACE2_EVENT",
+  "GIT_TRACE2_ENV_VARS",
+  "GIT_TRACE2",
+  "GIT_TRACE2_PERF",
+  "GIT_TRACE",
+];
 function gitContext(signal: AbortSignal | undefined, cwd: string, ...args: string[]): string {
   checkSignal(signal);
   const env = { ...process.env };
-  // The bridge's own Git must neither hit the GIT_TRACE_REFS branch bug (a `git branch <name> <sha>`
-  // fails) nor write into an agent's trace, which the harness or a shell may have exported.
   for (const key of [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
     "GIT_INDEX_FILE",
-    "GIT_TRACE_REFS",
-    "GIT_TRACE2_EVENT",
-    "GIT_TRACE2_ENV_VARS",
-    "GIT_TRACE2",
-    "GIT_TRACE2_PERF",
-    "GIT_TRACE",
+    ...TRACE_VARIABLES,
   ])
     delete env[key];
   Object.assign(env, {
