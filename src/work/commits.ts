@@ -32,6 +32,11 @@ interface GitProcess {
   end?: number;
   /** The process's exit code, from trace2's exit event. */
   code?: number;
+  /**
+   * The signal that ended the process, such as SIGPIPE from a closed pipe or a timeout's SIGTERM;
+   * such a process logs no exit event.
+   */
+  signal?: number;
   command?: string;
   worktree?: string;
   call?: string;
@@ -86,6 +91,7 @@ function processes(trace: string): GitProcess[] {
       p.end = instant(event.time);
       if (typeof event.code === "number") p.code = event.code;
     }
+    if (event.event === "signal") p.signal = typeof event.signo === "number" ? event.signo : 0;
   }
   return [...byId.values()];
 }
@@ -183,6 +189,9 @@ function headCommit(
     return { sha };
 }
 
+// Commands whose run can still end in a commit headCommit counts; `pull` merges or rebases in a child.
+const COMMITTING = new Set(["commit", "merge", "rebase", "cherry-pick", "revert", "pull"]);
+
 /** A trace's state: the commits it proves, and whether a Git process may still write into it. */
 export function traceState(
   events: string,
@@ -275,10 +284,17 @@ export function traceState(
   return {
     commits,
     // A command can outlive its shell call (unified exec), so its Git has no exit event yet and its
-    // commit is still to come. One killed before it could log an exit would hold the trace forever,
-    // so only a process started in the last ten minutes counts as unfinished — the window a quiet
-    // trace survives pruneTraces.
-    unfinished: running.some((p) => p.end === undefined && p.start > (now - 600_000) * 1000),
+    // commit is still to come. Only a run that can still end in a commit holds the trace: a piped
+    // `git log` its reader cut off, or a daemon, never commits. A Git a signal ended writes nothing
+    // more, and one killed before it logged anything would hold the trace forever, so only a process
+    // started in the last ten minutes counts — the window a quiet trace survives pruneTraces.
+    unfinished: running.some(
+      (p) =>
+        p.end === undefined &&
+        p.signal === undefined &&
+        (p.command === undefined || COMMITTING.has(p.command)) &&
+        p.start > (now - 600_000) * 1000,
+    ),
   };
 }
 
@@ -318,9 +334,9 @@ const traceKeys = Object.keys(traceVariables("", ""));
 // inside the markers when the block is last. Only the bridge's own lines go; without hook trust,
 // Codex runs none of the bridge's hooks.
 function withoutBlock(text: string): string {
-  const start = text.indexOf(BEGIN),
-    marker = text.indexOf(END, start);
+  const start = text.indexOf(BEGIN);
   if (start < 0) return text;
+  const marker = text.indexOf(END, start);
   // A block that lost its end marker (a truncated file, a manual edit) still ends at the file's end,
   // so a re-enable repairs the config instead of refusing over the stale table it left behind.
   const end = marker >= 0 ? marker : text.length;

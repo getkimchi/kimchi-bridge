@@ -94,12 +94,15 @@ function repo(trace = join(temp(), "trace")) {
       stdio: ["pipe", "ignore", "ignore"],
     });
   const plain = (...args: string[]) => run({}, ...args);
+  // A shell pipeline around traced Git, as an agent's command line runs it.
+  const sh = (call: string, script: string) =>
+    execFileSync("sh", ["-c", script], { cwd: root, env: env(tracing(call)), stdio: "ignore" });
   plain("init", "-q", "-b", "main");
   writeFileSync(join(root, "f"), "1\n");
   plain("add", "f");
   plain("commit", "-q", "-m", "init");
   const commits = () => tracedCommits(join(trace, "events"), join(trace, "refs"));
-  return { root, trace, traced, start, plain, commits };
+  return { root, trace, traced, start, plain, sh, commits };
 }
 
 test("agent shell commits, amends, reverts and new merges count; other ref moves do not", () => {
@@ -348,6 +351,44 @@ test("a lone call whose Git has exited still removes its trace", () => {
   expect(count(store, "commit")).toBe(1);
   expect(existsSync(join(g.trace, "events"))).toBe(false);
   expect(existsSync(join(g.trace, "refs"))).toBe(false);
+});
+
+test("a lone call whose piped Git its reader cut off still removes its trace", () => {
+  const { g, store, hook, shell } = session("claude-code");
+  // A patch larger than a pipe's buffer: `head` closes the pipe while `git log -p` still writes.
+  writeFileSync(join(g.root, "big"), `${"x".repeat(200_000)}\n`);
+  g.plain("add", "big");
+  g.plain("commit", "-q", "-m", "big");
+  hook("PreToolUse", shell("toolu_1"));
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.traced("toolu_1", "commit", "-q", "-am", "two");
+  g.sh("toolu_1", "git log -p | head -1 >/dev/null");
+  // The cut-off Git logged no exit event, yet it writes nothing more.
+  const events = readFileSync(join(g.trace, "events"), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const log = events.find((e) => e.event === "cmd_name" && e.name === "log")?.sid;
+  expect(log).toBeDefined();
+  expect(events.some((e) => e.sid === log && e.event === "exit")).toBe(false);
+  hook("PostToolUse", shell("toolu_1"));
+  expect(count(store, "commit")).toBe(1);
+  expect(existsSync(join(g.trace, "events"))).toBe(false);
+});
+
+test("a still-running Git that cannot commit does not hold the trace", async () => {
+  const { g, store, hook, shell } = session("claude-code");
+  hook("PreToolUse", shell("toolu_1"));
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.traced("toolu_1", "commit", "-q", "-am", "two");
+  // A long-running reader, as a daemon or a backgrounded query would be.
+  const child = g.start("toolu_1", {}, "cat-file", "--batch");
+  const exited = started(g.trace, "cat-file", child);
+  hook("PostToolUse", shell("toolu_1"));
+  expect(count(store, "commit")).toBe(1);
+  expect(existsSync(join(g.trace, "events"))).toBe(false);
+  child.stdin!.end();
+  await exited;
 });
 
 test("quiet or oversized traces are dropped; a session's directory goes after a quiet day", () => {
