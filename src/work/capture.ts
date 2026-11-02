@@ -252,16 +252,11 @@ export function filePaths(s: Scope, e: JsonObject): [string[], boolean] {
         if (line.startsWith(prefix)) paths.push(line.slice(prefix.length));
       }
   const native = paths.length > 0;
-  if (!native) {
-    base = root;
-    try {
-      paths.push(
-        ...git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0"),
-      );
-    } catch {
-      /* No complete inventory. */
-    }
-  }
+  // No inventory for tools without explicit file paths: listing and reading
+  // every repository file on every shell tool call made the bridge open
+  // arbitrary user content (a session in a home-directory repo pulls in
+  // Music, iCloud and other apps' data, surfacing macOS TCC prompts), and
+  // shell-driven edits are already attributed through the git trace.
   const found = new Set<string>();
   for (const path of paths) {
     if (!path) continue;
@@ -328,11 +323,10 @@ export function referencedPaths(prompt: string, cwd: string): string[] {
   for (const token of tokens.slice(0, 128)) {
     const v = token.startsWith("@") ? token.slice(1) : token;
     if (!v.includes("/") && !v.endsWith(".md")) continue;
-    try {
-      paths.push(realpathSync(resolve(cwd, v)));
-    } catch {
-      /* Referenced file does not exist. */
-    }
+    // Pure string resolution — never stat the candidate. Prompts mention
+    // arbitrary paths (iCloud, Music, other apps' data), and probing them
+    // from a process without macOS TCC grants surfaces privacy prompts.
+    paths.push(resolve(cwd, v));
   }
   return paths;
 }
@@ -398,16 +392,23 @@ export class Recorder {
     const owners = new Set<string>();
     if (!explicit)
       for (const path of referencedPaths(prompt, s.CWD)) {
+        // Privacy: prompt text can reference any path on the machine, and
+        // opening it from this unprivileged process surfaces macOS TCC
+        // prompts (iCloud Drive, Music, other apps' data). Only files this
+        // repository has already recorded as plan files are ever read;
+        // everything else binds by inference without touching the disk.
+        const known = this.store.db
+          .query("SELECT DISTINCT work_id, hash FROM plans WHERE repository=? AND path=?")
+          .all(s.Repo, planKey(rootOf(s), path)) as { work_id: string; hash: string }[];
+        if (known.length === 0) continue;
         let bytes: Buffer;
         try {
           bytes = safeRead(dirname(path), path).bytes;
         } catch {
           continue;
         }
-        const rows = this.store.db
-          .query("SELECT DISTINCT work_id FROM plans WHERE repository=? AND path=? AND hash=?")
-          .all(s.Repo, planKey(rootOf(s), path), digest(bytes)) as { work_id: string }[];
-        for (const row of rows) owners.add(row.work_id);
+        const hash = digest(bytes);
+        for (const row of known) if (row.hash === hash) owners.add(row.work_id);
       }
     const keys = issueKeys(title, "work");
     // Parsing, Git and file reads finish before taking the short writer lock.

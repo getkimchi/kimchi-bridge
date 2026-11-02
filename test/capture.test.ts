@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { checkSignal, lockSync, remainingTime, safeRead, withDeadline } from "../src/platform.ts";
 import {
   Recorder,
@@ -701,9 +701,15 @@ test("maintained Markdown and shell parsers recognize references without variabl
     'implement @"plan with spaces.md"',
     "don't forget [the plan](<plan with spaces.md>)",
   ]) {
-    expect(referencedPaths(text, root)).toContain(path);
+    expect(referencedPaths(text, root)).toContain(resolve(root, "plan with spaces.md"));
   }
-  expect(referencedPaths("implement $HOME/plan with spaces.md", root)).toHaveLength(0);
+  // No variable expansion: $HOME stays literal. Candidates are resolved with
+  // string math only — no stat — so referencing paths that may not exist
+  // (and macOS TCC-protected locations) never touches the filesystem here;
+  // bind() only opens files already recorded as plan files.
+  expect(referencedPaths("implement $HOME/plan with spaces.md", root)).toEqual([
+    resolve(root, "implement $HOME/plan with spaces.md"),
+  ]);
   const content = "*** Begin Patch\n*** Add File: file\n+literal $HOME\n*** End Patch";
   expect(patchInput({ tool_input: { cmd: `apply_patch '${content}'` } })).toBe(content);
   // Codex 0.165 hook payloads, captured from a real session.
@@ -712,4 +718,42 @@ test("maintained Markdown and shell parsers recognize references without variabl
   expect(patchInput({ tool_input: { cmd: `apply_patch '${content}'; echo side-effect` } })).toBe(
     "",
   );
+});
+
+test("shell tool calls do not open the repository inventory", () => {
+  const { root, store, r } = fixture();
+  Bun.spawnSync(["git", "init", "-q"], { cwd: root });
+  // An untracked file with distinctive content: the old inventory snapshot
+  // listed every cached and untracked repository file on each shell tool
+  // call and opened them for hashing — in a session rooted at the home
+  // directory that meant reading Music, iCloud and other apps' data
+  // (macOS TCC prompts attributed to the client).
+  const untracked = join(root, "untracked.txt");
+  writeFileSync(untracked, "private content\n");
+  const record = (stage: string, event: Record<string, unknown>, result = {}) =>
+    r.record({ stage, sessionId: "s", cwd: root, event, result });
+  record("turn.start", { turnId: "t", text: "run a command" });
+  const shell = { tool: "Bash", toolCallId: "sh", command: "ls" };
+  record("tool.before", shell);
+  record("tool.after", shell);
+  const rows = store.db
+    .query("SELECT COUNT(*) AS n FROM blobs")
+    .get() as { n: number };
+  expect(rows.n).toBe(0);
+  expect(events(store, "file")).toHaveLength(0);
+  store.close();
+});
+
+test("prompt references to paths that were never recorded as plans are not opened", () => {
+  const { root, r, store } = fixture();
+  // A FIFO stands in for any open-with-side-effects file (macOS TCC-protected
+  // paths behave the same way: the attempt itself surfaces a privacy prompt).
+  // Reading it would block forever; bind must complete without opening it.
+  const fifo = join(root, "probe.fifo");
+  Bun.spawnSync(["mkfifo", fifo]);
+  const before = r.work(scope(root));
+  prompt(r, root, "s", "t", `check the file at ${fifo}`);
+  expect(r.work(scope(root, "s", "t"))).not.toBe(before);
+  expect(events(store, "work").at(-1).work.reason).toBe("session_continuation");
+  store.close();
 });
