@@ -2,7 +2,6 @@ import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   appendFileSync,
-  chmodSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -618,6 +617,21 @@ test("Git revisits a late commit and excludes the old identical revision", () =>
   expect(sha).not.toBe(old);
 });
 
+// A native Edit from "before" to "after", as Claude Code's hooks report it around the write.
+function recordEdit(r: Recorder, root: string, path: string) {
+  const e = {
+    session_id: "s",
+    turn_id: "turn",
+    cwd: root,
+    tool_use_id: "call",
+    tool_name: "Edit",
+    tool_input: { file_path: path, old_string: "before", new_string: "after" },
+  };
+  r.record({ stage: "PreToolUse", event: e });
+  writeFileSync(path, "after\n");
+  r.record({ stage: "PostToolUse", event: e });
+}
+
 test("a person's commit is matched in a repository with 30,000 tips", () => {
   const { base, root, store, r } = fixture("claude-code");
   git(root, "init", "--initial-branch=main");
@@ -669,17 +683,7 @@ test("a person's commit is matched in a repository with 30,000 tips", () => {
     stage: "UserPromptSubmit",
     event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
   });
-  const e = {
-    session_id: "s",
-    turn_id: "turn",
-    cwd: root,
-    tool_use_id: "call",
-    tool_name: "Edit",
-    tool_input: { file_path: path, old_string: "before", new_string: "after" },
-  };
-  r.record({ stage: "PreToolUse", event: e });
-  writeFileSync(path, "after\n");
-  r.record({ stage: "PostToolUse", event: e });
+  recordEdit(r, root, path);
   git(root, "add", "file.txt");
   git(root, "commit", "-m", "edit");
   const sha = git(root, "rev-parse", "HEAD");
@@ -706,28 +710,31 @@ test("an unreadable ref list is reported, not silent", () => {
     stage: "UserPromptSubmit",
     event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
   });
-  // for-each-ref cannot read the ref list (here: no permission), so refTips returns none: a
-  // diagnostic reports that instead of the edit silently matching nothing.
+  // for-each-ref cannot read the ref list (here: a malformed packed-refs line, which Git refuses for
+  // any user, root included), so refTips returns none: a diagnostic reports that instead of the edit
+  // silently matching nothing.
   writeFileSync(
     join(root, ".git", "packed-refs"),
-    "# pack-refs with: peeled fully-peeled sorted\n",
+    "# pack-refs with: peeled fully-peeled sorted\nnot a ref line\n",
   );
-  chmodSync(join(root, ".git", "packed-refs"), 0o000);
-  const e = {
-    session_id: "s",
-    turn_id: "turn",
-    cwd: root,
-    tool_use_id: "call",
-    tool_name: "Edit",
-    tool_input: { file_path: path, old_string: "before", new_string: "after" },
-  };
-  r.record({ stage: "PreToolUse", event: e });
-  writeFileSync(path, "after\n");
-  r.record({ stage: "PostToolUse", event: e });
+  recordEdit(r, root, path);
   expect(store.status().diagnostics.git_refs_unavailable).toBe(1);
   expect(store.db.query("SELECT key FROM meta WHERE key LIKE 'git-change:%'").all()).toHaveLength(
     0,
   );
+});
+
+test("an edit outside any Git repository reports no unreadable ref list", () => {
+  const { root, store, r } = fixture("claude-code");
+  const path = join(root, "file.txt");
+  writeFileSync(path, "before\n");
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
+  });
+  // for-each-ref fails outside a repository too, but there is no ref list to miss.
+  recordEdit(r, root, path);
+  expect(store.status().diagnostics.git_refs_unavailable).toBeUndefined();
 });
 
 for (const source of ["claude-code", "codex"]) {

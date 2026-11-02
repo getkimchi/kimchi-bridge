@@ -643,7 +643,8 @@ export class Recorder {
       try {
         const tips = refTips(s.CWD);
         if (tips) refs = this.store.putBlob(Buffer.from(tips.join("\n")));
-        else this.store.diagnostic("git_refs_unavailable");
+        // Outside a repository there is no ref list to miss.
+        else if (s.Common) this.store.diagnostic("git_refs_unavailable");
       } catch {
         this.store.diagnostic("git_refs_unavailable");
       }
