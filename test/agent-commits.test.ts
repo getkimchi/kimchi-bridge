@@ -185,6 +185,55 @@ test("of two commits made at the same moment, neither is claimed", async () => {
   expect(mine.commits().map((c) => c.sha)).toEqual([theirs.plain("rev-parse", "HEAD")]);
 });
 
+test("another session's checkout while a commit runs is not claimed as a commit", async () => {
+  const trace = join(temp(), "trace");
+  const mine = repo(trace),
+    theirs = repo(trace);
+  // Their commit waits in its editor until released, so it runs throughout this checkout.
+  const editor = join(temp(), "editor");
+  const wait = '#!/bin/sh\nwhile [ ! -e "$0.go" ]; do sleep 0.01; done\necho theirs >"$1"\n';
+  writeFileSync(editor, wait, { mode: 0o755 });
+  writeFileSync(join(theirs.root, "f"), "theirs\n");
+  const child = theirs.start("call-theirs", { GIT_EDITOR: editor }, "commit", "-a");
+  const exited = started(trace, "commit", child);
+  const first = mine.plain("rev-parse", "HEAD");
+  writeFileSync(join(mine.root, "f"), "2\n");
+  mine.plain("commit", "-q", "-am", "two");
+  mine.traced("call-1", "checkout", "-q", "--detach", first);
+  writeFileSync(`${editor}.go`, "");
+  await exited;
+  expect(mine.commits().map((c) => c.sha)).toEqual([theirs.plain("rev-parse", "HEAD")]);
+});
+
+test("a hook inside a commit that moves another worktree's HEAD is not claimed", () => {
+  const g = repo();
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.plain("commit", "-q", "-am", "two");
+  const two = g.plain("rev-parse", "HEAD"),
+    other = join(temp(), "other");
+  g.plain("worktree", "add", "-q", other, "-b", "other", "HEAD~1");
+  const hooks = join(temp(), "hooks");
+  mkdirSync(hooks);
+  const checkout = `git -C "${other}" checkout -q --detach ${two}`;
+  writeFileSync(
+    join(hooks, "pre-commit"),
+    `#!/bin/sh\nenv -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE ${checkout}\n`,
+    { mode: 0o755 },
+  );
+  writeFileSync(join(g.root, "f"), "3\n");
+  g.traced("call-1", "-c", `core.hooksPath=${hooks}`, "commit", "-q", "-am", "three");
+  expect(g.plain("-C", other, "rev-parse", "HEAD")).toBe(two);
+  expect(g.commits().map((c) => c.sha)).toEqual([g.plain("rev-parse", "HEAD")]);
+});
+
+test("a commit GIT_REFLOG_ACTION names still counts when no other Git runs", () => {
+  const g = repo();
+  setEnv("GIT_REFLOG_ACTION", "mytool");
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.traced("call-1", "commit", "-q", "-am", "two");
+  expect(g.commits().map((c) => c.sha)).toEqual([g.plain("rev-parse", "HEAD")]);
+});
+
 function session(source: string) {
   const home = temp();
   setEnv("KIMCHI_BRIDGE_HOME", home);
@@ -279,12 +328,14 @@ test("a Claude Code session's lone shell call owns its trace even without a logg
   expect(latest(store, "commit").commit.id).toBe(g.plain("rev-parse", "HEAD"));
 });
 
-test("a commit counts when another traced process's ref transaction lands inside its own", () => {
-  // A ref trace names no process: a background `git maintenance` an earlier commit started, or another session's
-  // fetch in a shared trace, can open its transaction between this commit's HEAD move and its finish line.
-  const dir = temp(),
-    root = join(dir, "repo"),
-    start = Date.UTC(2026, 9, 30, 12, 0, 0) * 1000;
+// A synthetic trace in `dir`, at microsecond offsets from 2026-10-30T12:00:00Z: Git processes' trace2
+// events, and ref lines in the local time Git prints. Returns what tracedCommits reads from it.
+function writeTrace(
+  dir: string,
+  events: ({ event: string; sid: string; at: number } & Record<string, unknown>)[],
+  refs: [number, string][],
+) {
+  const start = Date.UTC(2026, 9, 30, 12, 0, 0) * 1000;
   const fraction = (us: number) => String(us % 1_000_000).padStart(6, "0");
   const iso = (us: number) =>
     `${new Date(Math.floor(us / 1000)).toISOString().slice(0, 20)}${fraction(us)}Z`;
@@ -293,44 +344,99 @@ test("a commit counts when another traced process's ref transaction lands inside
       two = (n: number) => String(n).padStart(2, "0");
     return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}.${fraction(us)}`;
   };
+  const lines = events.map(({ at, ...e }) => JSON.stringify({ ...e, time: iso(start + at) }));
+  writeFileSync(join(dir, "events"), lines.join("\n") + "\n");
+  const refLines = refs.map(
+    ([at, content]) => `${local(start + at)} refs/debug.c:88         ${content}`,
+  );
+  writeFileSync(join(dir, "refs"), refLines.join("\n") + "\n");
+  return tracedCommits(join(dir, "events"), join(dir, "refs"));
+}
+const headMove = `0: HEAD ${"a".repeat(40)} -> ${"b".repeat(40)} (F=0xd, T=0x1) "commit: two"`;
+
+test("a commit counts when another traced process's ref transaction lands inside its own", () => {
+  // A ref trace names no process: a background `git maintenance` an earlier commit started, or another session's
+  // fetch in a shared trace, can open its transaction between this commit's HEAD move and its finish line.
+  const dir = temp(),
+    root = join(dir, "repo");
   const write = (code: number) => {
     const commit = "20261030T120000.000000Z-H1-P1",
       maintenance = `${commit}/20261030T120000.005000Z-H1-P2`;
-    const events = [
-      { event: "start", sid: commit, time: iso(start) },
-      { event: "def_repo", sid: commit, time: iso(start + 100), worktree: root },
-      { event: "cmd_name", sid: commit, time: iso(start + 200), name: "commit" },
-      { event: "start", sid: maintenance, time: iso(start + 5_000) },
-      { event: "def_repo", sid: maintenance, time: iso(start + 5_100), worktree: root },
-      { event: "cmd_name", sid: maintenance, time: iso(start + 5_200), name: "maintenance" },
-      { event: "exit", sid: maintenance, time: iso(start + 25_000), code: 0 },
-      { event: "exit", sid: commit, time: iso(start + 30_000), code },
-    ];
-    writeFileSync(join(dir, "events"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
-    const line = (us: number, content: string) => `${local(us)} refs/debug.c:88         ${content}`;
-    const refs = [
-      line(start + 10_000, "transaction {"),
-      line(
-        start + 10_010,
-        `0: HEAD ${"a".repeat(40)} -> ${"b".repeat(40)} (F=0xd, T=0x1) "commit: two"`,
-      ),
-      line(start + 12_000, "transaction {"),
-      line(
-        start + 12_010,
-        `0: refs/heads/main ${"a".repeat(40)} -> ${"a".repeat(40)} (F=0x5, T=0x0) ""`,
-      ),
-      line(start + 12_020, "finish: 0"),
-      line(start + 14_000, "finish: 0"),
-    ];
-    writeFileSync(join(dir, "refs"), refs.join("\n") + "\n");
+    return writeTrace(
+      dir,
+      [
+        { event: "start", sid: commit, at: 0 },
+        { event: "def_repo", sid: commit, at: 100, worktree: root },
+        { event: "cmd_name", sid: commit, at: 200, name: "commit" },
+        { event: "start", sid: maintenance, at: 5_000 },
+        { event: "def_repo", sid: maintenance, at: 5_100, worktree: root },
+        { event: "cmd_name", sid: maintenance, at: 5_200, name: "maintenance" },
+        { event: "exit", sid: maintenance, at: 25_000, code: 0 },
+        { event: "exit", sid: commit, at: 30_000, code },
+      ],
+      [
+        [10_000, "transaction {"],
+        [10_010, headMove],
+        [12_000, "transaction {"],
+        [12_010, `0: refs/heads/main ${"a".repeat(40)} -> ${"a".repeat(40)} (F=0x5, T=0x0) ""`],
+        [12_020, "finish: 0"],
+        [14_000, "finish: 0"],
+      ],
+    );
   };
-  write(0);
-  expect(tracedCommits(join(dir, "events"), join(dir, "refs")).map((c) => c.sha)).toEqual([
-    "b".repeat(40),
-  ]);
+  expect(write(0).map((c) => c.sha)).toEqual(["b".repeat(40)]);
   // A commit whose process failed still does not count.
-  write(1);
-  expect(tracedCommits(join(dir, "events"), join(dir, "refs"))).toEqual([]);
+  expect(write(1)).toEqual([]);
+});
+
+test("a commit whose own ref transaction failed does not count, though its process exits 0", () => {
+  const dir = temp(),
+    commit = "20261030T120000.000000Z-H1-P1";
+  const commits = writeTrace(
+    dir,
+    [
+      { event: "start", sid: commit, at: 0 },
+      { event: "def_repo", sid: commit, at: 100, worktree: join(dir, "repo") },
+      { event: "cmd_name", sid: commit, at: 200, name: "commit" },
+      { event: "exit", sid: commit, at: 30_000, code: 0 },
+    ],
+    [
+      [10_000, "transaction {"],
+      [10_010, headMove],
+      [14_000, "finish: 1"],
+    ],
+  );
+  expect(commits).toEqual([]);
+});
+
+test("another process's failed transaction does not drop a commit that finished", () => {
+  // A maintenance an earlier commit started opens its transaction first and fails it after this commit's HEAD
+  // move: that failed finish is not this commit's.
+  const dir = temp(),
+    root = join(dir, "repo"),
+    maintenance = "20261030T120000.000000Z-H1-P9",
+    commit = "20261030T120000.001000Z-H1-P1";
+  const commits = writeTrace(
+    dir,
+    [
+      { event: "start", sid: maintenance, at: 0 },
+      { event: "def_repo", sid: maintenance, at: 50, worktree: root },
+      { event: "cmd_name", sid: maintenance, at: 60, name: "maintenance" },
+      { event: "start", sid: commit, at: 1_000 },
+      { event: "def_repo", sid: commit, at: 1_100, worktree: root },
+      { event: "cmd_name", sid: commit, at: 1_200, name: "commit" },
+      { event: "exit", sid: commit, at: 30_000, code: 0 },
+      { event: "exit", sid: maintenance, at: 40_000, code: 0 },
+    ],
+    [
+      [5_000, "transaction {"],
+      [10_000, "transaction {"],
+      [10_010, headMove],
+      [12_000, "finish: 1"],
+      [14_000, "finish: 0"],
+    ],
+  );
+  expect(commits.map((c) => c.sha)).toEqual(["b".repeat(40)]);
 });
 
 test("a call's commit counts even after commits in a repository its command already removed", () => {

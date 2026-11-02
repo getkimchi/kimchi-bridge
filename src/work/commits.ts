@@ -119,6 +119,13 @@ function ownerAt(
   return candidates.find((p) => candidates.every((other) => within(p, other)));
 }
 
+// The process a moment belongs to when nothing unrelated runs then. Housekeeping controllers never
+// move HEAD, so they make a HEAD move no less clear; with `all` they count, as their transactions (a
+// maintenance prefetch) write finish lines too.
+function soleOwnerAt(time: string, running: GitProcess[], all = false): GitProcess | undefined {
+  return ownerAt(time, running, (p) => all || (p.command !== "maintenance" && p.command !== "gc"));
+}
+
 function rewriteMessage(message: string): boolean {
   if (message.startsWith("cherry-pick:")) return true;
   for (const prefix of ["rebase (", "rebase -i ("])
@@ -219,13 +226,32 @@ export function tracedCommits(trace: string, refs: string): TracedCommit[] {
           p,
           replayed && p && within(p, replayed.owner) ? replayed.sha : undefined,
         );
-      const owner = ownerAt(time, running, (p) => commitBy(p) !== undefined);
+      // A `git commit` names its own HEAD move "commit…" unless GIT_REFLOG_ACTION renames it. Any other
+      // move, such as another process's checkout or reset, is its commit only when it ran alone then.
+      let sole: GitProcess | undefined | null = null;
+      const alone = (p: GitProcess) => {
+        if (localTimeInProcess(time, p) === undefined) return false;
+        if (sole === null) sole = soleOwnerAt(time, running);
+        return sole === p;
+      };
+      const owner = ownerAt(
+        time,
+        running,
+        (p) =>
+          commitBy(p) !== undefined &&
+          (p.command !== "commit" || update.message.startsWith("commit") || alone(p)),
+      );
       const commit = commitBy(owner);
       settle();
       pending = commit && owner ? { ...commit, owner } : undefined;
       if (commit?.rewrittenFrom) replayed = undefined;
     }
     if (!content.startsWith("finish: ")) continue;
+    // With no other Git running, a failed finish is the pending commit's own: its HEAD never moved.
+    if (pending && content !== "finish: 0" && soleOwnerAt(time, running, true) === pending.owner) {
+      pending = undefined;
+      continue;
+    }
     if (
       pending &&
       content === "finish: 0" &&
