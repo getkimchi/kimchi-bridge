@@ -705,45 +705,33 @@ export function rewriteClaudeDesktopConfig(anthropicBaseUrl: string): void {
   if (after !== before) writeAtomic(path, after, 0o600);
 }
 
-/** Restores the desktop app to the mode and library it had before enable. */
-export function restoreClaudeDesktopConfig(previous?: Desktop3pPrevious): void {
-  const appData = claudeDesktopAppData();
-  if (!appData || !previous) return;
-  // A snapshot an older bridge saved after two enables carries the bridge's
-  // own entry as its appliedId, and with it no trace of the person's setup is
-  // left. Restore the app default instead: no deployment mode, nothing
-  // applied, no bridge entry.
-  if (previous.appliedId === previous.entryId) {
-    try {
-      const config = readDesktopConfig(appData);
-      if (config[DESKTOP_MODE_KEY] === "3p") {
-        delete config[DESKTOP_MODE_KEY];
-        writeAtomic(
-          join(appData, DESKTOP_CONFIG_FILE),
-          JSON.stringify(config, null, 2) + "\n",
-          0o644,
-        );
-      }
-    } catch {
-      /* the app data changed shape; leave the mode key alone */
-    }
-    try {
-      const library = join(claudeDesktop3pData(), "configLibrary");
-      rmSync(join(library, `${previous.entryId}.json`), { force: true });
-      let meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> } = {};
-      try {
-        meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
-      } catch {
-        return;
-      }
-      meta.entries = (meta.entries ?? []).filter((entry) => entry && entry.id !== previous.entryId);
-      delete meta.appliedId;
-      writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
-    } catch {
-      /* the 3P profile is the app's to keep once it has run; ignore failures */
-    }
-    return;
+/**
+ * Whether a configLibrary entry's content is the bridge's own wiring: every
+ * bridge version keyed its entry with the proxy placeholder. No content means
+ * the entry's file was missing at enable, so nothing of the person's is left.
+ */
+function bridgeWiring(content: string | undefined): boolean {
+  if (content === undefined) return true;
+  try {
+    return JSON.parse(content)?.inferenceGatewayApiKey === PROXY_PLACEHOLDER;
+  } catch {
+    return false;
   }
+}
+
+/** Restores the desktop app to the mode and library it had before enable. */
+export function restoreClaudeDesktopConfig(saved?: Desktop3pPrevious): void {
+  const appData = claudeDesktopAppData();
+  if (!appData || !saved) return;
+  // An older bridge's second enable saved its own wiring as the person's
+  // setup: the bridge's entry, with the bridge's content, as the applied one.
+  // Nothing of the person's setup is left in such a snapshot, so disable
+  // restores the app default, as for an entry the bridge created. A "Kimchi
+  // Gateway" entry of the person's own has other content and comes back.
+  const previous: Desktop3pPrevious =
+    saved.appliedId === saved.entryId && bridgeWiring(saved.entryContent)
+      ? { mode: null, appliedId: null, createdEntry: true, entryId: saved.entryId }
+      : saved;
   try {
     const config = readDesktopConfig(appData);
     if (config[DESKTOP_MODE_KEY] === "3p") {

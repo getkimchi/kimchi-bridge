@@ -283,6 +283,19 @@ function desktopEntry(): Record<string, unknown> {
   const meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
   return JSON.parse(readFileSync(join(library, `${meta.appliedId}.json`), "utf8"));
 }
+/** A Claude model: without one, enable leaves Claude Desktop as it is. */
+const sonnet: GatewayModel[] = [
+  { ...models[0]!, slug: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6" },
+];
+/** Serves the models with a Claude one and stores an OAuth sign-in, so enable wires Claude Desktop. */
+function serveClaudeModels() {
+  process.env.KIMCHI_BASE_URL = server((request) =>
+    new URL(request.url).pathname === "/v1/models/metadata"
+      ? Response.json({ models: [...models, ...sonnet] })
+      : new Response("not found", { status: 404 }),
+  );
+  oauthCredential();
+}
 
 test("enable gives Claude Desktop only the Claude models, which it takes without a warning", async () => {
   desktopInstalled();
@@ -338,15 +351,7 @@ test("the proxy's rewrite drops the models an older bridge gave Claude Desktop",
 
 test("enable twice, then disable, restores Claude Desktop's own configuration", async () => {
   const main = desktopInstalled();
-  const claude: GatewayModel[] = [
-    { ...models[0]!, slug: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6" },
-  ];
-  process.env.KIMCHI_BASE_URL = server((request) =>
-    new URL(request.url).pathname === "/v1/models/metadata"
-      ? Response.json({ models: [...models, ...claude] })
-      : new Response("not found", { status: 404 }),
-  );
-  oauthCredential();
+  serveClaudeModels();
   await enable(oauthSignIn, () => {});
   await enable(oauthSignIn, () => {}); // e.g. a second sign-in runs enable again
   // The re-enable keeps the first enable's snapshot: the recomputed one would
@@ -366,13 +371,10 @@ test("enable twice, then disable, restores Claude Desktop's own configuration", 
 
 test("disable repairs a snapshot an older bridge saved after two enables", async () => {
   const main = desktopInstalled();
-  const claude: GatewayModel[] = [
-    { ...models[0]!, slug: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6" },
-  ];
   // The older bridge's second enable recomputed the snapshot after its own
   // first one, so it recorded the bridge's entry as the applied one.
-  writeClaudeDesktopConfig("http://127.0.0.1:8766/anthropic", claude);
-  const damaged = writeClaudeDesktopConfig("http://127.0.0.1:8766/anthropic", claude);
+  writeClaudeDesktopConfig("http://127.0.0.1:8766/anthropic", sonnet);
+  const damaged = writeClaudeDesktopConfig("http://127.0.0.1:8766/anthropic", sonnet);
   if (!damaged) throw new Error("the desktop writer returned no snapshot");
   expect(damaged.appliedId).toBe(damaged.entryId);
   saveGatewayState({
@@ -391,6 +393,86 @@ test("disable repairs a snapshot an older bridge saved after two enables", async
   expect(meta.appliedId).toBeUndefined();
   expect(meta.entries).toEqual([]);
   expect(readdirSync(library)).toEqual(["_meta.json"]);
+});
+
+test("enable twice, then disable, applies the person's own Claude Desktop entry again", async () => {
+  const main = desktopInstalled();
+  const library = join(claudeDesktop3pData(), "configLibrary"),
+    work = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  mkdirSync(library, { recursive: true });
+  writeFileSync(
+    join(library, "_meta.json"),
+    JSON.stringify({ appliedId: work, entries: [{ id: work, name: "Work" }] }),
+  );
+  writeFileSync(
+    join(library, `${work}.json`),
+    JSON.stringify({
+      inferenceProvider: "gateway",
+      inferenceGatewayBaseUrl: "https://work.example.invalid/anthropic",
+    }),
+  );
+  writeFileSync(join(main, "claude_desktop_config.json"), JSON.stringify({ deploymentMode: "3p" }));
+  serveClaudeModels();
+  await enable(oauthSignIn, () => {});
+  await enable(oauthSignIn, () => {});
+  await disable(() => {});
+  const config = JSON.parse(readFileSync(join(main, "claude_desktop_config.json"), "utf8"));
+  expect(config.deploymentMode).toBe("3p");
+  const meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+  expect(meta.appliedId).toBe(work);
+  expect(meta.entries).toEqual([{ id: work, name: "Work" }]);
+});
+
+test("disable gives back a Kimchi Gateway entry the person applied before enabling", async () => {
+  const main = desktopInstalled();
+  const library = join(claudeDesktop3pData(), "configLibrary"),
+    id = "11111111-2222-4333-8444-555555555555";
+  mkdirSync(library, { recursive: true });
+  // The person's own entry under the bridge's entry name, with their own gateway and key.
+  const own = JSON.stringify({
+    inferenceProvider: "gateway",
+    inferenceGatewayBaseUrl: "https://llm.example.invalid/anthropic",
+    inferenceGatewayApiKey: "the-person's-own-key",
+  });
+  writeFileSync(
+    join(library, "_meta.json"),
+    JSON.stringify({ appliedId: id, entries: [{ id, name: "Kimchi Gateway" }] }),
+  );
+  writeFileSync(join(library, `${id}.json`), own);
+  writeFileSync(join(main, "claude_desktop_config.json"), JSON.stringify({ deploymentMode: "3p" }));
+  serveClaudeModels();
+  await enable(oauthSignIn, () => {});
+  await disable(() => {});
+  const config = JSON.parse(readFileSync(join(main, "claude_desktop_config.json"), "utf8"));
+  expect(config.deploymentMode).toBe("3p");
+  expect(existsSync(join(library, `${id}.json`))).toBe(true);
+  expect(readFileSync(join(library, `${id}.json`), "utf8")).toBe(own);
+  expect(JSON.parse(readFileSync(join(library, "_meta.json"), "utf8")).appliedId).toBe(id);
+});
+
+test("repairing an older bridge's snapshot keeps an entry the person applied since", async () => {
+  desktopInstalled();
+  writeClaudeDesktopConfig("http://127.0.0.1:8766/anthropic", sonnet);
+  const damaged = writeClaudeDesktopConfig("http://127.0.0.1:8766/anthropic", sonnet);
+  if (!damaged) throw new Error("the desktop writer returned no snapshot");
+  saveGatewayState({
+    enabled: true,
+    mode: "proxy",
+    port: 8766,
+    previous: { claudeDesktop: damaged },
+  });
+  // Since that enable, the person has switched Claude Desktop to an entry of their own.
+  const library = join(claudeDesktop3pData(), "configLibrary"),
+    work = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+  meta.entries.push({ id: work, name: "Work" });
+  meta.appliedId = work;
+  writeFileSync(join(library, "_meta.json"), JSON.stringify(meta));
+  writeFileSync(join(library, `${work}.json`), "{}");
+  await disable(() => {});
+  const after = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+  expect(after.appliedId).toBe(work);
+  expect(after.entries).toEqual([{ id: work, name: "Work" }]);
 });
 
 test("enable with an API key routes through the local proxy and keeps the key out of the CLI configs", async () => {
