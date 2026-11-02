@@ -1076,6 +1076,8 @@ export async function loginStatus(): Promise<LoginStatusResult> {
   } catch (error) {
     status.error = error instanceof Error ? error.message : "stored sign-in is unreadable";
   }
-  if (await loginInProgress()) status.state = "in-progress";
+  // Another program may hold the callback port; only a login this plugin started counts.
+  if (["starting", "waiting"].includes(progress?.phase ?? "") && (await loginInProgress()))
+    status.state = "in-progress";
   return status;
 }

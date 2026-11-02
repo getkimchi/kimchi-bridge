@@ -1,15 +1,17 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   buildCodexCatalog,
   buildCodexToml,
+  claudeDesktop3pData,
   claudeSettingsPath,
   codexCatalogPath,
   codexConfigPath,
   disable,
   enable,
+  ensureClaudeAutoMode,
   gatewayPort,
   gatewayStatePath,
   health,
@@ -17,6 +19,8 @@ import {
   mergeCodexToml,
   proxyRequest,
   resolveMainModel,
+  rewriteClaudeDesktopConfig,
+  runDaemon,
   saveGatewayState,
   status,
   stripCodexToml,
@@ -33,6 +37,7 @@ let root: string;
 let previousRoot: string | undefined;
 let previousBase: string | undefined;
 let previousHome: string | undefined;
+let previousXdg: string | undefined;
 const cleanups: (() => void)[] = [];
 beforeEach(() => {
   previousRoot = process.env.KIMCHI_BRIDGE_HOME;
@@ -42,6 +47,9 @@ beforeEach(() => {
   previousHome = process.env.HOME;
   process.env.HOME = join(root, "home");
   process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(root, "home");
+  // On Linux, Claude Desktop's profiles live under XDG_CONFIG_HOME, which CI runners set to their own.
+  previousXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = join(root, "home", ".config");
   process.env.KIMCHI_BRIDGE_HOME = join(root, "state");
   process.env.KIMCHI_BRIDGE_SERVICE = "0";
   process.env.KIMCHI_BRIDGE_DAEMON = "0";
@@ -56,6 +64,8 @@ afterEach(() => {
   delete process.env.KIMCHI_BRIDGE_DAEMON;
   if (previousHome === undefined) delete process.env.HOME;
   else process.env.HOME = previousHome;
+  if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = previousXdg;
   if (previousBase === undefined) delete process.env.KIMCHI_BASE_URL;
   else process.env.KIMCHI_BASE_URL = previousBase;
   if (previousRoot === undefined) delete process.env.KIMCHI_BRIDGE_HOME;
@@ -93,9 +103,10 @@ function kimchiKey(apiKey: string, region = "us") {
   );
 }
 
-function modelsEndpoint(): string {
+function modelsEndpoint(listed = models): string {
   return server((request) => {
-    if (new URL(request.url).pathname === "/v1/models/metadata") return Response.json({ models });
+    if (new URL(request.url).pathname === "/v1/models/metadata")
+      return Response.json({ models: listed });
     return new Response("not found", { status: 404 });
   });
 }
@@ -235,6 +246,8 @@ test("enable in proxy mode writes proxy URLs and never a real credential into th
   // The beta kill-switch is deliberately not written: the telemetry collector
   // that feeds PR-cost usage attribution is beta-gated.
   expect(claude.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBeUndefined();
+  // No model behind the gateway runs auto mode's server-side checks, so Claude Code makes its own classifier calls.
+  expect(claude.env.CLAUDE_CODE_AUTO_MODE_SERVER).toBe("0");
   const codex = readFileSync(codexConfigPath(), "utf8");
   expect(codex).toContain('base_url = "http://127.0.0.1:8766/openai/v1"');
   expect(codex).not.toContain("id-token");
@@ -246,6 +259,72 @@ test("enable in proxy mode writes proxy URLs and never a real credential into th
   expect(state.mode).toBe("proxy");
   expect(state.port).toBe(8766);
   expect(messages.some((m) => m.includes("Gateway enabled"))).toBe(true);
+});
+
+/** Marks Claude Desktop installed: its main profile holds a config.json. Returns that profile's folder. */
+function desktopInstalled(): string {
+  const main = join(dirname(claudeDesktop3pData()), "Claude");
+  mkdirSync(main, { recursive: true });
+  writeFileSync(join(main, "config.json"), "{}");
+  return main;
+}
+/** The configLibrary entry the app applies. */
+function desktopEntry(): Record<string, unknown> {
+  const library = join(claudeDesktop3pData(), "configLibrary");
+  const meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
+  return JSON.parse(readFileSync(join(library, `${meta.appliedId}.json`), "utf8"));
+}
+
+test("enable gives Claude Desktop only the Claude models, which it takes without a warning", async () => {
+  desktopInstalled();
+  const claude: GatewayModel[] = [
+    { ...models[0]!, slug: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6" },
+    { ...models[0]!, slug: "anthropic/claude-opus-4-6", display_name: "Claude Opus 4.6" },
+  ];
+  process.env.KIMCHI_BASE_URL = server((request) =>
+    new URL(request.url).pathname === "/v1/models/metadata"
+      ? Response.json({ models: [...models, ...claude] })
+      : new Response("not found", { status: 404 }),
+  );
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  expect(desktopEntry().inferenceModels).toEqual([
+    { name: "claude-sonnet-4-6" },
+    { name: "anthropic/claude-opus-4-6" },
+  ]);
+});
+
+test("without a Claude model enable leaves Claude Desktop as it was", async () => {
+  const main = desktopInstalled();
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  expect(existsSync(join(claudeDesktop3pData(), "configLibrary"))).toBe(false);
+  expect(existsSync(join(main, "claude_desktop_config.json"))).toBe(false);
+});
+
+test("the proxy's rewrite drops the models an older bridge gave Claude Desktop", () => {
+  desktopInstalled();
+  const library = join(claudeDesktop3pData(), "configLibrary"),
+    id = "11111111-2222-4333-8444-555555555555";
+  mkdirSync(library, { recursive: true });
+  writeFileSync(
+    join(library, "_meta.json"),
+    JSON.stringify({ appliedId: id, entries: [{ id, name: "Kimchi Gateway" }] }),
+  );
+  writeFileSync(
+    join(library, `${id}.json`),
+    JSON.stringify({
+      inferenceProvider: "gateway",
+      inferenceGatewayBaseUrl: "http://127.0.0.1:8766/anthropic",
+      inferenceModels: [{ name: "glm-5.3" }, { name: "claude-sonnet-4-6" }, { name: "kimi-k3" }],
+    }),
+  );
+  rewriteClaudeDesktopConfig("http://127.0.0.1:8767/anthropic");
+  expect(desktopEntry()).toMatchObject({
+    inferenceGatewayBaseUrl: "http://127.0.0.1:8767/anthropic",
+    inferenceModels: [{ name: "claude-sonnet-4-6" }],
+  });
 });
 
 test("enable with an API key routes through the local proxy and keeps the key out of the CLI configs", async () => {
@@ -342,6 +421,7 @@ test("disable restores pre-existing values, removes the catalog, and stops the p
   expect(claude.env.ANTHROPIC_BASE_URL).toBe("https://old-gateway.example");
   expect(claude.env.ANTHROPIC_CUSTOM).toBe("keep");
   expect(claude.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  expect(claude.env.CLAUDE_CODE_AUTO_MODE_SERVER).toBeUndefined();
   expect(claude.other).toBe(true);
   const codex = readFileSync(codexConfigPath(), "utf8");
   expect(codex).toContain('model = "gpt-5"');
@@ -349,6 +429,111 @@ test("disable restores pre-existing values, removes the catalog, and stops the p
   expect(codex).toContain("[features]");
   expect(existsSync(codexCatalogPath())).toBe(false);
   expect(loadGatewayState().enabled).toBe(false);
+});
+
+test("a gateway enabled before the auto-mode setting gets it once, and disable removes it again", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  oauthCredential();
+  await enable(oauthSignIn);
+  // As an older bridge left it: no auto-mode setting and no earlier value recorded for it.
+  const settings = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
+  delete settings.env.CLAUDE_CODE_AUTO_MODE_SERVER;
+  writeFileSync(claudeSettingsPath(), JSON.stringify(settings));
+  const state = loadGatewayState();
+  delete state.previous?.claude?.CLAUDE_CODE_AUTO_MODE_SERVER;
+  saveGatewayState(state);
+  ensureClaudeAutoMode();
+  ensureClaudeAutoMode();
+  expect(
+    JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env.CLAUDE_CODE_AUTO_MODE_SERVER,
+  ).toBe("0");
+  await disable();
+  const after = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
+  expect(after.env.CLAUDE_CODE_AUTO_MODE_SERVER).toBeUndefined();
+  expect(after.env.ANTHROPIC_BASE_URL).toBeUndefined();
+});
+
+test("the auto-mode setting is added only through the proxy, and a person's own value stays", () => {
+  mkdirSync(join(root, "home", ".claude"), { recursive: true });
+  writeFileSync(claudeSettingsPath(), JSON.stringify({ env: {} }));
+  ensureClaudeAutoMode();
+  expect(
+    JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env.CLAUDE_CODE_AUTO_MODE_SERVER,
+  ).toBeUndefined();
+  saveGatewayState({ enabled: true, mode: "proxy", port: 8766 });
+  writeFileSync(
+    claudeSettingsPath(),
+    JSON.stringify({ env: { CLAUDE_CODE_AUTO_MODE_SERVER: "1" } }),
+  );
+  ensureClaudeAutoMode();
+  expect(
+    JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env.CLAUDE_CODE_AUTO_MODE_SERVER,
+  ).toBe("1");
+});
+
+test("an organization without Claude routes gets Claude Code the models it has, until disable", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "deepseek-v4-flash-0731", is_serverless: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("deepseek-v4-flash-0731");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4-flash-0731");
+  await disable();
+  expect(env().ANTHROPIC_MODEL).toBeUndefined();
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+});
+
+test("Claude routes keep Claude Code's own models, and a person's model stays", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "claude-sonnet-5", is_serverless: false },
+  ]);
+  oauthCredential();
+  await enable(oauthSignIn);
+  const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
+  expect(env().ANTHROPIC_MODEL).toBeUndefined();
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBeUndefined();
+  await disable();
+
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  writeFileSync(claudeSettingsPath(), JSON.stringify({ env: { ANTHROPIC_MODEL: "glm-5.3" } }));
+  await enable(oauthSignIn);
+  expect(env().ANTHROPIC_MODEL).toBe("glm-5.3");
+  await disable();
+  expect(env().ANTHROPIC_MODEL).toBe("glm-5.3");
+});
+
+test("the launchd service waits while another daemon holds the port instead of exiting into a restart", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  oauthCredential();
+  const fake = server((request) =>
+    new URL(request.url).pathname === "/healthz"
+      ? Response.json({ ok: true, service: "kimchi-bridge-gateway", pid: 42 })
+      : new Response("no", { status: 404 }),
+  );
+  saveGatewayState({ enabled: true, mode: "proxy", port: Number(new URL(fake).port) });
+  // A daemon started any other way, such as from a hook, leaves at once.
+  await runDaemon();
+  process.env.XPC_SERVICE_NAME = "dev.kimchi.bridge.gateway";
+  process.env.KIMCHI_BRIDGE_SERVICE_WAIT_MS = "20";
+  cleanups.push(() => {
+    delete process.env.XPC_SERVICE_NAME;
+    delete process.env.KIMCHI_BRIDGE_SERVICE_WAIT_MS;
+  });
+  let settled = false;
+  const run = runDaemon().then(() => {
+    settled = true;
+  });
+  await Bun.sleep(200);
+  expect(settled).toBe(false);
+  saveGatewayState({ ...loadGatewayState(), enabled: false });
+  await run;
+  expect(settled).toBe(true);
 });
 
 test("proxyRequest injects the fresh bearer and org header, passes the body, and retries once on 401", async () => {
@@ -607,6 +792,8 @@ test("the proxy forwards an API-key sign-in with its key and tags its requests",
   expect(auth).toBe("Bearer castai_v1_key");
   expect(String(tags).startsWith("kimchi-request:")).toBe(true);
   expect(await recorded("resp_key")).toBe(String(tags).slice("kimchi-request:".length));
+  // Claude Code reports the call under this ID, which is how a call no transcript records finds its bill.
+  expect(response.headers.get("request-id")).toBe(String(tags).slice("kimchi-request:".length));
 });
 
 test("a retried request carries a fresh billing tag, as in Kimchi", async () => {

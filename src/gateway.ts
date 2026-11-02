@@ -33,7 +33,7 @@ import {
   saveCredential,
   seedFromKimchi,
 } from "./oauth.ts";
-import { billingTags, readResponseId, recordTag } from "./request-tags.ts";
+import { billingTags, noteSideCall, readResponseId, recordTag } from "./request-tags.ts";
 
 const DEFAULT_PORT = 8766;
 const PORT_SCAN_SPAN = 10;
@@ -134,6 +134,10 @@ const CLAUDE_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+  "CLAUDE_CODE_AUTO_MODE_SERVER",
+  "CLAUDE_CODE_AUTO_MODE_MODEL",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 ] as const;
 
 function readJsonFile(path: string): Record<string, unknown> {
@@ -155,6 +159,7 @@ function writeJsonFile(path: string, value: Record<string, unknown>): void {
 function writeClaudeConfig(
   anthropicBaseUrl: string,
   authToken: string,
+  modelEnv: Record<string, string> = {},
 ): Record<string, string | null> {
   const path = claudeSettingsPath();
   const settings = readJsonFile(path);
@@ -169,18 +174,46 @@ function writeClaudeConfig(
   // No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: the telemetry collector that
   // feeds PR-cost usage attribution is beta-gated, and the desktop app's 3P
   // Code sessions load these settings too.
+  // Auto mode asks Anthropic's server to run its classifier checks inside the model requests, which no model behind
+  // the Kimchi gateway does; Claude Code then holds the first checked action behind a notice. Off, it makes its own
+  // classifier requests, as it always has.
   const pairs: Record<string, string> = {
     ANTHROPIC_BASE_URL: anthropicBaseUrl,
     ANTHROPIC_API_KEY: "",
     ANTHROPIC_AUTH_TOKEN: authToken,
+    CLAUDE_CODE_AUTO_MODE_SERVER: "0",
   };
   for (const [key, value] of Object.entries(pairs)) env[key] = value;
+  // A person's own model choice stays.
+  for (const [key, value] of Object.entries(modelEnv))
+    if (typeof env[key] !== "string") env[key] = value;
   // A stale kill-switch from an older bridge would keep the beta-gated
   // telemetry collector off; remove what we no longer set.
   delete env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS;
   settings.env = env;
   writeJsonFile(path, settings);
   return previous;
+}
+
+/** Gives Claude Code's auto-mode setting to a gateway enabled before it existed; disable removes it again. */
+export function ensureClaudeAutoMode(): void {
+  const state = loadGatewayState();
+  if (state.enabled !== true || state.mode !== "proxy") return;
+  const path = claudeSettingsPath();
+  const settings = readJsonFile(path);
+  const env =
+    settings.env && typeof settings.env === "object" && !Array.isArray(settings.env)
+      ? (settings.env as Record<string, unknown>)
+      : {};
+  if (typeof env.CLAUDE_CODE_AUTO_MODE_SERVER === "string") return;
+  env.CLAUDE_CODE_AUTO_MODE_SERVER = "0";
+  settings.env = env;
+  writeJsonFile(path, settings);
+  state.previous = {
+    ...state.previous,
+    claude: { CLAUDE_CODE_AUTO_MODE_SERVER: null, ...state.previous?.claude },
+  };
+  saveGatewayState(state);
 }
 
 function restoreClaudeConfig(previous?: Record<string, string | null>): void {
@@ -308,6 +341,24 @@ export function resolveMainModel(models: readonly GatewayModel[]): GatewayModel 
   if (preferred) return preferred;
   const vision = serverless.find((m) => (m.input_modalities ?? []).includes("image"));
   return vision ?? serverless[0] ?? models[0];
+}
+
+// The small model Kimchi's own checks use. It answers within the 64 tokens Claude Code's auto-mode check allows, which
+// the models that reason first spend before they reply.
+const CLAUDE_SMALL_MODEL = "deepseek-v4-flash-0731";
+
+/**
+ * Claude Code asks for Claude models by default, and an organization without Claude routes answers those with 400: the
+ * first prompt fails, and so does every auto-mode check. Such an organization gets the models it has.
+ */
+function claudeModelEnv(models: readonly GatewayModel[]): Record<string, string> {
+  if (!models.length || models.some((model) => isClaudeModel(model.slug))) return {};
+  const env: Record<string, string> = { ANTHROPIC_MODEL: resolveMainModel(models).slug };
+  if (models.some((model) => model.slug === CLAUDE_SMALL_MODEL)) {
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = CLAUDE_SMALL_MODEL;
+    env.CLAUDE_CODE_AUTO_MODE_MODEL = CLAUDE_SMALL_MODEL;
+  }
+  return env;
 }
 
 export async function fetchModels(
@@ -500,6 +551,15 @@ export function claudeDesktop3pData(): string {
 }
 
 const DESKTOP_CONFIG_FILE = "claude_desktop_config.json";
+
+/**
+ * Claude Desktop runs only Anthropic models: for a gateway it drops every other model name with a warning, and any
+ * warning shows its "Configuration may need attention" banner. Kimchi names its Claude routes claude-* or anthropic/*.
+ */
+function isClaudeModel(name: string): boolean {
+  const slug = name.toLowerCase();
+  return slug.startsWith("claude-") || slug.startsWith("anthropic/");
+}
 const DESKTOP_MODE_KEY = "deploymentMode";
 const DESKTOP_LIBRARY_ENTRY = "Kimchi Gateway";
 
@@ -548,6 +608,9 @@ export function writeClaudeDesktopConfig(
 ): Desktop3pPrevious | null {
   const appData = claudeDesktopAppData();
   if (!appData) return null;
+  const claude = models.filter((m) => isClaudeModel(m.slug));
+  // Without a Claude model the app has nothing to run through the gateway: leave it as it is.
+  if (!claude.length) return null;
 
   const config = readDesktopConfig(appData);
   const previous: Desktop3pPrevious = {
@@ -597,7 +660,7 @@ export function writeClaudeDesktopConfig(
         inferenceCredentialKind: "static",
         // The app's connection test needs a model without discovery, which the
         // proxy does not serve; the fetched list is what Codex catalogs too.
-        inferenceModels: models.slice(0, 200).map((m) => ({ name: m.slug })),
+        inferenceModels: claude.slice(0, 200).map((m) => ({ name: m.slug })),
       },
       null,
       2,
@@ -607,8 +670,11 @@ export function writeClaudeDesktopConfig(
   return previous;
 }
 
-/** Follows a gateway port move so desktop sessions point at the live proxy. */
-export function rewriteClaudeDesktopPort(anthropicBaseUrl: string): void {
+/**
+ * Points desktop sessions at the live proxy after a port move, and drops the model names an older bridge wrote that
+ * the app rejects.
+ */
+export function rewriteClaudeDesktopConfig(anthropicBaseUrl: string): void {
   const appData = claudeDesktopAppData();
   if (!appData) return;
   const library = join(claudeDesktop3pData(), "configLibrary");
@@ -629,8 +695,14 @@ export function rewriteClaudeDesktopPort(anthropicBaseUrl: string): void {
   } catch {
     return;
   }
+  const before = JSON.stringify(config, null, 2) + "\n";
   config.inferenceGatewayBaseUrl = anthropicBaseUrl;
-  writeAtomic(path, JSON.stringify(config, null, 2) + "\n", 0o600);
+  if (Array.isArray(config.inferenceModels))
+    config.inferenceModels = config.inferenceModels.filter(
+      (model) => typeof model?.name === "string" && isClaudeModel(model.name),
+    );
+  const after = JSON.stringify(config, null, 2) + "\n";
+  if (after !== before) writeAtomic(path, after, 0o600);
 }
 
 /** Restores the desktop app to the mode and library it had before enable. */
@@ -1141,6 +1213,16 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
   }
   let reply = response.body;
   const tagged = requestId;
+  // Claude Code reports a call with the request ID its reply carried, and its title requests reach no transcript, so
+  // the tag makes that report name the call's bill. Auto mode's checks are in neither; the proxy notes those itself.
+  if (tagged) headers.set("request-id", tagged);
+  if (tagged && response.ok) {
+    try {
+      noteSideCall(request.headers, json, tagged);
+    } catch (error) {
+      log(`side call not recorded: ${(error as Error).message}`);
+    }
+  }
   if (tagged && response.ok && reply) {
     // Transcripts name a call by its response ID, so remember which tag that response's request carried.
     const [client, copy] = reply.tee();
@@ -1162,9 +1244,19 @@ export async function runDaemon(): Promise<void> {
   for (let offset = 0; offset <= PORT_SCAN_SPAN; offset++) {
     const candidate = preferred + offset;
     if ((await health(candidate)).ok) {
-      // Our daemon is already listening; nothing to do.
-      log(`daemon already running on ${candidate}`);
-      return;
+      // Our daemon is already listening, often the one `gateway enable` starts before it registers the service.
+      // launchd restarts its job 10 s after every exit, so the service waits for that daemon and then takes the port.
+      if (process.env.XPC_SERVICE_NAME !== SERVICE_LABEL) {
+        log(`daemon already running on ${candidate}`);
+        return;
+      }
+      log(`daemon already running on ${candidate}; the service waits for it`);
+      // KIMCHI_BRIDGE_SERVICE_WAIT_MS is a test seam.
+      const wait = Number(process.env.KIMCHI_BRIDGE_SERVICE_WAIT_MS) || 30_000;
+      while ((await health(candidate)).ok) {
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        if (loadGatewayState().enabled === false) return;
+      }
     }
     try {
       server = Bun.serve({
@@ -1247,11 +1339,15 @@ export async function runDaemon(): Promise<void> {
     // The persisted port moved; repoint the CLI configs so new sessions follow.
     try {
       writeClaudeConfig(`http://127.0.0.1:${port}/anthropic`, PROXY_PLACEHOLDER);
-      rewriteClaudeDesktopPort(`http://127.0.0.1:${port}/anthropic`);
       log(`port moved to ${port}; CLI configs rewritten`);
     } catch (error) {
       log(`port moved to ${port} but CLI config rewrite failed: ${(error as Error).message}`);
     }
+  }
+  try {
+    rewriteClaudeDesktopConfig(`http://127.0.0.1:${port}/anthropic`);
+  } catch (error) {
+    log(`Claude Desktop config rewrite failed: ${(error as Error).message}`);
   }
   log(`gateway proxy listening on 127.0.0.1:${port} -> ${target.llmBase}`);
   // Poll for disable while running; SIGTERM also exits (default handler).
@@ -1325,7 +1421,11 @@ export async function enable(
 
   // Fetch the model list first: a failure leaves nothing written.
   const models = await fetchModels(llmBase, modelHeaders);
-  const claudePrevious = writeClaudeConfig(`http://127.0.0.1:${port}/anthropic`, PROXY_PLACEHOLDER);
+  const claudePrevious = writeClaudeConfig(
+    `http://127.0.0.1:${port}/anthropic`,
+    PROXY_PLACEHOLDER,
+    claudeModelEnv(models),
+  );
   const codexPrevious = writeCodexConfig(
     `http://127.0.0.1:${port}/openai/v1`,
     PROXY_PLACEHOLDER,
@@ -1352,6 +1452,8 @@ export async function enable(
       previousState.enabled && previousState.previous
         ? {
             ...previousState.previous,
+            // A key this version added still goes back to what it was before this enable.
+            claude: { ...claudePrevious, ...previousState.previous.claude },
             // The desktop snapshot is recomputed above, so re-enable keeps
             // what disable would need to restore now, not the first enable's.
             ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),

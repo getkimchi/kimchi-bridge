@@ -363,6 +363,11 @@ export async function run(
         .catch((error: unknown) =>
           output(`Gateway kept its direct connection: ${(error as Error).message}\n`),
         );
+    try {
+      gateway.ensureClaudeAutoMode();
+    } catch {
+      /* Claude Code's settings could not be read; the next activate retries. */
+    }
     return;
   }
   if (command === "codex-trace") {
@@ -433,7 +438,14 @@ export async function run(
         try {
           const parsed = parseJson(data.toString("utf8"));
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
-          native = (args[1] === "codex" ? { event: parsed } : parsed) as Native;
+          // Claude Code's command hooks send the JSON a mod's classic.<event> hook receives.
+          native = (
+            args[1] === "codex"
+              ? { event: parsed }
+              : typeof parsed.hook_event_name === "string"
+                ? { stage: `classic.${parsed.hook_event_name}`, event: parsed }
+                : parsed
+          ) as Native;
         } catch {
           s.diagnostic("hook_invalid_json");
           return;

@@ -30,6 +30,9 @@ async function ensure($) {
   }
 }
 // The sign-in hint is hooks.json's SessionStart command: Claude Code refuses to load a module that reads $.ui as a value.
+// Settings hook events (transcript paths, prompt IDs, subagents) reach the helper through hooks.json's command hooks:
+// Claude Code skips an installed mod's classic.* hooks wherever its built-in guard loads (managed settings, or a Team
+// or Enterprise login).
 export function register(on) {
   on('session.start', async ($, e, next) => {
     await record($, 'session.start', e);
@@ -38,7 +41,6 @@ export function register(on) {
     $.clock.every(30000, async () => { await sync($); await ensure($); });
     return next(e);
   });
-  on('classic.UserPromptSubmit', async ($, e, next) => { await ensure($); await record($, 'classic.UserPromptSubmit', e); return next(e); });
   on('turn.start', async ($, e, next) => { await record($, 'turn.start', e); return next(e); });
   on('tool.call', async ($, e, next) => {
     await record($, 'tool.before', e);
@@ -56,12 +58,8 @@ export function register(on) {
     await record($, 'step.after', e, result);
     return result;
   });
-  on('classic.PostToolUse', async ($, e, next) => { await record($, 'classic.PostToolUse', e); return next(e); });
-  on('classic.SubagentStart', async ($, e, next) => { await record($, 'classic.SubagentStart', e); return next(e); });
-  on('classic.SubagentStop', async ($, e, next) => { await record($, 'classic.SubagentStop', e); return next(e); });
-  on('classic.Stop', async ($, e, next) => {
-    await record($, 'classic.Stop', e);
-    $.clock.after(0, async () => { await sync($); });
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) $.clock.after(0, async () => { await sync($); });
     return next(e);
   });
   on('telemetry.log', {to: 'collector'}, async ($, e, next) => {

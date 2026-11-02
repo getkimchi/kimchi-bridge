@@ -31,6 +31,44 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" gateway ensure --quick",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" hook claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" hook claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" hook claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" hook claude-code",
+            "timeout": 2
           }
         ]
       }
@@ -41,6 +79,11 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" gateway ensure --quick",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" hook claude-code",
             "timeout": 2
           }
         ]

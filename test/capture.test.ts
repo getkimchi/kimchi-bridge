@@ -97,7 +97,12 @@ test("repository discovery preserves native Git roots and common identities for 
   for (const cwd of [root, subdir, linked, linkedSubdir, unborn, trailing]) {
     const expectedRoot = git(cwd, "rev-parse", "--show-toplevel"),
       common = git(expectedRoot, "rev-parse", "--path-format=absolute", "--git-common-dir");
-    expect(repository(cwd)).toEqual([expectedRoot, stableId("git-common-dir", common), undefined]);
+    expect(repository(cwd)).toEqual([
+      expectedRoot,
+      stableId("git-common-dir", common),
+      undefined,
+      common,
+    ]);
   }
   expect(repository(linked)[1]).toBe(repository(root)[1]);
   const nonGit = join(base, "not a repository"),
@@ -359,6 +364,113 @@ test("before capture persists bytes before editing and replay cannot change the 
   r.record({ stage: "PostToolUse", event: e });
   expect(events(store, "file")).toEqual(captured);
   expect(events(store, "tool")).toHaveLength(1);
+});
+
+test("each Claude Code prompt maps to its own turn, not the session's previous one", () => {
+  const { root, store, r } = fixture("claude-code");
+  const record = (stage: string, event: Record<string, unknown>) =>
+    r.record({ stage, sessionId: "s", cwd: root, event });
+  for (const [prompt, turn] of [
+    ["p1", "t1"],
+    ["p2", "t2"],
+  ]) {
+    record("classic.UserPromptSubmit", {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "s",
+      cwd: root,
+      prompt_id: prompt,
+      prompt: "edit the file",
+    });
+    record("turn.start", { turnId: turn, text: "edit the file" });
+  }
+  expect(store.meta("prompt-turn:s:p1")).toBe("t1");
+  expect(store.meta("prompt-turn:s:p2")).toBe("t2");
+});
+
+test("a subagent's calls under the user's next prompt keep the subagent's work", () => {
+  const { root, store, r } = fixture("claude-code");
+  const hook = (name: string, extra: Record<string, unknown>) =>
+    r.record({
+      stage: `classic.${name}`,
+      event: { hook_event_name: name, session_id: "s", cwd: root, ...extra },
+    });
+  const turn = (id: string) =>
+    r.record({ stage: "turn.start", sessionId: "s", cwd: root, event: { turnId: id, text: id } });
+  hook("UserPromptSubmit", { prompt_id: "p1", prompt: "review this" });
+  turn("t1");
+  const spawned = r.work(scope(root, "s", "t1"));
+  hook("SubagentStart", { prompt_id: "p1", agent_id: "a1", agent_type: "general-purpose" });
+  hook("UserPromptSubmit", { prompt_id: "p2", prompt: "new work: something else" });
+  turn("t2");
+  const path = join(root, "agent-a1.jsonl");
+  const row = (prompt: string, id: string) =>
+    JSON.stringify({ type: "user", timestamp: new Date().toISOString(), promptId: prompt }) +
+    "\n" +
+    JSON.stringify({
+      type: "assistant",
+      timestamp: new Date().toISOString(),
+      requestId: "req_" + id,
+      message: { id, model: "claude-opus-5-5", usage: { input_tokens: 1, output_tokens: 1 } },
+    }) +
+    "\n";
+  writeFileSync(path, row("p1", "m1") + row("p2", "m2"));
+  hook("SubagentStop", { prompt_id: "p2", agent_id: "a1", agent_transcript_path: path });
+  r.recoverContext();
+  const calls = events(store, "usage").filter((e: any) => e.agentId === "a1");
+  expect(calls.map((e: any) => e.workId)).toEqual([spawned, spawned]);
+});
+
+test("a call read late from a resumed session's transcript keeps its earlier work", () => {
+  const { root, store, r } = fixture("claude-code");
+  r.record({
+    stage: "turn.start",
+    sessionId: "s",
+    cwd: root,
+    event: { turnId: "t1", text: "implement" },
+  });
+  r.record({
+    stage: "telemetry.log",
+    sessionId: "s",
+    cwd: root,
+    event: {
+      event: "api_request",
+      attributes: {
+        request_id: "req_1",
+        "event.timestamp": new Date().toISOString(),
+        "prompt.id": "p1",
+        model: "m",
+      },
+    },
+  });
+  const telemetry = events(store, "usage").at(-1);
+  expect(telemetry.workId).toBeTruthy();
+  const transcript = join(root, "s.jsonl");
+  writeFileSync(
+    transcript,
+    JSON.stringify({ type: "user", timestamp: new Date().toISOString(), promptId: "p1" }) +
+      "\n" +
+      JSON.stringify({
+        type: "assistant",
+        timestamp: new Date().toISOString(),
+        requestId: "req_1",
+        message: { id: "msg_1", model: "m", usage: { input_tokens: 1, output_tokens: 1 } },
+      }) +
+      "\n",
+  );
+  r.record({
+    stage: "classic.UserPromptSubmit",
+    event: {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "s",
+      cwd: root,
+      prompt_id: "p2",
+      transcript_path: transcript,
+    },
+  });
+  r.recoverContext();
+  const read = store.latest(telemetry.entityId);
+  expect(read?.usage?.channel).toBe("transcript");
+  expect(read?.workId).toBe(telemetry.workId);
 });
 
 test("Claude mod flat Read and Edit payloads retain their exact native file evidence", () => {
