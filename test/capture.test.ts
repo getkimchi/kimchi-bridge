@@ -21,7 +21,7 @@ import {
   repository,
   type Scope,
 } from "../src/work/capture.ts";
-import { git } from "../src/work/git.ts";
+import { git, reconcileGit } from "../src/work/git.ts";
 import { Store } from "../src/work/ledger.ts";
 import { digest, stableId } from "../src/work/protocol.ts";
 
@@ -514,6 +514,53 @@ test("concurrent edits retain observed transitions without claiming the native e
   expect(store.db.query("SELECT key FROM meta WHERE key LIKE 'git-change:%'").all()).toHaveLength(
     0,
   );
+});
+
+test("a remote rewritten to carry a token keeps its identity, and the token reaches no record", () => {
+  const { root, store, r } = fixture("claude-code");
+  git(root, "init", "--initial-branch=main");
+  git(root, "config", "user.email", "fixture@example.invalid");
+  git(root, "config", "user.name", "Fixture");
+  git(root, "config", "commit.gpgsign", "false");
+  git(root, "config", "core.hooksPath", "/dev/null");
+  git(root, "remote", "add", "origin", "https://github.com/lumbrook/widgets.git");
+  // The rewrite lives in this repository only, as a credential helper would set it: Git then reads
+  // the remote as carrying the token.
+  git(root, "config", "url.https://ghp_fixturetoken@github.com/.insteadOf", "https://github.com/");
+  expect(git(root, "remote", "get-url", "origin")).toBe(
+    "https://ghp_fixturetoken@github.com/lumbrook/widgets.git",
+  );
+  const path = join(root, "file.txt");
+  writeFileSync(path, "before\n");
+  prompt(r, root, "s", "t", "edit");
+  const e = edit(root, path);
+  r.record({ stage: "PreToolUse", event: e });
+  writeFileSync(path, "after\n");
+  r.record({ stage: "PostToolUse", event: e });
+  git(root, "add", "file.txt");
+  git(root, "commit", "-m", "edit");
+  reconcileGit(r);
+  expect(repository(root)[2]).toMatchObject({
+    provider: "github",
+    host: "github.com",
+    name: "lumbrook/widgets",
+  });
+  const files = events(store, "file");
+  expect(files).toHaveLength(1);
+  expect(files[0].repository).toMatchObject({
+    provider: "github",
+    host: "github.com",
+    name: "lumbrook/widgets",
+  });
+  // The token reaches no record: not events, metadata or blobs.
+  const stored = [
+    ...(store.db.query("SELECT body AS text FROM events").all() as any[]),
+    ...(store.db.query("SELECT value AS text FROM meta").all() as any[]),
+    ...(store.db.query("SELECT content AS text FROM blobs").all() as any[]),
+  ]
+    .map((row) => row.text.toString())
+    .join("\n");
+  expect(stored.includes("ghp_fixturetoken")).toBe(false);
 });
 
 test("failed native tools and missing preimages remain unconfirmed", () => {

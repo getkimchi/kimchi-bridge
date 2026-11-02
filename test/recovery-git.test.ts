@@ -1,6 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Recorder, repository, type Scope } from "../src/work/capture.ts";
@@ -608,6 +615,126 @@ test("Git revisits a late commit and excludes the old identical revision", () =>
   ).toBe(1);
   expect(latest(store, "commit").commit.id).toBe(sha);
   expect(sha).not.toBe(old);
+});
+
+// A native Edit from "before" to "after", as Claude Code's hooks report it around the write.
+function recordEdit(r: Recorder, root: string, path: string) {
+  const e = {
+    session_id: "s",
+    turn_id: "turn",
+    cwd: root,
+    tool_use_id: "call",
+    tool_name: "Edit",
+    tool_input: { file_path: path, old_string: "before", new_string: "after" },
+  };
+  r.record({ stage: "PreToolUse", event: e });
+  writeFileSync(path, "after\n");
+  r.record({ stage: "PostToolUse", event: e });
+}
+
+test("a person's commit is matched in a repository with 30,000 tips", () => {
+  const { base, root, store, r } = fixture("claude-code");
+  git(root, "init", "--initial-branch=main");
+  git(root, "config", "user.email", "fixture@example.invalid");
+  git(root, "config", "user.name", "Fixture");
+  git(root, "config", "commit.gpgsign", "false");
+  git(root, "config", "core.hooksPath", "/dev/null");
+  const path = join(root, "file.txt");
+  writeFileSync(path, "before\n");
+  git(root, "add", "file.txt");
+  git(root, "commit", "-m", "baseline");
+  // 30,000 tips, written straight into packed-refs so the fixture stays fast: fast-import chains the
+  // commits into one pack, and the tags below point at them without one loose ref file each. On the
+  // command line, past about 24,000 tips (macOS ARG_MAX) Git cannot start and the edit stays unmatched.
+  const baseline = git(root, "rev-parse", "HEAD");
+  let stream = "";
+  for (let i = 1; i <= 30000; i++)
+    stream += [
+      "commit refs/heads/bulk",
+      `mark :${i}`,
+      "committer Fixture <fixture@example.invalid> 1700000000 +0000",
+      "data 12",
+      `bulk-${String(i).padStart(6, "0")}`,
+      i === 1 ? `from ${baseline}` : `from :${i - 1}`,
+      "",
+      "",
+    ].join("\n");
+  const marks = join(base, "marks");
+  execFileSync("git", ["fast-import", "--quiet", `--export-marks=${marks}`], {
+    cwd: root,
+    input: stream,
+  });
+  git(root, "update-ref", "-d", "refs/heads/bulk");
+  writeFileSync(
+    join(root, ".git", "packed-refs"),
+    "# pack-refs with: peeled fully-peeled sorted\n" +
+      readFileSync(marks, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map(
+          (line, i) =>
+            `${line.slice(line.indexOf(" ") + 1)} refs/tags/t${String(i + 1).padStart(6, "0")}`,
+        )
+        .join("\n") +
+      "\n",
+  );
+  expect(git(root, "for-each-ref", "--format=%(objectname)").split("\n")).toHaveLength(30001);
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
+  });
+  recordEdit(r, root, path);
+  git(root, "add", "file.txt");
+  git(root, "commit", "-m", "edit");
+  const sha = git(root, "rev-parse", "HEAD");
+  reconcileGit(r);
+  expect(latest(store, "commit").commit.id).toBe(sha);
+  expect(latest(store, "link").link).toMatchObject({
+    toKind: "commit",
+    toId: sha,
+    reason: "file_revision",
+  });
+});
+
+test("an unreadable ref list is reported, not silent", () => {
+  const { root, store, r } = fixture("claude-code");
+  git(root, "init", "--initial-branch=main");
+  git(root, "config", "user.email", "fixture@example.invalid");
+  git(root, "config", "user.name", "Fixture");
+  git(root, "config", "core.hooksPath", "/dev/null");
+  const path = join(root, "file.txt");
+  writeFileSync(path, "before\n");
+  git(root, "add", "file.txt");
+  git(root, "commit", "-m", "baseline");
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
+  });
+  // for-each-ref cannot read the ref list (here: a malformed packed-refs line, which Git refuses for
+  // any user, root included), so refTips returns none: a diagnostic reports that instead of the edit
+  // silently matching nothing.
+  writeFileSync(
+    join(root, ".git", "packed-refs"),
+    "# pack-refs with: peeled fully-peeled sorted\nnot a ref line\n",
+  );
+  recordEdit(r, root, path);
+  expect(store.status().diagnostics.git_refs_unavailable).toBe(1);
+  expect(store.db.query("SELECT key FROM meta WHERE key LIKE 'git-change:%'").all()).toHaveLength(
+    0,
+  );
+});
+
+test("an edit outside any Git repository reports no unreadable ref list", () => {
+  const { root, store, r } = fixture("claude-code");
+  const path = join(root, "file.txt");
+  writeFileSync(path, "before\n");
+  r.record({
+    stage: "UserPromptSubmit",
+    event: { session_id: "s", turn_id: "turn", cwd: root, prompt: "edit" },
+  });
+  // for-each-ref fails outside a repository too, but there is no ref list to miss.
+  recordEdit(r, root, path);
+  expect(store.status().diagnostics.git_refs_unavailable).toBeUndefined();
 });
 
 for (const source of ["claude-code", "codex"]) {
