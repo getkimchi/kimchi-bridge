@@ -722,7 +722,9 @@ test("maintained Markdown and shell parsers recognize references without variabl
 
 test("shell tool calls do not open the repository inventory", () => {
   const { root, store, r } = fixture();
-  Bun.spawnSync(["git", "init", "-q"], { cwd: root });
+  // env is given because a Bun spawn without it inherits the environment the runner was started
+  // with, not the isolated one the test preload sets up.
+  Bun.spawnSync(["git", "init", "-q"], { cwd: root, env: process.env });
   // An untracked file with distinctive content: the old inventory snapshot
   // listed every cached and untracked repository file on each shell tool
   // call and opened them for hashing — in a session rooted at the home

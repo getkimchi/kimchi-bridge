@@ -28,7 +28,20 @@ export function git(cwd: string, ...args: string[]): string {
 function gitContext(signal: AbortSignal | undefined, cwd: string, ...args: string[]): string {
   checkSignal(signal);
   const env = { ...process.env };
-  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"])
+  // The bridge's own Git must neither hit the GIT_TRACE_REFS branch bug (a `git branch <name> <sha>`
+  // fails) nor write into an agent's trace, which the harness or a shell may have exported.
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_TRACE_REFS",
+    "GIT_TRACE2_EVENT",
+    "GIT_TRACE2_ENV_VARS",
+    "GIT_TRACE2",
+    "GIT_TRACE2_PERF",
+    "GIT_TRACE",
+  ])
     delete env[key];
   Object.assign(env, {
     GIT_OPTIONAL_LOCKS: "0",
