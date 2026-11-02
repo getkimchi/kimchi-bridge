@@ -199,7 +199,8 @@ function recoverSideCalls(r: Recorder, t: Transcript) {
       model: call.model,
       "event.timestamp": call.at,
     };
-    telemetry(r, t.scope, { event: "api_request", attributes }, t.route, t.basis);
+    // Only a call no other record names: Claude Code reports its title requests itself, with tokens.
+    telemetry(r, t.scope, { event: "api_request", attributes }, t.route, t.basis, true);
     settleSideCall(call.requestId);
   }
 }
@@ -675,6 +676,7 @@ export function telemetry(
   e: JsonObject,
   observedRoute: string,
   basis: string,
+  onlyNew = false,
 ) {
   const a = obj(e.attributes);
   if (str(e, "event") !== "api_request" && str(a, "event.name") !== "api_request") return;
@@ -687,7 +689,8 @@ export function telemetry(
   const prompt = str(a, "prompt.id");
   if (prompt) s.Turn = r.store.meta(`prompt-turn:${s.Session}:${prompt}`);
   const event = r.event(s, requestEntity("", request), s.Turn ? r.workExact(s) : r.work(s));
-  if (r.store.latest(event.entityId)?.usage?.channel === "transcript") return;
+  const latest = r.store.latest(event.entityId);
+  if (latest?.usage?.channel === "transcript" || (onlyNew && latest)) return;
   event.observeTime = timestamp(str(a, "event.timestamp"));
   const cacheWrites = writes(a, [
     ["cache_creation_5m_tokens", 300],

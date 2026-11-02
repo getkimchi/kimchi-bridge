@@ -1204,6 +1204,54 @@ test("a billed call Claude Code's transcript leaves out is reported once, in its
   });
 });
 
+// A title request: Claude Code reports it itself, with its tokens, and the proxy notes it too.
+const titleReport = () =>
+  parseJson(
+    JSON.stringify({
+      event: "api_request",
+      attributes: {
+        request_id: tag,
+        "event.timestamp": "2026-11-01T10:00:00.000Z",
+        model: "title-model",
+        input_tokens: 12,
+        output_tokens: 3,
+      },
+    }),
+  );
+
+test("a noted call Claude Code already reported keeps that report", () => {
+  const { base, root, store, r, scope } = fixture("claude-code");
+  withBridgeHome(base, () => {
+    const path = join(root, "claude.jsonl");
+    writeFileSync(path, "");
+    registerTranscript(r, scope, path, "castai", "unknown");
+    telemetry(r, scope, titleReport(), "castai", "unknown");
+    const reported = usages(store).map((event) => event.usage);
+    const session = new Headers({ "x-claude-code-session-id": scope.Session });
+    noteSideCall(session, { model: "title-model" }, tag);
+    recoverContext(r);
+    expect(usages(store).map((event) => event.usage)).toEqual(reported);
+    expect(sideCalls(scope.Session)).toEqual([]);
+  });
+});
+
+test("Claude Code's own report still supersedes a side call reported before it", () => {
+  const { base, root, store, r, scope } = fixture("claude-code");
+  withBridgeHome(base, () => {
+    const path = join(root, "claude.jsonl");
+    writeFileSync(path, "");
+    registerTranscript(r, scope, path, "castai", "unknown");
+    const session = new Headers({ "x-claude-code-session-id": scope.Session });
+    noteSideCall(session, { model: "title-model" }, tag);
+    recoverContext(r);
+    telemetry(r, scope, titleReport(), "castai", "unknown");
+    const all = usages(store);
+    expect(all).toHaveLength(2);
+    expect(all[1].usage.raw.inputTokens).toBeDefined();
+    expect(all[1].usage).toMatchObject({ requestId: tag, reportedModel: "title-model" });
+  });
+});
+
 test("a Claude call the proxy tagged uploads its billing tag as requestId on the gateway route", () => {
   const { base, root, store, r, scope } = fixture("claude-code");
   withBridgeHome(base, () => {
