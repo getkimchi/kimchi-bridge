@@ -431,26 +431,24 @@ export function resolveMainModel(models: readonly GatewayModel[]): GatewayModel 
   return vision ?? serverless[0] ?? models[0];
 }
 
-// The small model Kimchi's own checks use. It answers within the 64 tokens Claude Code's auto-mode check allows, which
-// the models that reason first spend before they reply.
-const CLAUDE_SMALL_MODEL = "deepseek-v4-flash-0731";
+// The small models known to answer Claude Code's auto-mode check directly, in order; Kimchi's own checks use the first.
+// Each replies well within the 64 tokens the check allows. The model list can't tell which models do: some that can
+// switch thinking off still think first and spend the budget, and the ones marked as not reasoning are embedding and
+// test models that answer no chat request. So the models are named.
+const CLAUDE_SMALL_MODELS = ["deepseek-v4-flash-0731", "deepseek-v4.1-flash-1017"];
 
 /**
  * Claude Code asks for Claude models by default, and an organization without Claude routes answers those with 400: the
  * first prompt fails, and so does every auto-mode check. Such an organization gets the models it has: the main one for
- * prompts, and a small one for the background checks — the model Kimchi's own checks use when the organization lists
- * it, else the first serverless model that does not reason, else none.
+ * prompts, and for the background checks the first known small model it lists, else none.
  */
 function claudeModelEnv(models: readonly GatewayModel[]): Record<string, string> {
   if (!models.length || models.some((model) => isClaudeModel(model.slug))) return {};
   const env: Record<string, string> = { ANTHROPIC_MODEL: resolveMainModel(models).slug };
-  // Models carry no size: without Kimchi's own small model, the list's order picks among those that don't reason.
-  const small =
-    models.find((model) => model.slug === CLAUDE_SMALL_MODEL) ??
-    models.find((model) => model.is_serverless && model.reasoning === false);
+  const small = CLAUDE_SMALL_MODELS.find((slug) => models.some((model) => model.slug === slug));
   if (small) {
-    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = small.slug;
-    env.CLAUDE_CODE_AUTO_MODE_MODEL = small.slug;
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = small;
+    env.CLAUDE_CODE_AUTO_MODE_MODEL = small;
   }
   return env;
 }

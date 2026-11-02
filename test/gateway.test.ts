@@ -696,32 +696,50 @@ test("re-enable after the model list changes updates the bridge's choice, not th
   // The main model and the small model both change.
   process.env.KIMCHI_BASE_URL = modelsEndpoint([
     models[1],
-    { ...models[1], slug: "glm-5.3-air", reasoning: false },
+    { ...models[1], slug: "deepseek-v4.1-flash-1017", is_serverless: false },
   ]);
   await enable(oauthSignIn);
   const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
   expect(env().ANTHROPIC_MODEL).toBe("kimi-k2.6");
-  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("glm-5.3-air");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4.1-flash-1017");
   expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("glm-4.7-flash");
   expect(loadGatewayState().wrote?.claude).toEqual({
     ANTHROPIC_MODEL: "kimi-k2.6",
-    CLAUDE_CODE_AUTO_MODE_MODEL: "glm-5.3-air",
+    CLAUDE_CODE_AUTO_MODE_MODEL: "deepseek-v4.1-flash-1017",
   });
 });
 
-test("a non-reasoning model is chosen for auto mode when the preferred one is missing", async () => {
+test("the small model is one known to answer directly, never just any model that does not reason", async () => {
+  // Like the gateway's embedding models: marked as not reasoning, and answering no chat request.
+  const embedding = {
+    ...models[1],
+    slug: "bge-m3",
+    reasoning: false,
+    limits: { context_window: 8192, max_output_tokens: 0 },
+  };
+  const known = (slug: string) => ({ ...models[1], slug, is_serverless: false });
   process.env.KIMCHI_BASE_URL = modelsEndpoint([
     ...models,
-    { ...models[1], slug: "glm-5.3-air", reasoning: false },
+    embedding,
+    known("deepseek-v4.1-flash-1017"),
+    known("deepseek-v4-flash-0731"),
   ]);
   oauthCredential();
   await enable(oauthSignIn);
   const env = () => JSON.parse(readFileSync(claudeSettingsPath(), "utf8")).env;
-  expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
-  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("glm-5.3-air");
-  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("glm-5.3-air");
-  // Every serverless model reasons: no model is forced on the background checks.
-  process.env.KIMCHI_BASE_URL = modelsEndpoint();
+  // The bridge's order decides, not the list's.
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4-flash-0731");
+  // Kimchi's own small model leaves the list: the second known one takes over.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    embedding,
+    known("deepseek-v4.1-flash-1017"),
+  ]);
+  await enable(oauthSignIn);
+  expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("deepseek-v4.1-flash-1017");
+  expect(env().CLAUDE_CODE_AUTO_MODE_MODEL).toBe("deepseek-v4.1-flash-1017");
+  // Neither is listed: no model goes on the background checks.
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([...models, embedding]);
   await enable(oauthSignIn);
   expect(env().ANTHROPIC_MODEL).toBe("minimax-m3");
   expect(env().ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
