@@ -6,7 +6,7 @@ import { parse as parseShell } from "shell-quote";
 import type { fromMarkdown as parseMarkdown } from "mdast-util-from-markdown";
 import type { applyDiff as applyPatchDiff } from "@openai/agents-core/utils";
 import { safeRead, within } from "../platform.ts";
-import { traceDir, tracedCommits } from "./commits.ts";
+import { traceDir, traceState } from "./commits.ts";
 import {
   commitParents,
   git,
@@ -835,14 +835,20 @@ export class Recorder {
            LIMIT 1`,
         )
         .get(this.source, s.Session, call);
-    let commits;
+    let commits,
+      unfinished = false;
     try {
-      commits = tracedCommits(join(dir, "events"), join(dir, "refs"));
+      // A command can outlive its call (unified exec): its commit lands only after the call returned,
+      // so the trace its Git still writes into survives this reading and is read again later.
+      const state = traceState(join(dir, "events"), join(dir, "refs"));
+      commits = state.commits;
+      unfinished = state.unfinished;
     } finally {
       // Kimchi traces each shell call apart. A Claude Code session has one trace, so once no other shell call of
-      // the session runs, it is spent: otherwise every later hook rereads all the session's Git (a test suite
-      // writes tens of megabytes) and outlives its two-second limit, losing the commit.
-      if (this.source === "claude-code" && !busy)
+      // the session runs and no Git it left behind still writes into it, it is spent: otherwise every later hook
+      // rereads all the session's Git (a test suite writes tens of megabytes) and outlives its two-second
+      // limit, losing the commit.
+      if (this.source === "claude-code" && !busy && !unfinished)
         for (const name of ["events", "refs"]) rmSync(join(dir, name), { force: true });
     }
     for (const c of commits) {

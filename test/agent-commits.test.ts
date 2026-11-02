@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -297,6 +298,56 @@ test("a commit made after its call returned is recorded for that call's work", (
   expect(latest(store, "link").workId).toBe(
     r.work({ Session: "s", Turn: "t", Agent: "", CWD: g.root, Root: g.root, Repo: "" }),
   );
+});
+
+test("a late commit by the call's own still-running Git is recorded", async () => {
+  const { g, store, hook, shell } = session("claude-code");
+  // The control: a call whose Git finished before its PostToolUse records its commit at once.
+  hook("PreToolUse", shell("toolu_1"));
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.traced("toolu_1", "commit", "-q", "-am", "two");
+  hook("PostToolUse", shell("toolu_1"));
+  expect(count(store, "commit")).toBe(1);
+  // Unified exec: the call returns while its own Git still runs, and a later call polls for it.
+  hook("PreToolUse", shell("toolu_2"));
+  const editor = join(temp(), "editor");
+  const wait = '#!/bin/sh\nwhile [ ! -e "$0.go" ]; do sleep 0.01; done\necho three >"$1"\n';
+  writeFileSync(editor, wait, { mode: 0o755 });
+  writeFileSync(join(g.root, "f"), "3\n");
+  const child = g.start("toolu_2", { GIT_EDITOR: editor }, "commit", "-a");
+  const exited = started(g.trace, "commit", child);
+  hook("PostToolUse", shell("toolu_2"));
+  // The commit has not landed yet, and the trace its Git still writes into survives the read.
+  expect(count(store, "commit")).toBe(1);
+  expect(existsSync(join(g.trace, "events"))).toBe(true);
+  writeFileSync(`${editor}.go`, "");
+  await exited;
+  hook("PreToolUse", shell("toolu_3"));
+  hook("PostToolUse", shell("toolu_3"));
+  expect(count(store, "commit")).toBe(2);
+  expect(latest(store, "commit").commit.id).toBe(g.plain("rev-parse", "HEAD"));
+  // The trace is spent once no other shell call runs and no Git it started still writes.
+  expect(existsSync(join(g.trace, "events"))).toBe(false);
+});
+
+test("a lone call whose Git has exited still removes its trace", () => {
+  const { g, store, hook, shell } = session("claude-code");
+  hook("PreToolUse", shell("toolu_1"));
+  writeFileSync(join(g.root, "f"), "2\n");
+  g.traced("toolu_1", "commit", "-q", "-am", "two");
+  // A Git process killed eleven minutes ago wrote no exit event: it no longer holds the trace.
+  appendFileSync(
+    join(g.trace, "events"),
+    `${JSON.stringify({
+      event: "start",
+      sid: "20261030T120000.000000Z-H1-P0",
+      time: new Date(Date.now() - 11 * 60_000).toISOString(),
+    })}\n`,
+  );
+  hook("PostToolUse", shell("toolu_1"));
+  expect(count(store, "commit")).toBe(1);
+  expect(existsSync(join(g.trace, "events"))).toBe(false);
+  expect(existsSync(join(g.trace, "refs"))).toBe(false);
 });
 
 test("quiet or oversized traces are dropped; a session's directory goes after a quiet day", () => {
@@ -892,6 +943,44 @@ test("settings Codex appends inside the trace block survive a reinstall and its 
   );
   expect(codexTraceConfig(false, home)).toBe(true);
   expect(read().shell_environment_policy).toEqual({ set: { FOO: "1" } });
+});
+
+test("a trace block missing its end marker is repaired by enable and removed by disable", () => {
+  setEnv("KIMCHI_BRIDGE_HOME", temp());
+  const home = temp(),
+    path = join(home, "config.toml");
+  const read = () => Bun.TOML.parse(readFileSync(path, "utf8")) as any;
+  // A truncated or hand-edited file lost the block's end marker; Codex appended its own table after it.
+  writeFileSync(
+    path,
+    [
+      'model = "lab"',
+      "",
+      "# kimchi-bridge: begin (traces agent commits for PR attribution)",
+      "[shell_environment_policy.set]",
+      'GIT_TRACE2_EVENT = "/old/events"',
+      'GIT_TRACE_REFS = "/old/refs"',
+      'GIT_TRACE2_ENV_VARS = "CODEX_TOOL_CALL_ID"',
+      "",
+      '[projects."/work"]',
+      'trust_level = "trusted"',
+      "",
+    ].join("\n"),
+  );
+  expect(codexTraceConfig(true, home)).toBe(true);
+  expect(read().model).toBe("lab");
+  expect(read().projects).toEqual({ "/work": { trust_level: "trusted" } });
+  expect(read().shell_environment_policy).toEqual({
+    set: {
+      GIT_TRACE2_EVENT: join(traceDir("codex", ""), "events"),
+      GIT_TRACE_REFS: join(traceDir("codex", ""), "refs"),
+      GIT_TRACE2_ENV_VARS: "CODEX_TOOL_CALL_ID",
+    },
+  });
+  expect(codexTraceConfig(false, home)).toBe(true);
+  expect(read()).toEqual({ model: "lab", projects: { "/work": { trust_level: "trusted" } } });
+  const repaired = 'model = "lab"\n\n[projects."/work"]\ntrust_level = "trusted"\n';
+  expect(readFileSync(path, "utf8")).toBe(repaired);
 });
 
 test("Claude Code's session environment names its own trace directory", () => {
