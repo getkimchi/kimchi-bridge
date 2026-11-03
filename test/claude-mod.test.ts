@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
 
 test("native mod caches its version and avoids helper calls for irrelevant telemetry", async () => {
@@ -46,4 +47,30 @@ test("native mod caches its version and avoids helper calls for irrelevant telem
   expect(scheduled).toHaveLength(0);
   await handlers.get("turn.complete")!(api, {}, next);
   expect(scheduled).toEqual([0]);
+});
+
+test("hooks.json syncs the queue on the same events as Codex, so uploads do not depend on the mod loading", () => {
+  const read = (agent: string) =>
+    JSON.parse(
+      readFileSync(
+        new URL(`../plugins/kimchi-work/${agent}/hooks/hooks.json`, import.meta.url),
+        "utf8",
+      ),
+    ).hooks as Record<string, { hooks: { command: string; timeout: number; async?: boolean }[] }[]>;
+  const syncs = (hooks: ReturnType<typeof read>) =>
+    Object.entries(hooks)
+      .filter(([, groups]) => groups.some((g) => g.hooks.some((h) => h.command.endsWith('" sync'))))
+      .map(([name]) => name)
+      .sort();
+  const claude = read("claude");
+  expect(syncs(claude)).toEqual(syncs(read("codex")));
+  for (const name of syncs(claude)) {
+    const handler = claude[name]!.flatMap((g) => g.hooks).find((h) =>
+      h.command.endsWith('" sync'),
+    )!;
+    expect(handler.command).toBe('"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge" sync');
+    // A background upload must never hold up the prompt or the end of the turn.
+    expect(handler.async).toBe(true);
+    expect(handler.timeout).toBe(10);
+  }
 });
