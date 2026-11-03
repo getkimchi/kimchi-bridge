@@ -112,6 +112,15 @@ test("repository discovery preserves native Git roots and common identities for 
     expect(repository(cwd)).toEqual([cwd, `local:${digest(cwd)}`, undefined]);
 });
 
+test("repository identities refuse a home-rooted cwd without any git walk", () => {
+  // A hook process inherits the agent client's cwd. In a home-rooted session,
+  // `git rev-parse --show-toplevel` would walk the whole home directory
+  // looking for .git — visible to macOS as a background file access, the
+  // privacy prompt this guard exists to avoid. Identity there stays local.
+  const home = realpathSync(homedir());
+  expect(repository(home)).toEqual([home, `local:${digest(home)}`, undefined]);
+});
+
 test("safeRead bounds regular files and rejects final, parent and escaping symlinks", () => {
   const { base, root } = fixture(),
     file = join(root, "file");

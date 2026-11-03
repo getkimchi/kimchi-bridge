@@ -935,6 +935,7 @@ ${entry.map((part) => `    <string>${part}</string>`).join("\n")}
     <string>gateway</string>
     <string>run</string>
   </array>
+  <key>WorkingDirectory</key><string>${homeDir()}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${gatewayLogPath()}</string>

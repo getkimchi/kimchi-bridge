@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseShell } from "shell-quote";
 import type { fromMarkdown as parseMarkdown } from "mdast-util-from-markdown";
@@ -106,12 +107,26 @@ function sshHost(alias: string): string {
   return knownHost(host) ? host : alias;
 }
 
+function homeRoot(): string {
+  try {
+    return realpathSync(homedir());
+  } catch {
+    return homedir();
+  }
+}
+
 export function repository(cwd: string): [string, string, Repository | undefined, string?] {
   try {
     cwd = realpathSync(cwd);
   } catch {
     /* Keep the explicit native cwd. */
   }
+  // A hook process runs on the agent client's cwd. A home-rooted session makes
+  // git walk the whole home directory looking for .git, which shows up as a
+  // TCC prompt for a folder the person never asked us to touch. No repository
+  // identity can be trusted there; fall back to a local id without any git
+  // call.
+  if (cwd === homeRoot()) return [cwd, `local:${digest(cwd)}`, undefined];
   let root = "",
     common = "";
   try {
