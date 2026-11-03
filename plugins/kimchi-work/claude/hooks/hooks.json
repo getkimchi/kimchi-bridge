@@ -20,6 +20,12 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" trace-env",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" sync",
+            "timeout": 10,
+            "async": true
           }
         ]
       }
@@ -36,6 +42,12 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" hook claude-code",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" sync",
+            "timeout": 10,
+            "async": true
           }
         ]
       }
@@ -85,6 +97,12 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" hook claude-code",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/kimchi-bridge\" sync",
+            "timeout": 10,
+            "async": true
           }
         ]
       }
