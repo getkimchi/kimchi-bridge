@@ -56,11 +56,17 @@ export interface GatewayState {
   /** Pre-existing CLI values `enable` overwrote, so `disable` can restore them. */
   previous?: {
     claude?: Record<string, string | null>;
+    /** Claude Code's model picker block before the bridge wrote one: null absent, a string its JSON. */
+    picker?: string | null;
     codexTopLevel?: Array<[string, string]>;
     claudeDesktop?: Desktop3pPrevious;
   };
   /** The env values the bridge last wrote into the CLI configs, so later writes replace only its own. */
-  wrote?: { claude?: Record<string, string> };
+  wrote?: {
+    claude?: Record<string, string>;
+    /** The model values → row JSON the bridge last wrote into Claude Code's model picker. */
+    picker?: Record<string, string>;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -203,9 +209,16 @@ function writeClaudeConfig(
   anthropicBaseUrl: string,
   authToken: string,
   modelEnv: Record<string, string> = {},
+  models?: readonly GatewayModel[],
   wrote?: Record<string, string>,
   snapshot?: Record<string, string | null>,
-): { previous: Record<string, string | null>; wrote: Record<string, string> } {
+  pickerWrote?: Record<string, string>,
+): {
+  previous: Record<string, string | null>;
+  wrote: Record<string, string>;
+  pickerPrevious?: string | null;
+  pickerWrote?: Record<string, string>;
+} {
   const path = claudeSettingsPath();
   const settings = readJsonFile(path);
   const env =
@@ -234,8 +247,17 @@ function writeClaudeConfig(
   // telemetry collector off; remove what we no longer set.
   delete env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS;
   settings.env = env;
+  let pickerPrevious: string | null | undefined;
+  let pickerOwned: Record<string, string> | undefined;
+  if (models) {
+    pickerPrevious =
+      settings[CLAUDE_PICKER_KEY] === undefined
+        ? null
+        : JSON.stringify(settings[CLAUDE_PICKER_KEY]);
+    pickerOwned = applyClaudeModelPicker(settings, claudePickerRows(models), pickerWrote);
+  }
   writeJsonFile(path, settings);
-  return { previous, wrote: written };
+  return { previous, wrote: written, pickerPrevious, pickerWrote: pickerOwned };
 }
 
 /** Gives Claude Code's auto-mode setting to a gateway enabled before it existed; disable removes it again. */
@@ -275,6 +297,114 @@ function restoreClaudeConfig(previous?: Record<string, string | null>): void {
   writeJsonFile(path, settings);
 }
 
+// Claude Code's curated model picker: rows in settings.modelPicker.options join the built-in
+// lineup's model list, so /model can offer every model the organization's gateway has, not only
+// its Anthropic defaults. The bridge owns only the rows it wrote: ones the person added, and
+// rows for a model value the person set by hand first, stay.
+const CLAUDE_PICKER_KEY = "modelPicker";
+/** Desktop's explicit model list shares this cap. */
+const PICKER_LINEUP_LIMIT = 200;
+
+interface ClaudePickerRow {
+  model: string;
+  label?: string;
+  description?: string;
+}
+
+function claudePickerRows(models: readonly GatewayModel[]): ClaudePickerRow[] {
+  const rows: ClaudePickerRow[] = [];
+  const seen = new Set<string>();
+  for (const model of models.slice(0, PICKER_LINEUP_LIMIT)) {
+    if (!model.slug || seen.has(model.slug)) continue;
+    seen.add(model.slug);
+    const context = Math.ceil(model.limits.context_window / 1000);
+    rows.push({
+      model: model.slug,
+      ...(model.display_name ? { label: model.display_name } : {}),
+      description: `${String(context)}k context window · Kimchi gateway`,
+    });
+  }
+  return rows;
+}
+
+/** A settings value that arrived earlier than anyone's edits could leave it in. */
+function isPickerBlock(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A picker row the settings block carries, dropped when it cannot name a model. */
+function pickerRowOf(value: unknown): ClaudePickerRow | null {
+  if (!isPickerBlock(value)) return null;
+  const model = value.model;
+  if (typeof model !== "string" || !model.length) return null;
+  const row: ClaudePickerRow = { model };
+  if (typeof value.label === "string") row.label = value.label;
+  if (typeof value.description === "string") row.description = value.description;
+  return row;
+}
+
+/**
+ * Writes the gateway's catalog into Claude Code's model picker, mirroring the env rules: a row
+ * whose model the person set is never replaced, ours refresh in place, one we wrote for a model
+ * the catalog dropped leaves unless the person edited it after we wrote, and the whole block
+ * leaves with the last of ours. Returns the model values → row JSON the bridge now owns.
+ */
+function applyClaudeModelPicker(
+  settings: Record<string, unknown>,
+  rows: readonly ClaudePickerRow[],
+  wrote?: Record<string, string>,
+): Record<string, string> {
+  const block = settings[CLAUDE_PICKER_KEY];
+  const existing = isPickerBlock(block) ? block : undefined;
+  if (block !== undefined && existing === undefined) return {}; // the person's value is no block: leave it
+  // A lineup the person replaced with their own choices predates ours: ours never wrote there.
+  if (existing?.replaceBuiltInOptions === true && !Object.keys(wrote ?? {}).length) return {};
+  const current: ClaudePickerRow[] = [];
+  for (const value of Array.isArray(existing?.options) ? (existing.options as unknown[]) : []) {
+    const row = pickerRowOf(value);
+    if (row) current.push(row);
+  }
+  const byModel = new Map(current.map((row) => [row.model, row]));
+  const ownedNext: Record<string, string> = {};
+  const ownedPrevious = new Set(Object.keys(wrote ?? {}));
+  const dropped = new Set<string>();
+  for (const row of rows) {
+    const theirs = byModel.get(row.model);
+    if (theirs && !ownedPrevious.has(row.model)) continue; // the person set this model: theirs stays
+    ownedNext[row.model] = JSON.stringify(row);
+    if (theirs) dropped.add(row.model);
+  }
+  for (const [model, rowJson] of Object.entries(wrote ?? {})) {
+    if (ownedNext[model]) continue; // still in the catalog, refreshed above
+    const current = byModel.get(model);
+    if (!current) continue;
+    if (JSON.stringify(current) !== rowJson) continue; // the person edited our row: keep theirs
+    dropped.add(model);
+  }
+  const kept = current.filter((row) => !dropped.has(row.model));
+  const ours = rows.filter((row) => ownedNext[row.model]);
+  const options = [...kept, ...ours];
+  if (!options.length) {
+    delete settings[CLAUDE_PICKER_KEY];
+    return ownedNext;
+  }
+  settings[CLAUDE_PICKER_KEY] = {
+    ...(existing ?? {}),
+    options,
+    replaceBuiltInOptions: existing?.replaceBuiltInOptions === true,
+  };
+  return ownedNext;
+}
+
+function restoreClaudePicker(previous?: string | null): void {
+  if (previous === undefined) return;
+  const path = claudeSettingsPath();
+  const settings = readJsonFile(path);
+  if (previous === null) delete settings[CLAUDE_PICKER_KEY];
+  else settings[CLAUDE_PICKER_KEY] = JSON.parse(previous);
+  writeJsonFile(path, settings);
+}
+
 /**
  * Brings Claude Code's model env up to date when the daemon starts, for gateways an older bridge
  * enabled or has left stale: an organization without Claude routes gets the models it has, and a
@@ -295,8 +425,15 @@ async function refreshClaudeModelEnv(
       : {};
   if (env.ANTHROPIC_AUTH_TOKEN !== PROXY_PLACEHOLDER) return;
   const before = JSON.stringify(settings);
+  const unpicked =
+    CLAUDE_PICKER_KEY in settings ? JSON.stringify(settings[CLAUDE_PICKER_KEY]) : null;
   const known = state.previous?.claude ?? {};
   const wrote = applyClaudeModelEnv(env, claudeModelEnv(models), state.wrote?.claude, known);
+  const pickerOwned = applyClaudeModelPicker(
+    settings,
+    claudePickerRows(models),
+    state.wrote?.picker,
+  );
   settings.env = env;
   if (JSON.stringify(settings) !== before) writeJsonFile(path, settings);
   // Saved over the state as it is now, so a disable since the daemon started is not undone.
@@ -305,15 +442,24 @@ async function refreshClaudeModelEnv(
   // A key an older bridge's enable didn't snapshot goes back to absent on disable, as ensureClaudeAutoMode's does.
   const snapshot = current.previous?.claude ?? {};
   const added = Object.keys(wrote).filter((key) => !(key in snapshot));
-  if (added.length || JSON.stringify(wrote) !== JSON.stringify(current.wrote?.claude ?? {}))
+  const pickerUnset = current.previous?.picker === undefined;
+  if (
+    added.length ||
+    pickerUnset ||
+    JSON.stringify(wrote) !== JSON.stringify(current.wrote?.claude ?? {}) ||
+    JSON.stringify(pickerOwned) !== JSON.stringify(current.wrote?.picker ?? {})
+  )
     saveGatewayState({
       ...current,
-      wrote: { ...current.wrote, claude: wrote },
-      ...(added.length
+      wrote: { ...current.wrote, claude: wrote, picker: pickerOwned },
+      ...(added.length || pickerUnset
         ? {
             previous: {
               ...current.previous,
               claude: { ...snapshot, ...Object.fromEntries(added.map((key) => [key, null])) },
+              // The block an older bridge never wrote a picker over: absent (null) or the
+              // person's own, which disable puts back.
+              picker: unpicked,
             },
           }
         : {}),
@@ -1580,8 +1726,10 @@ export async function enable(
     `http://127.0.0.1:${port}/anthropic`,
     PROXY_PLACEHOLDER,
     claudeModelEnv(models),
+    models,
     previousState.wrote?.claude,
     previousState.enabled ? previousState.previous?.claude : undefined,
+    previousState.wrote?.picker,
   );
   const codexPrevious = writeCodexConfig(
     `http://127.0.0.1:${port}/openai/v1`,
@@ -1608,7 +1756,11 @@ export async function enable(
     mode: "proxy",
     port,
     // What this enable left in the settings, so a later one replaces only its own choice.
-    wrote: { ...previousState.wrote, claude: claude.wrote },
+    wrote: {
+      ...previousState.wrote,
+      claude: claude.wrote,
+      ...(claude.pickerWrote ? { picker: claude.pickerWrote } : {}),
+    },
     // Re-enabling over our own settings (a direct-mode upgrade) keeps the user's
     // original values, so disable still restores what they had before.
     previous:
@@ -1617,6 +1769,12 @@ export async function enable(
             ...previousState.previous,
             // A key this version added still goes back to what it was before this enable.
             claude: { ...claude.previous, ...previousState.previous.claude },
+            // The first snapshot stands for the picker too: a re-enable would
+            // overwrite it with our own rows and disable could not restore theirs.
+            picker:
+              previousState.previous.picker !== undefined
+                ? previousState.previous.picker
+                : claude.pickerPrevious,
             // Re-enabling over the bridge's own desktop wiring keeps the
             // first enable's snapshot: the recomputed one would record the
             // bridge's 3P mode and entry as the person's, so disable would
@@ -1627,6 +1785,7 @@ export async function enable(
           }
         : {
             claude: claude.previous,
+            picker: claude.pickerPrevious,
             ...(codexPrevious ? { codexTopLevel: codexPrevious } : {}),
             ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),
           },
@@ -1645,7 +1804,9 @@ export async function enable(
     service = installService(cliEntry());
   }
   onMessage?.(`Gateway enabled through the local proxy (127.0.0.1:${port}).`);
-  onMessage?.("Claude Code and Codex now send their model requests through Kimchi.");
+  onMessage?.(
+    "Claude Code and Codex now send their model requests through Kimchi; the /model picker lists them all.",
+  );
   if (desktopPrevious)
     onMessage?.(
       "Claude Desktop is configured for the same proxy; restart the Claude app to switch it over.",
@@ -1657,6 +1818,7 @@ export async function enable(
 export async function disable(onMessage?: (message: string) => void): Promise<void> {
   const state = loadGatewayState();
   restoreClaudeConfig(state.previous?.claude);
+  restoreClaudePicker(state.previous?.picker);
   restoreCodexConfig(state.previous?.codexTopLevel);
   if (state.previous?.claudeDesktop) {
     restoreClaudeDesktopConfig(state.previous.claudeDesktop);

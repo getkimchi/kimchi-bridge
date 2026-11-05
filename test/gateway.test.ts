@@ -1186,3 +1186,177 @@ test("a retried request carries a fresh billing tag, as in Kimchi", async () => 
   expect(seen[0]).not.toBe(seen[1]);
   expect(await recorded("msg_retry")).toBe(String(seen[1]).slice("kimchi-request:".length));
 });
+
+// ---------------------------------------------------------------------------
+// Claude Code's curated model picker (settings.modelPicker)
+// ---------------------------------------------------------------------------
+
+function pickerBlocked(rows: unknown[], replaced = false): void {
+  mkdirSync(dirname(claudeSettingsPath()), { recursive: true });
+  writeFileSync(
+    claudeSettingsPath(),
+    JSON.stringify({ env: {}, modelPicker: { options: rows, replaceBuiltInOptions: replaced } }) +
+      "\n",
+  );
+}
+function pickerInSettings():
+  | { options?: Array<Record<string, unknown>>; replaceBuiltInOptions?: boolean }
+  | undefined {
+  const settings = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
+  return settings.modelPicker;
+}
+
+test("enable lists every gateway model in Claude Code's /model picker", async () => {
+  process.env.KIMCHI_BASE_URL = server((request) =>
+    new URL(request.url).pathname === "/v1/models/metadata"
+      ? Response.json({
+          models: [
+            {
+              slug: "glm-5.3",
+              display_name: "GLM 5.3",
+              limits: { context_window: 200000, max_output_tokens: 64000 },
+            },
+            {
+              slug: "kimi-k3",
+              display_name: "",
+              limits: { context_window: 256000, max_output_tokens: 32000 },
+            },
+          ],
+        })
+      : new Response("not found", { status: 404 }),
+  );
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  expect(pickerInSettings()).toEqual({
+    options: [
+      { model: "glm-5.3", label: "GLM 5.3", description: "200k context window · Kimchi gateway" },
+      { model: "kimi-k3", description: "256k context window · Kimchi gateway" },
+    ],
+    replaceBuiltInOptions: false,
+  });
+  const state = loadGatewayState();
+  expect(Object.keys(state.wrote?.picker ?? {}).sort()).toEqual(["glm-5.3", "kimi-k3"]);
+  expect(state.previous?.picker).toBeNull();
+  await disable(() => {});
+  expect(pickerInSettings()).toBeUndefined();
+});
+
+test("the person's own picker rows survive enable and disable", async () => {
+  const original = {
+    options: [
+      { model: "glm-5.3", label: "GLM mine" },
+      { model: "vendored-lm", label: "A custom endpoint" },
+    ],
+    replaceBuiltInOptions: false,
+  };
+  pickerBlocked(original.options);
+  process.env.KIMCHI_BASE_URL = server((request) =>
+    new URL(request.url).pathname === "/v1/models/metadata"
+      ? Response.json({
+          models: [
+            {
+              slug: "glm-5.3",
+              display_name: "GLM 5.3",
+              limits: { context_window: 200000, max_output_tokens: 64000 },
+            },
+            {
+              slug: "kimi-k3",
+              display_name: "Kimi K3",
+              limits: { context_window: 256000, max_output_tokens: 32000 },
+            },
+          ],
+        })
+      : new Response("not found", { status: 404 }),
+  );
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  expect(pickerInSettings()?.options).toEqual([
+    { model: "glm-5.3", label: "GLM mine" }, // the person's row for the model wins
+    { model: "vendored-lm", label: "A custom endpoint" },
+    { model: "kimi-k3", label: "Kimi K3", description: "256k context window · Kimchi gateway" },
+  ]);
+  // Only the bridge's row is recorded: the person's stay unowned and unrestorable.
+  expect(Object.keys(loadGatewayState().wrote?.picker ?? {})).toEqual(["kimi-k3"]);
+  await disable(() => {});
+  expect(pickerInSettings()).toEqual(original);
+});
+
+test("re-enable refreshes the bridge's rows and drops models the catalog dropped", async () => {
+  const catalog = Response.json({
+    models: [
+      {
+        slug: "glm-5.3",
+        display_name: "GLM 5.3",
+        limits: { context_window: 200000, max_output_tokens: 64000 },
+      },
+      {
+        slug: "kimi-k3",
+        display_name: "Kimi K3",
+        limits: { context_window: 256000, max_output_tokens: 32000 },
+      },
+    ],
+  });
+  process.env.KIMCHI_BASE_URL = server((request) =>
+    new URL(request.url).pathname === "/v1/models/metadata"
+      ? catalog
+      : new Response("not found", { status: 404 }),
+  );
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  // The catalog is turned over: kimi-k3 is gone, deepseek is new.
+  process.env.KIMCHI_BASE_URL = server((request) =>
+    new URL(request.url).pathname === "/v1/models/metadata"
+      ? Response.json({
+          models: [
+            {
+              slug: "glm-5.3",
+              display_name: "GLM 5.3",
+              limits: { context_window: 200000, max_output_tokens: 64000 },
+            },
+            {
+              slug: "deepseek-v4",
+              display_name: "DeepSeek V4",
+              limits: { context_window: 128000, max_output_tokens: 32000 },
+            },
+          ],
+        })
+      : new Response("not found", { status: 404 }),
+  );
+  await enable(oauthSignIn, () => {});
+  expect(
+    pickerInSettings()
+      ?.options?.map((row) => row.model)
+      .sort(),
+  ).toEqual(["deepseek-v4", "glm-5.3"]);
+  expect(Object.keys(loadGatewayState().wrote?.picker ?? {}).sort()).toEqual([
+    "deepseek-v4",
+    "glm-5.3",
+  ]);
+});
+
+test("a lineup the person replaced with their own curated list stays untouched", async () => {
+  const curated = [
+    { model: "glm-5.3", label: "GLM 5.3" },
+    { model: "deepseek-v4-flash-0731", label: "DeepSeek" },
+  ];
+  pickerBlocked(curated, true);
+  process.env.KIMCHI_BASE_URL = server((request) =>
+    new URL(request.url).pathname === "/v1/models/metadata"
+      ? Response.json({
+          models: [
+            {
+              slug: "glm-5.3",
+              display_name: "GLM 5.3",
+              limits: { context_window: 200000, max_output_tokens: 64000 },
+            },
+          ],
+        })
+      : new Response("not found", { status: 404 }),
+  );
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  expect(pickerInSettings()).toEqual({ options: curated, replaceBuiltInOptions: true });
+  expect(loadGatewayState().wrote?.picker ?? {}).toEqual({});
+  await disable(() => {});
+  expect(pickerInSettings()).toEqual({ options: curated, replaceBuiltInOptions: true });
+});
