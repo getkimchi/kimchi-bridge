@@ -226,3 +226,28 @@ export async function authenticate(k: SignIn, signal?: AbortSignal) {
     credentialHash: credentialHash(k),
   };
 }
+
+/**
+ * The reporting endpoint the organization set in Kimchi's settings, requested as Kimchi's
+ * fetchOrgPolicy requests settings:resolve; undefined when the organization set none. Throws when
+ * the settings can't be read or the endpoint is not one the plugins may report to.
+ */
+export async function fetchOrgEndpoint(
+  k: SignIn,
+  organizationId: string,
+): Promise<string | undefined> {
+  secureEndpoint(k.apiUrl);
+  const response = await request(
+    `${baseUrl(k.apiUrl)}/ai-optimizer/v1beta/organizations/${encodeURIComponent(organizationId)}/settings:resolve`,
+    { method: "GET", headers: { ...authorization(k), Accept: "application/json" } },
+  );
+  if (response.status !== 200) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`Kimchi settings returned HTTP ${response.status}`);
+  }
+  const { settings } = object(JSON.parse(await readBody(response, 1 << 20)));
+  const endpoint = object(settings).kimchiReportingEndpoint;
+  if (!endpoint) return undefined;
+  secureEndpoint(endpoint);
+  return endpoint as string;
+}

@@ -36,6 +36,8 @@ export interface Config {
   disabled?: boolean;
   /** KIMCHI_REMOTE_ENDPOINT as an admin set it at install, for sessions started without it. */
   remoteEndpoint?: string;
+  /** The reporting endpoint the organization set in Kimchi's settings, read at activate. */
+  orgEndpoint?: string;
   /** A sign-in that failed to verify, and when it may be tried again (milliseconds since epoch). */
   verifyRetry?: { credentialHash: string; at: number; failures: number; rejected: boolean };
 }

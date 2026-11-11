@@ -3,8 +3,10 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
   IdentityError,
+  authenticate,
   baseUrl,
   credentialHash,
+  fetchOrgEndpoint,
   kimchiReportingEnabled,
   kimchiSignIn,
   secureEndpoint,
@@ -67,11 +69,21 @@ function csvCell(value: string): string {
 const PROXY_PLACEHOLDER = "kimchi-gateway";
 
 /**
- * The sign-in the plugins report with: an explicit key first, then this
- * helper's own OAuth credential, then Kimchi's saved sign-in (key or SSO),
- * else the placeholder when the endpoint in use is the one an admin saved.
+ * The sign-in the plugins report with: the placeholder when the endpoint in use is the
+ * organization's; else an explicit key, then this helper's own OAuth credential, then Kimchi's
+ * saved sign-in (key or SSO), else the placeholder when the endpoint in use is the one an admin saved.
  */
-function resolveSignIn(environmentKey: string | undefined, savedEndpoint?: string): SignIn {
+function resolveSignIn(
+  environmentKey: string | undefined,
+  savedEndpoint?: string,
+  orgEndpoint?: string,
+): SignIn {
+  // Security: the endpoint an organization admin set in Kimchi gets only the placeholder, never a
+  // real Kimchi credential, so the setting cannot collect developers' tokens; the organization's
+  // gateway adds the user's identity. Real credentials go only to Kimchi's API or to an endpoint
+  // set on this machine (KIMCHI_REMOTE_ENDPOINT, or the one activate saved), which wins.
+  if (orgEndpoint && !process.env.KIMCHI_REMOTE_ENDPOINT)
+    return { apiUrl: orgEndpoint, token: PROXY_PLACEHOLDER };
   if (environmentKey) return kimchiSignIn(environmentKey);
   const stored = storedSignIn();
   if (stored) return stored;
@@ -89,7 +101,7 @@ async function sessionAccount(c: Config, environmentKey?: string): Promise<Confi
   if (!kimchiReportingEnabled(c.organizationId)) return {};
   let k: SignIn;
   try {
-    k = resolveSignIn(environmentKey, c.remoteEndpoint);
+    k = resolveSignIn(environmentKey, c.remoteEndpoint, c.orgEndpoint);
   } catch {
     return c;
   }
@@ -117,12 +129,14 @@ export async function run(
   delete process.env.KIMCHI_API_KEY;
   // The endpoint an admin saved with activate stands in for KIMCHI_REMOTE_ENDPOINT; a set one wins.
   const environmentEndpoint = process.env.KIMCHI_REMOTE_ENDPOINT;
-  let savedEndpoint: string | undefined;
+  let savedEndpoint: string | undefined, orgEndpoint: string | undefined;
   try {
-    savedEndpoint = loadConfig().remoteEndpoint;
+    ({ remoteEndpoint: savedEndpoint, orgEndpoint } = loadConfig());
   } catch {
     // Unreadable settings fail the commands below that load them.
   }
+  // The organization's endpoint stays out of the environment, where OAuth sign-in and the gateway
+  // would send it real credentials: only resolveSignIn uses it, with the placeholder.
   if (!environmentEndpoint && savedEndpoint) process.env.KIMCHI_REMOTE_ENDPOINT = savedEndpoint;
   // Kimchi's runtime switch must not reach the git, gh and glab this starts.
   delete process.env.BUN_BE_BUN;
@@ -131,7 +145,7 @@ export async function run(
   // Unreadable Kimchi settings mean no sign-in: local recording continues, uploads wait.
   const signIn = (): SignIn => {
     try {
-      return resolveSignIn(environmentKey, savedEndpoint);
+      return resolveSignIn(environmentKey, savedEndpoint, orgEndpoint);
     } catch {
       return { apiUrl: "" };
     }
@@ -183,7 +197,7 @@ export async function run(
     // in for — bind the existing sign-in and turn the gateway on, no browser.
     // A stored bridge credential keeps the browser flow (account switching).
     if (!values["from-kimchi"] && !storedSignIn()) {
-      const existing = resolveSignIn(environmentKey, savedEndpoint);
+      const existing = resolveSignIn(environmentKey, savedEndpoint, orgEndpoint);
       if (existing.token) {
         writeLoginProgress({ phase: "starting", startedAt: Date.now() });
         try {
@@ -390,8 +404,28 @@ export async function run(
     } catch {
       /* Claude Code's settings could not be read; the next activate retries. */
     }
-    // Verified with flush's 15-second limit, so the first session's one-second check finds it done.
-    if (kimchiReportingEnabled(c.organizationId)) await verifySignIn(signIn()).catch(() => {});
+    if (kimchiReportingEnabled(c.organizationId)) {
+      // The organization's endpoint is read with Kimchi's sign-in, at Kimchi's API or this machine's
+      // endpoint, never at the organization's own. A failure keeps the one saved.
+      try {
+        const k = resolveSignIn(environmentKey, savedEndpoint);
+        if (!k.token) throw new Error("no Kimchi sign-in");
+        // Saved as the reporting account only when sessions report with it too.
+        const { organizationId } =
+          credentialHash(k) === credentialHash(signIn())
+            ? await verifySignIn(k)
+            : await authenticate(k);
+        orgEndpoint = await fetchOrgEndpoint(k, organizationId!);
+        const latest = loadConfig();
+        if (orgEndpoint) latest.orgEndpoint = orgEndpoint;
+        else delete latest.orgEndpoint;
+        saveConfig(latest);
+      } catch {
+        // Read again at the next activate.
+      }
+      // Verified with flush's 15-second limit, so the first session's one-second check finds it done.
+      await verifySignIn(signIn()).catch(() => {});
+    }
     return;
   }
   if (command === "codex-trace") {
@@ -507,22 +541,25 @@ export async function run(
             kimchiSignedIn: Boolean(k.token),
             kimchiReporting: kimchiReportingEnabled(c.organizationId),
             reportingVerified: Boolean(k.token) && c.credentialHash === credentialHash(k),
-            signInSource: environmentKey
-              ? "key"
-              : storedSignIn()
-                ? "oauth"
-                : k.token === PROXY_PLACEHOLDER
-                  ? "placeholder"
-                  : k.token
-                    ? "kimchi"
-                    : "none",
+            signInSource:
+              k.token === PROXY_PLACEHOLDER
+                ? "placeholder"
+                : environmentKey
+                  ? "key"
+                  : storedSignIn()
+                    ? "oauth"
+                    : k.token
+                      ? "kimchi"
+                      : "none",
             organizationId: c.organizationId ?? "",
             endpoint: k.apiUrl,
             endpointSource: environmentEndpoint
               ? "environment"
               : savedEndpoint
                 ? "saved"
-                : "default",
+                : orgEndpoint
+                  ? "org"
+                  : "default",
             gateway: await gatewayStatus(),
             ledger: stateDir(c),
             accounting: s.status(),
