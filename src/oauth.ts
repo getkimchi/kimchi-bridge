@@ -104,11 +104,16 @@ function textEnv(env: Environment, name: string): string | undefined {
   const value = env[name]?.trim();
   return value ? value : undefined;
 }
-/** Normalize an origin-ish endpoint; https required away from the loopback (test seams). */
-function origin(value: string, label: string): string {
+/**
+ * Normalize an origin-ish endpoint; https required away from the loopback (test seams).
+ * A scheme-less value ("llm.kimchi.dev"), as workspace shells often set, means https.
+ * The "://" separator marks an explicit scheme: new URL() alone cannot tell
+ * "host:port" from a schemed URL (dots are legal scheme characters).
+ */
+export function normalizeEndpoint(value: string, label: string): string {
   let url: URL;
   try {
-    url = new URL(value);
+    url = new URL(value.includes("://") ? value : `https://${value}`);
   } catch {
     throw new Error(`invalid ${label}: ${value}`);
   }
@@ -133,21 +138,27 @@ export function oauthEndpoints(region: RegionId, env: Environment = process.env)
   const tag = region.toUpperCase().replaceAll("-", "_");
   return {
     region,
-    authorizeUrl: origin(
+    authorizeUrl: normalizeEndpoint(
       textEnv(env, "KIMCHI_OAUTH_AUTHORIZE_URL") ?? base.authorizeUrl,
       "authorize URL",
     ),
-    tokenUrl: origin(textEnv(env, "KIMCHI_OAUTH_TOKEN_URL") ?? base.tokenUrl, "token URL"),
+    tokenUrl: normalizeEndpoint(
+      textEnv(env, "KIMCHI_OAUTH_TOKEN_URL") ?? base.tokenUrl,
+      "token URL",
+    ),
     clientId:
       textEnv(env, `KIMCHI_OAUTH_CLIENT_ID_${tag}`) ??
       textEnv(env, "KIMCHI_OAUTH_CLIENT_ID") ??
       base.clientId,
     audience: textEnv(env, "KIMCHI_OAUTH_AUDIENCE") ?? "https://app.kimchi.dev",
-    castApiUrl: origin(
+    castApiUrl: normalizeEndpoint(
       textEnv(env, "KIMCHI_REMOTE_ENDPOINT") ?? base.castApiUrl,
       "Cast AI API URL",
     ),
-    llmBaseUrl: origin(textEnv(env, "KIMCHI_BASE_URL") ?? base.llmBaseUrl, "LLM gateway URL"),
+    llmBaseUrl: normalizeEndpoint(
+      textEnv(env, "KIMCHI_BASE_URL") ?? base.llmBaseUrl,
+      "LLM gateway URL",
+    ),
     useIdToken: boolEnv(env, "KIMCHI_OAUTH_USE_ID_TOKEN") ?? true,
   };
 }

@@ -28,6 +28,7 @@ import {
   gatewayHeaders,
   isInvalidGrant,
   loadCredential,
+  normalizeEndpoint,
   ORGANIZATION_HEADER,
   refreshOAuth,
   saveCredential,
@@ -481,11 +482,25 @@ function tomlEscape(value: string): string {
 
 const CODEX_TOP_LEVEL_KEYS = ["model_provider", "model", "model_catalog_json"];
 
+/** Drop a trailing TOML comment from a would-be header line; a # inside quotes is content. */
+function withoutComment(line: string): string {
+  const hash = line.indexOf("#");
+  if (hash === -1) return line;
+  const before = line.slice(0, hash);
+  if ((before.split('"').length - 1) % 2 === 1 || (before.split("'").length - 1) % 2 === 1)
+    return line;
+  return before.trimEnd();
+}
+
 function classifyTomlLine(line: string): "kimchi-header" | "header" | "array-header" | "body" {
   const trimmed = line.trim();
   if (trimmed.startsWith("[[")) return "array-header";
-  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-    const section = trimmed.slice(1, -1).trim();
+  // A trailing comment after a table header is legal TOML (`[table] # note`).
+  // Lines stay the unit of classification: header-shaped lines inside multi-line
+  // strings are out of scope for codex's machine-managed config.
+  const core = trimmed.startsWith("[") ? withoutComment(trimmed) : trimmed;
+  if (core.startsWith("[") && core.endsWith("]")) {
+    const section = core.slice(1, -1).trim();
     // The whole kimchi namespace is ours: [model_providers.kimchi] and any
     // table nested under it re-defines the provider we replace.
     if (
@@ -552,11 +567,28 @@ export function stripCodexToml(existingText: string): string {
   return collapsed.trim();
 }
 
+/** Split TOML text at the first table header: top-level scalars and comments, then sections. */
+function splitTomlAtFirstHeader(text: string): { top: string; sections: string } {
+  const lines = text.split("\n");
+  const cut = lines.findIndex((line) => classifyTomlLine(line) !== "body");
+  if (cut === -1) return { top: text.trim(), sections: "" };
+  return {
+    top: lines.slice(0, cut).join("\n").trim(),
+    sections: lines.slice(cut).join("\n").trim(),
+  };
+}
+
 /** Merge fresh kimchi TOML over a stripped existing config (user sections last). */
 export function mergeCodexToml(existingText: string, freshToml: string): string {
   const collapsed = stripCodexToml(existingText).trim();
   if (!collapsed) return freshToml;
-  return `${freshToml}\n${collapsed}\n`;
+  // Top-level scalars the person set (e.g. the CLI's openai_base_url) must stay
+  // above the first table header: appended whole after the fresh block they
+  // would land inside [model_providers.kimchi], silently changing meaning and
+  // tripping codex's strict config parse.
+  const fresh = splitTomlAtFirstHeader(freshToml.trim());
+  const user = splitTomlAtFirstHeader(collapsed);
+  return `${[fresh.top, user.top, fresh.sections, user.sections].filter(Boolean).join("\n\n")}\n`;
 }
 
 export interface GatewayModel {
@@ -1348,9 +1380,23 @@ const BILLED_PATHS = [
 ];
 
 /** The gateway for a Kimchi sign-in's region, or KIMCHI_BASE_URL for a custom gateway. */
+let warnedBadEnvBase = false;
 export function llmBaseFor(apiUrl: string): string | undefined {
+  // KIMCHI_BASE_URL names a custom gateway; workspace shells often set it
+  // scheme-less ("llm.kimchi.dev"), which means https. An unusable value falls
+  // back to the region endpoints — loudly once: requests go to another gateway
+  // than the one the person named, and that must not be silent.
   const env = process.env.KIMCHI_BASE_URL?.trim();
-  if (env) return baseUrl(env);
+  if (env) {
+    try {
+      return normalizeEndpoint(env, "LLM gateway URL");
+    } catch {
+      if (!warnedBadEnvBase) {
+        warnedBadEnvBase = true;
+        log(`ignoring unusable KIMCHI_BASE_URL=${JSON.stringify(env)}; using the region's gateway`);
+      }
+    }
+  }
   // The kimchi CLI sign-in reports the console API URL (app.kimchi.dev/api);
   // the bridge's own OAuth store reports the CAST API base.
   const api = baseUrl(apiUrl);

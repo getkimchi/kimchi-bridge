@@ -24,6 +24,7 @@ import {
   gatewayStatePath,
   health,
   loadGatewayState,
+  llmBaseFor,
   mergeCodexToml,
   proxyRequest,
   resolveMainModel,
@@ -211,6 +212,78 @@ path = "/p"
   expect(merged.split("model_provider =").length - 1).toBe(1);
   expect(merged).toContain("[features]");
   expect(merged).toContain("[[projects]]");
+});
+
+test("mergeCodexToml keeps user top-level scalars above the provider table", () => {
+  // Kimchi's own codex wiring leaves a top-level openai_base_url; merging it
+  // under [model_providers.kimchi] would lose it and trip codex's strict parse.
+  const existing = `model_provider = "kimchi"
+model = "old"
+model_catalog_json = "/old.json"
+openai_base_url = "https://llm.kimchi.dev/openai/v1"
+
+[model_providers.kimchi]
+name = "Old"
+base_url = "https://old.example/v1"
+
+[mcp_servers.kimchi-mcp-gateway]
+url = "https://api.cast.ai/mcp"
+`;
+  const merged = mergeCodexToml(existing, buildCodexToml("http://l/v1", "k", "m", "/c.json"));
+  expect(merged.startsWith("model_provider = ")).toBe(true);
+  const scalar = merged.indexOf("openai_base_url");
+  expect(scalar).toBeGreaterThan(-1);
+  expect(scalar).toBeLessThan(merged.indexOf("[model_providers.kimchi]"));
+  const providerBody = merged.slice(
+    merged.indexOf("[model_providers.kimchi]"),
+    merged.indexOf("[mcp_servers.kimchi-mcp-gateway]"),
+  );
+  expect(providerBody).not.toContain("openai_base_url");
+  expect(merged).toContain("[mcp_servers.kimchi-mcp-gateway]");
+});
+
+test("mergeCodexToml keeps commented table headers with their tables", () => {
+  const existing = `openai_base_url = "https://llm.kimchi.dev/openai/v1"
+
+[model_providers.kimchi] # legacy
+base_url = "https://old.example/v1"
+
+[features] # wip
+multi_agent = true
+`;
+  const merged = mergeCodexToml(existing, buildCodexToml("http://l/v1", "k", "m", "/c.json"));
+  // The commented legacy provider header is stripped and replaced by ours — exactly one stays.
+  expect(merged).not.toContain("legacy");
+  expect(merged.split("[model_providers.kimchi]").length - 1).toBe(1);
+  // A table's keys stay under their (commented) header instead of becoming top-level scalars.
+  const features = merged.indexOf("[features] # wip");
+  expect(features).toBeGreaterThan(-1);
+  expect(merged.indexOf("multi_agent = true")).toBeGreaterThan(features);
+  expect(merged.indexOf("openai_base_url")).toBeLessThan(
+    merged.indexOf("[model_providers.kimchi]"),
+  );
+});
+
+test("llmBaseFor treats a scheme-less KIMCHI_BASE_URL as https", () => {
+  // Workspace shells set values like llm.kimchi.dev without a scheme: https is implied.
+  process.env.KIMCHI_BASE_URL = "llm.kimchi.dev";
+  expect(llmBaseFor("https://api.cast.ai")).toBe("https://llm.kimchi.dev");
+  expect(llmBaseFor("https://api.eu.cast.ai")).toBe("https://llm.kimchi.dev");
+  process.env.KIMCHI_BASE_URL = "llm.kimchi.dev:8443/v2";
+  expect(llmBaseFor("https://api.cast.ai")).toBe("https://llm.kimchi.dev:8443/v2");
+  // A scheme is honored as given; a trailing slash is trimmed.
+  process.env.KIMCHI_BASE_URL = "https://gateway.example.com/";
+  expect(llmBaseFor("https://api.cast.ai")).toBe("https://gateway.example.com");
+  // Plain http is honored for loopback only.
+  process.env.KIMCHI_BASE_URL = "http://example.com";
+  expect(llmBaseFor("https://api.cast.ai")).toBe("https://llm.kimchi.dev");
+  process.env.KIMCHI_BASE_URL = "http://127.0.0.1:9999";
+  expect(llmBaseFor("https://api.cast.ai")).toBe("http://127.0.0.1:9999");
+  // An unparseable value falls back rather than breaking every fetch.
+  process.env.KIMCHI_BASE_URL = "https://[invalid";
+  expect(llmBaseFor("https://api.cast.ai")).toBe("https://llm.kimchi.dev");
+  delete process.env.KIMCHI_BASE_URL;
+  expect(llmBaseFor("https://app.kimchi.dev/api")).toBe("https://llm.kimchi.dev");
 });
 
 test("catalog and main-model resolution mirror Kimchi's selection", () => {
