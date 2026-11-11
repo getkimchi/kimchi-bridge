@@ -31,6 +31,7 @@ const variables = [
   "KIMCHI_REMOTE_ENDPOINT",
   "KIMCHI_REGION",
   "KIMCHI_TELEMETRY_ENABLED",
+  "KIMCHI_BRIDGE_PREFIX",
 ];
 let previous: (string | undefined)[] = [];
 let previousConfigHome: string | undefined;
@@ -238,6 +239,82 @@ test("a session reports to the account Kimchi was signed in to when it started",
   expect(sessionStateDir(c, "codex", "before-sign-in")).toBe(stateDir({}));
   expect(sessionStateDir(c, "codex", "after-sign-in")).toBe(stateDir(c));
   expect(sessionStateDir(c, "codex", "next")).toBe(stateDir(c));
+});
+
+test("an endpoint saved at install reports without a sign-in, with a placeholder its proxy replaces", async () => {
+  const organization = randomUUID(),
+    actor = randomUUID(),
+    requests: string[] = [];
+  const proxy =
+    server(async (request) => {
+      const path = new URL(request.url).pathname;
+      requests.push(`${path.split("/").at(-1)} ${request.headers.get("authorization")}`);
+      if (path.endsWith("api-keys:verify"))
+        return Response.json({ organizationId: organization, userId: actor });
+      const batch = parseJson(await request.text()).batch as Batch;
+      return Response.json({
+        batchId: batch.id,
+        receipts: batch.events.map((e) => ({ id: e.id, revision: e.revision, status: "accepted" })),
+      });
+    }) + "/kimchi";
+  // Hooks start without the variable: each run takes it from the saved setting.
+  const bridge = async (args: string[], input?: object) => {
+    delete process.env.KIMCHI_REMOTE_ENDPOINT;
+    let text = "";
+    await cli(args, input && stdin(input), (out) => {
+      text += out;
+    });
+    return text;
+  };
+  process.env.KIMCHI_BRIDGE_PREFIX = join(root, "prefix");
+  process.env.KIMCHI_REMOTE_ENDPOINT = "http://proxy.example/kimchi";
+  await expect(cli(["activate"])).rejects.toThrow("HTTPS");
+  process.env.KIMCHI_REMOTE_ENDPOINT = proxy;
+  await cli(["activate"]);
+  await bridge(["activate"]);
+  expect(loadConfig().remoteEndpoint).toBe(proxy);
+  expect(requests).toEqual(["api-keys:verify Bearer kimchi-gateway"]);
+
+  const event = { session_id: "session", turn_id: "turn", cwd: root };
+  expect(await bridge(["hint"])).toBe("");
+  await bridge(["hook", "codex"], { ...event, hook_event_name: "SessionStart", source: "startup" });
+  await bridge(["hook", "codex"], {
+    ...event,
+    hook_event_name: "UserPromptSubmit",
+    prompt: "New work: x",
+  });
+  expect(sessionStateDir(loadConfig(), "codex", "session")).toBe(stateDir(loadConfig()));
+  expect(await bridge(["flush"])).toBe("All pending records acknowledged.\n");
+  expect(requests).toEqual([
+    "api-keys:verify Bearer kimchi-gateway",
+    "pr-cost-events:batchIngest Bearer kimchi-gateway",
+  ]);
+  expect(JSON.parse(await bridge(["status"]))).toMatchObject({
+    signInSource: "placeholder",
+    reportingVerified: true,
+    endpoint: proxy,
+    endpointSource: "saved",
+  });
+
+  // A real sign-in wins; an endpoint set in the environment wins and gets no placeholder.
+  kimchiFiles({ apiKey: "kimchi-key" });
+  await bridge(["hook", "codex"], {
+    ...event,
+    session_id: "signed-in",
+    hook_event_name: "SessionStart",
+  });
+  expect(requests.at(-1)).toBe("api-keys:verify Bearer kimchi-key");
+  kimchiFiles();
+  process.env.KIMCHI_REMOTE_ENDPOINT = "https://other.example/api";
+  let status = "";
+  await cli(["status"], undefined, (out) => {
+    status += out;
+  });
+  expect(JSON.parse(status)).toMatchObject({
+    signInSource: "none",
+    endpoint: "https://other.example/api",
+    endpointSource: "environment",
+  });
 });
 
 test("follows Kimchi's PR-reporting switch: explicit choice, then telemetry with the org directive", () => {

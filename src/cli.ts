@@ -7,6 +7,7 @@ import {
   credentialHash,
   kimchiReportingEnabled,
   kimchiSignIn,
+  secureEndpoint,
   type SignIn,
 } from "./kimchi.ts";
 import {
@@ -61,15 +62,22 @@ function csvCell(value: string): string {
     : text;
 }
 
+// The bearer the endpoint an admin saved gets without a sign-in: its proxy replaces it with the
+// user's identity, as the gateway's local proxy replaces gateway.ts's PROXY_PLACEHOLDER.
+const PROXY_PLACEHOLDER = "kimchi-gateway";
+
 /**
  * The sign-in the plugins report with: an explicit key first, then this
- * helper's own OAuth credential, then Kimchi's saved sign-in (key or SSO).
+ * helper's own OAuth credential, then Kimchi's saved sign-in (key or SSO),
+ * else the placeholder when the endpoint in use is the one an admin saved.
  */
-function resolveSignIn(environmentKey: string | undefined): SignIn {
+function resolveSignIn(environmentKey: string | undefined, savedEndpoint?: string): SignIn {
   if (environmentKey) return kimchiSignIn(environmentKey);
   const stored = storedSignIn();
   if (stored) return stored;
-  return kimchiSignIn(environmentKey);
+  const k = kimchiSignIn(environmentKey);
+  if (!k.token && k.apiUrl === savedEndpoint) k.token = PROXY_PLACEHOLDER;
+  return k;
 }
 
 // A starting session reports to the account Kimchi's sign-in verifies as. A sign-in that cannot be
@@ -81,7 +89,7 @@ async function sessionAccount(c: Config, environmentKey?: string): Promise<Confi
   if (!kimchiReportingEnabled(c.organizationId)) return {};
   let k: SignIn;
   try {
-    k = resolveSignIn(environmentKey);
+    k = resolveSignIn(environmentKey, c.remoteEndpoint);
   } catch {
     return c;
   }
@@ -107,6 +115,15 @@ export async function run(
 ): Promise<void> {
   const environmentKey = process.env.KIMCHI_API_KEY;
   delete process.env.KIMCHI_API_KEY;
+  // The endpoint an admin saved with activate stands in for KIMCHI_REMOTE_ENDPOINT; a set one wins.
+  const environmentEndpoint = process.env.KIMCHI_REMOTE_ENDPOINT;
+  let savedEndpoint: string | undefined;
+  try {
+    savedEndpoint = loadConfig().remoteEndpoint;
+  } catch {
+    // Unreadable settings fail the commands below that load them.
+  }
+  if (!environmentEndpoint && savedEndpoint) process.env.KIMCHI_REMOTE_ENDPOINT = savedEndpoint;
   // Kimchi's runtime switch must not reach the git, gh and glab this starts.
   delete process.env.BUN_BE_BUN;
   const prefix =
@@ -114,7 +131,7 @@ export async function run(
   // Unreadable Kimchi settings mean no sign-in: local recording continues, uploads wait.
   const signIn = (): SignIn => {
     try {
-      return resolveSignIn(environmentKey);
+      return resolveSignIn(environmentKey, savedEndpoint);
     } catch {
       return { apiUrl: "" };
     }
@@ -166,7 +183,7 @@ export async function run(
     // in for — bind the existing sign-in and turn the gateway on, no browser.
     // A stored bridge credential keeps the browser flow (account switching).
     if (!values["from-kimchi"] && !storedSignIn()) {
-      const existing = resolveSignIn(environmentKey);
+      const existing = resolveSignIn(environmentKey, savedEndpoint);
       if (existing.token) {
         writeLoginProgress({ phase: "starting", startedAt: Date.now() });
         try {
@@ -351,6 +368,11 @@ export async function run(
     }
   };
   if (command === "activate") {
+    // Saved for sessions that start without KIMCHI_REMOTE_ENDPOINT; an update without it keeps it.
+    if (environmentEndpoint) {
+      secureEndpoint(environmentEndpoint);
+      c.remoteEndpoint = savedEndpoint = environmentEndpoint;
+    }
     saveConfig(c);
     if (existsSync(join(prefix, "installed", "codex"))) codexTrace(true);
     // Gateway routing moves from the old direct mode to the local proxy, which tags each request so it is priced
@@ -368,6 +390,8 @@ export async function run(
     } catch {
       /* Claude Code's settings could not be read; the next activate retries. */
     }
+    // Verified with flush's 15-second limit, so the first session's one-second check finds it done.
+    if (kimchiReportingEnabled(c.organizationId)) await verifySignIn(signIn()).catch(() => {});
     return;
   }
   if (command === "codex-trace") {
@@ -487,10 +511,18 @@ export async function run(
               ? "key"
               : storedSignIn()
                 ? "oauth"
-                : k.token
-                  ? "kimchi"
-                  : "none",
+                : k.token === PROXY_PLACEHOLDER
+                  ? "placeholder"
+                  : k.token
+                    ? "kimchi"
+                    : "none",
             organizationId: c.organizationId ?? "",
+            endpoint: k.apiUrl,
+            endpointSource: environmentEndpoint
+              ? "environment"
+              : savedEndpoint
+                ? "saved"
+                : "default",
             gateway: await gatewayStatus(),
             ledger: stateDir(c),
             accounting: s.status(),

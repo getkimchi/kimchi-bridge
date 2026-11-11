@@ -53,7 +53,7 @@ function fixture(version: string, market: string) {
   executable(join(pkg, "bootstrap.sh"), script);
   executable(
     join(pkg, "bin/kimchi-bridge"),
-    `#!/bin/sh\nprintf '%s\\n' "$*" >> "${join(root, "helper-calls")}"\n`,
+    `#!/bin/sh\nprintf '%s\\n' "$*\${KIMCHI_REMOTE_ENDPOINT:+ $KIMCHI_REMOTE_ENDPOINT}" >> "${join(root, "helper-calls")}"\n`,
   );
   writeFileSync(join(pkg, "lib/kimchi-bridge.mjs"), "");
   writeFileSync(join(pkg, "VERSION"), version + "\n");
@@ -159,7 +159,7 @@ test("a lock left by a killed installer is replaced; a live or fresh one is not"
 });
 
 test("the installer needs Kimchi and leaves updates to Kimchi's release", () => {
-  const { root, pkg, env, prefix, calls } = fixture("v0.2.0", "kimchi-bridge-0123456789ab");
+  const { root, pkg, env, prefix, calls, helper } = fixture("v0.2.0", "kimchi-bridge-0123456789ab");
   const missing = run(join(pkg, "install.sh"), ["install", "claude"], {
     ...env,
     KIMCHI_BIN: join(root, "absent"),
@@ -167,9 +167,15 @@ test("the installer needs Kimchi and leaves updates to Kimchi's release", () => 
   expect(missing.status).not.toBe(0);
   expect(missing.output).toContain("install Kimchi first");
   expect(calls()).toEqual([]);
-  const result = run(join(pkg, "install.sh"), ["install", "claude"], env);
+  // An admin's endpoint reaches activate, which saves it.
+  const endpoint = "https://proxy.example/kimchi";
+  const result = run(join(pkg, "install.sh"), ["install", "claude"], {
+    ...env,
+    KIMCHI_REMOTE_ENDPOINT: endpoint,
+  });
   expect(result.status).toBe(0);
   expect(result.output).toContain("Reports with your Kimchi sign-in");
+  expect(helper()).toBe(`activate ${endpoint}\n`);
   expect(readFileSync(join(prefix, "installed/claude"), "utf8")).toBe(
     "kimchi-bridge-0123456789ab\n",
   );
