@@ -42,7 +42,7 @@ done
 mkdir -p "$prefix/installed" "$bin_dir"
 if [[ "$action" != uninstall && ( -e "$bin_dir/kimchi-bridge" || -L "$bin_dir/kimchi-bridge" ) ]]; then
   existing=$(readlink "$bin_dir/kimchi-bridge") || fail 'Refusing to replace an unmanaged kimchi-bridge binary.'
-  case "$existing" in "$prefix/releases/"*/bin/kimchi-bridge) ;; *) fail 'Refusing to replace an unmanaged kimchi-bridge link.' ;; esac
+  case "$existing" in "$prefix/releases/"*/bin/kimchi-bridge|"$prefix/bin/kimchi-bridge") ;; *) fail 'Refusing to replace an unmanaged kimchi-bridge link.' ;; esac
 fi
 lock="$prefix/install.lock"
 # A lock whose installer is gone (killed, or the machine lost power) would block every later
@@ -103,13 +103,32 @@ if [[ "$action" == uninstall ]]; then
 fi
 
 script_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-[[ -f "$script_root/VERSION" && -f "$script_root/lib/kimchi-bridge.mjs" ]] || fail 'Kimchi installs and updates the plugins: run the Kimchi installer.'
+# A standalone package, extracted by the kimchi-bridge binary, carries a marker instead of the
+# bundle and skips every Kimchi-runtime gate below.
+standalone=
+[[ ! -f "$script_root/standalone" ]] || standalone=1
+if [[ -n "$standalone" ]]; then
+  [[ -f "$script_root/VERSION" && -d "$script_root/markets" ]] || fail 'The standalone package is incomplete: run the kimchi-bridge installer.'
+else
+  [[ -f "$script_root/VERSION" && -f "$script_root/lib/kimchi-bridge.mjs" ]] || fail 'Kimchi installs and updates the plugins: run the Kimchi installer.'
+fi
 version=$(cat "$script_root/VERSION")
 [[ -z "$requested" || "$requested" == "$version" ]] || fail 'Requested version differs from this package.'
 valid_version "$version" || fail 'Invalid package version.'
-# The plugins run on Kimchi's runtime; Kimchi's installer and updater pass its path.
-runtime=${KIMCHI_BIN:-$(command -v kimchi || true)}
-[[ "$runtime" == /* && -x "$runtime" ]] || fail 'Kimchi runs the plugins: install Kimchi first.'
+# While Kimchi is installed it runs, registers and updates the plugins; a standalone package only
+# leaves its binary in place, which the plugins' stub runs once Kimchi is removed. Registering it
+# too could point the hooks at a wiring Kimchi's code does not have.
+if [[ -n "$standalone" && -x "$prefix/runtime" ]]; then
+  printf '%s\n' "Kimchi is installed: it runs and updates the plugins. kimchi-bridge $version takes over if Kimchi is removed."
+  exit 0
+fi
+# The plugins run on Kimchi's runtime; Kimchi's installer and updater pass its path. A
+# standalone package runs the kimchi-bridge binary instead, so it needs no runtime.
+runtime=
+if [[ -z "$standalone" ]]; then
+  runtime=${KIMCHI_BIN:-$(command -v kimchi || true)}
+  [[ "$runtime" == /* && -x "$runtime" ]] || fail 'Kimchi runs the plugins: install Kimchi first.'
+fi
 
 target="$prefix/releases/$version"
 mkdir -p "$prefix/releases"
@@ -117,20 +136,35 @@ if [[ ! -d "$target" ]]; then
   staged=$(mktemp -d "$prefix/releases/.install.XXXXXXXX")
   cp -R "$script_root/." "$staged/"
   # A Kimchi update can replace the package while it is copied; never keep a mixed copy.
-  if [[ "$(cat "$staged/VERSION" 2>/dev/null)" != "$version" || ! -f "$staged/lib/kimchi-bridge.mjs" ]]; then
+  if [[ "$(cat "$staged/VERSION" 2>/dev/null)" != "$version" || ( -z "$standalone" && ! -f "$staged/lib/kimchi-bridge.mjs" ) ]]; then
     rm -rf -- "$staged"
     fail 'The package changed while it was copied: run the installer again.'
   fi
   mv -- "$staged" "$target"
+elif [[ -z "$standalone" && ! -f "$target/lib/kimchi-bridge.mjs" ]]; then
+  # The standalone binary installed this version without the bundle Kimchi's runtime runs; add
+  # it before current.mjs links to it.
+  staged=$(mktemp -d "$target/.lib.XXXXXXXX")
+  cp "$script_root/lib/kimchi-bridge.mjs" "$staged/"
+  rm -rf -- "$target/lib"
+  mv -- "$staged" "$target/lib"
 fi
 # Every registered plugin runs this code, so link it before registering. Each link changes with
-# one rename: a running hook sees the old or the new target.
-ln -s "$runtime" "$prefix/.runtime.$$"
-mv -f -- "$prefix/.runtime.$$" "$prefix/runtime"
-ln -s "$target/lib/kimchi-bridge.mjs" "$prefix/.current.$$"
-mv -f -- "$prefix/.current.$$" "$prefix/current.mjs"
-ln -s "$target/bin/kimchi-bridge" "$bin_dir/.kimchi-bridge.new.$$"
-mv -f -- "$bin_dir/.kimchi-bridge.new.$$" "$bin_dir/kimchi-bridge"
+# one rename: a running hook sees the old or the new target. A harness install keeps the user's
+# command on the release's stub; a standalone install points it at the binary, but never disturbs
+# a link the harness owns (a removed Kimchi leaves that stub to find the binary on its own). The
+# check above allowed only managed links, so a dangling one, a removed Kimchi's, is replaced.
+if [[ -z "$standalone" ]]; then
+  ln -s "$runtime" "$prefix/.runtime.$$"
+  mv -f -- "$prefix/.runtime.$$" "$prefix/runtime"
+  ln -s "$target/lib/kimchi-bridge.mjs" "$prefix/.current.$$"
+  mv -f -- "$prefix/.current.$$" "$prefix/current.mjs"
+  ln -s "$target/bin/kimchi-bridge" "$bin_dir/.kimchi-bridge.new.$$"
+  mv -f -- "$bin_dir/.kimchi-bridge.new.$$" "$bin_dir/kimchi-bridge"
+elif [[ ! -e "$bin_dir/kimchi-bridge" ]]; then
+  ln -s "$prefix/bin/kimchi-bridge" "$bin_dir/.kimchi-bridge.new.$$"
+  mv -f -- "$bin_dir/.kimchi-bridge.new.$$" "$bin_dir/kimchi-bridge"
+fi
 registered=
 for cli in "${clients[@]}"; do
   [[ -f "$script_root/markets/$cli" ]] || fail 'Package missing its market receipts: reinstall the plugins.'
@@ -167,8 +201,11 @@ for cli in "${clients[@]}"; do
   fi
 done
 # Saving the settings drops what earlier releases kept there (their reporting key), which also
-# stops an earlier release's resident daemon.
-if output=$("$bin_dir/kimchi-bridge" activate 2>&1); then printf '%s\n' "$output"; else fail "kimchi-bridge activate failed: ${output:-unknown error}"; fi
+# stops an earlier release's resident daemon. Standalone activates its own binary; a harness
+# package the command its release linked.
+activate_bin=$bin_dir/kimchi-bridge
+[[ -z "$standalone" ]] || activate_bin=$prefix/bin/kimchi-bridge
+if output=$("$activate_bin" activate 2>&1); then printf '%s\n' "$output"; else fail "kimchi-bridge activate failed: ${output:-unknown error}"; fi
 # Written last, and only once every added client has this package's registration, so Kimchi's
 # next update retries a client whose registration failed.
 current=1
@@ -182,5 +219,9 @@ fi
 # Keep the bootstrap, rather than a package-bound script, for kimchi-bridge uninstall.
 cp "$target/bootstrap.sh" "$prefix/install.sh" || fail 'Package missing bootstrap.sh: reinstall the plugins.'
 chmod 700 "$prefix/install.sh"
-printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi, or kimchi-bridge login for the browser SSO.' "Control: $bin_dir/kimchi-bridge status" 'kimchi-bridge login routes model requests through the Kimchi gateway; revert with kimchi-bridge gateway disable.'
+if [[ -n "$standalone" ]]; then
+  printf '%s\n' "Installed $client $version." 'Sign in: kimchi-bridge login' "Update: $bin_dir/kimchi-bridge update" "Control: $bin_dir/kimchi-bridge status"
+else
+  printf '%s\n' "Installed $client $version." 'Reports with your Kimchi sign-in; sign in by running kimchi, or kimchi-bridge login for the browser SSO.' "Control: $bin_dir/kimchi-bridge status" 'kimchi-bridge login routes model requests through the Kimchi gateway; revert with kimchi-bridge gateway disable.'
+fi
 [[ -z "$registered" ]] || printf '%s\n' 'Start a new Claude Code or Codex session; Codex asks you to trust the hooks.'

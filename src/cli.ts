@@ -121,7 +121,7 @@ export async function run(
   };
   if (!args.length)
     throw new Error(
-      "usage: kimchi-bridge status | login | enable | disable | flush | export jsonl|csv | gateway start|run|ensure|stop|status|enable|disable | version",
+      "usage: kimchi-bridge status | login | install claude|codex|both | update [vX.Y.Z] | uninstall claude|codex|both | enable | disable | flush | export jsonl|csv | gateway start|run|ensure|stop|status|enable|disable | version",
     );
   const command = args[0];
   if (command === "version") {
@@ -321,6 +321,27 @@ export async function run(
       return;
     }
     throw new Error("usage: kimchi-bridge gateway start|run|ensure|stop|status|enable|disable");
+  }
+  if (command === "install") {
+    if (!["claude", "codex", "both"].includes(args[1] ?? ""))
+      throw new Error("choose claude, codex or both");
+    // Extract this build's package and let its own install.sh register the plugins.
+    const { installPackage } = await import("./install.ts");
+    await installPackage(args[1], prefix);
+    return;
+  }
+  if (command === "update") {
+    // A standalone binary replaces itself with a checked release; Kimchi's bundle updates with Kimchi.
+    const { compiledBinary } = await import("./install.ts");
+    const { update } = await import("./update.ts");
+    await update({
+      prefix,
+      current: version,
+      binary: compiledBinary(),
+      requested: args[1],
+      output,
+    });
+    return;
   }
   if (command === "uninstall") {
     if (!["claude", "codex", "both"].includes(args[1]))

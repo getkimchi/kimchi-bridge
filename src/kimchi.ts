@@ -163,9 +163,10 @@ export function request(url: string, init: RequestInit, signal?: AbortSignal): P
   });
 }
 
-export async function readBody(response: Response, limit: number): Promise<string> {
+/** A response body up to `limit` bytes; a longer one is cancelled and rejected. */
+export async function readBytes(response: Response, limit: number): Promise<Buffer> {
   const reader = response.body?.getReader();
-  if (!reader) return "";
+  if (!reader) return Buffer.alloc(0);
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
@@ -180,7 +181,11 @@ export async function readBody(response: Response, limit: number): Promise<strin
     await reader.cancel().catch(() => {});
     throw error;
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
+}
+
+export async function readBody(response: Response, limit: number): Promise<string> {
+  return (await readBytes(response, limit)).toString("utf8");
 }
 
 // Kimchi's gatewayAuthHeaders: the bearer, plus the organization header for SSO.

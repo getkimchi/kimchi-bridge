@@ -10,7 +10,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildBundle, releaseVersion, shim } from "../scripts/package.ts";
+import { buildBundle, releaseVersion } from "../scripts/package.ts";
+import { stub } from "../src/packaging.ts";
 
 // What the installer leaves: the shim, the current code and a runtime link. Bun stands in
 // for Kimchi's binary, which runs the code as Bun does when BUN_BE_BUN=1 is set.
@@ -21,7 +22,7 @@ async function installed(root: string, version: string) {
   mkdirSync(join(root, "bin"));
   await buildBundle(version, join(prefix, "current.mjs"));
   symlinkSync(process.execPath, join(prefix, "runtime"));
-  writeFileSync(helper, shim, { mode: 0o755 });
+  writeFileSync(helper, stub, { mode: 0o755 });
   return { prefix, helper };
 }
 
@@ -57,7 +58,7 @@ test("the shim runs the code on Kimchi's runtime without the project's .env or b
     );
     writeFileSync(join(project, "bunfig.toml"), 'preload = ["./preload.js"]\n');
     const { prefix, helper } = await installed(root, "bundle-test");
-    const run = (args: string[]) =>
+    const run = (args: string[], extra: Record<string, string> = {}) =>
       Bun.spawnSync([helper, ...args], {
         cwd: project,
         env: {
@@ -65,6 +66,7 @@ test("the shim runs the code on Kimchi's runtime without the project's .env or b
           PATH: process.env.PATH!,
           KIMCHI_BRIDGE_PREFIX: prefix,
           KIMCHI_BRIDGE_HOME: state,
+          ...extra,
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -79,13 +81,27 @@ test("the shim runs the code on Kimchi's runtime without the project's .env or b
     });
     expect(existsSync(redirect)).toBe(false);
     expect(existsSync(canary)).toBe(false);
-    // Without Kimchi, hooks succeed silently: Codex shows hook output in the session, and a
-    // real Codex run showed the hint after every hook. Hooks have no terminal.
+    // With neither Kimchi's runtime nor the standalone binary, hooks succeed silently: Codex
+    // shows hook output in the session, and a real Codex run showed the hint after every hook.
+    // Hooks have no terminal.
     rmSync(join(prefix, "runtime"));
     const missing = run(["hook", "codex"]);
     expect(missing.exitCode).toBe(0);
     expect(missing.stdout.toString()).toBe("");
     expect(missing.stderr.toString()).toBe("");
+    // The standalone binary takes over when Kimchi's runtime is gone, never as the bun command.
+    mkdirSync(join(prefix, "bin"));
+    writeFileSync(
+      join(prefix, "bin", "kimchi-bridge"),
+      '#!/bin/sh\necho "binary:$*:${BUN_BE_BUN:-unset}"\n',
+      { mode: 0o755 },
+    );
+    const dispatched = run(["hook", "codex"], { BUN_BE_BUN: "1" });
+    expect(dispatched.exitCode).toBe(0);
+    expect(dispatched.stdout.toString()).toBe("binary:hook codex:unset\n");
+    // Kimchi's runtime wins when both exist, so Kimchi's updates stay authoritative.
+    symlinkSync(process.execPath, join(prefix, "runtime"));
+    expect(run(["version"]).stdout.toString()).toBe("bundle-test\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -1,6 +1,8 @@
 .kimchi/
 /bin/
 /dist/
+/.generated/
+/dist-bin/
 .DS_Store
 node_modules/
 .desloppify/

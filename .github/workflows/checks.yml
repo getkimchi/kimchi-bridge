@@ -21,10 +21,14 @@ jobs:
         with:
           bun-version: 1.4.0
       - run: pnpm install --frozen-lockfile
+      - run: pnpm gen
       - run: pnpm typecheck
       - run: pnpm format:check
       - run: pnpm test
-      - run: bash -n install.sh scripts/package.sh
+      # bash -n checks only its first file; the rest become arguments.
+      - run: for script in install.sh scripts/*.sh; do bash -n "$script"; done
+      - run: sh -n scripts/install-standalone.sh
+      - run: python3 -c "import plistlib; plistlib.load(open('build/entitlements.mac.plist', 'rb'))"
       - run: git diff --check
   package:
     runs-on: ubuntu-latest
