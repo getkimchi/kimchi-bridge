@@ -27,7 +27,9 @@ import {
 } from "./protocol.ts";
 
 const conflictError = new Error("event identity conflicts with persisted content");
-const schemaVersion = 0x4b570002;
+const schemaVersion = 0x4b570003;
+/** A batch or export window that fails with an HTTP error this many times is parked locally. */
+export const DEAD_LETTER_AFTER_FAILED_ATTEMPTS = 10;
 // Ledgers up to rc.5 named a revision's base by its hash.
 const hashBaseVersion = 0x4b570001;
 const schema = `CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -35,12 +37,13 @@ CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,entity_id TEXT NOT NULL,ki
 CREATE INDEX IF NOT EXISTS pending_events ON events(acked_at,created_at);
 CREATE INDEX IF NOT EXISTS entity_events ON events(entity_id);
 CREATE TABLE IF NOT EXISTS export_receipts(target TEXT NOT NULL,event_id TEXT NOT NULL,PRIMARY KEY(target,event_id));
+CREATE TABLE IF NOT EXISTS export_failures(target TEXT NOT NULL,event_id TEXT NOT NULL,attempts INTEGER NOT NULL,PRIMARY KEY(target,event_id));
 CREATE TABLE IF NOT EXISTS ledger_totals(id INTEGER PRIMARY KEY CHECK(id=1),total_bytes INTEGER NOT NULL,pending_bytes INTEGER NOT NULL);
 INSERT OR IGNORE INTO ledger_totals SELECT 1,(SELECT COALESCE(SUM(length(body)),0) FROM events),(SELECT COALESCE(SUM(length(body)),0) FROM events WHERE acked_at IS NULL) WHERE NOT EXISTS(SELECT 1 FROM ledger_totals WHERE id=1);
 CREATE TRIGGER IF NOT EXISTS event_size_insert AFTER INSERT ON events BEGIN UPDATE ledger_totals SET total_bytes=total_bytes+length(new.body),pending_bytes=pending_bytes+CASE WHEN new.acked_at IS NULL THEN length(new.body) ELSE 0 END WHERE id=1; END;
 CREATE TRIGGER IF NOT EXISTS event_size_ack AFTER UPDATE OF acked_at ON events WHEN old.acked_at IS NULL AND new.acked_at IS NOT NULL BEGIN UPDATE ledger_totals SET pending_bytes=pending_bytes-length(new.body) WHERE id=1; END;
 CREATE TRIGGER IF NOT EXISTS event_size_delete AFTER DELETE ON events BEGIN UPDATE ledger_totals SET total_bytes=total_bytes-length(old.body),pending_bytes=pending_bytes-CASE WHEN old.acked_at IS NULL THEN length(old.body) ELSE 0 END WHERE id=1; DELETE FROM export_receipts WHERE event_id=old.id; END;
-CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY,body BLOB NOT NULL,event_ids BLOB NOT NULL,created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY,body BLOB NOT NULL,event_ids BLOB NOT NULL,created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS batch_order(batch_id TEXT PRIMARY KEY,order_key TEXT NOT NULL);
 CREATE TRIGGER IF NOT EXISTS batch_order_delete AFTER DELETE ON batches BEGIN DELETE FROM batch_order WHERE batch_id=old.id; END;
 CREATE TABLE IF NOT EXISTS work(id TEXT PRIMARY KEY,repository TEXT NOT NULL,created_at INTEGER NOT NULL);
@@ -71,9 +74,14 @@ export class Store {
         this.db
           .transaction(() => {
             this.db.exec(schema);
+            if (version === 0 || version === hashBaseVersion) this.baseByEventId();
             // Unknown future markers are not claimed by this version.
-            if (version === 0 || version === hashBaseVersion) {
-              this.baseByEventId();
+            if (version >= 0 && version <= schemaVersion) {
+              const columns = this.db
+                .query("SELECT name FROM pragma_table_info('batches')")
+                .all() as { name: string }[];
+              if (!columns.some((c) => c.name === "attempts"))
+                this.db.exec("ALTER TABLE batches ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
               this.db.exec(`PRAGMA user_version=${schemaVersion}`);
             }
           })
@@ -311,6 +319,45 @@ export class Store {
   }
   dropBatch(b: Batch): void {
     this.db.query("DELETE FROM batches WHERE id=?").run(b.id);
+  }
+  /** Count an HTTP-error upload of the batch and report how many failures it has seen. */
+  recordBatchFailure(b: Batch): number {
+    this.db.query("UPDATE batches SET attempts=attempts+1 WHERE id=?").run(b.id);
+    return (
+      (this.db.query("SELECT attempts FROM batches WHERE id=?").get(b.id) as any)?.attempts ?? 0
+    );
+  }
+  /** Park a batch that can never upload: its events stay in the ledger, blocked from future batches. */
+  private setAside(b: Batch, blocked: string, code: string): void {
+    this.tx(() => {
+      const mark = this.db.query(
+        "UPDATE events SET blocked=? WHERE id=? AND acked_at IS NULL AND blocked=''",
+      );
+      for (const e of b.events) mark.run(blocked, e.id!);
+      this.db.query("DELETE FROM batches WHERE id=?").run(b.id);
+      this.diagnostic(code);
+    });
+  }
+  deadLetter(b: Batch): void {
+    this.setAside(b, "deadletter", "upload_deadletter");
+  }
+  /** Park a single record the server can never accept because it exceeds the payload limit. */
+  blockOversize(b: Batch): void {
+    this.setAside(b, "oversize", "upload_oversize_blocked");
+  }
+  /** Count an HTTP-error or partially rejected export per record; report how many crossed the leash. */
+  recordExportFailures(target: string, ids: string[]): number {
+    let crossed = 0;
+    this.tx(() => {
+      const insert = this.db.query(
+        `INSERT INTO export_failures(target,event_id,attempts) VALUES(?,?,1) ON CONFLICT(target,event_id) DO UPDATE SET attempts=attempts+1 RETURNING attempts`,
+      );
+      for (const id of ids) {
+        const row = insert.get(target, id) as { attempts: number } | undefined;
+        if (row && row.attempts >= DEAD_LETTER_AFTER_FAILED_ATTEMPTS) crossed++;
+      }
+    });
+    return crossed;
   }
   splitBatch(b: Batch): void {
     if (b.events.length < 2)

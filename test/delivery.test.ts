@@ -5,9 +5,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { authenticate, credentialHash, type SignIn } from "../src/kimchi.ts";
 import { validateConfig, type Config } from "../src/settings.ts";
-import { checkReady, flush, flushOtlp } from "../src/work/delivery.ts";
+import {
+  checkReady,
+  DEAD_LETTER_AFTER_FAILED_ATTEMPTS,
+  flush,
+  flushOtlp,
+} from "../src/work/delivery.ts";
 import { Store } from "../src/work/ledger.ts";
-import { canonicalHash, parseJson, type Batch, type Event } from "../src/work/protocol.ts";
+import {
+  canonicalHash,
+  encodeBatch,
+  parseJson,
+  type Batch,
+  type Event,
+} from "../src/work/protocol.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -242,6 +253,131 @@ test("nested 413 splits keep event revisions and survive accepted-but-lost respo
     expect(last).toBe("8");
     expect(s.status().pending).toBe(0);
   }
+});
+
+test("a dead port looks offline: network failures never count toward dead-lettering", async () => {
+  const s = store(),
+    e = event();
+  s.put(e);
+  const offline = `http://127.0.0.1:${55_000 + Math.floor(Math.random() * 2000)}`;
+  const [c, k] = configured(offline);
+  const b = s.pendingBatch()!;
+  for (let i = 0; i < 50; i++)
+    await expect(flush(s, c, k)).rejects.toThrow("reporting endpoint unavailable");
+  expect(s.status().pending).toBe(1);
+  expect(s.status().diagnostics).toMatchObject({ upload_network_failed: 50 });
+  expect(
+    (s.db.query("SELECT attempts FROM batches WHERE id=?").get(b.id) as { attempts: number })
+      .attempts,
+  ).toBe(0);
+  expect(encodeBatch(s.pendingBatch()!)).toBe(encodeBatch(b));
+});
+
+test("a persistent HTTP failure dead-letters the head batch and the queue flows on", async () => {
+  const s = store(),
+    failed = event();
+  s.put(failed);
+  const ids: string[] = [];
+  let healthy = false;
+  const apiUrl = server(async (req) => {
+    const batch = parseJson(await req.text()).batch as Batch;
+    ids.push(batch.id);
+    if (!healthy) return new Response(null, { status: 500 });
+    return acknowledgement(batch);
+  });
+  const [c, k] = configured(apiUrl);
+  for (let i = 1; i < DEAD_LETTER_AFTER_FAILED_ATTEMPTS; i++)
+    await expect(flush(s, c, k)).rejects.toThrow("HTTP 500; batch retained");
+  expect(s.status()).toMatchObject({ pending: 1, blocked: 0 });
+  expect(await flush(s, c, k)).toBe(true);
+  expect(new Set(ids).size).toBe(1);
+  expect(s.status()).toMatchObject({ pending: 1, blocked: 1 });
+  expect(s.status().diagnostics).toMatchObject({ upload_http_500: 10, upload_deadletter: 1 });
+  expect(s.events()).toHaveLength(1);
+  healthy = true;
+  s.put(event());
+  expect(await flush(s, c, k)).toBe(true);
+  expect(s.status()).toMatchObject({ pending: 1, blocked: 1 });
+});
+
+test("a lone oversize record is parked instead of wedging the queue", async () => {
+  const s = store();
+  s.put(event());
+  const apiUrl = server(() => new Response(null, { status: 413 }));
+  const [c, k] = configured(apiUrl);
+  expect(await flush(s, c, k)).toBe(true);
+  expect(s.status()).toMatchObject({ pending: 1, blocked: 1 });
+  expect(s.status().diagnostics).toEqual({ upload_oversize_blocked: 1 });
+  expect(await flush(s, c, k)).toBe(false);
+});
+
+test("a persistent OTLP failure parks the window after ten passes; later records export", async () => {
+  const s = store(),
+    parked = event(),
+    later = event();
+  s.put(parked);
+  const failures = () => s.db.query("SELECT * FROM export_failures").all() as any[];
+  const receipts = () =>
+    s.db.query("SELECT event_id FROM export_receipts").all() as { event_id: string }[];
+  const bodies: string[] = [];
+  let healthy = false;
+  const apiUrl = server(async (req) => {
+    bodies.push(await req.text());
+    return healthy ? Response.json({}) : new Response(null, { status: 500 });
+  });
+  const c: Config = {
+    apiUrl,
+    organizationId: randomUUID(),
+    actorId: randomUUID(),
+    credentialHash: credentialHash({ apiUrl, token: "synthetic-key" }),
+    otlpUrl: apiUrl + "/v1/logs",
+  };
+  for (let i = 1; i < DEAD_LETTER_AFTER_FAILED_ATTEMPTS; i++) {
+    await expect(flushOtlp(s, c)).rejects.toThrow("OTLP returned HTTP 500; records retained");
+    expect(failures()).toEqual([expect.objectContaining({ event_id: parked.id, attempts: i })]);
+  }
+  await expect(flushOtlp(s, c)).rejects.toThrow("OTLP returned HTTP 500; records retained");
+  expect(s.status().diagnostics).toMatchObject({ otlp_deadletter: 1 });
+  healthy = true;
+  s.put(later);
+  expect(await flushOtlp(s, c)).toBe(true);
+  const exported = JSON.parse(bodies.at(-1)!).resourceLogs[0].scopeLogs[0].logRecords;
+  expect(exported).toHaveLength(1);
+  expect(exported[0].attributes[0].value.stringValue).toBe(later.id);
+  expect(receipts()).toEqual([{ event_id: later.id! }]);
+});
+
+test("OTLP network failures and partial rejections count differently", async () => {
+  const s = store();
+  s.put(event());
+  const early = s.events()[0]!;
+  const failures = () => s.db.query("SELECT * FROM export_failures").all() as any[];
+  const offline: Config = {
+    apiUrl: "http://127.0.0.1:9",
+    organizationId: randomUUID(),
+    actorId: randomUUID(),
+    credentialHash: credentialHash({ apiUrl: "http://127.0.0.1:9", token: "synthetic-key" }),
+    otlpUrl: "http://127.0.0.1:9/v1/logs",
+  };
+  for (let i = 0; i < 50; i++)
+    await expect(flushOtlp(s, offline)).rejects.toThrow("OTLP endpoint unavailable");
+  expect(failures()).toEqual([]);
+  const apiUrl = server(() => Response.json({ partialSuccess: { rejectedLogRecords: "1" } }));
+  const rejecting: Config = {
+    apiUrl,
+    organizationId: randomUUID(),
+    actorId: randomUUID(),
+    credentialHash: credentialHash({ apiUrl, token: "synthetic-key" }),
+    otlpUrl: apiUrl + "/v1/logs",
+  };
+  for (let i = 1; i <= DEAD_LETTER_AFTER_FAILED_ATTEMPTS; i++)
+    await expect(flushOtlp(s, rejecting)).rejects.toThrow("partially rejected");
+  expect(failures()).toEqual([
+    expect.objectContaining({ event_id: early.id, attempts: DEAD_LETTER_AFTER_FAILED_ATTEMPTS }),
+  ]);
+  expect(s.status().diagnostics).toMatchObject({ otlp_deadletter: 1 });
+  expect(await flushOtlp(s, rejecting)).toBe(false);
+  expect(s.status().pending).toBe(1);
 });
 
 test("OTLP partial failure retries independently without Kimchi credentials", async () => {
