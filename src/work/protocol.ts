@@ -546,7 +546,9 @@ function convert(type: string, value: any): any {
   return shape(type, value);
 }
 function quoted(value: string): string {
-  return JSON.stringify(value.toWellFormed())
+  // A UTF-8 round trip replaces lone surrogates with U+FFFD, as Go does. It is what
+  // String.prototype.toWellFormed does, without asking importers for an ES2024 library.
+  return JSON.stringify(Buffer.from(value).toString("utf8"))
     .replaceAll("<", "\\u003c")
     .replaceAll(">", "\\u003e")
     .replaceAll("&", "\\u0026")
