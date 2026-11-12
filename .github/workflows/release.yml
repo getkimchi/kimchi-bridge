@@ -1,0 +1,151 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+  # Builds and signs the binaries for a version without publishing anything.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (vX.Y.Z or vX.Y.Z-rc.N); nothing is published"
+        required: true
+permissions:
+  contents: read
+env:
+  BUN_VERSION: "1.4.0"
+  # Passed to every script through the environment, never interpolated into one.
+  VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm format:check
+      - run: pnpm test
+
+  # macOS binaries are built on macOS so they can be re-signed: bun --compile invalidates the
+  # runtime's signature (oven-sh/bun#7208). darwin-x64 is cross-compiled on the arm64 runner.
+  # linux-x64 uses Bun's baseline build, so hooks run on CPUs without AVX2 too.
+  build:
+    needs: checks
+    strategy:
+      matrix:
+        include:
+          - platform: darwin-arm64
+            target: bun-darwin-arm64
+            runner: macos-15
+          - platform: darwin-x64
+            target: bun-darwin-x64
+            runner: macos-15
+          - platform: linux-x64
+            target: bun-linux-x64-baseline
+            runner: ubuntu-22.04
+          - platform: linux-arm64
+            target: bun-linux-arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      BINARY: dist-bin/kimchi-bridge-${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - name: Compile
+        run: bun scripts/compile.ts "$VERSION" "$BINARY" "${{ matrix.target }}"
+      # codesign parses entitlements as strictly as AMFI; plistlib fails as fast, plutil does not.
+      - name: Validate entitlements
+        if: runner.os == 'macOS'
+        run: python3 -c "import plistlib; plistlib.load(open('build/entitlements.mac.plist', 'rb'))"
+      # Without the secrets (forks), the binaries are signed ad hoc.
+      - name: Set up Developer ID signing
+        if: runner.os == 'macOS'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: bash scripts/setup-codesign.sh
+      - name: Sign
+        if: runner.os == 'macOS'
+        run: bash scripts/codesign.sh "$BINARY"
+      - name: Smoke test
+        if: matrix.platform != 'darwin-x64'
+        run: test "$("$BINARY" version)" = "$VERSION"
+      # The Intel build runs under Rosetta 2 on the arm64 runner, when the image has it.
+      - name: Smoke test (Rosetta 2)
+        if: matrix.platform == 'darwin-x64'
+        run: |
+          if arch -x86_64 /usr/bin/true 2> /dev/null; then
+            test "$(arch -x86_64 "$BINARY" version)" = "$VERSION"
+          else
+            echo "::warning::Rosetta 2 is not installed; the darwin-x64 binary was not run."
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kimchi-bridge-${{ matrix.platform }}
+          path: ${{ env.BINARY }}
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: kimchi-bridge-*
+          merge-multiple: true
+      # Kimchi's package, exactly as before: getkimchi/kimchi's bundle-bridge.sh downloads it.
+      - name: Package Kimchi's release
+        run: bash scripts/package.sh "$VERSION" dist
+      # The curl installer ships with the binaries it downloads.
+      - name: Assemble the standalone release
+        run: |
+          cd dist
+          sha256sum kimchi-bridge-darwin-arm64 kimchi-bridge-darwin-x64 kimchi-bridge-linux-arm64 kimchi-bridge-linux-x64 > checksums.txt
+          cp ../scripts/install-standalone.sh install.sh
+          ls -la
+      # A draft: publishing it, as the latest release, makes it live for the curl installer,
+      # kimchi-bridge update and Kimchi's build. A release made by hand keeps its files, above all
+      # the package whose SHA-256 Kimchi pins; only the missing ones are added.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$VERSION" > /dev/null 2>&1; then
+            have=$(gh release view "$VERSION" --json assets --jq '.assets[].name')
+            for file in dist/*; do
+              if grep -qxF "${file##*/}" <<< "$have"; then echo "Kept ${file##*/}"; else gh release upload "$VERSION" "$file"; fi
+            done
+          else
+            gh release create "$VERSION" dist/* --draft --verify-tag --title "$VERSION" --generate-notes
+          fi

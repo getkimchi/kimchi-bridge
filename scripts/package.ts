@@ -3,18 +3,16 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { parse, valid } from "semver";
-
-// The plugin each client's marketplace lists, from plugins/<plugin>/<client>.
-const plugin = "kimchi-work";
+import { marketName, marketplaceManifest, plugin, stub, type Client } from "../src/packaging.ts";
+import { writeAssets } from "./gen-assets.ts";
 
 export function releaseVersion(value: string): string {
   const text = value.startsWith("v") ? value.slice(1) : "",
@@ -31,16 +29,9 @@ export function releaseVersion(value: string): string {
   return value;
 }
 
-// Every plugin's bin/kimchi-bridge, and the user's command. Kimchi's runtime runs the code
-// the installer made current, without loading the project's .env or bunfig.toml. Without Kimchi
-// only a terminal gets the hint: Codex shows every hook's output in the session.
-export const shim = `#!/bin/sh
-prefix=\${KIMCHI_BRIDGE_PREFIX:-$HOME/.local/share/kimchi-bridge}
-[ -x "$prefix/runtime" ] || { [ ! -t 2 ] || echo 'kimchi-bridge: run the Kimchi installer.' >&2; exit 0; }
-exec env BUN_BE_BUN=1 "$prefix/runtime" --no-env-file --config=/dev/null "$prefix/current.mjs" "$@"
-`;
-
 export async function buildBundle(version: string, outfile: string) {
+  // The bundle carries the standalone installer's payload, generated from this checkout.
+  writeAssets(join(import.meta.dir, ".."));
   const result = await Bun.build({
     entrypoints: [join(import.meta.dir, "../src/cli.ts")],
     target: "bun",
@@ -49,13 +40,6 @@ export async function buildBundle(version: string, outfile: string) {
   });
   if (!result.success) throw new AggregateError(result.logs, "Bundle build failed");
   await Bun.write(outfile, result.outputs[0]!);
-}
-
-function files(dir: string): string[] {
-  return readdirSync(dir, { recursive: true, withFileTypes: true })
-    .filter((entry) => entry.isFile())
-    .map((entry) => join(entry.parentPath, entry.name))
-    .sort();
 }
 
 async function main() {
@@ -67,14 +51,7 @@ async function main() {
     stage = mkdtempSync(join(tmpdir(), "kimchi-bridge-package-"));
   // The archive's top folder becomes share/kimchi/bridge in Kimchi's release; mkdtemp makes it 0700.
   chmodSync(stage, 0o755);
-  // Clients key hook trust by marketplace, so each client's marketplace changes only when its
-  // own plugin wiring does: a release that changes only code needs no new registration or review.
-  const market = (client: string) => {
-    const wiring = createHash("sha256").update(shim);
-    for (const path of files(join(root, "plugins", plugin, client)))
-      wiring.update(relative(root, path)).update("\0").update(readFileSync(path));
-    return `kimchi-bridge-${wiring.digest("hex").slice(0, 12)}`;
-  };
+  const market = (client: Client) => marketName(root, client);
   try {
     for (const path of ["bin", "lib", "markets", ".claude-plugin", ".agents/plugins"])
       mkdirSync(join(stage, path), { recursive: true });
@@ -82,37 +59,17 @@ async function main() {
     cpSync(join(root, "plugins"), join(stage, "plugins"), { recursive: true });
     for (const bin of ["bin", `plugins/${plugin}/claude/bin`, `plugins/${plugin}/codex/bin`]) {
       mkdirSync(join(stage, bin), { recursive: true });
-      writeFileSync(join(stage, bin, "kimchi-bridge"), shim, { mode: 0o755 });
+      writeFileSync(join(stage, bin, "kimchi-bridge"), stub, { mode: 0o755 });
     }
     writeFileSync(
       join(stage, ".claude-plugin/marketplace.json"),
-      JSON.stringify({
-        name: market("claude"),
-        owner: { name: "Kimchi" },
-        plugins: [
-          {
-            name: plugin,
-            source: `./plugins/${plugin}/claude`,
-            description: "Quiet work accounting for official Claude Code",
-          },
-        ],
-      }) + "\n",
+      marketplaceManifest(root, "claude"),
     );
     writeFileSync(
       join(stage, ".agents/plugins/marketplace.json"),
-      JSON.stringify({
-        name: market("codex"),
-        plugins: [
-          {
-            name: plugin,
-            source: { source: "local", path: `./plugins/${plugin}/codex` },
-            policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
-            category: "Productivity",
-          },
-        ],
-      }) + "\n",
+      marketplaceManifest(root, "codex"),
     );
-    for (const client of ["claude", "codex"])
+    for (const client of ["claude", "codex"] as const)
       writeFileSync(join(stage, "markets", client), market(client) + "\n");
     writeFileSync(join(stage, "VERSION"), version + "\n");
     cpSync(join(root, "install.sh"), join(stage, "install.sh"));

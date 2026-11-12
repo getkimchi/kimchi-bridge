@@ -6,7 +6,7 @@ Kimchi plugins for other coding harnesses, run by the `kimchi-bridge` command. T
 
 ### Requirements
 
-- Kimchi, installed with its install script. The plugins run on Kimchi's runtime.
+- Kimchi, installed with its install script, or the standalone `kimchi-bridge` binary (see [Install without Kimchi](#install-without-kimchi)). The plugins run on Kimchi's runtime, or on the binary when Kimchi is not installed.
 - Claude Code (`claude`), Codex (`codex`) or both, in a version that supports plugins.
 - GitHub CLI (`gh`) signed in for repositories on GitHub, GitLab CLI (`glab`) signed in for repositories on GitLab.
 - For a self-hosted GitHub or GitLab, `GH_HOST` or `GITLAB_HOST` set to its host name.
@@ -22,9 +22,31 @@ curl -fsSL https://github.com/getkimchi/kimchi/releases/latest/download/install.
 
 Start a new Claude Code or Codex session. Codex first shows "Hooks need review"; choose to trust them. If you install Claude Code or Codex later, run Kimchi's installer again.
 
+### Install without Kimchi
+
+The standalone `kimchi-bridge` binary needs no Kimchi. Its installer downloads the binary for your machine from the latest release, checks it against the release's checksums and adds the plugins to each official client it finds:
+
+```sh
+curl -fsSL https://github.com/getkimchi/kimchi-bridge/releases/latest/download/install.sh | sh
+```
+
+To choose the clients, end the command with `sh -s -- claude`, `codex` or `both`. To install a given release, set `KIMCHI_BRIDGE_VERSION`, for example `KIMCHI_BRIDGE_VERSION=v0.2.0`. The binary goes to `~/.local/share/kimchi-bridge/bin` and the `kimchi-bridge` command to `~/.local/bin`; `KIMCHI_BRIDGE_PREFIX` and `KIMCHI_BRIDGE_BIN_DIR` move them.
+
+Sign in with `kimchi-bridge login` (see [Sign in](#sign-in)), then start a new Claude Code or Codex session. Codex asks you to trust the hooks. If you install Claude Code or Codex later, run `kimchi-bridge install claude` or `kimchi-bridge install codex`.
+
+If Kimchi is installed too, Kimchi keeps running and updating the plugins, and the binary only waits. If you remove Kimchi later, run `kimchi-bridge install both` once so the plugins run on the binary.
+
 ### Update
 
-Kimchi's releases include the plugins, and Kimchi updates the plugins it added when it updates itself. Open sessions switch to the new code with their next hook. Only an update that changes the plugins' hooks registers them again: open Codex sessions then stop recording until you start a new one, and Codex asks you to trust the new hooks.
+Kimchi's releases include the plugins, and Kimchi updates the plugins it added when it updates itself. Open sessions switch to the new code with their next hook. Only an update that changes the plugins' hooks registers them again: open Codex sessions then stop recording until you start a new one, and Codex asks you to trust the new hooks. The release that adds the standalone binary changes how the hooks start, so updating to it registers the plugins again once.
+
+Without Kimchi, update the binary and its plugins yourself:
+
+```sh
+kimchi-bridge update
+```
+
+Add a version, such as `kimchi-bridge update v0.2.0`, to install that release instead of the latest one. The update checks the download against the release's checksums before it replaces anything.
 
 ### Uninstall
 
@@ -41,13 +63,13 @@ Kimchi's releases include the plugins, and Kimchi updates the plugins it added w
    kimchi-bridge uninstall both
    ```
 
-Your local records and the plugin files stay in `~/.local/state/kimchi-bridge` and `~/.local/share/kimchi-bridge` until you delete them. Kimchi's updates leave removed plugins removed; running Kimchi's installer adds them again.
+Your local records and the plugin files stay in `~/.local/state/kimchi-bridge` and `~/.local/share/kimchi-bridge` until you delete them. Kimchi's updates leave removed plugins removed; running Kimchi's installer adds them again. Without Kimchi, also delete the binary and its command: `rm -r ~/.local/share/kimchi-bridge/bin ~/.local/bin/kimchi-bridge`.
 
 ## Use
 
 ### Sign in
 
-There is nothing to set up: the plugins report with your Kimchi sign-in. They use the API key in `KIMCHI_API_KEY` or `~/.config/kimchi/config.json`, or else your Kimchi SSO login, in Kimchi's region. To sign in or switch accounts, run `kimchi`.
+There is nothing to set up: the plugins report with your Kimchi sign-in. They use the API key in `KIMCHI_API_KEY` or `~/.config/kimchi/config.json`, or else your Kimchi SSO login, in Kimchi's region. To sign in or switch accounts, run `kimchi`. Without Kimchi, sign in with `kimchi-bridge login`, described below.
 
 **One sign-in serves both surfaces — routing is opt-in.** When you are signed into Kimchi (key or SSO), `kimchi-bridge login` has nothing to sign in for: it binds the existing Kimchi sign-in for reporting only and does NOT send Claude Code or Codex through the gateway. To route inference through Kimchi, opt in explicitly — during install, on an update that first ships the plugins, or anytime with `kimchi bridge setup` (or `kimchi-bridge gateway enable`; revert with `kimchi bridge disable` / `kimchi-bridge gateway disable`). The separate CAST AI browser sign-in remains available for users who don't sign in with the Kimchi CLI (it enables the gateway as part of that flow).
 
@@ -106,7 +128,7 @@ To continue the same work in another session, or in the other client, have the a
 
 ## How it works
 
-Claude Code and Codex hooks run the plugins' code on Kimchi's own runtime (`BUN_BE_BUN=1 kimchi`), without loading the project's `.env` or `bunfig.toml`. The code records the token usage of each model request, read from the client's transcripts, and each tool call with its outcome. It also keeps copies of the files each tool works on, from before and after the call. Commits the agent makes in its shell are recorded as Git makes them, through Git's trace variables: Claude Code gets them from a session hook, and Codex from a marked `[shell_environment_policy.set]` block that the installer adds to `~/.codex/config.toml` and removes on uninstall. Commits you make from the agent's edits are matched by their file changes. It then asks `gh` or `glab` which pull requests contain those commits: right after each commit, then less often as it ages, for up to 32 days. It doesn't change prompts or replies, and if recording fails, your session carries on.
+Claude Code and Codex hooks run the plugins' code on Kimchi's own runtime (`BUN_BE_BUN=1 kimchi`), or on the standalone binary when Kimchi is not installed. Neither loads the project's `.env` or `bunfig.toml`. The code records the token usage of each model request, read from the client's transcripts, and each tool call with its outcome. It also keeps copies of the files each tool works on, from before and after the call. Commits the agent makes in its shell are recorded as Git makes them, through Git's trace variables: Claude Code gets them from a session hook, and Codex from a marked `[shell_environment_policy.set]` block that the installer adds to `~/.codex/config.toml` and removes on uninstall. Commits you make from the agent's edits are matched by their file changes. It then asks `gh` or `glab` which pull requests contain those commits: right after each commit, then less often as it ages, for up to 32 days. It doesn't change prompts or replies, and if recording fails, your session carries on.
 
 Records are saved in SQLite databases under `~/.local/state/kimchi-bridge`, one for each account. The plugins keep no key: they read Kimchi's sign-in each time they upload. File copies never leave your machine. While recording is on, copies older than seven days are deleted.
 
@@ -207,3 +229,5 @@ Other records connect the request to the commit, or count what couldn't be measu
 ## Repository layout
 
 Shared code lives at the top of `src/`: the `kimchi-bridge` command in `cli.ts`, Kimchi's sign-in in `kimchi.ts`, local settings and session binding in `settings.ts`, and platform helpers in `platform.ts`. A plugin's code lives in its own folder under `src/`, and its Claude Code and Codex files in `plugins/<plugin>/claude/` and `plugins/<plugin>/codex/`. The `kimchi-work` plugin uses `src/work/` and `plugins/kimchi-work/`.
+
+The standalone binary carries the package that Kimchi's release ships: `pnpm gen` writes it to `.generated/install-assets.json`, and `pnpm test` and `pnpm typecheck` run `gen` first. `pnpm compile vX.Y.Z dist-bin/kimchi-bridge` builds the binary for this machine; a binary built without a version refuses to install. Pushing a `vX.Y.Z` or `vX.Y.Z-rc.N` tag runs `.github/workflows/release.yml`. It builds and signs the four binaries and drafts the release with them, their `checksums.txt`, the standalone `install.sh`, and Kimchi's `kimchi-bridge.tar.gz` and `SHA256SUMS`. The release goes live when you publish the draft.

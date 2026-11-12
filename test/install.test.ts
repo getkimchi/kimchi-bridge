@@ -87,6 +87,109 @@ exit 0
   return { root, pkg, env, prefix, calls, helper };
 }
 
+// A package as the kimchi-bridge binary extracts it: a marker instead of the bundle, and the
+// binary already in place for the package to activate through.
+function standaloneFixture(version: string, market: string) {
+  const root = temp(),
+    pkg = join(root, "package"),
+    fake = join(root, "fake-bin");
+  for (const path of [join(pkg, "markets"), fake]) mkdirSync(path, { recursive: true });
+  const script = readFileSync(installer, "utf8");
+  executable(join(pkg, "install.sh"), script);
+  executable(join(pkg, "bootstrap.sh"), script);
+  writeFileSync(join(pkg, "VERSION"), version + "\n");
+  writeFileSync(join(pkg, "standalone"), "1\n");
+  for (const cli of ["claude", "codex"]) writeFileSync(join(pkg, "markets", cli), market + "\n");
+  for (const cli of ["claude", "codex"])
+    executable(
+      join(fake, cli),
+      `#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_CALLS"
+exit 0
+`,
+    );
+  const env: Record<string, string> = {
+    ...environment(root, fake),
+    FAKE_CALLS: join(root, "calls"),
+  };
+  const prefix = env.KIMCHI_BRIDGE_PREFIX!;
+  mkdirSync(join(prefix, "installed"), { recursive: true });
+  mkdirSync(join(prefix, "bin"), { recursive: true });
+  executable(
+    join(prefix, "bin", "kimchi-bridge"),
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "${join(root, "helper-calls")}"
+`,
+  );
+  const calls = () =>
+    existsSync(env.FAKE_CALLS!) ? readFileSync(env.FAKE_CALLS!, "utf8").split("\n") : [];
+  const helper = () => readFileSync(join(root, "helper-calls"), "utf8");
+  return { root, pkg, env, prefix, calls, helper };
+}
+
+test("a standalone package registers through its own binary, with no Kimchi runtime", () => {
+  const { env, pkg, prefix, calls, helper } = standaloneFixture(
+    "v0.2.0",
+    "kimchi-bridge-0123456789ab",
+  );
+  const result = run(join(pkg, "install.sh"), ["install", "both"], env);
+  expect(result.status).toBe(0);
+  expect(result.output).toContain("Installed both v0.2.0");
+  expect(result.output).toContain("Sign in: kimchi-bridge login");
+  expect(result.output).toContain("kimchi-bridge update");
+  expect(readFileSync(join(prefix, "installed/claude"), "utf8")).toBe(
+    "kimchi-bridge-0123456789ab\n",
+  );
+  expect(readFileSync(join(prefix, "installed/codex"), "utf8")).toBe(
+    "kimchi-bridge-0123456789ab\n",
+  );
+  expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.2.0\n");
+  for (const cli of ["claude", "codex"] as const) {
+    const add =
+      cli === "claude"
+        ? "plugin install kimchi-work@kimchi-bridge-0123456789ab"
+        : "plugin add kimchi-work@kimchi-bridge-0123456789ab";
+    const flag = cli === "claude" ? "--scope user" : "--json";
+    expect(calls().filter((c) => c.startsWith(add + " ")).length).toBe(1);
+    expect(
+      calls().filter((c) => c.startsWith("plugin marketplace add ") && c.endsWith(flag)).length,
+    ).toBe(1);
+  }
+  // Activation ran through the standalone binary, not a linked command.
+  expect(helper().trim()).toBe("activate");
+  // Nothing on Kimchi's side was linked.
+  expect(existsSync(join(prefix, "runtime"))).toBe(false);
+  expect(existsSync(join(prefix, "current.mjs"))).toBe(false);
+  // The user's command points at the binary, never the stub.
+  expect(readlinkSync(join(env.KIMCHI_BRIDGE_BIN_DIR!, "kimchi-bridge"))).toBe(
+    join(prefix, "bin", "kimchi-bridge"),
+  );
+  expect(existsSync(join(prefix, "install.sh"))).toBe(true);
+  expect(existsSync(join(prefix, "releases/v0.2.0/standalone"))).toBe(true);
+});
+
+test("a standalone release that changes only code re-registers nothing", () => {
+  const { pkg, env, prefix, calls } = standaloneFixture("v0.3.0", "kimchi-bridge-0123456789ab");
+  for (const cli of ["claude", "codex"])
+    writeFileSync(join(prefix, "installed", cli), "kimchi-bridge-0123456789ab\n");
+  writeFileSync(join(prefix, "installed/code"), "v0.2.0\n");
+  const result = run(join(pkg, "install.sh"), ["update", "both"], env);
+  expect(result.status).toBe(0);
+  expect(result.output).toContain("claude plugin already registered");
+  expect(result.output).toContain("codex plugin already registered");
+  expect(calls()).toEqual([]);
+  expect(readFileSync(join(prefix, "installed/code"), "utf8")).toBe("v0.3.0\n");
+});
+
+test("the kept standalone bootstrap uninstalls", () => {
+  const { pkg, env, prefix, calls } = standaloneFixture("v0.2.0", "kimchi-bridge-0123456789ab");
+  expect(run(join(pkg, "install.sh"), ["install", "claude"], env).status).toBe(0);
+  const result = run(join(prefix, "install.sh"), ["uninstall", "claude"], env);
+  expect(result.status).toBe(0);
+  expect(calls()).toContain("plugin uninstall kimchi-work@kimchi-bridge-0123456789ab --scope user");
+  expect(existsSync(join(prefix, "installed/claude"))).toBe(false);
+});
+
 describe("a new wiring registers once and retries removing the old registration", () => {
   for (const cli of ["claude", "codex"] as const)
     test(cli, () => {
@@ -122,6 +225,29 @@ describe("a new wiring registers once and retries removing the old registration"
       expect(calls().filter((c) => c.startsWith(remove + " ")).length).toBe(2);
       expect(existsSync(join(prefix, "install.lock"))).toBe(false);
     });
+});
+
+test("Kimchi's package adds its bundle to a release the standalone binary installed", () => {
+  const { pkg, env, prefix } = fixture("v0.2.0", "kimchi-bridge-0123456789ab");
+  // The standalone install of the same version: its package, without the bundle.
+  const release = join(prefix, "releases/v0.2.0");
+  mkdirSync(join(release, "markets"), { recursive: true });
+  mkdirSync(join(release, "bin"), { recursive: true });
+  for (const file of [
+    "install.sh",
+    "bootstrap.sh",
+    "VERSION",
+    "markets/claude",
+    "markets/codex",
+    "bin/kimchi-bridge",
+  ])
+    executable(join(release, file), readFileSync(join(pkg, file), "utf8"));
+  writeFileSync(join(release, "standalone"), "1\n");
+  const result = run(join(pkg, "install.sh"), ["install", "both"], env);
+  expect(result.status).toBe(0);
+  expect(readlinkSync(join(prefix, "current.mjs"))).toBe(join(release, "lib/kimchi-bridge.mjs"));
+  expect(existsSync(join(prefix, "current.mjs"))).toBe(true);
+  expect(readlinkSync(join(prefix, "runtime"))).toBe(env.KIMCHI_BIN);
 });
 
 test("a release that changes only code relinks it without the clients' plugin managers", () => {
