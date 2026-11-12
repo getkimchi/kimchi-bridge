@@ -1,12 +1,11 @@
 import { isIssueKey } from "../issue-keys.ts";
+import type { PullRequestCost, RequestCostAllocation } from "./costs.ts";
 import { requestWorkLinks } from "./links.ts";
 import {
   isObject,
   isWorkId,
   isWorkScope,
   validTime,
-  type PullRequestAllocation,
-  type RequestAllocation,
   type SameAccount,
   type WorkAccount,
   type WorkRecord,
@@ -52,7 +51,7 @@ export function accountKey(account: WorkAccount): string {
 }
 
 function method(
-  request: RequestAllocation,
+  request: RequestCostAllocation,
   links: Map<string, WorkRecord>,
 ): ClaimAllocation["method"] {
   // An inferred local assignment stays inferred on the server, whatever evidence its segment or a link carries.
@@ -73,8 +72,8 @@ function method(
 
 /** Everything known about where one request's cost goes, before any upload bound. */
 export interface RequestAttribution<
-  Request extends RequestAllocation = RequestAllocation,
-  PullRequest extends PullRequestAllocation = PullRequestAllocation,
+  Request extends RequestCostAllocation = RequestCostAllocation,
+  PullRequest extends PullRequestCost = PullRequestCost,
 > {
   request: Request;
   candidates: PullRequest[];
@@ -89,8 +88,8 @@ export interface RequestAttribution<
 
 /** Full local attribution of each request of the report: its candidate PRs, their repositories and its correction. */
 export function requestAttributions<
-  Request extends RequestAllocation,
-  PullRequest extends PullRequestAllocation,
+  Request extends RequestCostAllocation,
+  PullRequest extends PullRequestCost,
 >(
   records: WorkRecord[],
   report: { requests: Request[]; pullRequests: PullRequest[] },

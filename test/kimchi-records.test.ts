@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import { allocationFor, requestAttributions } from "../src/work/kimchi/attribution.ts";
+import type { PullRequestCost, RequestCostAllocation } from "../src/work/kimchi/costs.ts";
 import { requestWorkLinks } from "../src/work/kimchi/links.ts";
 import {
   isSha256Hex,
   isWorkId,
   time,
   validTime,
-  type RequestAllocation,
   type SameAccount,
   type WorkRecord,
 } from "../src/work/kimchi/records.ts";
@@ -188,26 +188,41 @@ test("the harness confirms a continued plan's producing input only with its requ
   expect(unresolved({ segmentId: SEGMENT })).toBe(true);
 });
 
-const allocation = (extra: Partial<RequestAllocation> = {}): RequestAllocation => ({
+const allocation = (extra: Partial<RequestCostAllocation> = {}): RequestCostAllocation => ({
   requestId: REQUEST,
   account,
+  workIds: [PLANNING],
+  sessionIds: ["session"],
+  startedAt: "2026-10-20T10:00:00Z",
   pullRequestIds: ["github:github.com/acme/repo#7"],
   allocation: "pull-request",
   billingRecordIds: [],
+  priceStatus: "missing",
+  knownCostUsd: "0.000000000",
+  totalCostUsd: null,
   ...extra,
 });
-const pullRequest = (number: number, extra: object = {}) => ({
+const total = { requestIds: [], knownCostUsd: "0.000000000", totalCostUsd: null };
+const pullRequest = (number: number, extra: object = {}): PullRequestCost => ({
+  ...total,
+  explicit: total,
+  inferred: total,
   key: `github:github.com/acme/repo#${number}`,
   account,
+  workIds: [],
+  sharedRequestIds: [],
+  inferredRequestIds: [],
+  unknownRequestIds: [],
   pullRequest: {
-    provider: "github" as const,
+    provider: "github",
     id: String(2_000_000_000 + number),
     repositoryId: "42",
     url: `https://github.com/acme/repo/pull/${number}`,
     number,
-    state: "merged" as const,
+    state: "merged",
     repository: "acme/repo",
     host: "github.com",
+    headSha: "a".repeat(40),
     mergeCommitSha: null,
     mergedAt: null,
     closedAt: null,
@@ -215,7 +230,11 @@ const pullRequest = (number: number, extra: object = {}) => ({
     ...extra,
   },
 });
-const attribute = (requests: RequestAllocation[], records: WorkRecord[] = history, same = exact) =>
+const attribute = (
+  requests: RequestCostAllocation[],
+  records: WorkRecord[] = history,
+  same = exact,
+) =>
   requestAttributions(
     records,
     { requests, pullRequests: [pullRequest(7), pullRequest(8)] },
@@ -295,7 +314,7 @@ test("issue keys come from the request's own records, and bills only from a veri
 
 test("the uploaded allocation is unknown whenever the PRs it names are not all identified", () => {
   const two = ["github:github.com/acme/repo#7", "github:github.com/acme/repo#8"];
-  const kind = (request: RequestAllocation, ids: string[]) =>
+  const kind = (request: RequestCostAllocation, ids: string[]) =>
     allocationFor(attribute([request]), ids).kind;
   expect(allocationFor(attribute([allocation()]), ["2000000007"])).toEqual({
     kind: "pull-request",

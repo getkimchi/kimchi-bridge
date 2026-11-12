@@ -6,6 +6,7 @@
   "exports": {
     "./work/issue-keys": "./src/work/issue-keys.ts",
     "./work/kimchi/attribution": "./src/work/kimchi/attribution.ts",
+    "./work/kimchi/costs": "./src/work/kimchi/costs.ts",
     "./work/kimchi/events": "./src/work/kimchi/events.ts",
     "./work/kimchi/links": "./src/work/kimchi/links.ts",
     "./work/kimchi/native": "./src/work/kimchi/native.ts",

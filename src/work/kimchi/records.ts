@@ -42,54 +42,27 @@ export interface StoredRecord {
 }
 
 /** A pull or merge request as the harness last saw it at its provider. */
-export interface ReportedPullRequest {
+export interface WorkPullRequest {
   provider?: "github" | "gitlab";
   /** Provider IDs belong to the target repository, including fork contributions. */
   id?: string;
   repositoryId?: string;
   url: string;
   number: number;
+  /** The provider's title, cut to 1,024 characters. Display metadata for uploads only; older links omit it. */
   title?: string;
+  /** The author's login: GitHub `user.login`, GitLab `author.username`. Like `title`, uploaded only. */
   author?: string;
+  /** The Jira keys the PR's head branch names, at most 20; the branch name itself is not kept. Uploaded only. */
   branchIssueKeys?: string[];
   state: "open" | "closed" | "merged";
   repository: string;
   host: string;
+  headSha: string;
   mergeCommitSha: string | null;
   mergedAt: string | null;
   closedAt: string | null;
   checkedAt: string;
-}
-/** Where the harness's calculator put one request. */
-export interface RequestAllocation {
-  requestId: string;
-  /** Account captured with the request's work; null when missing or contradictory. */
-  account: WorkAccount | null;
-  pullRequestIds: string[];
-  allocation:
-    | "pull-request"
-    | "inferred"
-    | "shared"
-    | "unlinked"
-    | "unmerged"
-    | "post-merge"
-    | "unknown";
-  reason?: string;
-  segment?: WorkSegment;
-  linkIds?: string[];
-  billingRecordIds: string[];
-}
-/** A pull request of the report: its canonical key and what the provider said about it. */
-export interface PullRequestAllocation {
-  key: string;
-  account: WorkAccount | null;
-  /** Null when provider metadata is unusable or equally recent observations disagree. */
-  pullRequest: ReportedPullRequest | null;
-}
-/** The part of the harness's cost report the event builder reads. */
-export interface CostReport {
-  pullRequests: PullRequestAllocation[];
-  requests: RequestAllocation[];
 }
 
 export function isObject(value: unknown): value is Record<string, unknown> {
@@ -209,4 +182,77 @@ export function pullRequestAuthor(value: unknown): string | undefined {
   return typeof value === "string" && value && Array.from(value).length <= MAX_AUTHOR_CHARACTERS
     ? value
     : undefined;
+}
+
+/** A Git object name, SHA-1 or SHA-256, in either case. */
+export function isGitHash(value: string): boolean {
+  return (value.length === 40 || value.length === 64) && hex(value.toLowerCase());
+}
+
+/** A provider's numeric ID as text: a positive integer of at most 20 digits. */
+export function providerId(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return String(value);
+  if (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 20 &&
+    value[0] !== "0" &&
+    Array.from(value).every(digit)
+  )
+    return value;
+}
+
+const pathCharacter = (character: string) =>
+  digit(character) ||
+  (character >= "a" && character <= "z") ||
+  (character >= "A" && character <= "Z") ||
+  character === "_" ||
+  character === "." ||
+  character === "-";
+/** A repository's path at its provider: owner/name on GitHub, any depth of groups on GitLab. */
+export function repositoryPath(value: unknown, provider?: "github" | "gitlab"): value is string {
+  if (typeof value !== "string") return false;
+  const segments = value.split("/");
+  return (
+    segments.length >= 2 &&
+    (provider !== "github" || segments.length === 2) &&
+    segments.every(
+      (segment) =>
+        segment.length > 0 &&
+        Array.from(segment).every(pathCharacter) &&
+        segment !== "." &&
+        segment !== "..",
+    )
+  );
+}
+
+/** A URL with an allowed protocol and no credentials, query or fragment; otherwise undefined. */
+export function plainURL(
+  value: unknown,
+  protocols: readonly string[] = ["https:"],
+): URL | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    const url = new URL(value);
+    if (
+      protocols.includes(url.protocol) &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    )
+      return url;
+  } catch {}
+  return undefined;
+}
+
+/** A PR's identity across observations: its provider ID where one is known, else its URL. */
+export function pullRequestKey(pr: {
+  provider?: unknown;
+  host?: unknown;
+  id?: unknown;
+  url?: unknown;
+}): string {
+  const id = typeof pr.id === "string" && typeof pr.host === "string" ? pr.id : pr.url;
+  return JSON.stringify([pr.provider ?? "github", pr.host, id]);
 }

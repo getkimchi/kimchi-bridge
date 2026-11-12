@@ -20,6 +20,7 @@ import {
   requestAttributions,
   type RepositoryIdentity,
 } from "./attribution.ts";
+import type { PullRequestCostReport } from "./costs.ts";
 import { nativeObservations } from "./native.ts";
 import {
   isObject,
@@ -30,7 +31,6 @@ import {
   pullRequestTitle,
   sameScope,
   validTime,
-  type CostReport,
   type SameAccount,
   type StoredRecord,
   type WorkAccount,
@@ -70,7 +70,7 @@ export function buildEvents({
   touched,
 }: {
   stored: readonly StoredRecord[];
-  report: CostReport;
+  report: PullRequestCostReport;
   /** Each local repository's provider identity, by the path the records name it with. */
   repositories: Map<string, RepositoryIdentity>;
   /** This installation's ID: the device every event names, and part of each entity's identity. */
