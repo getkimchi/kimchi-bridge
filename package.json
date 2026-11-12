@@ -4,6 +4,12 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./work/issue-keys": "./src/work/issue-keys.ts",
+    "./work/kimchi/attribution": "./src/work/kimchi/attribution.ts",
+    "./work/kimchi/events": "./src/work/kimchi/events.ts",
+    "./work/kimchi/links": "./src/work/kimchi/links.ts",
+    "./work/kimchi/native": "./src/work/kimchi/native.ts",
+    "./work/kimchi/records": "./src/work/kimchi/records.ts",
     "./work/outbox": "./src/work/outbox.ts",
     "./work/protocol": "./src/work/protocol.ts"
   },
