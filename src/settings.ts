@@ -34,6 +34,10 @@ export interface Config {
   otlpUrl?: string;
   otlpHeaders?: Record<string, string>;
   disabled?: boolean;
+  /** KIMCHI_REMOTE_ENDPOINT as an admin set it at install, for sessions started without it. */
+  remoteEndpoint?: string;
+  /** The reporting endpoint the organization set in Kimchi's settings, read at activate. */
+  orgEndpoint?: string;
   /** A sign-in that failed to verify, and when it may be tried again (milliseconds since epoch). */
   verifyRetry?: { credentialHash: string; at: number; failures: number; rejected: boolean };
 }
@@ -139,7 +143,7 @@ export function decodeOtlp(data: string | Uint8Array): Pick<Config, "otlpUrl" | 
   } catch {
     throw new Error("invalid configuration JSON");
   }
-  if (["apiUrl", "apiKey", "api_key", "accessToken"].some((key) => key in c))
+  if (["apiUrl", "remoteEndpoint", "apiKey", "api_key", "accessToken"].some((key) => key in c))
     throw new Error("the plugins report with Kimchi's sign-in; configure sets OTLP export only");
   const otlp = { otlpUrl: c.otlpUrl, otlpHeaders: c.otlpHeaders } as Config;
   validateOtlp(otlp);

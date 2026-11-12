@@ -173,7 +173,7 @@ test("next sync retries the original offline batch and recovers late usage exact
   }
 });
 
-test("configure sets only OTLP export, keeps the disable state, and refuses keys", async () => {
+test("configure sets only OTLP export, keeps the disable state, and refuses keys and endpoints", async () => {
   saveConfig({ disabled: true });
   let output = "";
   const exporter = {
@@ -190,6 +190,10 @@ test("configure sets only OTLP export, keeps the disable state, and refuses keys
   expect(output).toBe("OTLP export configured.\n");
   await expect(
     cli(["configure"], stdin({ apiUrl: "https://app.kimchi.dev/api", apiKey: "synthetic-key" })),
+  ).rejects.toThrow("Kimchi's sign-in");
+  // Only the installer's activate saves the upload endpoint.
+  await expect(
+    cli(["configure"], stdin({ remoteEndpoint: "https://proxy.example/kimchi" })),
   ).rejects.toThrow("Kimchi's sign-in");
   await expect(cli(["frobnicate"])).rejects.toThrow("unknown command");
 });
