@@ -7,7 +7,8 @@ import {
   type SignIn,
 } from "../kimchi.ts";
 import { validateConfig, type Config } from "../settings.ts";
-import { bodyText, type Store } from "./ledger.ts";
+import { bodyText, DEAD_LETTER_AFTER_FAILED_ATTEMPTS, type Store } from "./ledger.ts";
+export { DEAD_LETTER_AFTER_FAILED_ATTEMPTS };
 import {
   canonicalHash,
   encodeBatch,
@@ -52,6 +53,11 @@ export async function flush(
   }
   if (response.status === 413) {
     await response.body?.cancel().catch(() => {});
+    // A lone record that exceeds the payload limit can never fit any batch: park it out of the queue.
+    if (batch.events.length === 1) {
+      s.blockOversize(batch);
+      return true;
+    }
     s.diagnostic("upload_payload_split");
     s.splitBatch(batch);
     return true;
@@ -66,6 +72,11 @@ export async function flush(
   if (response.status !== 200) {
     await response.body?.cancel().catch(() => {});
     s.diagnostic(`upload_http_${response.status}`);
+    // Network errors never count: only deterministic HTTP failures can park a batch this way.
+    if (s.recordBatchFailure(batch) >= DEAD_LETTER_AFTER_FAILED_ATTEMPTS) {
+      s.deadLetter(batch);
+      return true;
+    }
     throw new Error(`reporting returned HTTP ${response.status}; batch retained`);
   }
   let ack: Acknowledgement;
@@ -84,9 +95,12 @@ export async function flushOtlp(s: Store, c: Config, signal?: AbortSignal): Prom
   const target = canonicalHash([c.otlpUrl, c.otlpHeaders ?? null]);
   const rows = s.db
     .query(
-      "SELECT id,body FROM events e WHERE NOT EXISTS(SELECT 1 FROM export_receipts r WHERE r.target=? AND r.event_id=e.id) ORDER BY e.created_at,e.rowid LIMIT 100",
+      `SELECT id,body FROM events e WHERE NOT EXISTS(SELECT 1 FROM export_receipts r WHERE r.target=? AND r.event_id=e.id) AND NOT EXISTS(SELECT 1 FROM export_failures f WHERE f.target=? AND f.event_id=e.id AND f.attempts>=?) ORDER BY e.created_at,e.rowid LIMIT 100`,
     )
-    .all(target) as { id: string; body: Uint8Array | string }[];
+    .all(target, target, DEAD_LETTER_AFTER_FAILED_ATTEMPTS) as {
+    id: string;
+    body: Uint8Array | string;
+  }[];
   if (!rows.length) return false;
   const records = rows.map(({ id, body }) => {
     const text = bodyText(body);
@@ -127,6 +141,13 @@ export async function flushOtlp(s: Store, c: Config, signal?: AbortSignal): Prom
   }
   if (response.status !== 200) {
     await response.body?.cancel().catch(() => {});
+    if (
+      s.recordExportFailures(
+        target,
+        rows.map((r) => r.id),
+      ) > 0
+    )
+      s.diagnostic("otlp_deadletter");
     throw new Error(`OTLP returned HTTP ${response.status}; records retained`);
   }
   let result: { partialSuccess?: { rejectedLogRecords?: unknown } };
@@ -137,8 +158,17 @@ export async function flushOtlp(s: Store, c: Config, signal?: AbortSignal): Prom
     throw new Error("invalid OTLP response");
   }
   const rejected = result?.partialSuccess?.rejectedLogRecords;
-  if (rejected !== undefined && String(rejected) !== "0")
+  if (rejected !== undefined && String(rejected) !== "0") {
+    // The response names only a rejected count, so the whole window serves the leash.
+    if (
+      s.recordExportFailures(
+        target,
+        rows.map((r) => r.id),
+      ) > 0
+    )
+      s.diagnostic("otlp_deadletter");
     throw new Error("OTLP partially rejected records; batch retained");
+  }
   s.db.transaction(() => {
     const insert = s.db.query("INSERT OR IGNORE INTO export_receipts(target,event_id) VALUES(?,?)");
     for (const { id } of rows) insert.run(target, id);
