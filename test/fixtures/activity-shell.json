@@ -1,0 +1,10 @@
+{
+  "stage": "PostToolUse",
+  "session_id": "session-7",
+  "cwd": "/workspace/repo",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "toolu_bash_001",
+  "tool_input": { "command": "git status --short" },
+  "tool_response": "Exit code: 0\n M src/auth.ts\n"
+}
