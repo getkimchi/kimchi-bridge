@@ -29,6 +29,8 @@ import {
   type RegionId,
 } from "./oauth.ts";
 import { Recorder, type Native } from "./work/capture.ts";
+import { workspaceActivityEnabled } from "./work/workspace.ts";
+import { workspaceCommand } from "./work/workspace-command.ts";
 import { claudeTraceEnv, codexTraceConfig } from "./work/commits.ts";
 import { flush, flushOtlp } from "./work/delivery.ts";
 import { Store } from "./work/ledger.ts";
@@ -434,6 +436,13 @@ export async function run(
     return;
   }
   if (command === "hook" && c.disabled) return;
+  if (["hook", "flush", "status"].includes(command) && workspaceActivityEnabled()) {
+    await workspaceCommand(command, args, {
+      readHookInput: () => input(4 << 20),
+      output,
+    });
+    return;
+  }
   const k = command === "flush" || command === "status" ? signIn() : { apiUrl: "" };
   if (command === "flush") {
     if (!k.token) throw new Error("sign in to Kimchi to report; local records retained");

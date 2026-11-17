@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   TOOL_ACTIVITY_LIMITS,
   activityAction,
@@ -269,6 +271,56 @@ test("a truncated mid-UTF-8-prefix is valid UTF-8 and explicitly incomplete", ()
   );
   expect(Number(payload.capturedBytes)).toBeLessThanOrEqual(TOOL_ACTIVITY_LIMITS.maxPayloadBytes);
   expect(payload.capturedBytes).toBe(String(Buffer.byteLength(payload.data)));
+});
+
+test("live Claude Code hooks replay into valid linked shell and file events", () => {
+  const events = readFileSync(join(import.meta.dir, "fixtures/claude-code-hooks.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  for (let index = 0; index < events.length; index += 2) {
+    const before = activityAction({
+      source: "claude-code",
+      stage: events[index].hook_event_name,
+      event: events[index],
+      sessionId: events[index].session_id,
+      cwd: events[index].cwd,
+      eventId: events[index].tool_use_id,
+      occurredAt: "2026-11-16T10:15:02.000Z",
+    });
+    const observation = activityObservation(before, {
+      source: "claude-code",
+      stage: events[index + 1].hook_event_name,
+      event: events[index + 1],
+      sessionId: events[index].session_id,
+      cwd: events[index].cwd,
+      occurredAt: new Date(
+        Date.parse(before.occurredAt) + events[index + 1].duration_ms,
+      ).toISOString(),
+    });
+    expect(observation.trajectoryId).toBe("6c12b7f3-bcff-44e8-a6b7-b183bfb88181");
+    expect(observation.causality?.causationId).toBe(before.eventId);
+    if (events[index].tool_name === "Bash") {
+      expect(observation.observation.shellCommandOutput).toMatchObject({
+        callId: "toolu_mock_bash_001",
+        stdout: "/workspace/repo",
+        stderr: "",
+        outcome: "OUTCOME_COMPLETED",
+        durationMs: "60",
+      });
+      expect(observation.observation.shellCommandOutput?.exitCode).toBeUndefined();
+    } else {
+      expect(observation.observation.fileOperationResult).toMatchObject({
+        callId: "toolu_mock_read_001",
+        success: true,
+        path: "/workspace/repo/fixture.txt",
+        content: "activity-test: harmless synthetic value\n",
+        outcome: "OUTCOME_COMPLETED",
+        durationMs: "6",
+      });
+    }
+    expect(validateActivityEvent(observation)).toEqual([]);
+  }
 });
 
 test("causation and ToolCall integrity validation reject mismatched invocation/input IDs", () => {

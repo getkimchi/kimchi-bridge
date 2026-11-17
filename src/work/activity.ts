@@ -148,8 +148,16 @@ type EventHeader = {
     parentId?: string;
   };
 };
-export type WorkspaceActionEvent = EventHeader & { action: Action };
-export type WorkspaceObservationEvent = EventHeader & { observation: Observation };
+export type WorkspaceActionEvent = EventHeader & {
+  action: Action;
+  observation?: never;
+  control?: never;
+};
+export type WorkspaceObservationEvent = EventHeader & {
+  observation: Observation;
+  action?: never;
+  control?: never;
+};
 export type WorkspaceActivityEvent = WorkspaceActionEvent | WorkspaceObservationEvent;
 
 const sha256 = (data: string) => createHash("sha256").update(data).digest("hex");
@@ -209,6 +217,20 @@ function integerField(body: unknown, keys: string[]): number | undefined {
   }
   return undefined;
 }
+function documentedExitPrefix(output: string): { code: number; stdout: string } | undefined {
+  const prefix = "Exit code: ";
+  if (!output.startsWith(prefix)) return;
+  const newline = output.indexOf("\n");
+  if (newline < prefix.length) return;
+  let token = output.slice(prefix.length, newline);
+  if (token.endsWith("\r")) token = token.slice(0, -1);
+  const digits = token.startsWith("-") ? token.slice(1) : token;
+  if (!digits) return;
+  for (const char of digits) if (char < "0" || char > "9") return;
+  const code = integerField({ value: Number(token) }, ["value"]);
+  return code === undefined ? undefined : { code, stdout: output.slice(newline + 1) };
+}
+
 function rawResponse(event: Record<string, any>): { present: boolean; value: unknown } {
   if (event.tool_response == null) return { present: false, value: undefined };
   return { present: true, value: event.tool_response };
@@ -456,10 +478,10 @@ function specializedObservation(
     let stdout: unknown, stderr: unknown, exitCode: number | undefined;
     if (typeof value === "string") {
       stdout = value;
-      const match = /^Exit code: (-?\d+)\r?\n([\s\S]*)$/.exec(value);
+      const match = documentedExitPrefix(value);
       if (match) {
-        exitCode = Number(match[1]);
-        stdout = match[2];
+        exitCode = match.code;
+        stdout = match.stdout;
       }
     } else if (value && typeof value === "object" && !Array.isArray(value)) {
       stdout = value.stdout;
@@ -492,7 +514,20 @@ function specializedObservation(
     return undefined;
   }
   let content: unknown;
-  if (typeof value === "string") content = value;
+  let path = action.fileOperation.path;
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    value.file &&
+    typeof value.file === "object"
+  ) {
+    // Claude Code's Read tool returns {type:"text", file:{filePath,content,...}}.
+    const reportedPath = firstField(value.file, ["filePath", "path"]);
+    if (reportedPath && Buffer.byteLength(reportedPath) <= TOOL_ACTIVITY_LIMITS.maxMetadataBytes)
+      path = reportedPath;
+    content = firstField(value.file, ["content"]);
+  } else if (typeof value === "string") content = value;
   else content = firstField(value, ["content", "output", "stdout", "text"]);
   if (content !== undefined && typeof content !== "string") return undefined;
   if (
@@ -504,7 +539,7 @@ function specializedObservation(
     fileOperationResult: {
       ...base,
       success: !failed,
-      path: action.fileOperation.path,
+      path,
       ...(content !== undefined ? { content } : {}),
       ...(responseError(input) ? { error: responseError(input) } : {}),
     },
