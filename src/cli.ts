@@ -107,7 +107,8 @@ export async function run(
     process.stdout.write(text);
   },
 ): Promise<void> {
-  const environmentKey = process.env.KIMCHI_API_KEY;
+  const workspace = workspaceActivityEnabled();
+  const environmentKey = workspace ? "" : process.env.KIMCHI_API_KEY;
   delete process.env.KIMCHI_API_KEY;
   // Kimchi's runtime switch must not reach the git, gh and glab this starts.
   delete process.env.BUN_BE_BUN;
@@ -115,6 +116,7 @@ export async function run(
     process.env.KIMCHI_BRIDGE_PREFIX || join(homedir(), ".local", "share", "kimchi-bridge");
   // Unreadable Kimchi settings mean no sign-in: local recording continues, uploads wait.
   const signIn = (): SignIn => {
+    if (workspace) return { apiUrl: "" };
     try {
       return resolveSignIn(environmentKey);
     } catch {
@@ -126,6 +128,12 @@ export async function run(
       "usage: kimchi-bridge status | login | install claude|codex|both | update [vX.Y.Z] | uninstall claude|codex|both | enable | disable | flush | export jsonl|csv | gateway start|run|ensure|stop|status|enable|disable | version",
     );
   const command = args[0];
+  // The workspace profile is capture-only. Legacy routing, sign-in and Git tracing
+  // are intentionally inert, including calls from the installed hook manifests.
+  if (workspace && ["gateway", "hint", "trace-env", "activate", "codex-trace"].includes(command))
+    return;
+  if (workspace && command === "login")
+    throw new Error("workspace activity capture does not use Kimchi sign-in");
   if (command === "version") {
     output(version + "\n");
     return;
@@ -425,10 +433,19 @@ export async function run(
     process.once("SIGTERM", cancel);
     process.once("SIGINT", cancel);
     try {
-      // An expired OAuth bearer is refreshed before its sign-in is read.
-      const { ensureFresh } = await import("./oauth.ts");
-      await ensureFresh(controller.signal).catch(() => {});
-      await sync(signIn(), controller.signal);
+      if (workspace) {
+        await workspaceCommand(
+          "sync",
+          [],
+          { readHookInput: () => stdin(4 << 20), output },
+          controller.signal,
+        );
+      } else {
+        // An expired OAuth bearer is refreshed before its sign-in is read.
+        const { ensureFresh } = await import("./oauth.ts");
+        await ensureFresh(controller.signal).catch(() => {});
+        await sync(signIn(), controller.signal);
+      }
     } finally {
       process.off("SIGTERM", cancel);
       process.off("SIGINT", cancel);
@@ -436,9 +453,9 @@ export async function run(
     return;
   }
   if (command === "hook" && c.disabled) return;
-  if (["hook", "flush", "status"].includes(command) && workspaceActivityEnabled()) {
+  if (["hook", "flush", "status"].includes(command) && workspace) {
     await workspaceCommand(command, args, {
-      readHookInput: () => input(4 << 20),
+      readHookInput: () => stdin(4 << 20),
       output,
     });
     return;

@@ -1,5 +1,6 @@
 import type { Native } from "./capture.ts";
 import { ActivityStore } from "./activity-store.ts";
+import { loadConfig } from "../settings.ts";
 import { flushAllActivities } from "./activity-delivery.ts";
 import { parseJson } from "./protocol.ts";
 import { workspaceActivityState, workspaceActivityURL } from "./workspace.ts";
@@ -14,11 +15,13 @@ export async function workspaceCommand(
   command: string,
   args: string[],
   io: WorkspaceIO,
+  signal?: AbortSignal,
 ): Promise<void> {
   const store = new ActivityStore(workspaceActivityState());
   try {
     switch (command) {
       case "hook": {
+        store.pruneIfDue();
         if (args.length !== 2 || !["claude-code", "codex"].includes(args[1]))
           throw new Error("missing hook source");
         let data: Buffer;
@@ -43,15 +46,32 @@ export async function workspaceCommand(
           return;
         }
         try {
-          await flushAllActivities(store, workspaceActivityURL(), AbortSignal.timeout(1500));
+          await flushAllActivities(
+            store,
+            workspaceActivityURL(),
+            signal
+              ? AbortSignal.any([signal, AbortSignal.timeout(1500)])
+              : AbortSignal.timeout(1500),
+          );
         } catch {
           store.diagnostic("activity_delivery_pending");
         }
         return;
       }
       case "flush": {
-        await flushAllActivities(store, workspaceActivityURL());
+        store.pruneIfDue();
+        await flushAllActivities(store, workspaceActivityURL(), signal);
         io.output("All pending activity records acknowledged.\n");
+        return;
+      }
+      case "sync": {
+        store.pruneIfDue();
+        if (loadConfig().disabled) return;
+        try {
+          await flushAllActivities(store, workspaceActivityURL(), signal);
+        } catch {
+          store.diagnostic("activity_delivery_pending");
+        }
         return;
       }
       case "status": {

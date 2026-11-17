@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
-import { stringifyJson } from "./protocol.ts";
+import { integer, stringifyJson } from "./protocol.ts";
 
 export const TOOL_ACTIVITY_LIMITS = {
   maxPayloadBytes: 64 << 10,
@@ -193,7 +193,12 @@ function callIdentity(event: Record<string, any>): { tool: string; callId: strin
   };
 }
 function inputBody(event: Record<string, any>): unknown {
-  return event.tool_input === undefined ? event : event.tool_input;
+  if (event != null && event.tool_input !== undefined) return event.tool_input;
+  // Flat harness events combine request arguments with after-hook metadata.
+  // Do not let response/stage/timing fields change invocation identity or args.
+  if (event == null || typeof event !== "object" || Array.isArray(event)) return event;
+  const { tool_response, duration_ms, durationMs, hook_event_name, stage, ...projection } = event;
+  return projection;
 }
 function firstField(body: unknown, keys: string[]): string {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "";
@@ -206,14 +211,8 @@ function firstField(body: unknown, keys: string[]): string {
 function integerField(body: unknown, keys: string[]): number | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
   for (const key of keys) {
-    const value = (body as any)[key];
-    if (
-      typeof value === "number" &&
-      Number.isInteger(value) &&
-      value >= -2147483648 &&
-      value <= 2147483647
-    )
-      return value;
+    const value = integer((body as any)[key]);
+    if (value !== undefined && value >= -2147483648 && value <= 2147483647) return value;
   }
   return undefined;
 }
@@ -231,9 +230,20 @@ function documentedExitPrefix(output: string): { code: number; stdout: string } 
   return code === undefined ? undefined : { code, stdout: output.slice(newline + 1) };
 }
 
-function rawResponse(event: Record<string, any>): { present: boolean; value: unknown } {
-  if (event.tool_response == null) return { present: false, value: undefined };
-  return { present: true, value: event.tool_response };
+function rawResponse(input: ActivityInput): { present: boolean; value: unknown } {
+  const event = nativeBody(input);
+  if (event.tool_response != null) return { present: true, value: event.tool_response };
+  if (input.result == null) return { present: false, value: undefined };
+  // The mod passes the next(e) result separately from the native event. Its
+  // `result` field is the actual tool payload when that envelope is present.
+  const result = input.result.result !== undefined ? input.result.result : input.result;
+  if (result == null) return { present: false, value: undefined };
+  if (typeof result === "object" && !Array.isArray(result)) {
+    // Capture metadata is used for phase timing; it is not tool output itself.
+    const { durationMs, duration_ms, ...payload } = result as Record<string, any>;
+    return { present: true, value: payload };
+  }
+  return { present: true, value: result };
 }
 function eventFailure(input: ActivityInput): boolean {
   return (
@@ -242,12 +252,29 @@ function eventFailure(input: ActivityInput): boolean {
     (typeof input.result?.deny === "string" && !!input.result.deny)
   );
 }
+function outcome(input: ActivityInput): ToolOutcome {
+  const response = rawResponse(input).value;
+  const interrupted =
+    input.result?.interrupted === true ||
+    (response &&
+      typeof response === "object" &&
+      !Array.isArray(response) &&
+      (response as Record<string, any>).interrupted === true);
+  // An explicit interruption signal is stronger than the transport's phase.
+  if (interrupted) return "OUTCOME_INTERRUPTED";
+  return eventFailure(input) ? "OUTCOME_FAILED" : "OUTCOME_COMPLETED";
+}
 function errorText(response: unknown): string | undefined {
   if (!response || typeof response !== "object" || Array.isArray(response)) return undefined;
   const value = (response as any).error;
-  return typeof value === "string" && value.length
-    ? boundedText(value, TOOL_ACTIVITY_LIMITS.maxMetadataBytes)
-    : undefined;
+  if (typeof value !== "string" || !value.length) return undefined;
+  // A long provider/compiler error stays in bounded ToolPayload.output rather
+  // than rejecting the entire result. Do not pretend a short prefix is a full error.
+  return Buffer.byteLength(value) <= TOOL_ACTIVITY_LIMITS.maxMetadataBytes ? value : undefined;
+}
+function hasOnlyFields(value: unknown, fields: string[]): boolean {
+  if (value == null || typeof value !== "object") return true;
+  return !Array.isArray(value) && Object.keys(value).every((key) => fields.includes(key));
 }
 
 function header(input: ActivityInput): EventHeader {
@@ -429,15 +456,15 @@ function genericObservation(
   input: ActivityInput,
 ): { toolOutput: GenericToolOutput } {
   const id = actionCallId(action.action);
-  const response = rawResponse(nativeBody(input));
-  const failed = eventFailure(input);
+  const response = rawResponse(input);
+  const result = outcome(input);
   return {
     toolOutput: {
       callId: id,
-      success: !failed,
+      success: result === "OUTCOME_COMPLETED",
       ...(response.present ? { output: contentPayload(response.value) } : {}),
       ...(responseError(input) ? { error: responseError(input) } : {}),
-      outcome: failed ? "OUTCOME_FAILED" : "OUTCOME_COMPLETED",
+      outcome: result,
       ...duration(action.occurredAt, input.occurredAt),
     },
   };
@@ -463,12 +490,12 @@ function specializedObservation(
   input: ActivityInput,
 ): Observation | undefined {
   if (!action.shellCommand && !action.webFetch && !action.fileOperation) return undefined;
-  const response = rawResponse(nativeBody(input));
+  const response = rawResponse(input);
   const value = response.value as any;
-  const failed = eventFailure(input);
+  const result = outcome(input);
   const base = {
     callId: actionCallId(action),
-    outcome: failed ? ("OUTCOME_FAILED" as const) : ("OUTCOME_COMPLETED" as const),
+    outcome: result,
     ...duration(startedAt, input.occurredAt),
   };
   if (action.shellCommand) {
@@ -488,7 +515,21 @@ function specializedObservation(
       stderr = value.stderr;
       exitCode = integerField(value, ["exit_code", "exitCode", "code"]);
     }
-    if (![stdout, stderr].every(optionalText)) return undefined;
+    if (
+      (response.present &&
+        !hasOnlyFields(value, [
+          "stdout",
+          "stderr",
+          "exit_code",
+          "exitCode",
+          "code",
+          "interrupted",
+          "isImage",
+          "noOutputExpected",
+        ])) ||
+      ![stdout, stderr].every(optionalText)
+    )
+      return undefined;
     return {
       shellCommandOutput: {
         ...base,
@@ -513,6 +554,7 @@ function specializedObservation(
       };
     return undefined;
   }
+  if (response.present && !hasOnlyFields(value, ["type", "file"])) return undefined;
   let content: unknown;
   let path = action.fileOperation.path;
   if (
@@ -522,6 +564,17 @@ function specializedObservation(
     value.file &&
     typeof value.file === "object"
   ) {
+    if (
+      !hasOnlyFields(value.file, [
+        "filePath",
+        "path",
+        "content",
+        "numLines",
+        "startLine",
+        "totalLines",
+      ])
+    )
+      return undefined;
     // Claude Code's Read tool returns {type:"text", file:{filePath,content,...}}.
     const reportedPath = firstField(value.file, ["filePath", "path"]);
     if (reportedPath && Buffer.byteLength(reportedPath) <= TOOL_ACTIVITY_LIMITS.maxMetadataBytes)
@@ -529,7 +582,11 @@ function specializedObservation(
     content = firstField(value.file, ["content"]);
   } else if (typeof value === "string") content = value;
   else content = firstField(value, ["content", "output", "stdout", "text"]);
-  if (content !== undefined && typeof content !== "string") return undefined;
+  if (
+    (content !== undefined && typeof content !== "string") ||
+    (response.present && content === undefined && !responseError(input) && !errorText(value))
+  )
+    return undefined;
   if (
     typeof content === "string" &&
     Buffer.byteLength(content) > TOOL_ACTIVITY_LIMITS.maxPayloadBytes
@@ -538,7 +595,7 @@ function specializedObservation(
   return {
     fileOperationResult: {
       ...base,
-      success: !failed,
+      success: result === "OUTCOME_COMPLETED",
       path,
       ...(content !== undefined ? { content } : {}),
       ...(responseError(input) ? { error: responseError(input) } : {}),
@@ -551,10 +608,17 @@ export function activityObservation(
   input: ActivityInput,
 ): WorkspaceObservationEvent {
   if (!before.action) throw new Error("activity observation requires a preceding action");
+  // One explicit end timestamp is used by the header and duration calculation.
+  // Without it, a default header time would leave durationMs absent, and a replay
+  // could change the event body independently of the underlying native result.
+  const timed: ActivityInput = {
+    ...input,
+    occurredAt: input.occurredAt ?? new Date().toISOString(),
+  };
   const observation: Observation = {
     invocation: before.action,
-    ...(specializedObservation(before.action, before.occurredAt, input) ??
-      genericObservation(before, input)),
+    ...(specializedObservation(before.action, before.occurredAt, timed) ??
+      genericObservation(before, timed)),
   };
   // Preserve a supplied after-hook identity; validation will reject a conflicting
   // identity rather than silently rebinding this result to another call.

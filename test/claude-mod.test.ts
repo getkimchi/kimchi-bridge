@@ -1,5 +1,9 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, test } from "bun:test";
+import { ActivityStore } from "../src/work/activity-store.ts";
+import type { Native } from "../src/work/capture.ts";
 
 test("native mod caches its version and avoids helper calls for irrelevant telemetry", async () => {
   const { register } = await import(
@@ -72,5 +76,57 @@ test("hooks.json syncs the queue on the same events as Codex, so uploads do not 
     // A background upload must never hold up the prompt or the end of the turn.
     expect(handler.async).toBe(true);
     expect(handler.timeout).toBe(10);
+  }
+});
+
+test("the native mod hands its tool result into activity capture", async () => {
+  const { register } = await import(
+    new URL("../plugins/kimchi-work/claude/hooks/register.js", import.meta.url).href
+  );
+  const handlers = new Map<string, (...args: any[]) => any>();
+  register((event: string, ...args: any[]) => handlers.set(event, args.at(-1)));
+  const records: { input: Record<string, any> }[] = [];
+  let versionReads = 0;
+  const api = {
+    plugin: { root: "/plugin" },
+    session: {
+      id: async () => "mod-session",
+      cwd: async () => "/workspace/repo",
+      version: async () => {
+        versionReads++;
+        return { version: "2.1.309" };
+      },
+    },
+    process: {
+      run: async (_args: string[], options: { stdin: string }) => {
+        records.push({ input: JSON.parse(options.stdin) });
+      },
+    },
+  };
+  const event = { tool: "Bash", toolCallId: "mod-call-001", tool_input: { command: "pwd" } };
+  const result = await handlers.get("tool.call")!(api, event, async () => ({
+    stdout: "/workspace/repo",
+    stderr: "",
+    durationMs: 4,
+  }));
+  expect(result.stdout).toBe("/workspace/repo");
+  // sourceVersion is deliberately cached across registrations in this module.
+  expect(records[0].input.version).toBe("2.1.309");
+  expect(records.map((r) => r.input.stage)).toEqual(["tool.before", "tool.after"]);
+  const dir = mkdtempSync(join(tmpdir(), "activity-mod-"));
+  const store = new ActivityStore(dir);
+  try {
+    store.observe(records[0].input as Native, "claude-code");
+    store.observe(records[1].input as Native, "claude-code");
+    const observation = store.allEvents()[1].observation;
+    expect(observation?.shellCommandOutput).toMatchObject({
+      stdout: "/workspace/repo",
+      stderr: "",
+      durationMs: "4",
+      outcome: "OUTCOME_COMPLETED",
+    });
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
