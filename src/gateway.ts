@@ -1611,10 +1611,15 @@ function codexRouteFor(model: unknown): string {
 
 function chatGPTAuthorization(request: Request): string | undefined {
   const authorization = request.headers.get("authorization");
-  const match = authorization ? /^Bearer (\S+)$/.exec(authorization) : null;
-  const token = match?.[1];
-  if (!token || token === PROXY_PLACEHOLDER) return undefined;
-  return authorization!;
+  if (!authorization?.startsWith("Bearer ")) return undefined;
+  const token = authorization.slice("Bearer ".length);
+  if (
+    !token ||
+    token === PROXY_PLACEHOLDER ||
+    [...token].some((character) => character.trim().length === 0)
+  )
+    return undefined;
+  return authorization;
 }
 
 export async function proxyRequest(request: Request, llmBase: string): Promise<Response> {
