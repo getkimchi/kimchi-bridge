@@ -791,15 +791,23 @@ export function hasUsableChatGPTLogin(path = join(homeDir(), ".codex", "auth.jso
       auth_mode?: unknown;
       OPENAI_API_KEY?: unknown;
       tokens?: { access_token?: unknown };
+      personal_access_token?: unknown;
     };
     if (!auth || typeof auth !== "object" || Array.isArray(auth)) return false;
     if (
       (auth.auth_mode !== undefined &&
         auth.auth_mode !== "chatgpt" &&
-        auth.auth_mode !== "chatgptAuthTokens") ||
+        auth.auth_mode !== "chatgptAuthTokens" &&
+        auth.auth_mode !== "personalAccessToken") ||
       (typeof auth.OPENAI_API_KEY === "string" && auth.OPENAI_API_KEY.length > 0)
     )
       return false;
+    if (
+      (auth.auth_mode === "personalAccessToken" || auth.auth_mode === undefined) &&
+      typeof auth.personal_access_token === "string" &&
+      auth.personal_access_token.trim().length > 0
+    )
+      return true;
     const accessToken = auth.tokens?.access_token;
     return (
       typeof accessToken === "string" &&
@@ -1605,13 +1613,7 @@ function chatGPTAuthorization(request: Request): string | undefined {
   const authorization = request.headers.get("authorization");
   const match = authorization ? /^Bearer (\S+)$/.exec(authorization) : null;
   const token = match?.[1];
-  if (
-    !token ||
-    token === PROXY_PLACEHOLDER ||
-    token.split(".").length !== 3 ||
-    token.split(".").some((part) => !part)
-  )
-    return undefined;
+  if (!token || token === PROXY_PLACEHOLDER) return undefined;
   return authorization!;
 }
 

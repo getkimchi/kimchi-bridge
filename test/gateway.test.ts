@@ -230,6 +230,8 @@ test("ChatGPT login detection accepts Codex token auth and rejects other credent
     tokens: { access_token: "header.payload.signature" },
   });
   expect(hasUsableChatGPTLogin()).toBe(true);
+  chatGPTLogin({ auth_mode: "personalAccessToken", personal_access_token: "opaque-pat" });
+  expect(hasUsableChatGPTLogin()).toBe(true);
   chatGPTLogin({
     auth_mode: "apikey",
     OPENAI_API_KEY: "sk-openai",
