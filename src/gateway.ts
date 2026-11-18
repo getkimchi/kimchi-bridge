@@ -44,6 +44,10 @@ const KIMCHI_PROVIDER = "kimchi";
 const CODEX_PROVIDER_NAME = "Kimchi Gateway";
 /** Placeholder bearer for proxy mode; the proxy replaces it per request. */
 const PROXY_PLACEHOLDER = "kimchi-gateway";
+const CODEX_ORDINARY_ROUTE = "kimchi-dev";
+const CODEX_SUBSCRIPTION_ROUTE = "kimchi-dev/openai-codex";
+const CHATGPT_FEED_PROVIDER = "chatgpt";
+const UNSUPPORTED_SUBSCRIPTION_MODEL = "gpt-5.3-codex";
 
 export type GatewayMode = "proxy" | "direct";
 
@@ -496,16 +500,17 @@ function classifyTomlLine(line: string): "kimchi-header" | "header" | "array-hea
   const trimmed = line.trim();
   if (trimmed.startsWith("[[")) return "array-header";
   // A trailing comment after a table header is legal TOML (`[table] # note`).
-  // Lines stay the unit of classification: header-shaped lines inside multi-line
-  // strings are out of scope for codex's machine-managed config.
   const core = trimmed.startsWith("[") ? withoutComment(trimmed) : trimmed;
   if (core.startsWith("[") && core.endsWith("]")) {
     const section = core.slice(1, -1).trim();
     // The whole kimchi namespace is ours: [model_providers.kimchi] and any
     // table nested under it re-defines the provider we replace.
     if (
-      section === `model_providers.${KIMCHI_PROVIDER}` ||
-      section.startsWith(`model_providers.${KIMCHI_PROVIDER}.`)
+      [KIMCHI_PROVIDER, "kimchi_chatgpt"].some(
+        (provider) =>
+          section === `model_providers.${provider}` ||
+          section.startsWith(`model_providers.${provider}.`),
+      )
     )
       return "kimchi-header";
     return "header";
@@ -513,12 +518,55 @@ function classifyTomlLine(line: string): "kimchi-header" | "header" | "array-hea
   return "body";
 }
 
+function classifyTomlLines(
+  text: string,
+): Array<{ line: string; kind: ReturnType<typeof classifyTomlLine> }> {
+  let multiline: '"""' | "'''" | undefined;
+  return text.split("\n").map((line) => {
+    const kind = multiline ? "body" : classifyTomlLine(line);
+    let basic = false;
+    let literal = false;
+    for (let i = 0; i < line.length; i++) {
+      if (multiline) {
+        if (line.startsWith(multiline, i)) {
+          multiline = undefined;
+          i += 2;
+        } else if (multiline === '"""' && line[i] === "\\") {
+          i++;
+        }
+        continue;
+      }
+      if (basic) {
+        if (line[i] === "\\") i++;
+        else if (line[i] === '"') basic = false;
+        continue;
+      }
+      if (literal) {
+        if (line[i] === "'") literal = false;
+        continue;
+      }
+      if (line[i] === "#") break;
+      if (line.startsWith('"""', i) || line.startsWith("'''", i)) {
+        multiline = line.startsWith('"""', i) ? '"""' : "'''";
+        i += 2;
+      } else if (line[i] === '"') {
+        basic = true;
+      } else if (line[i] === "'") {
+        literal = true;
+      }
+    }
+    return { line, kind };
+  });
+}
+
 export function buildCodexToml(
   baseUrlValue: string,
   bearer: string,
   modelSlug: string,
   catalogPath: string,
+  requiresOpenAIAuth = false,
 ): string {
+  const openAIAuth = requiresOpenAIAuth ? "requires_openai_auth = true\n" : "";
   return `model_provider = "${KIMCHI_PROVIDER}"
 model = "${tomlEscape(modelSlug)}"
 model_catalog_json = "${tomlEscape(catalogPath)}"
@@ -528,7 +576,7 @@ name = "${CODEX_PROVIDER_NAME}"
 base_url = "${tomlEscape(baseUrlValue)}"
 http_headers = { Authorization = "Bearer ${tomlEscape(bearer)}" }
 wire_api = "responses"
-`;
+${openAIAuth}`;
 }
 
 /** Strip the kimchi top-level keys and provider section, keeping user sections. */
@@ -536,8 +584,7 @@ export function stripCodexToml(existingText: string): string {
   const kept: string[] = [];
   let inKimchiSection = false;
   let inAnySection = false;
-  for (const line of existingText.split("\n")) {
-    const kind = classifyTomlLine(line);
+  for (const { line, kind } of classifyTomlLines(existingText)) {
     if (kind === "kimchi-header") {
       inKimchiSection = true;
       inAnySection = true;
@@ -569,12 +616,20 @@ export function stripCodexToml(existingText: string): string {
 
 /** Split TOML text at the first table header: top-level scalars and comments, then sections. */
 function splitTomlAtFirstHeader(text: string): { top: string; sections: string } {
-  const lines = text.split("\n");
-  const cut = lines.findIndex((line) => classifyTomlLine(line) !== "body");
+  const lines = classifyTomlLines(text);
+  const cut = lines.findIndex(({ kind }) => kind !== "body");
   if (cut === -1) return { top: text.trim(), sections: "" };
   return {
-    top: lines.slice(0, cut).join("\n").trim(),
-    sections: lines.slice(cut).join("\n").trim(),
+    top: lines
+      .slice(0, cut)
+      .map(({ line }) => line)
+      .join("\n")
+      .trim(),
+    sections: lines
+      .slice(cut)
+      .map(({ line }) => line)
+      .join("\n")
+      .trim(),
   };
 }
 
@@ -594,6 +649,7 @@ export function mergeCodexToml(existingText: string, freshToml: string): string 
 export interface GatewayModel {
   slug: string;
   display_name: string;
+  provider?: string;
   reasoning?: boolean;
   input_modalities?: string[];
   is_serverless?: boolean;
@@ -679,14 +735,28 @@ interface CodexModelEntry {
   supported_reasoning_levels: Array<{ effort: "low" | "medium" | "high"; description: string }>;
 }
 
-export function buildCodexCatalog(models: readonly GatewayModel[]): { models: CodexModelEntry[] } {
+export function buildCodexCatalog(
+  models: readonly GatewayModel[],
+  subscriptionAvailable = false,
+): { models: CodexModelEntry[]; routes: Record<string, string> } {
   const REASONING_LEVELS = [
     { effort: "low", description: "Low reasoning effort" },
     { effort: "medium", description: "Medium reasoning effort" },
     { effort: "high", description: "High reasoning effort" },
   ] as const;
+  const selected = new Map<string, { model: GatewayModel; route: string }>();
+  for (const model of models) {
+    const subscription = model.provider === CHATGPT_FEED_PROVIDER;
+    if (subscription && (!subscriptionAvailable || model.slug === UNSUPPORTED_SUBSCRIPTION_MODEL))
+      continue;
+    const route = subscription ? CODEX_SUBSCRIPTION_ROUTE : CODEX_ORDINARY_ROUTE;
+    const existing = selected.get(model.slug);
+    if (existing?.route === CODEX_SUBSCRIPTION_ROUTE || (existing && !subscription)) continue;
+    selected.set(model.slug, { model, route });
+  }
+  const chosen = [...selected.values()];
   return {
-    models: models.map((m, index) => ({
+    models: chosen.map(({ model: m }, index) => ({
       slug: m.slug,
       // The gateway's model registry currently serves empty display_name;
       // codex's /model picker renders display_name, so fall back to the slug
@@ -709,13 +779,43 @@ export function buildCodexCatalog(models: readonly GatewayModel[]): { models: Co
       support_verbosity: m.reasoning === true,
       supported_reasoning_levels: m.reasoning === true ? [...REASONING_LEVELS] : [],
     })),
+    routes: Object.fromEntries(chosen.map(({ model, route }) => [model.slug, route])),
   };
+}
+
+export function hasUsableChatGPTLogin(path = join(homeDir(), ".codex", "auth.json")): boolean {
+  try {
+    const bytes = readFileSync(path);
+    if (bytes.length > 1 << 20) return false;
+    const auth = JSON.parse(bytes.toString("utf8")) as {
+      auth_mode?: unknown;
+      OPENAI_API_KEY?: unknown;
+      tokens?: { access_token?: unknown };
+    };
+    if (!auth || typeof auth !== "object" || Array.isArray(auth)) return false;
+    if (
+      (auth.auth_mode !== undefined &&
+        auth.auth_mode !== "chatgpt" &&
+        auth.auth_mode !== "chatgptAuthTokens") ||
+      (typeof auth.OPENAI_API_KEY === "string" && auth.OPENAI_API_KEY.length > 0)
+    )
+      return false;
+    const accessToken = auth.tokens?.access_token;
+    return (
+      typeof accessToken === "string" &&
+      accessToken.split(".").length === 3 &&
+      accessToken.split(".").every((part) => part.length > 0)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function writeCodexConfig(
   base: string,
   bearer: string,
   models: readonly GatewayModel[],
+  subscriptionAvailable: boolean,
 ): Array<[string, string]> | undefined {
   const path = codexConfigPath();
   let existingText = "";
@@ -727,8 +827,7 @@ function writeCodexConfig(
   // Snapshot the user's top-level values our enable replaces.
   const previous: Array<[string, string]> = [];
   let inAnySection = false;
-  for (const line of existingText.split("\n")) {
-    const kind = classifyTomlLine(line);
+  for (const { line, kind } of classifyTomlLines(existingText)) {
     if (kind !== "body") {
       inAnySection = true;
       continue;
@@ -739,15 +838,22 @@ function writeCodexConfig(
         const split = trimmed.indexOf("=");
         const key = trimmed.slice(0, split).trim();
         const value = trimmed.slice(split + 1).trim();
-        if (CODEX_TOP_LEVEL_KEYS.includes(key) && value) previous.push([key, value]);
+        const legacyProvider =
+          key === "model_provider" &&
+          ['"kimchi"', "'kimchi'", '"kimchi_chatgpt"', "'kimchi_chatgpt'"].includes(value);
+        if (CODEX_TOP_LEVEL_KEYS.includes(key) && value && !legacyProvider)
+          previous.push([key, value]);
       }
     }
   }
-  const main = resolveMainModel(models);
+  const catalog = buildCodexCatalog(models, subscriptionAvailable);
+  const selectedModels = models.filter((model) => catalog.routes[model.slug] !== undefined);
+  const main = resolveMainModel(selectedModels);
   const catalogPath = codexCatalogPath();
-  const fresh = buildCodexToml(base, bearer, main.slug, catalogPath);
+  const requiresOpenAIAuth = Object.values(catalog.routes).includes(CODEX_SUBSCRIPTION_ROUTE);
+  const fresh = buildCodexToml(base, bearer, main.slug, catalogPath, requiresOpenAIAuth);
   writeAtomic(path, mergeCodexToml(existingText, fresh), 0o644);
-  writeAtomic(catalogPath, JSON.stringify(buildCodexCatalog(models), null, 2) + "\n", 0o644);
+  writeAtomic(catalogPath, JSON.stringify(catalog, null, 2) + "\n", 0o644);
   return previous.length ? previous : undefined;
 }
 
@@ -1479,6 +1585,36 @@ function anthropicModelsResponse(url: URL): Response | undefined {
   });
 }
 
+function codexRouteFor(model: unknown): string {
+  if (typeof model !== "string" || !model) return CODEX_ORDINARY_ROUTE;
+  try {
+    const bytes = readFileSync(codexCatalogPath());
+    if (bytes.length > 24 << 20) return CODEX_ORDINARY_ROUTE;
+    const catalog = JSON.parse(bytes.toString("utf8")) as { routes?: unknown };
+    const routes = catalog.routes;
+    if (!routes || typeof routes !== "object" || Array.isArray(routes)) return CODEX_ORDINARY_ROUTE;
+    return (routes as Record<string, unknown>)[model] === CODEX_SUBSCRIPTION_ROUTE
+      ? CODEX_SUBSCRIPTION_ROUTE
+      : CODEX_ORDINARY_ROUTE;
+  } catch {
+    return CODEX_ORDINARY_ROUTE;
+  }
+}
+
+function chatGPTAuthorization(request: Request): string | undefined {
+  const authorization = request.headers.get("authorization");
+  const match = authorization ? /^Bearer (\S+)$/.exec(authorization) : null;
+  const token = match?.[1];
+  if (
+    !token ||
+    token === PROXY_PLACEHOLDER ||
+    token.split(".").length !== 3 ||
+    token.split(".").some((part) => !part)
+  )
+    return undefined;
+  return authorization!;
+}
+
 export async function proxyRequest(request: Request, llmBase: string): Promise<Response> {
   const url = new URL(request.url);
   const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
@@ -1504,11 +1640,31 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
     } catch {
       // An unreadable body goes untagged, as in Kimchi.
     }
+  const model =
+    json && typeof json === "object" && !Array.isArray(json)
+      ? (json as { model?: unknown }).model
+      : undefined;
+  const subscription =
+    url.pathname.startsWith("/openai/v1/") && codexRouteFor(model) === CODEX_SUBSCRIPTION_ROUTE;
+  const chatGPTAuth = subscription ? chatGPTAuthorization(request) : undefined;
+  const subscriptionKey =
+    subscription && !credential && signIn?.token && !signIn.organizationId
+      ? signIn.token
+      : undefined;
+  if (subscription && (!chatGPTAuth || !subscriptionKey))
+    return new Response(
+      "this model requires Codex ChatGPT login and a saved Kimchi API key; run kimchi bridge setup\n",
+      { status: 401, headers: { "content-type": "text/plain" } },
+    );
   let requestId: string | undefined;
   const forward = async (): Promise<Response> => {
     const headers = forwardHeaders(
       request.headers,
-      credential ? gatewayHeaders(await ensureFresh()) : keyHeaders(signIn!),
+      subscription
+        ? { Authorization: chatGPTAuth!, "X-API-Key": subscriptionKey! }
+        : credential
+          ? gatewayHeaders(await ensureFresh())
+          : keyHeaders(signIn!),
     );
     // Every attempt gets its own tag, so a retry's bill never joins the first attempt's.
     const id = randomUUID();
@@ -1746,6 +1902,7 @@ export async function enable(
 
   let modelHeaders: Record<string, string>;
   let llmBase: string;
+  let subscriptionAvailable = false;
   if (credential) {
     modelHeaders = gatewayHeaders(credential);
     llmBase = endpointsForCredential(credential).llmBaseUrl;
@@ -1764,10 +1921,14 @@ export async function enable(
       );
     modelHeaders = keyHeaders(saved);
     llmBase = base;
+    subscriptionAvailable = !saved.organizationId && hasUsableChatGPTLogin();
   }
 
   // Fetch the model list first: a failure leaves nothing written.
   const models = await fetchModels(llmBase, modelHeaders);
+  const codexCatalog = buildCodexCatalog(models, subscriptionAvailable);
+  if (!codexCatalog.models.length)
+    throw new Error("the gateway model list has no models usable with the saved sign-in");
   const claude = writeClaudeConfig(
     `http://127.0.0.1:${port}/anthropic`,
     PROXY_PLACEHOLDER,
@@ -1781,6 +1942,7 @@ export async function enable(
     `http://127.0.0.1:${port}/openai/v1`,
     PROXY_PLACEHOLDER,
     models,
+    subscriptionAvailable,
   );
   // Claude Desktop ignores the CLI settings, so it is switched into its
   // third-party mode pointing at the same proxy; null when it is not installed
