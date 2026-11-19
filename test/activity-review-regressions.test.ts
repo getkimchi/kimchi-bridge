@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
 } from "../src/work/activity.ts";
 import { ActivityStore, type ActivityBatch } from "../src/work/activity-store.ts";
 import type { Native } from "../src/work/capture.ts";
+import { parseJson } from "../src/work/protocol.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -258,4 +259,108 @@ test("mixed-status receipts are joined by event identity even when reversed", ()
       value.db.query("SELECT status,reason_code FROM receipts WHERE event_id=?").get(id),
     ).toEqual(result);
   expect(value.allEvents()).toHaveLength(0);
+});
+
+// A live Claude Code 2.1.326 session (local paths rewritten). Every tool call arrives twice:
+// from the mod (flattened tool.before/tool.after) and from the command hooks (PreToolUse,
+// PostToolUse or PostToolUseFailure), in arrival order. Input is built as `hook claude-code` does.
+function liveSession(): Native[] {
+  return readFileSync(join(import.meta.dir, "fixtures/claude-code-mod-and-hooks.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => {
+      const payload = parseJson(line);
+      return typeof payload.hook_event_name === "string"
+        ? { stage: `classic.${payload.hook_event_name}`, event: payload }
+        : payload;
+    });
+}
+const GLOB_CALL = "toolu_01J5FW4zgnsiYBRqteb6zzBz";
+const FAILED_CALL = "toolu_018rjQyvn24bSWAJkktEpqc8";
+const FAILED_MESSAGE = 'Exit code 2\n"does-not-exist": No such file or directory (os error 2)';
+
+test("a live session reported by the mod and the command hooks keeps one Action and Observation per call", () => {
+  const value = store();
+  for (const native of liveSession()) value.observe(native, "claude-code");
+  const events = value.allEvents();
+  const actions = events.filter((event) => event.action);
+  const observations = events.filter((event) => event.observation);
+  expect(actions).toHaveLength(9);
+  expect(observations).toHaveLength(9);
+  expect(value.status().diagnostics).toEqual({});
+  expect(observations.map((event) => event.causality?.causationId).sort()).toEqual(
+    actions.map((event) => event.eventId).sort(),
+  );
+  // Generic arguments are the request only, and results keep the hooks' own durations.
+  const generic = actions.flatMap((event) =>
+    event.action?.toolCall ? [event.action.toolCall] : [],
+  );
+  expect(generic.map((call) => [call.tool, JSON.parse(call.arguments!.data)])).toEqual([
+    ["Glob", { pattern: "**/*.toml" }],
+    ["Grep", { pattern: "max_retries" }],
+  ]);
+  expect(
+    observations
+      .filter((event) => event.observation?.invocation?.toolCall)
+      .map((event) => event.observation?.toolOutput?.durationMs),
+  ).toEqual(["16", "18"]);
+  // The failed command is one Observation that keeps its error.
+  const failed = observations.filter((event) => event.observation?.toolOutput?.success === false);
+  expect(failed).toHaveLength(1);
+  expect(failed[0].observation?.toolOutput).toMatchObject({
+    callId: FAILED_CALL,
+    outcome: "OUTCOME_FAILED",
+    error: FAILED_MESSAGE,
+    durationMs: "41",
+  });
+  expect(JSON.parse(failed[0].observation!.toolOutput!.output!.data)).toEqual({
+    error: FAILED_MESSAGE,
+  });
+});
+
+test("the mod and the command hooks record the same evidence for a call, with either result first or alone", () => {
+  const session = liveSession();
+  for (const callId of [GLOB_CALL, FAILED_CALL]) {
+    // Arrival order: mod before, hook pre, hook post (or failure), mod after. The mod's
+    // tool.before is recorded before the call runs, so it precedes the PreToolUse hook.
+    const [modBefore, hookBefore, hookAfter, modAfter] = session.filter(
+      (native) => native.event.tool_use_id === callId,
+    );
+    const evidence: unknown[] = [];
+    for (const reports of [
+      [modBefore, hookBefore, hookAfter, modAfter],
+      [modBefore, hookBefore, modAfter, hookAfter],
+      [modBefore, modAfter],
+      [hookBefore, hookAfter],
+    ]) {
+      const value = store();
+      for (const native of reports) value.observe(native, "claude-code");
+      const events = value.allEvents();
+      expect(events).toHaveLength(2);
+      expect(events[1].causality?.causationId).toBe(events[0].eventId);
+      // Only phase timing may differ between the paths.
+      const { durationMs, ...output } = events[1].observation!.toolOutput!;
+      evidence.push({
+        action: events[0].action,
+        invocation: events[1].observation?.invocation,
+        output,
+      });
+    }
+    for (const each of evidence) expect(each).toEqual(evidence[0]);
+  }
+});
+
+test("a failure message too long for the error field stays in the bounded output", () => {
+  const [, hookBefore, hookAfter] = liveSession().filter(
+    (native) => native.event.tool_use_id === FAILED_CALL,
+  );
+  const message = "Exit code 1\n" + "x".repeat(5_000);
+  const value = store();
+  value.observe(hookBefore, "claude-code");
+  value.observe({ ...hookAfter, event: { ...hookAfter.event, error: message } }, "claude-code");
+  const output = value.allEvents()[1].observation?.toolOutput;
+  expect(output).toMatchObject({ success: false, outcome: "OUTCOME_FAILED" });
+  expect(output?.error).toBeUndefined();
+  expect(output?.output).toMatchObject({ complete: true });
+  expect(JSON.parse(output!.output!.data)).toEqual({ error: message });
 });
