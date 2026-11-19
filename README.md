@@ -2,6 +2,8 @@
 
 Kimchi plugins for other coding harnesses, run by the `kimchi-bridge` command. The `kimchi-work` plugin works with the official Claude Code and Codex CLIs. It records the token usage of your coding sessions, links it to the pull requests that contain your changes and uploads it to your Kimchi account. The Kimchi console then shows what each pull request cost. Your inference provider and settings stay the same.
 
+An opt-in workspace activity profile also records linked tool-call actions and results from Claude Code and Codex. It uses a separate local ledger and an explicit loopback receiver, and can keep all activity local with dry run. See [Workspace activity tracking](#workspace-activity-tracking).
+
 ## Install
 
 ### Requirements
@@ -114,7 +116,95 @@ The plugins also follow Kimchi's PR reporting setting. If you turn it off with `
 | `kimchi-bridge export jsonl` | Prints all local records as JSON Lines. Use `export csv` for CSV. |
 | `kimchi-bridge version` | Prints the installed version. |
 
-`export` reads the active profile's store. In the workspace activity profile, it prints pending activity bodies; acknowledged activity retains compact receipts rather than full exportable bodies.
+### Workspace activity tracking
+
+Workspace activity is an opt-in tool-trajectory recorder, separate from PR-cost reporting. It captures before-tool **Actions** and after-tool **Observations**, linked by native call ID and causation metadata. Shell commands, file operations, web fetches and unknown tools have typed or generic representations that preserve their arguments and results.
+
+Workspace mode does not use a Kimchi account, OAuth, organization ID, Git attribution or the LLM gateway. Legacy PR-cost capture, sign-in, Git tracing and gateway hook commands are inactive while the profile is set.
+
+#### Enable capture and delivery
+
+Set both variables in the environment inherited by the Claude Code or Codex hook processes, then start a new client session:
+
+```sh
+export KIMCHI_BRIDGE_PROFILE=workspace
+export KIMCHI_BRIDGE_ACTIVITY_URL=http://127.0.0.1:8765/imds/tool-calls:batchRecord
+claude
+# or: codex
+```
+
+The receiver must use plain HTTP on `127.0.0.1`, `localhost` or `[::1]`, and the exact path `/imds/tool-calls:batchRecord`. Credentials, query strings, fragments and non-loopback destinations are rejected. The receiver is a separate service that you run; the bridge does not start it.
+
+After a hook, the bridge attempts delivery to that receiver. Workspace `sync` retries pending batches, and explicit `kimchi-bridge flush` drains the whole queue. Each JSON batch contains up to 100 events and targets 1 MiB. It must be accepted with one receipt per event:
+
+```json
+{
+  "batchId": "the-received-batch-id",
+  "receipts": [
+    {
+      "eventId": "the-received-event-id",
+      "status": "RECEIPT_STATUS_ACCEPTED"
+    }
+  ]
+}
+```
+
+Valid statuses are `RECEIPT_STATUS_ACCEPTED`, `RECEIPT_STATUS_UNCHANGED` and `RECEIPT_STATUS_REJECTED`. Network failures and invalid or unsuccessful replies retain the exact batch for retry. HTTP 413 splits it in causal order; HTTP 409 rebuilds it under a new batch ID.
+
+Changing the shell environment does not update an already-running client. Restart Claude Code or Codex after changing these settings, or run `kimchi-bridge flush` yourself with the new environment.
+
+#### Keep activity local with dry run
+
+Dry run captures the same events but never contacts a receiver:
+
+```sh
+export KIMCHI_BRIDGE_PROFILE=workspace
+export KIMCHI_BRIDGE_ACTIVITY_DRY_RUN=1
+claude
+# or: codex
+```
+
+No `KIMCHI_BRIDGE_ACTIVITY_URL` is required. Hook-triggered delivery is skipped, workspace sync performs only local maintenance, and `flush` reports `Dry run: pending activity records kept locally.` instead of uploading. `status` includes `dryRun: true`.
+
+To resume delivery, unset dry run, set the loopback URL and restart the client. Previously captured events remain queued and subsequent hooks or syncs retry them. `kimchi-bridge flush` delivers all of them immediately:
+
+```sh
+unset KIMCHI_BRIDGE_ACTIVITY_DRY_RUN
+export KIMCHI_BRIDGE_ACTIVITY_URL=http://127.0.0.1:8765/imds/tool-calls:batchRecord
+kimchi-bridge flush
+```
+
+#### Inspect status, export and SQLite
+
+Workspace status shows the dry-run state, ledger path, pending work, receipts, capture/delivery diagnostics and storage limits:
+
+```sh
+KIMCHI_BRIDGE_PROFILE=workspace kimchi-bridge status
+```
+
+Export pending activity as JSON Lines or CSV:
+
+```sh
+KIMCHI_BRIDGE_PROFILE=workspace kimchi-bridge export jsonl
+KIMCHI_BRIDGE_PROFILE=workspace kimchi-bridge export csv
+```
+
+Only pending event bodies are exported. Acknowledged bodies leave the queue; compact receipts with body hashes and outcomes remain instead.
+
+The default activity database is `~/.local/state/kimchi-bridge/workspace-activity/activity.sqlite`. `KIMCHI_BRIDGE_HOME` moves the whole state root. Inspect it read-only while clients are active:
+
+```sh
+sqlite3 -readonly ~/.local/state/kimchi-bridge/workspace-activity/activity.sqlite \
+  "SELECT event_id, source, call_id, trajectory_id, CAST(body AS TEXT) FROM events ORDER BY created_at, rowid;"
+```
+
+#### Lifecycle, data and retention
+
+Capture and delivery run as short-lived hook/sync commands, not a resident reporting daemon. Claude's native mod also schedules sync every 30 seconds while Claude Code is open. Final hooks normally run on shutdown; anything left pending survives in SQLite until a later hook, session, sync or explicit flush.
+
+Activity can include exact commands, arguments, file paths, old/new file contents, URLs, web results, stdout/stderr, provider text and errors. Unlike PR-cost reporting, this is not a metadata-only stream. Generic payloads are bounded at 64 KiB with UTF-8-safe truncation, completeness markers and SHA-256 hashes. Each serialized event is limited to 256 KiB.
+
+Local maintenance runs from hooks, syncs and flushes. Completed Action preimages expire after seven days, receipts after 30 days, and the receipt cache holds at most 50,000 entries. Pending work is protected from pruning. Pending bodies have a 64 MiB budget, Action bodies have a preferred 64 MiB reclamation budget, and the main SQLite page count is capped at 256 MiB; exceeding capture capacity produces visible backpressure diagnostics instead of partially recording a preimage.
 
 ### Start new work
 

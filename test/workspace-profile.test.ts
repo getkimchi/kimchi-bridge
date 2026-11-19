@@ -11,6 +11,7 @@ const variables = [
   "KIMCHI_BRIDGE_CONFIG_HOME",
   "KIMCHI_BRIDGE_PROFILE",
   "KIMCHI_BRIDGE_ACTIVITY_URL",
+  "KIMCHI_BRIDGE_ACTIVITY_DRY_RUN",
   "KIMCHI_API_KEY",
   "KIMCHI_TELEMETRY_ENABLED",
   "KIMCHI_REMOTE_ENDPOINT",
@@ -26,6 +27,7 @@ beforeEach(() => {
   process.env.KIMCHI_BRIDGE_HOME = join(root, "bridge-state");
   process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(root, "kimi-config");
   process.env.KIMCHI_BRIDGE_PROFILE = "workspace";
+  delete process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN;
   process.env.KIMCHI_API_KEY = "synthetic-not-a-real-credential";
   process.env.KIMCHI_TELEMETRY_ENABLED = "1";
   process.env.KIMCHI_REMOTE_ENDPOINT = "http://127.0.0.1:1";
@@ -34,6 +36,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.KIMCHI_BRIDGE_PROFILE;
   delete process.env.KIMCHI_BRIDGE_ACTIVITY_URL;
+  delete process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN;
   delete process.env.CLAUDE_ENV_FILE;
   for (const cleanup of cleanups.splice(0)) cleanup();
   rmSync(root, { recursive: true, force: true });
@@ -155,6 +158,49 @@ test("workspace export reads pending activity as JSONL and CSV instead of the le
   expect(rows[1]).toContain("workspace-profile-session");
   expect(rows[1]).toContain("export-001");
   expect(existsSync(join(root, "bridge-state", "accounts", "local", "ledger.sqlite"))).toBe(false);
+});
+
+test("workspace dry run stores and exports events without delivery, then resumes normally", async () => {
+  process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN = "1";
+  let requests = 0;
+  const endpoint = localRecorder(async (request) => {
+    requests++;
+    const batch = parseActivity(await request.text());
+    return Response.json({
+      batchId: batch.batchId,
+      receipts: batch.events.map((event: any) => ({
+        eventId: event.eventId,
+        status: "RECEIPT_STATUS_ACCEPTED",
+      })),
+    });
+  });
+  process.env.KIMCHI_BRIDGE_ACTIVITY_URL = endpoint;
+  await run(["hook", "claude-code"], stdin(toolEvent("dry-run-001")), () => {});
+  await run(["sync"], stdin({}), () => {});
+  let flushOutput = "";
+  await run(["flush"], stdin({}), (text) => {
+    flushOutput += text;
+  });
+  expect(requests).toBe(0);
+  expect(flushOutput).toBe("Dry run: pending activity records kept locally.\n");
+  let statusText = "";
+  await run(["status"], stdin({}), (text) => {
+    statusText += text;
+  });
+  expect(JSON.parse(statusText)).toMatchObject({
+    dryRun: true,
+    pending_events: 1,
+    acknowledgements: 0,
+    diagnostics: {},
+  });
+  let exported = "";
+  await run(["export", "jsonl"], stdin({}), (text) => {
+    exported += text;
+  });
+  expect(JSON.parse(exported).action.shellCommand.callId).toBe("dry-run-001");
+  delete process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN;
+  await run(["flush"], stdin({}), () => {});
+  expect(requests).toBe(1);
 });
 
 test("workspace flush drains every pending activity batch", async () => {

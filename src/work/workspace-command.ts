@@ -3,7 +3,11 @@ import { ActivityStore } from "./activity-store.ts";
 import { loadConfig } from "../settings.ts";
 import { drainActivities, flushAllActivities } from "./activity-delivery.ts";
 import { parseJson, stringifyJson } from "./protocol.ts";
-import { workspaceActivityState, workspaceActivityURL } from "./workspace.ts";
+import {
+  workspaceActivityDryRun,
+  workspaceActivityState,
+  workspaceActivityURL,
+} from "./workspace.ts";
 
 export interface WorkspaceIO {
   readHookInput(): Promise<Buffer>;
@@ -24,6 +28,7 @@ export async function workspaceCommand(
   io: WorkspaceIO,
   signal?: AbortSignal,
 ): Promise<void> {
+  const dryRun = workspaceActivityDryRun();
   const store = new ActivityStore(workspaceActivityState());
   try {
     switch (command) {
@@ -52,28 +57,33 @@ export async function workspaceCommand(
           store.diagnostic("activity_capture_failed");
           return;
         }
-        try {
-          await flushAllActivities(
-            store,
-            workspaceActivityURL(),
-            signal
-              ? AbortSignal.any([signal, AbortSignal.timeout(1500)])
-              : AbortSignal.timeout(1500),
-          );
-        } catch {
-          store.diagnostic("activity_delivery_pending");
-        }
+        if (!dryRun)
+          try {
+            await flushAllActivities(
+              store,
+              workspaceActivityURL(),
+              signal
+                ? AbortSignal.any([signal, AbortSignal.timeout(1500)])
+                : AbortSignal.timeout(1500),
+            );
+          } catch {
+            store.diagnostic("activity_delivery_pending");
+          }
         return;
       }
       case "flush": {
         store.pruneIfDue();
+        if (dryRun) {
+          io.output("Dry run: pending activity records kept locally.\n");
+          return;
+        }
         await drainActivities(store, workspaceActivityURL(), signal);
         io.output("All pending activity records acknowledged.\n");
         return;
       }
       case "sync": {
         store.pruneIfDue();
-        if (loadConfig().disabled) return;
+        if (dryRun || loadConfig().disabled) return;
         try {
           await flushAllActivities(store, workspaceActivityURL(), signal);
         } catch {
@@ -83,7 +93,8 @@ export async function workspaceCommand(
       }
       case "status": {
         io.output(
-          JSON.stringify({ profile: "workspace", ledger: store.dir, ...store.status() }) + "\n",
+          JSON.stringify({ profile: "workspace", dryRun, ledger: store.dir, ...store.status() }) +
+            "\n",
         );
         return;
       }

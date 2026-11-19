@@ -3,6 +3,11 @@ import { stateRoot } from "../settings.ts";
 
 export const workspaceActivityPath = "/imds/tool-calls:batchRecord";
 
+/** Keep workspace records local without requiring or contacting a receiver. */
+export function workspaceActivityDryRun(): boolean {
+  return process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN === "1";
+}
+
 /** Workspace capture never selects an account or reads Kimchi credentials. */
 export function workspaceActivityEnabled(): boolean {
   const profile = process.env.KIMCHI_BRIDGE_PROFILE ?? "";
