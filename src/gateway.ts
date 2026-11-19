@@ -23,6 +23,7 @@ import type { SignIn } from "./kimchi.ts";
 import { baseUrl, kimchiSignIn } from "./kimchi.ts";
 import { cliEntry, lockSync } from "./platform.ts";
 import {
+  bearerToken,
   endpointsForCredential,
   ensureFresh,
   gatewayHeaders,
@@ -1624,7 +1625,6 @@ function chatGPTAuthorization(request: Request): string | undefined {
 
 export async function proxyRequest(request: Request, llmBase: string): Promise<Response> {
   const url = new URL(request.url);
-  const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
   const credential = loadCredential();
   const signIn = credential ? undefined : kimchiSignIn();
   if (!credential && !signIn?.token)
@@ -1652,27 +1652,37 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
       ? (json as { model?: unknown }).model
       : undefined;
   const subscription =
-    url.pathname.startsWith("/openai/v1/") && codexRouteFor(model) === CODEX_SUBSCRIPTION_ROUTE;
+    url.pathname === "/openai/v1/responses" && codexRouteFor(model) === CODEX_SUBSCRIPTION_ROUTE;
   const chatGPTAuth = subscription ? chatGPTAuthorization(request) : undefined;
   const subscriptionKey =
     subscription && !credential && signIn?.token && !signIn.organizationId
       ? signIn.token
       : undefined;
-  if (subscription && (!chatGPTAuth || !subscriptionKey))
+  const subscriptionCredentialAvailable =
+    subscriptionKey || (subscription && credential?.orgId && bearerToken(credential));
+  if (subscription && (!chatGPTAuth || !subscriptionCredentialAvailable))
     return new Response(
-      "this model requires Codex ChatGPT login and a saved Kimchi API key; run kimchi bridge setup\n",
+      "this model requires Codex ChatGPT login and CAST AI SSO or a saved Kimchi API key; run kimchi bridge setup\n",
       { status: 401, headers: { "content-type": "text/plain" } },
     );
+  const upstreamPath = subscription ? "/openai/v1/codex/responses" : url.pathname;
+  const upstream = `${baseUrl(llmBase)}${upstreamPath}${url.search}`;
   let requestId: string | undefined;
   const forward = async (): Promise<Response> => {
-    const headers = forwardHeaders(
-      request.headers,
-      subscription
-        ? { Authorization: chatGPTAuth!, "X-API-Key": subscriptionKey! }
-        : credential
-          ? gatewayHeaders(await ensureFresh())
-          : keyHeaders(signIn!),
-    );
+    let auth: Record<string, string>;
+    if (subscription && credential) {
+      const fresh = await ensureFresh();
+      auth = {
+        Authorization: chatGPTAuth!,
+        "X-API-Key": bearerToken(fresh),
+        [ORGANIZATION_HEADER]: fresh.orgId,
+      };
+    } else if (subscription) {
+      auth = { Authorization: chatGPTAuth!, "X-API-Key": subscriptionKey! };
+    } else {
+      auth = credential ? gatewayHeaders(await ensureFresh()) : keyHeaders(signIn!);
+    }
+    const headers = forwardHeaders(request.headers, auth);
     // Every attempt gets its own tag, so a retry's bill never joins the first attempt's.
     const id = randomUUID();
     const tags = billingTags(headers, json, id);
@@ -1913,6 +1923,9 @@ export async function enable(
   if (credential) {
     modelHeaders = gatewayHeaders(credential);
     llmBase = endpointsForCredential(credential).llmBaseUrl;
+    subscriptionAvailable = Boolean(
+      credential.orgId && bearerToken(credential) && hasUsableChatGPTLogin(),
+    );
   } else {
     if (!signIn.token) throw new Error("run kimchi-bridge login before enabling the gateway");
     // The proxy reads Kimchi's saved sign-in; a key only in KIMCHI_API_KEY never reaches the daemon.

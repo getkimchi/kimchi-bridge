@@ -38,7 +38,7 @@ import {
   type GatewayModel,
   type GatewayState,
 } from "../src/gateway.ts";
-import { credentialPath, saveCredential } from "../src/oauth.ts";
+import { credentialPath, loadCredential, saveCredential } from "../src/oauth.ts";
 import type { SignIn } from "../src/kimchi.ts";
 import { tagFor } from "../src/request-tags.ts";
 
@@ -687,6 +687,27 @@ test("enable with an API key routes through the local proxy and keeps the key ou
   expect(existsSync(credentialPath())).toBe(false);
 });
 
+test("enable accepts ChatGPT subscription rows with org-bound CAST AI SSO", async () => {
+  process.env.KIMCHI_BASE_URL = modelsEndpoint([
+    ...models,
+    { ...models[1], slug: "gpt-5.5", display_name: "GPT 5.5", provider: "chatgpt" },
+  ]);
+  oauthCredential();
+  const authBefore = chatGPTLogin();
+  await enable(oauthSignIn);
+  const codex = readFileSync(codexConfigPath(), "utf8");
+  expect(codex).toContain("requires_openai_auth = true");
+  expect(codex).not.toContain("id-token");
+  expect(codex).not.toContain("access");
+  const catalog = JSON.parse(readFileSync(codexCatalogPath(), "utf8"));
+  expect(catalog.routes).toEqual({
+    "minimax-m3": "kimchi-dev",
+    "kimi-k2.6": "kimchi-dev",
+    "gpt-5.5": "kimchi-dev/openai-codex",
+  });
+  expect(readFileSync(join(root, "home", ".codex", "auth.json"), "utf8")).toBe(authBefore);
+});
+
 test("setup with both credentials is idempotent and migrates old Codex providers", async () => {
   const feed = [
     { ...models[0], provider: "openai" },
@@ -1282,9 +1303,15 @@ test("proxyRequest injects the fresh bearer and org header, passes the body, and
 test("proxyRequest forwards ChatGPT OAuth and a Kimchi API key only for subscription routes", async () => {
   kimchiKey("castai_v1_key");
   catalogRoutes({ "gpt-5.4": "kimchi-dev/openai-codex" });
-  let seen: { authorization: string | null; key: string | null; custom: string | null };
+  let seen: {
+    path: string;
+    authorization: string | null;
+    key: string | null;
+    custom: string | null;
+  };
   const upstream = server(async (request) => {
     seen = {
+      path: new URL(request.url).pathname,
       authorization: request.headers.get("authorization"),
       key: request.headers.get("x-api-key"),
       custom: request.headers.get("x-custom"),
@@ -1306,18 +1333,78 @@ test("proxyRequest forwards ChatGPT OAuth and a Kimchi API key only for subscrip
   );
   expect(response.status).toBe(200);
   expect(seen!).toEqual({
+    path: "/openai/v1/codex/responses",
     authorization: "Bearer header.payload.signature",
     key: "castai_v1_key",
     custom: "preserved",
   });
 });
 
+test("proxyRequest refreshes SSO before using its access token for a subscription", async () => {
+  catalogRoutes({ "gpt-5.4": "kimchi-dev/openai-codex" });
+  let refreshes = 0;
+  const tokenEndpoint = server(async () => {
+    refreshes++;
+    return Response.json({
+      access_token: "access-refreshed",
+      id_token: "id-refreshed-not-selected",
+      refresh_token: "refresh-2",
+      expires_in: 3600,
+    });
+  });
+  saveCredential({
+    region: "us",
+    tokenUrl: `${tokenEndpoint}/oauth/token`,
+    clientId: "c",
+    useIdToken: false,
+    accessToken: "access-expired",
+    idToken: "id-expired",
+    refreshToken: "refresh",
+    expires: Date.now() - 1000,
+    orgId: org,
+    orgName: "Org",
+  });
+  let seen: {
+    path: string;
+    authorization: string | null;
+    key: string | null;
+    organization: string | null;
+  };
+  const upstream = server(async (request) => {
+    seen = {
+      path: new URL(request.url).pathname,
+      authorization: request.headers.get("authorization"),
+      key: request.headers.get("x-api-key"),
+      organization: request.headers.get("x-castai-organization-id"),
+    };
+    await request.text();
+    return Response.json({ ok: true });
+  });
+  const response = await proxyRequest(
+    new Request("http://127.0.0.1:8766/openai/v1/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer header.payload.signature" },
+      body: JSON.stringify({ model: "gpt-5.4", input: "hi" }),
+    }),
+    upstream,
+  );
+  expect(response.status).toBe(200);
+  expect(refreshes).toBe(1);
+  expect(seen!).toEqual({
+    path: "/openai/v1/codex/responses",
+    authorization: "Bearer header.payload.signature",
+    key: "access-refreshed",
+    organization: org,
+  });
+});
+
 test("proxyRequest discards ChatGPT OAuth for ordinary and unknown models", async () => {
   kimchiKey("castai_v1_key");
   catalogRoutes({ deepseek: "kimchi-dev", "gpt-5.4": "kimchi-dev/openai-codex" });
-  const seen: Array<{ authorization: string | null; key: string | null }> = [];
+  const seen: Array<{ path: string; authorization: string | null; key: string | null }> = [];
   const upstream = server(async (request) => {
     seen.push({
+      path: new URL(request.url).pathname,
       authorization: request.headers.get("authorization"),
       key: request.headers.get("x-api-key"),
     });
@@ -1338,9 +1425,9 @@ test("proxyRequest discards ChatGPT OAuth for ordinary and unknown models", asyn
       upstream,
     );
   expect(seen).toEqual([
-    { authorization: "Bearer castai_v1_key", key: null },
-    { authorization: "Bearer castai_v1_key", key: null },
-    { authorization: "Bearer castai_v1_key", key: null },
+    { path: "/openai/v1/responses", authorization: "Bearer castai_v1_key", key: null },
+    { path: "/openai/v1/responses", authorization: "Bearer castai_v1_key", key: null },
+    { path: "/anthropic/v1/messages", authorization: "Bearer castai_v1_key", key: null },
   ]);
 });
 
@@ -1365,6 +1452,7 @@ test("proxyRequest refuses subscription routes without both usable credentials",
 
   rmSync(join(root, "home", ".config", "kimchi", "config.json"));
   oauthCredential();
+  saveCredential({ ...loadCredential()!, idToken: undefined });
   const noCompatibleKey = await proxyRequest(
     new Request("http://127.0.0.1:8766/openai/v1/responses", {
       method: "POST",
