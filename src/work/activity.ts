@@ -197,7 +197,22 @@ function inputBody(event: Record<string, any>): unknown {
   // Flat harness events combine request arguments with after-hook metadata.
   // Do not let response/stage/timing fields change invocation identity or args.
   if (event == null || typeof event !== "object" || Array.isArray(event)) return event;
-  const { tool_response, duration_ms, durationMs, hook_event_name, stage, ...projection } = event;
+  // The Claude mod also flattens the call's identity into its event. Those fields
+  // name the call (callIdentity) and are not arguments; keeping them would make
+  // the mod's Action differ from the hook's `tool_input` one for the same call.
+  const {
+    tool_response,
+    duration_ms,
+    durationMs,
+    hook_event_name,
+    stage,
+    tool,
+    tool_name,
+    tool_use_id,
+    call_id,
+    toolCallId,
+    ...projection
+  } = event;
   return projection;
 }
 function firstField(body: unknown, keys: string[]): string {
@@ -240,18 +255,44 @@ function documentedExitPrefix(output: string): { code: number; stdout: string } 
 
 function rawResponse(input: ActivityInput): { present: boolean; value: unknown } {
   const event = nativeBody(input);
-  if (event.tool_response != null) return { present: true, value: event.tool_response };
+  if (event.tool_response != null) return responsePayload(event.tool_response);
+  const failure = failureMessage(input);
+  if (failure !== undefined) return { present: true, value: { error: failure } };
   if (input.result == null) return { present: false, value: undefined };
   // The mod passes the next(e) result separately from the native event. Its
   // `result` field is the actual tool payload when that envelope is present.
   const result = input.result.result !== undefined ? input.result.result : input.result;
   if (result == null) return { present: false, value: undefined };
-  if (typeof result === "object" && !Array.isArray(result)) {
+  return responsePayload(result);
+}
+function responsePayload(value: unknown): { present: boolean; value: unknown } {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
     // Capture metadata is used for phase timing; it is not tool output itself.
-    const { durationMs, duration_ms, ...payload } = result as Record<string, any>;
+    // Both paths drop it, so one result deduplicates whichever path reports it.
+    const { durationMs, duration_ms, ...payload } = value as Record<string, any>;
     return { present: true, value: payload };
   }
-  return { present: true, value: result };
+  return { present: true, value };
+}
+/**
+ * A failed Claude Code call carries its message outside any tool response: the
+ * PostToolUseFailure hook as a top-level `error`, the mod as `text` beside its
+ * `isError` string result. Both become the same `{error}` response a failing
+ * tool_response has, so the error is kept (bounded) and the two reports agree.
+ */
+function failureMessage(input: ActivityInput): string | undefined {
+  const event = nativeBody(input);
+  if (
+    input.stage === "PostToolUseFailure" &&
+    typeof event.hook_event_name === "string" &&
+    typeof event.error === "string" &&
+    event.error.length
+  )
+    return event.error;
+  const result = input.result;
+  if (result?.isError === true && typeof result.result === "string")
+    return typeof result.text === "string" && result.text.length ? result.text : result.result;
+  return undefined;
 }
 function eventFailure(input: ActivityInput): boolean {
   return (
@@ -453,7 +494,12 @@ function actionCallId(action: Action): string {
 
 function responseError(input: ActivityInput): string | undefined {
   const e = nativeBody(input);
-  return errorText(e.tool_response) || errorText(input.result);
+  const failure = failureMessage(input);
+  return (
+    errorText(e.tool_response) ||
+    errorText(input.result) ||
+    (failure === undefined ? undefined : errorText({ error: failure }))
+  );
 }
 
 function genericObservation(
