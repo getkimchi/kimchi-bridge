@@ -453,7 +453,7 @@ export async function run(
     return;
   }
   if (command === "hook" && c.disabled) return;
-  if (["hook", "flush", "status"].includes(command) && workspace) {
+  if (["hook", "flush", "status", "export"].includes(command) && workspace) {
     await workspaceCommand(command, args, {
       readHookInput: () => stdin(4 << 20),
       output,

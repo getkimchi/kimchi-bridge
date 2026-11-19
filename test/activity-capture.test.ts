@@ -167,6 +167,51 @@ test("FileOperation read preserves path and content", () => {
   expect(validateActivityEvent(event)).toEqual([]);
 });
 
+test("FileOperation preserves explicit empty writes, replacements, and results", () => {
+  const write = activityAction({
+    ...before,
+    event: {
+      tool_name: "Write",
+      tool_use_id: "write-empty",
+      tool_input: { file_path: "/workspace/repo/empty.txt", content: "" },
+    },
+  });
+  expect(write.action.fileOperation).toMatchObject({
+    operation: "FILE_OP_TYPE_WRITE",
+    path: "/workspace/repo/empty.txt",
+    content: "",
+  });
+  const edit = activityAction({
+    ...before,
+    event: {
+      tool_name: "Edit",
+      tool_use_id: "edit-empty",
+      tool_input: {
+        file_path: "/workspace/repo/edit.txt",
+        old_string: "delete me",
+        new_string: "",
+      },
+    },
+  });
+  expect(edit.action.fileOperation).toMatchObject({
+    operation: "FILE_OP_TYPE_EDIT",
+    oldContent: "delete me",
+    content: "",
+  });
+  const readInput: ActivityInput = {
+    ...before,
+    event: {
+      tool_name: "Read",
+      tool_use_id: "read-empty",
+      tool_input: { file_path: "/workspace/repo/empty.txt" },
+    },
+  };
+  const result = after(activityAction(readInput), {
+    event: { ...readInput.event, tool_response: "" },
+  });
+  expect(result.observation.fileOperationResult).toMatchObject({ content: "" });
+});
+
 test("multi-file patches remain rich generic ToolCall events rather than a lossy single FileOperation", () => {
   const patch =
     "*** Begin Patch\n*** Update File: a.ts\n@@\n-old\n+new\n*** Update File: b.ts\n@@\n-old\n+new\n*** End Patch";

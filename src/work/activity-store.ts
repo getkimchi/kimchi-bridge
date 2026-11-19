@@ -550,7 +550,7 @@ export class ActivityStore {
         this.db
           .query("DELETE FROM observations WHERE source=? AND trajectory_id=? AND call_id=?")
           .run(row.source, row.trajectory_id, row.call_id);
-        actionOverBudget = this.actionBytes() - row.size > this.limits.actionBytes;
+        actionOverBudget = this.actionBytes() > this.limits.actionBytes;
       }
       this.db
         .query(

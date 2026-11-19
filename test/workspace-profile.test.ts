@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { run } from "../src/cli.ts";
+import { ActivityStore } from "../src/work/activity-store.ts";
 
 const variables = [
   "HOME",
@@ -130,6 +131,77 @@ test("workspace sync retains and retries the same activity batch without account
   expect(status.diagnostics.activity_delivery_pending).toBeGreaterThan(0);
   expect(status.diagnostics.activity_http_503).toBeGreaterThan(0);
   expect(existsSync(join(root, "bridge-state", "accounts", "local", "ledger.sqlite"))).toBe(false);
+});
+
+test("workspace export reads pending activity as JSONL and CSV instead of the legacy ledger", async () => {
+  await run(["hook", "claude-code"], stdin(toolEvent("export-001")), () => {});
+  let jsonl = "";
+  await run(["export", "jsonl"], stdin({}), (text) => {
+    jsonl += text;
+  });
+  const records = jsonl
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  expect(records).toHaveLength(1);
+  expect(records[0].action.shellCommand).toMatchObject({ callId: "export-001", command: "pwd" });
+  let csv = "";
+  await run(["export", "csv"], stdin({}), (text) => {
+    csv += text;
+  });
+  const rows = csv.trim().split("\n");
+  expect(rows[0]).toBe("event_id,variant,source,trajectory_id,turn_id,occurred_at,event_json");
+  expect(rows).toHaveLength(2);
+  expect(rows[1]).toContain("workspace-profile-session");
+  expect(rows[1]).toContain("export-001");
+  expect(existsSync(join(root, "bridge-state", "accounts", "local", "ledger.sqlite"))).toBe(false);
+});
+
+test("workspace flush drains every pending activity batch", async () => {
+  const store = new ActivityStore(join(root, "bridge-state", "workspace-activity"));
+  for (let index = 0; index < 1002; index++)
+    store.observe(
+      {
+        event: {
+          session_id: "large-flush-session",
+          cwd: "/workspace/repo",
+          hook_event_name: "PreToolUse",
+          tool_name: "Bash",
+          tool_use_id: `call-${String(index).padStart(4, "0")}`,
+          tool_input: { command: "pwd" },
+        },
+      },
+      "claude-code",
+    );
+  store.close();
+  const sizes: number[] = [];
+  const endpoint = localRecorder(async (request) => {
+    const batch = parseActivity(await request.text());
+    sizes.push(batch.events.length);
+    return Response.json({
+      batchId: batch.batchId,
+      receipts: batch.events.map((event: any) => ({
+        eventId: event.eventId,
+        status: "RECEIPT_STATUS_ACCEPTED",
+      })),
+    });
+  });
+  process.env.KIMCHI_BRIDGE_ACTIVITY_URL = endpoint;
+  let output = "";
+  await run(["flush"], stdin({}), (text) => {
+    output += text;
+  });
+  expect(sizes).toEqual([...Array(10).fill(100), 2]);
+  expect(output).toBe("All pending activity records acknowledged.\n");
+  let statusText = "";
+  await run(["status"], stdin({}), (text) => {
+    statusText += text;
+  });
+  expect(JSON.parse(statusText)).toMatchObject({
+    pending_events: 0,
+    pending_batches: 0,
+    acknowledgements: 1002,
+  });
 });
 
 function parseActivity(value: string): { batchId: string; events: any[] } {

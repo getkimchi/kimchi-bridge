@@ -63,3 +63,14 @@ export async function flushAllActivities(
   }
   if (store.pendingBatch()) throw new Error("activity delivery work remains for the next pass");
 }
+
+/** Explicit flush drains until empty; a network, HTTP, or receipt failure stops at the retained batch. */
+export async function drainActivities(
+  store: ActivityStore,
+  endpoint: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  while (await flushActivity(store, endpoint, signal)) {
+    /* Each receipt frees the next durable batch. */
+  }
+}

@@ -208,6 +208,14 @@ function firstField(body: unknown, keys: string[]): string {
   }
   return "";
 }
+function optionalStringField(body: unknown, keys: string[]): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  for (const key of keys) {
+    const value = (body as any)[key];
+    if (typeof value === "string") return value;
+  }
+  return undefined;
+}
 function integerField(body: unknown, keys: string[]): number | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
   for (const key of keys) {
@@ -387,30 +395,27 @@ function actionFor(input: ActivityInput): Action {
   const operation = operations[name];
   if (operation) {
     const path = firstField(args, ["file_path", "path", "filePath"]);
+    const content = optionalStringField(args, ["content", "new_string", "new_content"]);
+    const oldContent = optionalStringField(args, ["old_string", "old_content"]);
     if (
       path &&
       Buffer.byteLength(path) <= TOOL_ACTIVITY_LIMITS.maxMetadataBytes &&
-      Buffer.byteLength(firstField(args, ["content", "new_string", "new_content"])) <=
-        TOOL_ACTIVITY_LIMITS.maxPayloadBytes &&
-      Buffer.byteLength(firstField(args, ["old_string", "old_content"])) <=
-        TOOL_ACTIVITY_LIMITS.maxPayloadBytes
-    ) {
-      const content = firstField(args, ["content", "new_string", "new_content"]);
-      const oldContent = firstField(args, ["old_string", "old_content"]);
+      Buffer.byteLength(content ?? "") <= TOOL_ACTIVITY_LIMITS.maxPayloadBytes &&
+      Buffer.byteLength(oldContent ?? "") <= TOOL_ACTIVITY_LIMITS.maxPayloadBytes
+    )
       return {
         fileOperation: {
           callId,
           operation,
           path: boundedText(path, TOOL_ACTIVITY_LIMITS.maxMetadataBytes),
-          ...(content
+          ...(content !== undefined
             ? { content: boundedText(content, TOOL_ACTIVITY_LIMITS.maxPayloadBytes) }
             : {}),
-          ...(oldContent
+          ...(oldContent !== undefined
             ? { oldContent: boundedText(oldContent, TOOL_ACTIVITY_LIMITS.maxPayloadBytes) }
             : {}),
         },
       };
-    }
   }
   if (["bash", "exec_command", "shell", "shell_command", "write_stdin"].includes(name)) {
     const cmd = firstField(args, ["command", "cmd", "script"]);
@@ -579,9 +584,9 @@ function specializedObservation(
     const reportedPath = firstField(value.file, ["filePath", "path"]);
     if (reportedPath && Buffer.byteLength(reportedPath) <= TOOL_ACTIVITY_LIMITS.maxMetadataBytes)
       path = reportedPath;
-    content = firstField(value.file, ["content"]);
+    content = optionalStringField(value.file, ["content"]);
   } else if (typeof value === "string") content = value;
-  else content = firstField(value, ["content", "output", "stdout", "text"]);
+  else content = optionalStringField(value, ["content", "output", "stdout", "text"]);
   if (
     (content !== undefined && typeof content !== "string") ||
     (response.present && content === undefined && !responseError(input) && !errorText(value))

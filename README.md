@@ -114,6 +114,8 @@ The plugins also follow Kimchi's PR reporting setting. If you turn it off with `
 | `kimchi-bridge export jsonl` | Prints all local records as JSON Lines. Use `export csv` for CSV. |
 | `kimchi-bridge version` | Prints the installed version. |
 
+`export` reads the active profile's store. In the workspace activity profile, it prints pending activity bodies; acknowledged activity retains compact receipts rather than full exportable bodies.
+
 ### Start new work
 
 All prompts in a session count as one piece of work. To start a new one, begin a prompt with `New work:` and a title:

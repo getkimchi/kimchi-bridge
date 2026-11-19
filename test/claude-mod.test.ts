@@ -79,6 +79,60 @@ test("hooks.json syncs the queue on the same events as Codex, so uploads do not 
   }
 });
 
+test("Claude command hooks alone capture completed and failed tool calls", () => {
+  const hooks = JSON.parse(
+    readFileSync(
+      new URL("../plugins/kimchi-work/claude/hooks/hooks.json", import.meta.url),
+      "utf8",
+    ),
+  ).hooks as Record<string, unknown>;
+  for (const stage of ["PreToolUse", "PostToolUse", "PostToolUseFailure"])
+    expect(hooks[stage]).toBeDefined();
+  const dir = mkdtempSync(join(tmpdir(), "activity-command-hooks-"));
+  const store = new ActivityStore(dir);
+  const observe = (stage: string, id: string, response?: Record<string, unknown>) => {
+    // Exercise only lifecycle events actually registered by the command manifest.
+    expect(hooks[stage]).toBeDefined();
+    store.observe(
+      {
+        event: {
+          session_id: "command-only-session",
+          cwd: "/workspace/repo",
+          hook_event_name: stage,
+          tool_name: "Bash",
+          tool_use_id: id,
+          tool_input: { command: "pwd" },
+          ...(response ? { tool_response: response, duration_ms: 4 } : {}),
+        },
+      },
+      "claude-code",
+    );
+  };
+  try {
+    observe("PreToolUse", "success");
+    observe("PostToolUse", "success", { stdout: "/workspace/repo", stderr: "" });
+    observe("PreToolUse", "failure");
+    observe("PostToolUseFailure", "failure", { error: "permission denied" });
+    const events = store.allEvents();
+    expect(events).toHaveLength(4);
+    expect(events[1].observation?.shellCommandOutput).toMatchObject({
+      callId: "success",
+      stdout: "/workspace/repo",
+      outcome: "OUTCOME_COMPLETED",
+    });
+    expect(events[3].observation?.toolOutput).toMatchObject({
+      callId: "failure",
+      success: false,
+      error: "permission denied",
+      outcome: "OUTCOME_FAILED",
+    });
+    expect(store.status().diagnostics).toEqual({});
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the native mod hands its tool result into activity capture", async () => {
   const { register } = await import(
     new URL("../plugins/kimchi-work/claude/hooks/register.js", import.meta.url).href

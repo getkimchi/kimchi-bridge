@@ -110,6 +110,32 @@ test("byte-budget pruning removes an older completed preimage but protects a pen
   );
 });
 
+test("byte-budget pruning removes as many completed preimages as needed", () => {
+  const first = store();
+  call(first, "call-0");
+  const cost = Buffer.from(
+    (first.db.query("SELECT body FROM actions").get() as { body: Uint8Array }).body,
+  ).byteLength;
+  accept(first);
+  const value = store({ actionBytes: cost * 2 });
+  for (const id of ["call-0", "call-1", "call-2", "call-3"]) {
+    call(value, id);
+    accept(value);
+  }
+  expect(value.status().preimages).toBe(4);
+  value.prune();
+  expect(value.status().preimages).toBe(2);
+  expect(value.status().observations).toBe(2);
+  expect((value.status().storage as { actionBytes: number }).actionBytes).toBeLessThanOrEqual(
+    value.limits.actionBytes,
+  );
+  expect(
+    (
+      value.db.query("SELECT call_id FROM actions ORDER BY call_id").all() as { call_id: string }[]
+    ).map((row) => row.call_id),
+  ).toEqual(["call-2", "call-3"]);
+});
+
 test("receipt caches retain the newest bounded deduplication identities", () => {
   const value = store({ receiptRecords: 2 });
   for (const id of ["first", "second", "third"]) {
