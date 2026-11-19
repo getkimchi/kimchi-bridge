@@ -1475,6 +1475,35 @@ test("proxyRequest refuses subscription routes without both usable credentials",
   expect(hits).toBe(0);
 });
 
+test("proxyRequest preserves Anthropic tools and upstream validation errors", async () => {
+  oauthCredential();
+  const tools = [
+    { type: "web_search", external_web_access: false },
+    { type: "web_search_preview", search_context_size: "high" },
+    { type: "web_search_20250305", name: "web_search", max_uses: 2 },
+  ];
+  let seen: { path: string; tools: unknown };
+  const upstream = server(async (request) => {
+    seen = {
+      path: new URL(request.url).pathname,
+      tools: (await request.json()) as unknown,
+    };
+    return new Response("upstream rejected these tool definitions", { status: 503 });
+  });
+  const response = await proxyRequest(
+    new Request("http://127.0.0.1:8766/anthropic/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [], tools }),
+    }),
+    upstream,
+  );
+  expect(response.status).toBe(503);
+  expect(await response.text()).toBe("upstream rejected these tool definitions");
+  expect(seen!.path).toBe("/anthropic/v1/messages");
+  expect(seen!.tools).toEqual({ model: "m", messages: [], tools });
+});
+
 test("proxyRequest streams the upstream body through untouched", async () => {
   oauthCredential();
   const stream = new ReadableStream<Uint8Array>({
