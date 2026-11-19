@@ -1,5 +1,9 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, test } from "bun:test";
+import { ActivityStore } from "../src/work/activity-store.ts";
+import type { Native } from "../src/work/capture.ts";
 
 test("native mod caches its version and avoids helper calls for irrelevant telemetry", async () => {
   const { register } = await import(
@@ -72,5 +76,111 @@ test("hooks.json syncs the queue on the same events as Codex, so uploads do not 
     // A background upload must never hold up the prompt or the end of the turn.
     expect(handler.async).toBe(true);
     expect(handler.timeout).toBe(10);
+  }
+});
+
+test("Claude command hooks alone capture completed and failed tool calls", () => {
+  const hooks = JSON.parse(
+    readFileSync(
+      new URL("../plugins/kimchi-work/claude/hooks/hooks.json", import.meta.url),
+      "utf8",
+    ),
+  ).hooks as Record<string, unknown>;
+  for (const stage of ["PreToolUse", "PostToolUse", "PostToolUseFailure"])
+    expect(hooks[stage]).toBeDefined();
+  const dir = mkdtempSync(join(tmpdir(), "activity-command-hooks-"));
+  const store = new ActivityStore(dir);
+  const observe = (stage: string, id: string, response?: Record<string, unknown>) => {
+    // Exercise only lifecycle events actually registered by the command manifest.
+    expect(hooks[stage]).toBeDefined();
+    store.observe(
+      {
+        event: {
+          session_id: "command-only-session",
+          cwd: "/workspace/repo",
+          hook_event_name: stage,
+          tool_name: "Bash",
+          tool_use_id: id,
+          tool_input: { command: "pwd" },
+          ...(response ? { tool_response: response, duration_ms: 4 } : {}),
+        },
+      },
+      "claude-code",
+    );
+  };
+  try {
+    observe("PreToolUse", "success");
+    observe("PostToolUse", "success", { stdout: "/workspace/repo", stderr: "" });
+    observe("PreToolUse", "failure");
+    observe("PostToolUseFailure", "failure", { error: "permission denied" });
+    const events = store.allEvents();
+    expect(events).toHaveLength(4);
+    expect(events[1].observation?.shellCommandOutput).toMatchObject({
+      callId: "success",
+      stdout: "/workspace/repo",
+      outcome: "OUTCOME_COMPLETED",
+    });
+    expect(events[3].observation?.toolOutput).toMatchObject({
+      callId: "failure",
+      success: false,
+      error: "permission denied",
+      outcome: "OUTCOME_FAILED",
+    });
+    expect(store.status().diagnostics).toEqual({});
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the native mod hands its tool result into activity capture", async () => {
+  const { register } = await import(
+    new URL("../plugins/kimchi-work/claude/hooks/register.js", import.meta.url).href
+  );
+  const handlers = new Map<string, (...args: any[]) => any>();
+  register((event: string, ...args: any[]) => handlers.set(event, args.at(-1)));
+  const records: { input: Record<string, any> }[] = [];
+  let versionReads = 0;
+  const api = {
+    plugin: { root: "/plugin" },
+    session: {
+      id: async () => "mod-session",
+      cwd: async () => "/workspace/repo",
+      version: async () => {
+        versionReads++;
+        return { version: "2.1.309" };
+      },
+    },
+    process: {
+      run: async (_args: string[], options: { stdin: string }) => {
+        records.push({ input: JSON.parse(options.stdin) });
+      },
+    },
+  };
+  const event = { tool: "Bash", toolCallId: "mod-call-001", tool_input: { command: "pwd" } };
+  const result = await handlers.get("tool.call")!(api, event, async () => ({
+    stdout: "/workspace/repo",
+    stderr: "",
+    durationMs: 4,
+  }));
+  expect(result.stdout).toBe("/workspace/repo");
+  // sourceVersion is deliberately cached across registrations in this module.
+  expect(records[0].input.version).toBe("2.1.309");
+  expect(records.map((r) => r.input.stage)).toEqual(["tool.before", "tool.after"]);
+  const dir = mkdtempSync(join(tmpdir(), "activity-mod-"));
+  const store = new ActivityStore(dir);
+  try {
+    store.observe(records[0].input as Native, "claude-code");
+    store.observe(records[1].input as Native, "claude-code");
+    const observation = store.allEvents()[1].observation;
+    expect(observation?.shellCommandOutput).toMatchObject({
+      stdout: "/workspace/repo",
+      stderr: "",
+      durationMs: "4",
+      outcome: "OUTCOME_COMPLETED",
+    });
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
