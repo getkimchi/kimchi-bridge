@@ -209,9 +209,9 @@ test("buildCodexToml emits the provider block and top-level keys", () => {
   expect(out).toContain('base_url = "http://127.0.0.1:8766/openai/v1"');
   expect(out).toContain('http_headers = { Authorization = "Bearer bearer-x" }');
   expect(out).toContain('wire_api = "responses"');
-  expect(out).toContain("supports_standalone_web_search = true");
+  expect(out).not.toContain("supports_standalone_web_search");
   expect(out).toContain('web_search = "live"');
-  expect(out).toContain("[features]\nstandalone_web_search = true");
+  expect(out).not.toContain("[features]\nstandalone_web_search = true");
 });
 
 test("buildCodexToml enables ChatGPT auth only for usable subscription rows", () => {
@@ -284,12 +284,18 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
   );
   expect(available.models.find((model) => model.slug === "plain")?.display_name).toBe("plain");
   expect(new Set(available.models.map((model) => model.slug)).size).toBe(available.models.length);
-  for (const slug of ["plain", "chat-only"])
-    expect(available.models.find((model) => model.slug === slug)).toMatchObject({
-      supports_search_tool: true,
-      web_search_tool_type: "text",
-      web_search_provider: "standalone",
-    });
+  expect(available.models.find((model) => model.slug === "plain")).toMatchObject({
+    supports_search_tool: true,
+    web_search_tool_type: "text",
+  });
+  expect(
+    available.models.find((model) => model.slug === "plain")?.web_search_provider,
+  ).toBeUndefined();
+  expect(available.models.find((model) => model.slug === "chat-only")).toMatchObject({
+    supports_search_tool: true,
+    web_search_tool_type: "text_and_image",
+    web_search_provider: "search_mcp",
+  });
 
   const unavailable = buildCodexCatalog(feed, false);
   expect(unavailable.routes).toEqual({
@@ -404,7 +410,7 @@ test("enable preserves an explicit search mode and restores it with the old feat
     `web_search = "cached"
 
 [features]
-standalone_web_search = false
+standalone_web_search = true
 multi_agent = true
 
 [plugins]
@@ -420,17 +426,17 @@ local = true
   expect(first).toContain('web_search = "cached"');
   expect(first).not.toContain('web_search = "live"');
   expect(first.split("[features]").length - 1).toBe(1);
-  expect(first.split("\nstandalone_web_search =").length - 1).toBe(1);
-  expect(first).toContain("standalone_web_search = true");
+  expect(first).not.toContain("standalone_web_search");
   expect(first).toContain("multi_agent = true");
   expect(first).toContain("[plugins]\nlocal = true");
+  expect(messages.some((message) => message.includes("Removed the bridge-managed"))).toBe(true);
   expect(messages.some((message) => message.includes("bridge did not select live search"))).toBe(
     true,
   );
   await disable();
   const restored = readFileSync(codexConfigPath(), "utf8");
   expect(restored).toContain('web_search = "cached"');
-  expect(restored).toContain("standalone_web_search = false");
+  expect(restored).toContain("standalone_web_search = true");
   expect(restored).toContain("multi_agent = true");
   expect(restored).toContain("[plugins]\nlocal = true");
 });
@@ -477,7 +483,7 @@ test("catalog and main-model resolution mirror Kimchi's selection", () => {
       (model) =>
         model.supports_search_tool &&
         model.web_search_tool_type === "text" &&
-        model.web_search_provider === "standalone",
+        model.web_search_provider === undefined,
     ),
   ).toBe(true);
   expect(resolveMainModel(models).slug).toBe("minimax-m3");
@@ -820,7 +826,8 @@ local = true
   expect(firstToml).toContain('http_headers = { Authorization = "Bearer kimchi-gateway" }');
   expect(firstToml).toContain("requires_openai_auth = true");
   expect(firstToml).toContain('web_search = "live"');
-  expect(firstToml).toContain("[features]\nstandalone_web_search = true\nmulti_agent = true");
+  expect(firstToml).toContain("[features]\nmulti_agent = true");
+  expect(firstToml).not.toContain("standalone_web_search");
   expect(firstToml).not.toContain("castai_v1_key");
   expect(firstToml).not.toContain("KIMCHI_API_KEY");
   expect(firstToml).not.toContain("env_key");
@@ -1580,16 +1587,16 @@ test("proxyRequest streams the upstream body through untouched", async () => {
   expect(await response.text()).toBe("data: one\n\ndata: two\n\ndata: [DONE]\n\n");
 });
 
-test("Codex 0.169 registers and invokes web.run against a synthetic Responses server", async () => {
+test("Codex 0.169 uses backend web_search and a sourced result for an ordinary model", async () => {
   const codex = Bun.which("codex");
   if (!codex) {
-    console.warn("SKIP actual executor registration: codex is unavailable");
+    console.warn("SKIP actual backend search execution: codex is unavailable");
     return;
   }
   const version = Bun.spawnSync([codex, "--version"]).stdout.toString();
   if (!version.includes("0.169.0")) {
     console.warn(
-      `SKIP actual executor registration: expected Codex 0.169.0, got ${version.trim()}`,
+      `SKIP actual backend search execution: expected Codex 0.169.0, got ${version.trim()}`,
     );
     return;
   }
@@ -1602,42 +1609,37 @@ test("Codex 0.169 registers and invokes web.run against a synthetic Responses se
   mkdirSync(dirname(codexCatalogPath()), { recursive: true });
   writeFileSync(codexCatalogPath(), JSON.stringify(buildCodexCatalog([model]), null, 2) + "\n");
   const requests: any[] = [];
+  const paths: string[] = [];
   const upstream = server(async (request) => {
-    if (new URL(request.url).pathname !== "/openai/v1/responses")
-      return new Response("not found", { status: 404 });
+    const pathname = new URL(request.url).pathname;
+    paths.push(pathname);
+    if (pathname !== "/openai/v1/responses") return new Response("not found", { status: 404 });
     const body = await request.json();
     requests.push(body);
-    const output =
-      requests.length === 1
-        ? [
-            {
-              id: "call_web_run_item",
-              type: "function_call",
-              namespace: "web",
-              call_id: "call_web_run",
-              name: "run",
-              arguments: JSON.stringify({
-                search_query: [{ q: "synthetic standalone result" }],
-              }),
-            },
-          ]
-        : [
-            {
-              id: "msg_result",
-              type: "message",
-              status: "completed",
-              role: "assistant",
-              content: [
-                {
-                  type: "output_text",
-                  text: "Synthetic result-backed web.run answer",
-                  annotations: [],
-                },
-              ],
-            },
-          ];
+    const output = [
+      {
+        id: "backend_search_item",
+        type: "web_search_call",
+        action: { type: "search", query: "synthetic backend result" },
+      },
+      {
+        id: "msg_result",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "Synthetic sourced answer from the backend search result",
+            annotations: [
+              { type: "url_citation", url: "https://kimchi.dev/search", title: "Synthetic result" },
+            ],
+          },
+        ],
+      },
+    ];
     const response = {
-      id: `resp_web_run_${requests.length}`,
+      id: `resp_backend_search_${requests.length}`,
       object: "response",
       created_at: Math.floor(Date.now() / 1000),
       status: "completed",
@@ -1651,10 +1653,11 @@ test("Codex 0.169 registers and invokes web.run against a synthetic Responses se
         total_tokens: 2,
       },
     };
-    const itemEvents = ["response.output_item.added", "response.output_item.done"]
-      .map(
-        (type) =>
-          `event: ${type}\ndata: ${JSON.stringify({ type, output_index: 0, item: output[0] })}\n\n`,
+    const itemEvents = output
+      .flatMap((item, output_index) =>
+        ["response.output_item.added", "response.output_item.done"].map(
+          (type) => `event: ${type}\ndata: ${JSON.stringify({ type, output_index, item })}\n\n`,
+        ),
       )
       .join("");
     return new Response(
@@ -1687,7 +1690,7 @@ test("Codex 0.169 registers and invokes web.run against a synthetic Responses se
       "never",
       "-C",
       join(root, "home"),
-      "Use web.run once to find the synthetic standalone result, then state its answer.",
+      "Use backend web search to find the synthetic backend result, then state its sourced answer.",
     ],
     { env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 40_000 },
   );
@@ -1695,12 +1698,13 @@ test("Codex 0.169 registers and invokes web.run against a synthetic Responses se
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
   expect({ exitCode, stdout, stderr }).toMatchObject({ exitCode: 0 });
-  expect(requests.length).toBeGreaterThanOrEqual(2);
-  expect(
-    (requests[0]?.tools ?? []).some((tool: unknown) => JSON.stringify(tool).includes("web.run")),
-  ).toBe(true);
-  expect(JSON.stringify(requests.at(-1))).toContain("call_web_run");
-  expect(stdout + stderr).toContain("Synthetic result-backed web.run answer");
+  expect(requests.length).toBeGreaterThanOrEqual(1);
+  expect(paths.every((path) => path === "/openai/v1/responses")).toBe(true);
+  const serializedTools = JSON.stringify(requests[0]?.tools ?? []);
+  expect(serializedTools).toContain('"type":"web_search"');
+  expect(serializedTools).not.toContain('"type":"namespace"');
+  expect(serializedTools).not.toContain("web.run");
+  expect(stdout + stderr).toContain("Synthetic sourced answer from the backend search result");
 }, 50_000);
 
 test("proxyRequest preserves search tools and streamed answers for plain and zstd bodies", async () => {

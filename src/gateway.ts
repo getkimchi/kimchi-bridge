@@ -580,11 +580,7 @@ name = "${CODEX_PROVIDER_NAME}"
 base_url = "${tomlEscape(baseUrlValue)}"
 http_headers = { Authorization = "Bearer ${tomlEscape(bearer)}" }
 wire_api = "responses"
-supports_standalone_web_search = true
-${openAIAuth}
-[features]
-standalone_web_search = true
-`;
+${openAIAuth}`;
 }
 
 /** Strip the kimchi top-level keys and provider section, keeping user sections. */
@@ -706,7 +702,7 @@ export function mergeCodexToml(existingText: string, freshToml: string): string 
       header: userFeatures.header ?? freshFeatures.header,
       body: [...freshFeatures.body, ...userFeatures.body],
     },
-    "true",
+    null,
   );
   if (!collapsed) return `${freshText}\n`;
   // Top-level scalars the person set (e.g. the CLI's openai_base_url) must stay
@@ -806,8 +802,8 @@ interface CodexModelEntry {
   support_verbosity: boolean;
   supported_reasoning_levels: Array<{ effort: "low" | "medium" | "high"; description: string }>;
   supports_search_tool: boolean;
-  web_search_tool_type: "text";
-  web_search_provider: "standalone";
+  web_search_tool_type: "text" | "text_and_image";
+  web_search_provider?: "search_mcp";
 }
 
 export function buildCodexCatalog(
@@ -831,7 +827,7 @@ export function buildCodexCatalog(
   }
   const chosen = [...selected.values()];
   return {
-    models: chosen.map(({ model: m }, index) => ({
+    models: chosen.map(({ model: m, route }, index) => ({
       slug: m.slug,
       // The gateway's model registry currently serves empty display_name;
       // codex's /model picker renders display_name, so fall back to the slug
@@ -854,8 +850,8 @@ export function buildCodexCatalog(
       support_verbosity: m.reasoning === true,
       supported_reasoning_levels: m.reasoning === true ? [...REASONING_LEVELS] : [],
       supports_search_tool: true,
-      web_search_tool_type: "text",
-      web_search_provider: "standalone",
+      web_search_tool_type: route === CODEX_SUBSCRIPTION_ROUTE ? "text_and_image" : "text",
+      ...(route === CODEX_SUBSCRIPTION_ROUTE ? { web_search_provider: "search_mcp" } : {}),
     })),
     routes: Object.fromEntries(chosen.map(({ model, route }) => [model.slug, route])),
   };
@@ -2088,6 +2084,10 @@ export async function enable(
           },
   };
   saveGatewayState(state);
+  if (codexPrevious.standaloneWebSearch && codexPrevious.standaloneWebSearch !== "false")
+    onMessage?.(
+      "Removed the bridge-managed standalone_web_search activation; search uses native discovery or the backend Responses tool.",
+    );
   if (codexPrevious.searchMode !== '"live"')
     onMessage?.(
       `Preserved existing Codex web_search = ${codexPrevious.searchMode}; bridge did not select live search.`,
