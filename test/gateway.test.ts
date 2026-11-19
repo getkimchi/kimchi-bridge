@@ -209,6 +209,7 @@ test("buildCodexToml emits the provider block and top-level keys", () => {
   expect(out).toContain('base_url = "http://127.0.0.1:8766/openai/v1"');
   expect(out).toContain('http_headers = { Authorization = "Bearer bearer-x" }');
   expect(out).toContain('wire_api = "responses"');
+  expect(out).toContain("supports_standalone_web_search = true");
 });
 
 test("buildCodexToml enables ChatGPT auth only for usable subscription rows", () => {
@@ -285,6 +286,7 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
     expect(available.models.find((model) => model.slug === slug)).toMatchObject({
       supports_search_tool: true,
       web_search_tool_type: "text",
+      web_search_provider: "standalone",
     });
 
   const unavailable = buildCodexCatalog(feed, false);
@@ -430,7 +432,10 @@ test("catalog and main-model resolution mirror Kimchi's selection", () => {
   expect(catalog.models[1].supports_reasoning_summaries).toBe(true);
   expect(
     catalog.models.every(
-      (model) => model.supports_search_tool && model.web_search_tool_type === "text",
+      (model) =>
+        model.supports_search_tool &&
+        model.web_search_tool_type === "text" &&
+        model.web_search_provider === "standalone",
     ),
   ).toBe(true);
   expect(resolveMainModel(models).slug).toBe("minimax-m3");
@@ -1544,6 +1549,16 @@ test("proxyRequest preserves search tools and streamed answers for plain and zst
     },
     { type: "web_search_preview", search_context_size: "high", user_location: { country: "LT" } },
   ];
+  const searchQueries: string[] = [];
+  const search = server(async (request) => {
+    if (new URL(request.url).pathname !== "/v1/search")
+      return new Response("not found", { status: 404 });
+    const query = ((await request.json()) as { query?: string }).query ?? "";
+    searchQueries.push(query);
+    return Response.json({
+      results: [{ title: `Search result for ${query}`, url: "https://kimchi.dev/search" }],
+    });
+  });
   const seen: Array<{
     path: string;
     authorization: string | null;
@@ -1565,11 +1580,30 @@ test("proxyRequest preserves search tools and streamed answers for plain and zst
       model: parsed.model,
       tools: parsed.tools,
     });
+    const intercepted = parsed.model === "minimax-m3";
+    let answer = "Sourced answer [1] native";
+    if (intercepted) {
+      const searchResponse = await fetch(`${search}/v1/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: "Kimchi gateway" }),
+      });
+      const results = (await searchResponse.json()) as {
+        results: Array<{ title: string; url: string }>;
+      };
+      answer = `Sourced answer [1] ${results.results[0]!.title} (${results.results[0]!.url})`;
+    }
     const searchItem = {
       type: "response.output_item.done",
-      item: { type: "web_search_call", action: { type: "search", query: "Kimchi gateway" } },
+      item: intercepted
+        ? {
+            type: "function_call",
+            name: "litellm_web_search",
+            arguments: JSON.stringify({ query: "Kimchi gateway" }),
+          }
+        : { type: "web_search_call", action: { type: "search", query: "Kimchi gateway" } },
     };
-    const finalText = { type: "response.output_text.done", text: "Sourced answer [1]" };
+    const finalText = { type: "response.output_text.done", text: answer };
     const completed = {
       type: "response.completed",
       response: { id: "resp_search", object: "response", output: [] },
@@ -1601,11 +1635,14 @@ test("proxyRequest preserves search tools and streamed answers for plain and zst
       );
       expect(response.status).toBe(200);
       const stream = await response.text();
-      expect(stream).toContain('"type":"web_search_call"');
+      expect(stream).toContain(
+        model === "gpt-5.4" ? '"type":"web_search_call"' : "litellm_web_search",
+      );
       expect(stream).toContain("Sourced answer [1]");
       expect(response.headers.get("content-type")).toBe("text/event-stream");
     }
   expect(seen).toHaveLength(4);
+  expect(searchQueries).toEqual(["Kimchi gateway", "Kimchi gateway"]);
   for (const request of seen) {
     expect(request.path).toBe("/openai/v1/responses");
     expect(request.tools).toEqual(tools);

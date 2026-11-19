@@ -577,6 +577,7 @@ name = "${CODEX_PROVIDER_NAME}"
 base_url = "${tomlEscape(baseUrlValue)}"
 http_headers = { Authorization = "Bearer ${tomlEscape(bearer)}" }
 wire_api = "responses"
+supports_standalone_web_search = true
 ${openAIAuth}`;
 }
 
@@ -736,6 +737,7 @@ interface CodexModelEntry {
   supported_reasoning_levels: Array<{ effort: "low" | "medium" | "high"; description: string }>;
   supports_search_tool: boolean;
   web_search_tool_type: "text";
+  web_search_provider: "standalone";
 }
 
 export function buildCodexCatalog(
@@ -783,6 +785,7 @@ export function buildCodexCatalog(
       supported_reasoning_levels: m.reasoning === true ? [...REASONING_LEVELS] : [],
       supports_search_tool: true,
       web_search_tool_type: "text",
+      web_search_provider: "standalone",
     })),
     routes: Object.fromEntries(chosen.map(({ model, route }) => [model.slug, route])),
   };
