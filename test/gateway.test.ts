@@ -281,6 +281,11 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
   );
   expect(available.models.find((model) => model.slug === "plain")?.display_name).toBe("plain");
   expect(new Set(available.models.map((model) => model.slug)).size).toBe(available.models.length);
+  for (const slug of ["plain", "chat-only"])
+    expect(available.models.find((model) => model.slug === slug)).toMatchObject({
+      supports_search_tool: true,
+      web_search_tool_type: "text",
+    });
 
   const unavailable = buildCodexCatalog(feed, false);
   expect(unavailable.routes).toEqual({
@@ -423,6 +428,11 @@ test("catalog and main-model resolution mirror Kimchi's selection", () => {
     "high",
   ]);
   expect(catalog.models[1].supports_reasoning_summaries).toBe(true);
+  expect(
+    catalog.models.every(
+      (model) => model.supports_search_tool && model.web_search_tool_type === "text",
+    ),
+  ).toBe(true);
   expect(resolveMainModel(models).slug).toBe("minimax-m3");
   expect(
     resolveMainModel([
@@ -1333,7 +1343,7 @@ test("proxyRequest forwards ChatGPT OAuth and a Kimchi API key only for subscrip
   );
   expect(response.status).toBe(200);
   expect(seen!).toEqual({
-    path: "/openai/v1/codex/responses",
+    path: "/openai/v1/responses",
     authorization: "Bearer header.payload.signature",
     key: "castai_v1_key",
     custom: "preserved",
@@ -1391,7 +1401,7 @@ test("proxyRequest refreshes SSO before using its access token for a subscriptio
   expect(response.status).toBe(200);
   expect(refreshes).toBe(1);
   expect(seen!).toEqual({
-    path: "/openai/v1/codex/responses",
+    path: "/openai/v1/responses",
     authorization: "Bearer header.payload.signature",
     key: "access-refreshed",
     organization: org,
@@ -1490,31 +1500,94 @@ test("proxyRequest streams the upstream body through untouched", async () => {
   expect(await response.text()).toBe("data: one\n\ndata: two\n\ndata: [DONE]\n\n");
 });
 
-test("proxyRequest strips server-side web_search tools that break the gateway streaming path", async () => {
-  oauthCredential();
-  let seenTypes: (string | undefined)[] | undefined;
+test("proxyRequest preserves search tools and streamed answers for plain and zstd bodies", async () => {
+  kimchiKey("castai_v1_key");
+  catalogRoutes({
+    "minimax-m3": "kimchi-dev",
+    "gpt-5.4": "kimchi-dev/openai-codex",
+  });
+  const tools = [
+    { type: "function", name: "exec_command" },
+    {
+      type: "web_search",
+      external_web_access: false,
+      filters: { allowed_domains: ["kimchi.dev"] },
+    },
+    { type: "web_search_preview", search_context_size: "high", user_location: { country: "LT" } },
+  ];
+  const seen: Array<{
+    path: string;
+    authorization: string | null;
+    key: string | null;
+    model: string;
+    tools: unknown;
+  }> = [];
   const upstream = server(async (request) => {
-    const parsed = JSON.parse(await request.text()) as { tools?: { type?: string }[] };
-    seenTypes = parsed.tools?.map((tool) => tool.type);
-    return Response.json({ ok: true });
+    const bytes = Buffer.from(await request.arrayBuffer());
+    const plain =
+      request.headers.get("content-encoding") === "zstd"
+        ? Buffer.from(await Bun.zstdDecompress(bytes))
+        : bytes;
+    const parsed = JSON.parse(plain.toString("utf8"));
+    seen.push({
+      path: new URL(request.url).pathname,
+      authorization: request.headers.get("authorization"),
+      key: request.headers.get("x-api-key"),
+      model: parsed.model,
+      tools: parsed.tools,
+    });
+    const searchItem = {
+      type: "response.output_item.done",
+      item: { type: "web_search_call", action: { type: "search", query: "Kimchi gateway" } },
+    };
+    const finalText = { type: "response.output_text.done", text: "Sourced answer [1]" };
+    const completed = {
+      type: "response.completed",
+      response: { id: "resp_search", object: "response", output: [] },
+    };
+    return new Response(
+      `event: response.output_item.done\ndata: ${JSON.stringify(searchItem)}\n\n` +
+        `event: response.output_text.done\ndata: ${JSON.stringify(finalText)}\n\n` +
+        `event: response.completed\ndata: ${JSON.stringify(completed)}\n\n`,
+      { headers: { "content-type": "text/event-stream" } },
+    );
   });
-  const request = new Request("http://127.0.0.1:8766/openai/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "minimax-m3",
-      stream: true,
-      input: "Reply with exactly: OK",
-      tools: [
-        { type: "function", name: "exec_command" },
-        { type: "web_search", external_web_access: false },
-        { type: "web_search_preview" },
-      ],
-    }),
-  });
-  const response = await proxyRequest(request, upstream);
-  expect(response.status).toBe(200);
-  expect(seenTypes).toEqual(["function"]);
+  for (const model of ["minimax-m3", "gpt-5.4"])
+    for (const encoding of [undefined, "zstd"] as const) {
+      const plain = Buffer.from(
+        JSON.stringify({ model, stream: true, input: "Find and cite Kimchi", tools }),
+      );
+      const body = encoding === "zstd" ? Buffer.from(await Bun.zstdCompress(plain)) : plain;
+      const response = await proxyRequest(
+        new Request("http://127.0.0.1:8766/openai/v1/responses", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer header.payload.signature",
+            "content-type": "application/json",
+            ...(encoding ? { "content-encoding": encoding } : {}),
+          },
+          body,
+        }),
+        upstream,
+      );
+      expect(response.status).toBe(200);
+      const stream = await response.text();
+      expect(stream).toContain('"type":"web_search_call"');
+      expect(stream).toContain("Sourced answer [1]");
+      expect(response.headers.get("content-type")).toBe("text/event-stream");
+    }
+  expect(seen).toHaveLength(4);
+  for (const request of seen) {
+    expect(request.path).toBe("/openai/v1/responses");
+    expect(request.tools).toEqual(tools);
+    if (request.model === "gpt-5.4") {
+      expect(request.authorization).toBe("Bearer header.payload.signature");
+      expect(request.key).toBe("castai_v1_key");
+    } else {
+      expect(request.authorization).toBe("Bearer castai_v1_key");
+      expect(request.key).toBeNull();
+    }
+  }
 });
 
 test("proxyRequest forwards bodies without unsupported tools byte-identical, including non-JSON", async () => {

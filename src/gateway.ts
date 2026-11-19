@@ -734,6 +734,8 @@ interface CodexModelEntry {
   supports_reasoning_summaries: boolean;
   support_verbosity: boolean;
   supported_reasoning_levels: Array<{ effort: "low" | "medium" | "high"; description: string }>;
+  supports_search_tool: boolean;
+  web_search_tool_type: "text";
 }
 
 export function buildCodexCatalog(
@@ -779,6 +781,8 @@ export function buildCodexCatalog(
       supports_reasoning_summaries: m.reasoning === true,
       support_verbosity: m.reasoning === true,
       supported_reasoning_levels: m.reasoning === true ? [...REASONING_LEVELS] : [],
+      supports_search_tool: true,
+      web_search_tool_type: "text",
     })),
     routes: Object.fromEntries(chosen.map(({ model, route }) => [model.slug, route])),
   };
@@ -1447,46 +1451,6 @@ function forwardHeaders(incoming: Headers, auth: Record<string, string>): Header
   return headers;
 }
 
-// The gateway's serving stack (LiteLLM in front of vLLM) only implements
-// client-executed function tools. Responses-API server-side built-ins such as
-// {"type":"web_search"} pass request validation but then kill the streaming
-// path mid-stream with a generic overloaded_error, which codex surfaces as
-// "stream disconnected before completion". Both proxied routes hard-fail on
-// these tools today (the anthropic route answers 503), so strip the known
-// broken built-ins to keep requests working; revisit when the backend learns
-// to serve or cleanly reject them.
-const UNSUPPORTED_SERVER_TOOLS = ["web_search", "web_search_preview"];
-
-export function stripUnsupportedServerTools(body: ArrayBuffer, pathname: string): ArrayBuffer {
-  let parsed: { tools?: unknown };
-  try {
-    parsed = JSON.parse(new TextDecoder().decode(body));
-  } catch {
-    return body;
-  }
-  if (!Array.isArray(parsed.tools)) return body;
-  const kept = parsed.tools.filter((tool) => !isUnsupportedTool(tool));
-  if (kept.length === parsed.tools.length) return body; // nothing to drop: byte-identical passthrough
-  const dropped = parsed.tools.filter(isUnsupportedTool).map(describeToolType);
-  log(`stripped unsupported server tool(s) ${dropped.join(", ")} from ${pathname}`);
-  parsed.tools = kept;
-  return new TextEncoder().encode(JSON.stringify(parsed)).buffer as ArrayBuffer;
-}
-
-function isUnsupportedTool(tool: unknown): boolean {
-  if (typeof tool !== "object" || tool === null) return false;
-  const type = (tool as { type?: unknown }).type;
-  return typeof type === "string" && UNSUPPORTED_SERVER_TOOLS.includes(type);
-}
-
-function describeToolType(tool: unknown): string {
-  if (typeof tool === "object" && tool !== null && "type" in tool) {
-    const type = (tool as { type?: unknown }).type;
-    if (typeof type === "string") return type;
-  }
-  return "unknown";
-}
-
 // The model requests the gateway bills; each carries its own billing tag.
 const BILLED_PATHS = [
   "/anthropic/v1/messages",
@@ -1636,14 +1600,22 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
   // finite JSON, and one in-flight buffer per request is bounded.
   const buffered =
     request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
-  // Drop server-side built-in tools the backend cannot serve; everything else
-  // forwards byte-identical.
-  const body =
-    buffered === undefined ? undefined : stripUnsupportedServerTools(buffered, url.pathname);
-  let json: unknown;
-  if (request.method === "POST" && BILLED_PATHS.includes(url.pathname) && body !== undefined)
+  const body = buffered;
+  let inspectedBody: ArrayBuffer | Uint8Array | undefined = body;
+  if (body !== undefined && request.headers.get("content-encoding")?.toLowerCase() === "zstd")
     try {
-      json = JSON.parse(new TextDecoder().decode(body));
+      inspectedBody = await Bun.zstdDecompress(body);
+    } catch {
+      inspectedBody = body;
+    }
+  let json: unknown;
+  if (
+    request.method === "POST" &&
+    BILLED_PATHS.includes(url.pathname) &&
+    inspectedBody !== undefined
+  )
+    try {
+      json = JSON.parse(new TextDecoder().decode(inspectedBody));
     } catch {
       // An unreadable body goes untagged, as in Kimchi.
     }
@@ -1665,8 +1637,7 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
       "this model requires Codex ChatGPT login and CAST AI SSO or a saved Kimchi API key; run kimchi bridge setup\n",
       { status: 401, headers: { "content-type": "text/plain" } },
     );
-  const upstreamPath = subscription ? "/openai/v1/codex/responses" : url.pathname;
-  const upstream = `${baseUrl(llmBase)}${upstreamPath}${url.search}`;
+  const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
   let requestId: string | undefined;
   const forward = async (): Promise<Response> => {
     let auth: Record<string, string>;
