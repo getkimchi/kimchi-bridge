@@ -50,6 +50,7 @@ const CODEX_ORDINARY_ROUTE = "kimchi-dev";
 const CODEX_SUBSCRIPTION_ROUTE = "kimchi-dev/openai-codex";
 const CHATGPT_FEED_PROVIDER = "chatgpt";
 const UNSUPPORTED_SUBSCRIPTION_MODEL = "gpt-5.3-codex";
+const NATIVE_SOL_MODEL_SLUG = "gpt-6.1-sol";
 
 export type GatewayMode = "proxy" | "direct";
 
@@ -805,6 +806,8 @@ interface CodexModelEntry {
   supports_search_tool: boolean;
   web_search_tool_type: "text" | "text_and_image";
   web_search_provider?: "search_mcp";
+  use_responses_lite?: boolean;
+  tool_mode?: "code_mode_only";
 }
 
 export function buildCodexCatalog(
@@ -851,8 +854,17 @@ export function buildCodexCatalog(
       support_verbosity: m.reasoning === true,
       supported_reasoning_levels: m.reasoning === true ? [...REASONING_LEVELS] : [],
       supports_search_tool: true,
-      web_search_tool_type: route === CODEX_SUBSCRIPTION_ROUTE ? "text_and_image" : "text",
-      ...(route === CODEX_SUBSCRIPTION_ROUTE ? { web_search_provider: "search_mcp" } : {}),
+      web_search_tool_type:
+        route === CODEX_SUBSCRIPTION_ROUTE && m.slug === NATIVE_SOL_MODEL_SLUG
+          ? "text_and_image"
+          : "text",
+      ...(route === CODEX_SUBSCRIPTION_ROUTE && m.slug === NATIVE_SOL_MODEL_SLUG
+        ? {
+            web_search_provider: "search_mcp",
+            use_responses_lite: true,
+            tool_mode: "code_mode_only",
+          }
+        : {}),
     })),
     routes: Object.fromEntries(chosen.map(({ model, route }) => [model.slug, route])),
   };

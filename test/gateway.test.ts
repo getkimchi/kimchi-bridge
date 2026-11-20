@@ -264,6 +264,7 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
     ordinary("gpt-5.3-codex", "ordinary codex"),
     subscription("shared", "subscription shared"),
     subscription("chat-only", "chat only"),
+    subscription("gpt-6.1-sol", "native Sol"),
     subscription("gpt-5.3-codex", "unsupported subscription codex"),
     ordinary("plain", "duplicate plain"),
   ];
@@ -273,12 +274,14 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
     plain: "kimchi-dev",
     "gpt-5.3-codex": "kimchi-dev",
     "chat-only": "kimchi-dev/openai-codex",
+    "gpt-6.1-sol": "kimchi-dev/openai-codex",
   });
   expect(available.models.map((model) => model.slug)).toEqual([
     "shared",
     "plain",
     "gpt-5.3-codex",
     "chat-only",
+    "gpt-6.1-sol",
   ]);
   expect(available.models.find((model) => model.slug === "shared")?.display_name).toBe(
     "subscription shared",
@@ -289,13 +292,21 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
     supports_search_tool: true,
     web_search_tool_type: "text",
   });
-  expect(
-    available.models.find((model) => model.slug === "plain")?.web_search_provider,
-  ).toBeUndefined();
-  expect(available.models.find((model) => model.slug === "chat-only")).toMatchObject({
+  const plainEntry = available.models.find((model) => model.slug === "plain");
+  expect(plainEntry?.web_search_provider).toBeUndefined();
+  expect(plainEntry?.use_responses_lite).toBeUndefined();
+  expect(plainEntry?.tool_mode).toBeUndefined();
+  const otherNative = available.models.find((model) => model.slug === "chat-only");
+  expect(otherNative).toMatchObject({ supports_search_tool: true, web_search_tool_type: "text" });
+  expect(otherNative?.web_search_provider).toBeUndefined();
+  expect(otherNative?.use_responses_lite).toBeUndefined();
+  expect(otherNative?.tool_mode).toBeUndefined();
+  expect(available.models.find((model) => model.slug === "gpt-6.1-sol")).toMatchObject({
     supports_search_tool: true,
     web_search_tool_type: "text_and_image",
     web_search_provider: "search_mcp",
+    use_responses_lite: true,
+    tool_mode: "code_mode_only",
   });
 
   const unavailable = buildCodexCatalog(feed, false);
@@ -1588,7 +1599,7 @@ test("proxyRequest streams the upstream body through untouched", async () => {
   expect(await response.text()).toBe("data: one\n\ndata: two\n\ndata: [DONE]\n\n");
 });
 
-test("Codex 0.169 uses backend web_search and a sourced result for an ordinary model", async () => {
+test("Codex 0.169 accepts backend web_search compatibility fixtures for ordinary inference", async () => {
   const codex = Bun.which("codex");
   if (!codex) {
     console.warn("SKIP actual backend search execution: codex is unavailable");
