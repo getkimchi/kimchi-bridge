@@ -22,6 +22,10 @@ function store(): ActivityStore {
   });
   return value;
 }
+function observeFull(value: ActivityStore, native: Native, source: "claude-code"): void {
+  value.observe(native, source, { includeSensitive: true });
+}
+
 function nativeHooks(): Native[] {
   return readFileSync(join(import.meta.dir, "fixtures/claude-code-hooks.ndjson"), "utf8")
     .trim()
@@ -29,7 +33,7 @@ function nativeHooks(): Native[] {
     .map((line) => ({ event: parseJson(line) }) as Native);
 }
 function recordFixture(value: ActivityStore): void {
-  for (const native of nativeHooks()) value.observe(native, "claude-code");
+  for (const native of nativeHooks()) observeFull(value, native, "claude-code");
 }
 function endpoint(handler: (request: Request) => Response | Promise<Response>): string {
   const running = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: handler });
@@ -49,10 +53,10 @@ function ack(batch: ActivityBatch): Response {
 test("actual captured hooks become linked paired events and retain absence", () => {
   const value = store();
   const [before, after] = nativeHooks();
-  value.observe(before, "claude-code");
+  observeFull(value, before, "claude-code");
   // Repeating a native PreToolUse callback is idempotent for the same call.
-  value.observe(before, "claude-code");
-  value.observe(after, "claude-code");
+  observeFull(value, before, "claude-code");
+  observeFull(value, after, "claude-code");
   recordFixture(value);
   const events = value.allEvents();
   expect(events).toHaveLength(4);
@@ -81,7 +85,7 @@ test("actual captured hooks become linked paired events and retain absence", () 
 test("unknown results never fabricate an Action or lose a raw call identity", () => {
   const value = store();
   const after = nativeHooks()[1];
-  value.observe(after, "claude-code");
+  observeFull(value, after, "claude-code");
   expect(value.allEvents()).toHaveLength(0);
   const code = value.db
     .query("SELECT code FROM diagnostics WHERE code='activity_preimage_missing'")

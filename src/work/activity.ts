@@ -22,6 +22,8 @@ export interface ActivityInput {
   version?: string;
   eventId?: string;
   occurredAt?: string;
+  /** Rich tool payloads are opt-in; absence always constructs a private event. */
+  includeSensitive?: boolean;
 }
 
 export interface ToolPayload {
@@ -481,8 +483,56 @@ function actionFor(input: ActivityInput): Action {
   return genericAction(event, callId, tool);
 }
 
+function privateUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Project only fields whose disclosure is deliberate in private workspace capture. */
+function privateAction(action: Action, tool: string): Action {
+  if (action.toolCall)
+    return { toolCall: { callId: action.toolCall.callId, tool: action.toolCall.tool } };
+  if (action.shellCommand)
+    return {
+      shellCommand: {
+        callId: action.shellCommand.callId,
+        command: action.shellCommand.command,
+        ...(action.shellCommand.workingDir !== undefined
+          ? { workingDir: action.shellCommand.workingDir }
+          : {}),
+      },
+    };
+  if (action.fileOperation)
+    return {
+      fileOperation: {
+        callId: action.fileOperation.callId,
+        operation: action.fileOperation.operation,
+        path: action.fileOperation.path,
+      },
+    };
+  const url = privateUrl(action.webFetch.url);
+  if (url === undefined) return { toolCall: { callId: action.webFetch.callId, tool } };
+  return { webFetch: { callId: action.webFetch.callId, url } };
+}
+
 export function activityAction(input: ActivityInput): WorkspaceActionEvent {
-  return { ...header(input), action: actionFor(input) };
+  const action = actionFor(input);
+  return {
+    ...header(input),
+    action:
+      input.includeSensitive === true
+        ? action
+        : privateAction(action, callIdentity(nativeBody(input)).tool),
+  };
 }
 
 function actionCallId(action: Action): string {
@@ -654,6 +704,61 @@ function specializedObservation(
   };
 }
 
+function privateObservation(observation: Observation, tool: string): Observation {
+  const invocation = observation.invocation
+    ? { invocation: privateAction(observation.invocation, tool) }
+    : {};
+  if (observation.toolOutput) {
+    const output = observation.toolOutput;
+    return {
+      ...invocation,
+      toolOutput: {
+        callId: output.callId,
+        success: output.success,
+        outcome: output.outcome,
+        ...(output.durationMs !== undefined ? { durationMs: output.durationMs } : {}),
+      },
+    };
+  }
+  if (observation.shellCommandOutput) {
+    const output = observation.shellCommandOutput;
+    return {
+      ...invocation,
+      shellCommandOutput: {
+        callId: output.callId,
+        ...(output.exitCode !== undefined ? { exitCode: output.exitCode } : {}),
+        outcome: output.outcome,
+        ...(output.durationMs !== undefined ? { durationMs: output.durationMs } : {}),
+      },
+    };
+  }
+  if (observation.webFetchOutput) {
+    const output = observation.webFetchOutput;
+    const url = output.url === undefined ? undefined : privateUrl(output.url);
+    return {
+      ...invocation,
+      webFetchOutput: {
+        callId: output.callId,
+        ...(url !== undefined ? { url } : {}),
+        ...(output.code !== undefined ? { code: output.code } : {}),
+        outcome: output.outcome,
+        ...(output.durationMs !== undefined ? { durationMs: output.durationMs } : {}),
+      },
+    };
+  }
+  const output = observation.fileOperationResult!;
+  return {
+    ...invocation,
+    fileOperationResult: {
+      callId: output.callId,
+      success: output.success,
+      ...(output.path !== undefined ? { path: output.path } : {}),
+      outcome: output.outcome,
+      ...(output.durationMs !== undefined ? { durationMs: output.durationMs } : {}),
+    },
+  };
+}
+
 export function activityObservation(
   before: WorkspaceActivityEvent & { action: Action },
   input: ActivityInput,
@@ -678,10 +783,15 @@ export function activityObservation(
   else if (observation.shellCommandOutput) observation.shellCommandOutput.callId = callId;
   else if (observation.webFetchOutput) observation.webFetchOutput.callId = callId;
   else if (observation.fileOperationResult) observation.fileOperationResult.callId = callId;
-  return {
+  const event: WorkspaceObservationEvent = {
     ...header(input),
     causality: { causationId: before.eventId },
     observation,
+  };
+  if (input.includeSensitive === true) return event;
+  return {
+    ...event,
+    observation: privateObservation(observation, callIdentity(nativeBody(input)).tool),
   };
 }
 

@@ -12,6 +12,7 @@ const variables = [
   "KIMCHI_BRIDGE_PROFILE",
   "KIMCHI_BRIDGE_ACTIVITY_URL",
   "KIMCHI_BRIDGE_ACTIVITY_DRY_RUN",
+  "KIMCHI_BRIDGE_ACTIVITY_INCLUDE_SENSITIVE",
   "KIMCHI_API_KEY",
   "KIMCHI_TELEMETRY_ENABLED",
   "KIMCHI_REMOTE_ENDPOINT",
@@ -28,6 +29,7 @@ beforeEach(() => {
   process.env.KIMCHI_BRIDGE_CONFIG_HOME = join(root, "kimi-config");
   process.env.KIMCHI_BRIDGE_PROFILE = "workspace";
   delete process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN;
+  delete process.env.KIMCHI_BRIDGE_ACTIVITY_INCLUDE_SENSITIVE;
   process.env.KIMCHI_API_KEY = "synthetic-not-a-real-credential";
   process.env.KIMCHI_TELEMETRY_ENABLED = "1";
   process.env.KIMCHI_REMOTE_ENDPOINT = "http://127.0.0.1:1";
@@ -37,6 +39,7 @@ afterEach(() => {
   delete process.env.KIMCHI_BRIDGE_PROFILE;
   delete process.env.KIMCHI_BRIDGE_ACTIVITY_URL;
   delete process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN;
+  delete process.env.KIMCHI_BRIDGE_ACTIVITY_INCLUDE_SENSITIVE;
   delete process.env.CLAUDE_ENV_FILE;
   for (const cleanup of cleanups.splice(0)) cleanup();
   rmSync(root, { recursive: true, force: true });
@@ -248,6 +251,222 @@ test("workspace flush drains every pending activity batch", async () => {
     pending_batches: 0,
     acknowledgements: 1002,
   });
+});
+
+function richToolEvent(
+  id: string,
+  tool: string,
+  input: Record<string, unknown>,
+  response: unknown,
+  failed = false,
+): unknown[] {
+  const event = {
+    session_id: "workspace-profile-session",
+    cwd: "/workspace/repo",
+    tool_use_id: id,
+    tool_name: tool,
+    tool_input: input,
+  };
+  return [
+    { stage: "tool.before", event, version: "2.1.326" },
+    {
+      stage: failed ? "PostToolUseFailure" : "PostToolUse",
+      event: { ...event, tool_response: response, duration_ms: 5 },
+      version: "2.1.326",
+    },
+  ];
+}
+async function recordEvents(events: unknown[]): Promise<void> {
+  for (const event of events) await run(["hook", "claude-code"], stdin(event), () => {});
+}
+
+test("default private capture keeps sensitive fields out of SQLite, exports, and IMDS", async () => {
+  process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN = "1";
+  const requests: string[] = [];
+  process.env.KIMCHI_BRIDGE_ACTIVITY_URL = localRecorder(async (request) => {
+    const raw = await request.text();
+    requests.push(raw);
+    const batch = parseActivity(raw);
+    return Response.json({
+      batchId: batch.batchId,
+      receipts: batch.events.map((event: any) => ({
+        eventId: event.eventId,
+        status: "RECEIPT_STATUS_ACCEPTED",
+      })),
+    });
+  });
+  const fixtures = [
+    richToolEvent(
+      "private-edit",
+      "Edit",
+      {
+        file_path: "/workspace/repo/src/private.ts",
+        old_string: "SENSITIVE_OLD_CONTENT",
+        new_string: "SENSITIVE_NEW_CONTENT",
+      },
+      "SENSITIVE_FILE_RESULT",
+    ),
+    richToolEvent(
+      "private-bash",
+      "Bash",
+      { command: "pwd" },
+      { stdout: "SENSITIVE_STDOUT", stderr: "SENSITIVE_STDERR", exit_code: 0 },
+    ),
+    richToolEvent(
+      "private-web",
+      "WebFetch",
+      {
+        url: "https://SENSITIVE_URL_USERINFO:SENSITIVE_URL_PASSWORD@example.com:8443/search?q=SENSITIVE_URL_QUERY#SENSITIVE_URL_FRAGMENT",
+        prompt: "SENSITIVE_WEB_PROMPT",
+      },
+      { code: 200, result: "SENSITIVE_WEB_RESULT" },
+    ),
+    richToolEvent(
+      "private-generic",
+      "custom_tool",
+      { pattern: "SENSITIVE_GENERIC_ARGUMENT" },
+      { error: "SENSITIVE_RAW_ERROR", detail: "SENSITIVE_GENERIC_RESULT" },
+      true,
+    ),
+  ];
+  for (const events of fixtures) await recordEvents(events);
+  expect(requests).toHaveLength(0);
+
+  let jsonl = "";
+  await run(["export", "jsonl"], stdin({}), (chunk) => {
+    jsonl += chunk;
+  });
+  const records = jsonl
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  expect(records).toHaveLength(8);
+  expect(records[0].action.fileOperation).toEqual({
+    callId: "private-edit",
+    operation: "FILE_OP_TYPE_EDIT",
+    path: "/workspace/repo/src/private.ts",
+  });
+  expect(records[3].observation.shellCommandOutput).toMatchObject({
+    callId: "private-bash",
+    exitCode: 0,
+    outcome: "OUTCOME_COMPLETED",
+  });
+  expect(records[5].observation.webFetchOutput).toMatchObject({
+    callId: "private-web",
+    url: "https://example.com:8443/search",
+    code: 200,
+  });
+  expect(records[6].action.toolCall).toEqual({
+    callId: "private-generic",
+    tool: "custom_tool",
+  });
+  expect(records[7].observation.toolOutput).toMatchObject({
+    callId: "private-generic",
+    success: false,
+    outcome: "OUTCOME_FAILED",
+  });
+
+  let csv = "";
+  await run(["export", "csv"], stdin({}), (chunk) => {
+    csv += chunk;
+  });
+  const secrets = [
+    "SENSITIVE_OLD_CONTENT",
+    "SENSITIVE_NEW_CONTENT",
+    "SENSITIVE_FILE_RESULT",
+    "SENSITIVE_STDOUT",
+    "SENSITIVE_STDERR",
+    "SENSITIVE_URL_USERINFO",
+    "SENSITIVE_URL_PASSWORD",
+    "SENSITIVE_URL_QUERY",
+    "SENSITIVE_URL_FRAGMENT",
+    "SENSITIVE_WEB_PROMPT",
+    "SENSITIVE_WEB_RESULT",
+    "SENSITIVE_GENERIC_ARGUMENT",
+    "SENSITIVE_RAW_ERROR",
+    "SENSITIVE_GENERIC_RESULT",
+  ];
+  for (const secret of secrets) {
+    expect(jsonl).not.toContain(secret);
+    expect(csv).not.toContain(secret);
+  }
+
+  let statusText = "";
+  await run(["status"], stdin({}), (chunk) => {
+    statusText += chunk;
+  });
+  expect(JSON.parse(statusText)).toMatchObject({ captureMode: "private", dryRun: true });
+
+  const store = new ActivityStore(join(root, "bridge-state", "workspace-activity"));
+  expect(store.pendingBatch()?.events).toHaveLength(8);
+  const persisted = (["events", "actions", "batches"] as const)
+    .flatMap((table) => store.db.query(`SELECT body FROM ${table}`).all() as { body: Uint8Array }[])
+    .map((row) => Buffer.from(row.body).toString("utf8"))
+    .join("\n");
+  store.close();
+  for (const secret of secrets) expect(persisted).not.toContain(secret);
+
+  delete process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN;
+  let output = "";
+  await run(["flush"], stdin({}), (chunk) => {
+    output += chunk;
+  });
+  expect(output).toBe("All pending activity records acknowledged.\n");
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toContain("https://example.com:8443/search");
+  for (const secret of secrets) expect(requests[0]).not.toContain(secret);
+});
+
+test("full capture is explicit, respects dry run, and queued full bodies flush normally in private mode", async () => {
+  process.env.KIMCHI_BRIDGE_ACTIVITY_INCLUDE_SENSITIVE = "1";
+  process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN = "1";
+  const requests: string[] = [];
+  process.env.KIMCHI_BRIDGE_ACTIVITY_URL = localRecorder(async (request) => {
+    const raw = await request.text();
+    requests.push(raw);
+    const batch = parseActivity(raw);
+    return Response.json({
+      batchId: batch.batchId,
+      receipts: batch.events.map((event: any) => ({
+        eventId: event.eventId,
+        status: "RECEIPT_STATUS_ACCEPTED",
+      })),
+    });
+  });
+  await recordEvents(
+    richToolEvent(
+      "full-bash",
+      "Bash",
+      { command: "pwd" },
+      { stdout: "SENSITIVE_FULL_OUTPUT", stderr: "SENSITIVE_FULL_ERROR", exit_code: 0 },
+    ),
+  );
+  expect(requests).toHaveLength(0);
+
+  let exported = "";
+  await run(["export", "jsonl"], stdin({}), (chunk) => {
+    exported += chunk;
+  });
+  expect(exported).toContain("SENSITIVE_FULL_OUTPUT");
+  expect(exported).toContain("SENSITIVE_FULL_ERROR");
+  let fullStatus = "";
+  await run(["status"], stdin({}), (chunk) => {
+    fullStatus += chunk;
+  });
+  expect(JSON.parse(fullStatus)).toMatchObject({ captureMode: "full", dryRun: true });
+
+  delete process.env.KIMCHI_BRIDGE_ACTIVITY_INCLUDE_SENSITIVE;
+  delete process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN;
+  let privateStatus = "";
+  await run(["status"], stdin({}), (chunk) => {
+    privateStatus += chunk;
+  });
+  expect(JSON.parse(privateStatus)).toMatchObject({ captureMode: "private", dryRun: false });
+
+  await run(["flush"], stdin({}), () => {});
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toContain("SENSITIVE_FULL_OUTPUT");
+  expect(requests[0]).toContain("SENSITIVE_FULL_ERROR");
 });
 
 function parseActivity(value: string): { batchId: string; events: any[] } {

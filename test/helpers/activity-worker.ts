@@ -12,7 +12,9 @@ try {
       tool_name: "Bash",
       tool_input: { command: "pwd" },
     };
-    store.observe({ stage: "PreToolUse", event, version: "2.1.326" }, "claude-code");
+    store.observe({ stage: "PreToolUse", event, version: "2.1.326" }, "claude-code", {
+      includeSensitive: true,
+    });
     store.observe(
       {
         stage: "PostToolUse",
@@ -23,6 +25,7 @@ try {
         },
       },
       "claude-code",
+      { includeSensitive: true },
     );
   }
   console.log(JSON.stringify(store.status()));

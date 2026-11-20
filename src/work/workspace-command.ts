@@ -5,6 +5,7 @@ import { drainActivities, flushAllActivities } from "./activity-delivery.ts";
 import { parseJson, stringifyJson } from "./protocol.ts";
 import {
   workspaceActivityDryRun,
+  workspaceActivityIncludeSensitive,
   workspaceActivityState,
   workspaceActivityURL,
 } from "./workspace.ts";
@@ -29,6 +30,7 @@ export async function workspaceCommand(
   signal?: AbortSignal,
 ): Promise<void> {
   const dryRun = workspaceActivityDryRun();
+  const includeSensitive = workspaceActivityIncludeSensitive();
   const store = new ActivityStore(workspaceActivityState());
   try {
     switch (command) {
@@ -52,7 +54,7 @@ export async function workspaceCommand(
               : typeof parsed.hook_event_name === "string"
                 ? { stage: `classic.${parsed.hook_event_name}`, event: parsed }
                 : parsed;
-          store.observe(native, args[1] as "claude-code" | "codex");
+          store.observe(native, args[1] as "claude-code" | "codex", { includeSensitive });
         } catch {
           store.diagnostic("activity_capture_failed");
           return;
@@ -93,8 +95,13 @@ export async function workspaceCommand(
       }
       case "status": {
         io.output(
-          JSON.stringify({ profile: "workspace", dryRun, ledger: store.dir, ...store.status() }) +
-            "\n",
+          JSON.stringify({
+            profile: "workspace",
+            dryRun,
+            captureMode: includeSensitive ? "full" : "private",
+            ledger: store.dir,
+            ...store.status(),
+          }) + "\n",
         );
         return;
       }

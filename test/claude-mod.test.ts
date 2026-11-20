@@ -5,6 +5,10 @@ import { expect, test } from "bun:test";
 import { ActivityStore } from "../src/work/activity-store.ts";
 import type { Native } from "../src/work/capture.ts";
 
+function observeFull(store: ActivityStore, native: Native, source: "claude-code"): void {
+  store.observe(native, source, { includeSensitive: true });
+}
+
 test("native mod caches its version and avoids helper calls for irrelevant telemetry", async () => {
   const { register } = await import(
     new URL("../plugins/kimchi-work/claude/hooks/register.js", import.meta.url).href
@@ -93,7 +97,8 @@ test("Claude command hooks alone capture completed and failed tool calls", () =>
   const observe = (stage: string, id: string, response?: Record<string, unknown>) => {
     // Exercise only lifecycle events actually registered by the command manifest.
     expect(hooks[stage]).toBeDefined();
-    store.observe(
+    observeFull(
+      store,
       {
         event: {
           session_id: "command-only-session",
@@ -170,8 +175,8 @@ test("the native mod hands its tool result into activity capture", async () => {
   const dir = mkdtempSync(join(tmpdir(), "activity-mod-"));
   const store = new ActivityStore(dir);
   try {
-    store.observe(records[0].input as Native, "claude-code");
-    store.observe(records[1].input as Native, "claude-code");
+    observeFull(store, records[0].input as Native, "claude-code");
+    observeFull(store, records[1].input as Native, "claude-code");
     const observation = store.allEvents()[1].observation;
     expect(observation?.shellCommandOutput).toMatchObject({
       stdout: "/workspace/repo",
