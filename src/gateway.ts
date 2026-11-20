@@ -5,7 +5,7 @@
 // request carries Kimchi's billing tag so its bill can be found, as Kimchi's
 // own requests do (CAST AI, Apache-2.0: src/integrations/claude-code.ts,
 // codex.ts, extensions/work-attribution/request-tags.ts).
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendFileSync,
   mkdirSync,
@@ -50,6 +50,8 @@ const HEALTH_PATH = "/healthz";
 const HEALTH_MARKER = "kimchi-bridge-gateway";
 /** Placeholder bearer for proxy mode; the proxy replaces it per request. */
 const PROXY_PLACEHOLDER = "kimchi-gateway";
+/** Bounds the file the daemon reads on every request; the picker snapshot used to exceed the old 16 KiB limit. */
+const MAX_GATEWAY_STATE_BYTES = 1 << 20;
 
 export type GatewayMode = "proxy" | "direct";
 
@@ -101,7 +103,7 @@ function homeDir(): string {
 export function loadGatewayState(path = gatewayStatePath()): GatewayState {
   try {
     const bytes = readFileSync(path);
-    if (bytes.length > 16 << 10) throw new Error("gateway state too large");
+    if (bytes.length > MAX_GATEWAY_STATE_BYTES) throw new Error("gateway state too large");
     const value = JSON.parse(bytes.toString("utf8"));
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("invalid gateway state");
@@ -337,7 +339,7 @@ function pickerRowOf(value: unknown): ClaudePickerRow | null {
  * Writes the gateway's catalog into Claude Code's model picker, mirroring the env rules: a row
  * whose model the person set is never replaced, ours refresh in place, one we wrote for a model
  * the catalog dropped leaves unless the person edited it after we wrote, and the whole block
- * leaves with the last of ours. Returns the model values → row JSON the bridge now owns.
+ * leaves with the last of ours. Returns the model values → row fingerprints the bridge now owns.
  */
 function applyClaudeModelPicker(
   settings: Record<string, unknown>,
@@ -361,14 +363,14 @@ function applyClaudeModelPicker(
   for (const row of rows) {
     const theirs = byModel.get(row.model);
     if (theirs && !ownedPrevious.has(row.model)) continue; // the person set this model: theirs stays
-    ownedNext[row.model] = JSON.stringify(row);
+    ownedNext[row.model] = rowFingerprint(row);
     if (theirs) dropped.add(row.model);
   }
   for (const [model, rowJson] of Object.entries(wrote ?? {})) {
     if (ownedNext[model]) continue; // still in the catalog, refreshed above
     const current = byModel.get(model);
     if (!current) continue;
-    if (JSON.stringify(current) !== rowJson) continue; // the person edited our row: keep theirs
+    if (!matchesFingerprint(current, rowJson)) continue; // the person edited our row: keep theirs
     dropped.add(model);
   }
   const kept = current.filter((row) => !dropped.has(row.model));
@@ -384,6 +386,15 @@ function applyClaudeModelPicker(
     replaceBuiltInOptions: existing?.replaceBuiltInOptions === true,
   };
   return ownedNext;
+}
+
+function rowFingerprint(row: ClaudePickerRow): string {
+  return createHash("sha256").update(JSON.stringify(row)).digest("hex").slice(0, 16);
+}
+
+/** Older bridges stored the whole row; both forms mean the same thing to the picker's ownership check. */
+function matchesFingerprint(row: ClaudePickerRow, stored: string): boolean {
+  return stored === rowFingerprint(row) || stored === JSON.stringify(row);
 }
 
 function restoreClaudePicker(previous?: string | null): void {

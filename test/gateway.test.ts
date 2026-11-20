@@ -2227,6 +2227,49 @@ test("re-enable refreshes the bridge's rows and drops models the catalog dropped
   ]);
 });
 
+test("gateway state beyond the old 16 KiB bound still loads", () => {
+  // A full picker snapshot pushed the real file past 16 KiB, and enable then failed with "gateway state is unreadable".
+  const large = "x".repeat(64 * 1024);
+  saveGatewayState({ enabled: true, mode: "proxy", port: 8766, previous: { picker: large } });
+  const state = loadGatewayState();
+  expect(state.enabled).toBe(true);
+  expect(state.previous?.picker).toHaveLength(large.length);
+});
+
+test("the picker snapshot keeps fingerprints and protects an edited row whose model left", async () => {
+  const feed = (slugs: string[]) =>
+    server((request) =>
+      new URL(request.url).pathname === "/v1/models/metadata"
+        ? Response.json({
+            models: slugs.map((slug) => ({
+              slug,
+              display_name: slug,
+              limits: { context_window: 200000, max_output_tokens: 64000 },
+            })),
+          })
+        : new Response("not found", { status: 404 }),
+    );
+  process.env.KIMCHI_BASE_URL = feed(["glm-5.3", "kimi-k3"]);
+  oauthCredential();
+  await enable(oauthSignIn, () => {});
+  const owned = loadGatewayState().wrote?.picker ?? {};
+  expect(Object.values(owned).every((value) => value.length <= 16)).toBe(true);
+
+  // The person edits the row for kimi-k3, then the catalog drops that model.
+  const settings = JSON.parse(readFileSync(claudeSettingsPath(), "utf8"));
+  const kimi = settings.modelPicker.options.find(
+    (row: { model: string }) => row.model === "kimi-k3",
+  );
+  kimi.label = "My Kimi";
+  writeFileSync(claudeSettingsPath(), JSON.stringify(settings));
+
+  process.env.KIMCHI_BASE_URL = feed(["glm-5.3", "deepseek-v4"]);
+  await enable(oauthSignIn, () => {});
+  const rows = pickerInSettings()?.options ?? [];
+  expect(rows.map((row) => row.model).sort()).toEqual(["deepseek-v4", "glm-5.3", "kimi-k3"]);
+  expect(rows.find((row) => row.model === "kimi-k3")?.label).toBe("My Kimi");
+});
+
 test("a lineup the person replaced with their own curated list stays untouched", async () => {
   const curated = [
     { model: "glm-5.3", label: "GLM 5.3" },
