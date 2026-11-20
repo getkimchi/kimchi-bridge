@@ -36,6 +36,7 @@ import {
   seedFromKimchi,
 } from "./oauth.ts";
 import { billingTags, noteSideCall, readResponseId, recordTag } from "./request-tags.ts";
+import { observeSearchResponse, requestSearchTrace } from "./search-trace.ts";
 
 const DEFAULT_PORT = 8766;
 const PORT_SCAN_SPAN = 10;
@@ -1731,6 +1732,8 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
       { status: 401, headers: { "content-type": "text/plain" } },
     );
   const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
+  const schemaTrace = requestSearchTrace(request.method, url.pathname, inspectedBody, model);
+  if (schemaTrace) log(`search-trace ${JSON.stringify(schemaTrace)}`);
   let requestId: string | undefined;
   const forward = async (): Promise<Response> => {
     let auth: Record<string, string>;
@@ -1785,6 +1788,18 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
     headers.set(key, value);
   }
   let reply = response.body;
+  if (BILLED_PATHS.includes(url.pathname) && reply) {
+    const [client, copy] = reply.tee();
+    reply = client;
+    void observeSearchResponse(
+      copy,
+      url.pathname,
+      response.status,
+      response.headers.get("content-type"),
+    )
+      .then((trace) => trace && log(`search-trace ${JSON.stringify(trace)}`))
+      .catch(() => {});
+  }
   const tagged = requestId;
   // Claude Code reports a call with the request ID its reply carried, and its title requests reach no transcript, so
   // the tag makes that report name the call's bill. Auto mode's checks are in neither; the proxy notes those itself.

@@ -21,6 +21,7 @@ import {
   enable,
   ensureClaudeAutoMode,
   gatewayPort,
+  gatewayLogPath,
   gatewayStatePath,
   hasUsableChatGPTLogin,
   health,
@@ -1706,6 +1707,95 @@ test("Codex 0.169 uses backend web_search and a sourced result for an ordinary m
   expect(serializedTools).not.toContain("web.run");
   expect(stdout + stderr).toContain("Synthetic sourced answer from the backend search result");
 }, 50_000);
+
+test("search trace redacts sensitive request and response content for plain and zstd bodies", async () => {
+  const secrets = [
+    "sk-sensitive-auth",
+    "private-prompt-42",
+    "private-query-42",
+    "private-tool-label",
+    "private-result-text",
+  ];
+  kimchiKey("castai_v1_key");
+  catalogRoutes({ "minimax-m3": "kimchi-dev" });
+  const tools = [
+    { type: "web_search", external_web_access: false },
+    { type: "web_search_preview", search_context_size: "high" },
+    {
+      type: "namespace",
+      name: "web",
+      tools: [{ type: "function", name: "run", description: "private-tool-label" }],
+    },
+    { type: "function", name: "private-tool-label" },
+  ];
+  const seenBodies: unknown[] = [];
+  const upstream = server(async (request) => {
+    const bytes = Buffer.from(await request.arrayBuffer());
+    const plain =
+      request.headers.get("content-encoding") === "zstd"
+        ? Buffer.from(await Bun.zstdDecompress(bytes))
+        : bytes;
+    seenBodies.push(JSON.parse(plain.toString("utf8")));
+    const searchItem = {
+      type: "response.output_item.done",
+      item: {
+        type: "web_search_call",
+        action: { type: "search", query: "private-query-42" },
+      },
+    };
+    const unsupported = {
+      type: "response.output_item.done",
+      item: {
+        type: "function_call_output",
+        output: "unsupported call: webrun (private-result-text)",
+      },
+    };
+    const finalText = { type: "response.output_text.done", text: "private-result-text" };
+    return new Response(
+      `event: response.output_item.done\ndata: ${JSON.stringify(searchItem)}\n\n` +
+        `event: response.output_item.done\ndata: ${JSON.stringify(unsupported)}\n\n` +
+        `event: response.output_text.done\ndata: ${JSON.stringify(finalText)}\n\n`,
+      { headers: { "content-type": "text/event-stream" } },
+    );
+  });
+  const originalBodies = seenBodies;
+  for (const encoding of [undefined, "zstd"] as const) {
+    const plain = Buffer.from(
+      JSON.stringify({ model: "minimax-m3", input: "private-prompt-42", stream: true, tools }),
+    );
+    const body = encoding ? Buffer.from(await Bun.zstdCompress(plain)) : plain;
+    const response = await proxyRequest(
+      new Request("http://127.0.0.1:8766/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer sk-sensitive-auth",
+          "content-type": "application/json",
+          ...(encoding ? { "content-encoding": encoding } : {}),
+        },
+        body,
+      }),
+      upstream,
+    );
+    expect(response.status).toBe(200);
+    const stream = await response.text();
+    expect(stream).toContain("private-query-42");
+    expect(stream).toContain("private-result-text");
+    expect(response.headers.get("content-type")).toBe("text/event-stream");
+  }
+  expect(originalBodies).toHaveLength(2);
+  for (const body of originalBodies)
+    expect(body).toMatchObject({ model: "minimax-m3", input: "private-prompt-42", tools });
+  const trace = readFileSync(gatewayLogPath(), "utf8");
+  expect(trace).toContain('"event":"search_schema"');
+  expect(trace).toContain('"event":"search_items"');
+  expect(trace).toContain('"web_search_preview"');
+  expect(trace).toContain('"namespace_web_run"');
+  expect(trace).toContain('"web_search_call"');
+  expect(trace).toContain('"function_call_output"');
+  expect(trace).toContain('"unsupported_call_webrun"');
+  expect(trace).toContain('"otherTools":1');
+  for (const secret of secrets) expect(trace).not.toContain(secret);
+});
 
 test("proxyRequest preserves search tools and streamed answers for plain and zstd bodies", async () => {
   kimchiKey("castai_v1_key");
