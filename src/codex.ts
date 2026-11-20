@@ -316,7 +316,7 @@ interface CodexModelEntry {
   support_verbosity: boolean;
   supported_reasoning_levels: Array<{ effort: "low" | "medium" | "high"; description: string }>;
   supports_search_tool: boolean;
-  web_search_tool_type?: "text_and_image";
+  web_search_tool_type: "text" | "text_and_image";
 }
 
 export interface CodexCatalog {
@@ -373,8 +373,8 @@ function entryFor(model: GatewayModel, route: CodexRoute, index: number): CodexM
     supports_reasoning_summaries: model.reasoning === true,
     support_verbosity: model.reasoning === true,
     supported_reasoning_levels: model.reasoning === true ? [...REASONING_LEVELS] : [],
-    supports_search_tool: subscription,
-    ...(subscription ? { web_search_tool_type: "text_and_image" as const } : {}),
+    supports_search_tool: true,
+    web_search_tool_type: subscription ? ("text_and_image" as const) : ("text" as const),
   };
 }
 

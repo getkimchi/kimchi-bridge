@@ -289,11 +289,8 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
   );
   expect(available.models.find((model) => model.slug === "plain")?.display_name).toBe("plain");
   expect(new Set(available.models.map((model) => model.slug)).size).toBe(available.models.length);
-  expect(available.models.find((model) => model.slug === "plain")?.supports_search_tool).toBe(
-    false,
-  );
   const plainEntry = available.models.find((model) => model.slug === "plain");
-  expect(plainEntry?.web_search_tool_type).toBeUndefined();
+  expect(plainEntry).toMatchObject({ supports_search_tool: true, web_search_tool_type: "text" });
   expect(JSON.stringify(plainEntry)).not.toContain("web_search_provider");
   expect(JSON.stringify(plainEntry)).not.toContain("use_responses_lite");
   expect(JSON.stringify(plainEntry)).not.toContain("tool_mode");
@@ -487,8 +484,8 @@ test("catalog and main-model resolution mirror Kimchi's selection", () => {
     "high",
   ]);
   expect(catalog.models[1].supports_reasoning_summaries).toBe(true);
-  expect(catalog.models.every((model) => model.supports_search_tool === false)).toBe(true);
-  expect(catalog.models.every((model) => model.web_search_tool_type === undefined)).toBe(true);
+  expect(catalog.models.every((model) => model.supports_search_tool)).toBe(true);
+  expect(catalog.models.every((model) => model.web_search_tool_type === "text")).toBe(true);
   expect(resolveMainModel(models).slug).toBe("minimax-m3");
   expect(
     resolveMainModel([
@@ -1701,8 +1698,11 @@ test("Codex >= 0.169 runs ordinary inference without advertising search", async 
   expect(paths).not.toContain("/v1/search");
   const generated = JSON.parse(readFileSync(codexCatalogPath(), "utf8"));
   expect(generated.models).toHaveLength(1);
-  expect(generated.models[0]).toMatchObject({ slug: model.slug, supports_search_tool: false });
-  expect(JSON.stringify(generated.models[0])).not.toContain("web_search_tool_type");
+  expect(generated.models[0]).toMatchObject({
+    slug: model.slug,
+    supports_search_tool: true,
+    web_search_tool_type: "text",
+  });
   expect(stdout + stderr).toContain("Synthetic ordinary inference answer");
 }, 50_000);
 
