@@ -296,18 +296,14 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
   expect(plainEntry?.web_search_provider).toBeUndefined();
   expect(plainEntry?.use_responses_lite).toBeUndefined();
   expect(plainEntry?.tool_mode).toBeUndefined();
-  const otherNative = available.models.find((model) => model.slug === "chat-only");
-  expect(otherNative).toMatchObject({ supports_search_tool: true, web_search_tool_type: "text" });
-  expect(otherNative?.web_search_provider).toBeUndefined();
-  expect(otherNative?.use_responses_lite).toBeUndefined();
-  expect(otherNative?.tool_mode).toBeUndefined();
-  expect(available.models.find((model) => model.slug === "gpt-6.1-sol")).toMatchObject({
-    supports_search_tool: true,
-    web_search_tool_type: "text_and_image",
-    web_search_provider: "search_mcp",
-    use_responses_lite: true,
-    tool_mode: "code_mode_only",
-  });
+  for (const slug of ["shared", "chat-only", "gpt-6.1-sol"])
+    expect(available.models.find((model) => model.slug === slug)).toMatchObject({
+      supports_search_tool: true,
+      web_search_tool_type: "text_and_image",
+      web_search_provider: "search_mcp",
+      use_responses_lite: true,
+      tool_mode: "code_mode_only",
+    });
 
   const unavailable = buildCodexCatalog(feed, false);
   expect(unavailable.routes).toEqual({
