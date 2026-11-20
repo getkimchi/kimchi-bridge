@@ -25,9 +25,14 @@ function store(): ActivityStore {
   });
   return value;
 }
+function observeFull(value: ActivityStore, native: Native, source: "claude-code"): void {
+  value.observe(native, source, { includeSensitive: true });
+}
+
 function input(tool: "Bash" | "Read" | "custom_tool" = "Bash"): ActivityInput {
   return {
     source: "claude-code",
+    includeSensitive: true,
     stage: "PostToolUse",
     sessionId: "review-session",
     cwd: "/workspace/repo",
@@ -162,13 +167,13 @@ function ackAll(value: ActivityStore): ActivityBatch {
 test("mod and classic observations deduplicate in both orders", () => {
   for (const classicFirst of [false, true]) {
     const value = store();
-    value.observe(before("shared-call"), "claude-code");
+    observeFull(value, before("shared-call"), "claude-code");
     if (classicFirst) {
-      value.observe(classicAfter("shared-call"), "claude-code");
-      value.observe(modAfter("shared-call"), "claude-code");
+      observeFull(value, classicAfter("shared-call"), "claude-code");
+      observeFull(value, modAfter("shared-call"), "claude-code");
     } else {
-      value.observe(modAfter("shared-call"), "claude-code");
-      value.observe(classicAfter("shared-call"), "claude-code");
+      observeFull(value, modAfter("shared-call"), "claude-code");
+      observeFull(value, classicAfter("shared-call"), "claude-code");
     }
     const events = value.allEvents();
     expect(events).toHaveLength(2);
@@ -180,15 +185,15 @@ test("mod and classic observations deduplicate in both orders", () => {
 
 test("an exact duplicate without duration preserves the first event and accepted body", () => {
   const value = store();
-  value.observe(before("replay"), "claude-code");
+  observeFull(value, before("replay"), "claude-code");
   const after = classicAfter("replay");
   delete after.event.duration_ms;
-  value.observe(after, "claude-code");
+  observeFull(value, after, "claude-code");
   const first = value.allEvents()[1];
   const now = Date.now;
   Date.now = () => now() + 100;
   try {
-    value.observe(after, "claude-code");
+    observeFull(value, after, "claude-code");
   } finally {
     Date.now = now;
   }
@@ -201,17 +206,17 @@ test("an exact duplicate without duration preserves the first event and accepted
       .events.map((e) => ({ eventId: e.eventId, status: "RECEIPT_STATUS_ACCEPTED" })),
   });
   expect(value.allEvents()).toHaveLength(0);
-  value.observe(after, "claude-code");
+  observeFull(value, after, "claude-code");
   expect(value.allEvents()).toHaveLength(0);
   expect(value.allEvents()[0]?.eventId).toBeUndefined();
 });
 
 test("new evidence is a distinct linked observation after acknowledgement, not an overwrite", () => {
   const value = store();
-  value.observe(before("enriched-call"), "claude-code");
-  value.observe(modAfter("enriched-call"), "claude-code");
+  observeFull(value, before("enriched-call"), "claude-code");
+  observeFull(value, modAfter("enriched-call"), "claude-code");
   const delivered = ackAll(value);
-  value.observe(classicAfter("enriched-call", "/workspace/repo", 0), "claude-code");
+  observeFull(value, classicAfter("enriched-call", "/workspace/repo", 0), "claude-code");
   const events = value.allEvents();
   expect(events).toHaveLength(1);
   expect(events[0].eventId).not.toBe(delivered.events[1].eventId);
@@ -231,10 +236,10 @@ test("new evidence is a distinct linked observation after acknowledgement, not a
 
 test("mixed-status receipts are joined by event identity even when reversed", () => {
   const value = store();
-  value.observe(before("first"), "claude-code");
-  value.observe(classicAfter("first"), "claude-code");
-  value.observe(before("second"), "claude-code");
-  value.observe(modAfter("second"), "claude-code");
+  observeFull(value, before("first"), "claude-code");
+  observeFull(value, classicAfter("first"), "claude-code");
+  observeFull(value, before("second"), "claude-code");
+  observeFull(value, modAfter("second"), "claude-code");
   const batch = value.pendingBatch()!;
   const expected = new Map(
     batch.events.map((event, index) => [
@@ -281,7 +286,7 @@ const FAILED_MESSAGE = 'Exit code 2\n"does-not-exist": No such file or directory
 
 test("a live session reported by the mod and the command hooks keeps one Action and Observation per call", () => {
   const value = store();
-  for (const native of liveSession()) value.observe(native, "claude-code");
+  for (const native of liveSession()) observeFull(value, native, "claude-code");
   const events = value.allEvents();
   const actions = events.filter((event) => event.action);
   const observations = events.filter((event) => event.observation);
@@ -334,7 +339,7 @@ test("the mod and the command hooks record the same evidence for a call, with ei
       [hookBefore, hookAfter],
     ]) {
       const value = store();
-      for (const native of reports) value.observe(native, "claude-code");
+      for (const native of reports) observeFull(value, native, "claude-code");
       const events = value.allEvents();
       expect(events).toHaveLength(2);
       expect(events[1].causality?.causationId).toBe(events[0].eventId);
@@ -356,11 +361,34 @@ test("a failure message too long for the error field stays in the bounded output
   );
   const message = "Exit code 1\n" + "x".repeat(5_000);
   const value = store();
-  value.observe(hookBefore, "claude-code");
-  value.observe({ ...hookAfter, event: { ...hookAfter.event, error: message } }, "claude-code");
+  observeFull(value, hookBefore, "claude-code");
+  observeFull(
+    value,
+    { ...hookAfter, event: { ...hookAfter.event, error: message } },
+    "claude-code",
+  );
   const output = value.allEvents()[1].observation?.toolOutput;
   expect(output).toMatchObject({ success: false, outcome: "OUTCOME_FAILED" });
   expect(output?.error).toBeUndefined();
   expect(output?.output).toMatchObject({ complete: true });
   expect(JSON.parse(output!.output!.data)).toEqual({ error: message });
+});
+
+test("private mod and classic hooks deduplicate sanitized output in both orders", () => {
+  for (const classicFirst of [false, true]) {
+    const value = store();
+    value.observe(before("private-shared"), "claude-code");
+    const mod = modAfter("private-shared", "SENSITIVE_MOD_OUTPUT");
+    const classic = classicAfter("private-shared", "SENSITIVE_CLASSIC_OUTPUT");
+    for (const native of classicFirst ? [classic, mod] : [mod, classic])
+      value.observe(native, "claude-code");
+    const events = value.allEvents();
+    expect(events).toHaveLength(2);
+    expect(events[1].observation?.shellCommandOutput?.stdout).toBeUndefined();
+    expect(events[1].observation?.shellCommandOutput?.stderr).toBeUndefined();
+    expect(events[1].observation?.shellCommandOutput?.durationMs).toBe("60");
+    expect(events[1].causality?.causationId).toBe(events[0].eventId);
+    expect(JSON.stringify(events)).not.toContain("SENSITIVE_");
+    expect(value.status().diagnostics).toEqual({});
+  }
 });

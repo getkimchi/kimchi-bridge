@@ -12,6 +12,7 @@ import {
 
 const before: ActivityInput = {
   source: "claude-code",
+  includeSensitive: true,
   stage: "PreToolUse",
   sessionId: "session-7",
   cwd: "/workspace/repo",
@@ -31,6 +32,23 @@ const after = (
 ): ReturnType<typeof activityObservation> =>
   activityObservation(action, {
     ...before,
+    ...input,
+    eventId: "22222222-2222-4222-8222-222222222222",
+    occurredAt: "2026-11-16T10:15:02.183Z",
+  });
+
+function privateInput(input: ActivityInput): ActivityInput {
+  const copy = { ...input };
+  delete copy.includeSensitive;
+  return copy;
+}
+
+const privateAfter = (
+  action: ReturnType<typeof activityAction>,
+  input: Partial<ActivityInput>,
+): ReturnType<typeof activityObservation> =>
+  activityObservation(action, {
+    ...privateInput(before),
     ...input,
     eventId: "22222222-2222-4222-8222-222222222222",
     occurredAt: "2026-11-16T10:15:02.183Z",
@@ -217,6 +235,7 @@ test("multi-file patches remain rich generic ToolCall events rather than a lossy
     "*** Begin Patch\n*** Update File: a.ts\n@@\n-old\n+new\n*** Update File: b.ts\n@@\n-old\n+new\n*** End Patch";
   const input: ActivityInput = {
     source: "codex",
+    includeSensitive: true,
     stage: "PostToolUse",
     sessionId: "session-7",
     cwd: "/workspace/repo",
@@ -326,6 +345,7 @@ test("live Claude Code hooks replay into valid linked shell and file events", ()
   for (let index = 0; index < events.length; index += 2) {
     const before = activityAction({
       source: "claude-code",
+      includeSensitive: true,
       stage: events[index].hook_event_name,
       event: events[index],
       sessionId: events[index].session_id,
@@ -335,6 +355,7 @@ test("live Claude Code hooks replay into valid linked shell and file events", ()
     });
     const observation = activityObservation(before, {
       source: "claude-code",
+      includeSensitive: true,
       stage: events[index + 1].hook_event_name,
       event: events[index + 1],
       sessionId: events[index].session_id,
@@ -376,4 +397,172 @@ test("causation and ToolCall integrity validation reject mismatched invocation/i
   );
   expect(() => validateActivityEvent({ ...event, observation: {} })).not.toThrow();
   expect(validateActivityEvent({ ...event, observation: {} }).length).toBeGreaterThan(0);
+});
+
+test("private Bash capture retains execution metadata without stdout, stderr, or placeholders", () => {
+  const action = activityAction(privateInput(before));
+  const event = privateAfter(action, {
+    stage: "PostToolUse",
+    event: {
+      ...before.event,
+      tool_response: {
+        stdout: "SENSITIVE_STDOUT",
+        stderr: "SENSITIVE_STDERR",
+        exit_code: 1,
+      },
+    },
+  });
+  expect(action.action.shellCommand).toEqual({
+    callId: "toolu_bash_001",
+    command: "git status --short",
+    workingDir: "/workspace/repo",
+  });
+  expect(event.observation).toEqual({
+    invocation: action.action,
+    shellCommandOutput: {
+      callId: "toolu_bash_001",
+      exitCode: 1,
+      outcome: "OUTCOME_COMPLETED",
+      durationMs: "183",
+    },
+  });
+  expect(JSON.stringify(event)).not.toContain("SENSITIVE_");
+  expect(validateActivityEvent(event)).toEqual([]);
+});
+
+test("private file capture retains paths and outcomes without old, new, or returned content", () => {
+  const edit = privateInput({
+    ...before,
+    event: {
+      tool_name: "Edit",
+      tool_use_id: "private-edit",
+      tool_input: {
+        file_path: "/workspace/repo/src/private.ts",
+        old_string: "SENSITIVE_OLD_CONTENT",
+        new_string: "SENSITIVE_NEW_CONTENT",
+      },
+    },
+  });
+  const action = activityAction(edit);
+  expect(action.action.fileOperation).toEqual({
+    callId: "private-edit",
+    operation: "FILE_OP_TYPE_EDIT",
+    path: "/workspace/repo/src/private.ts",
+  });
+  const event = privateAfter(action, {
+    event: { ...edit.event, tool_response: "SENSITIVE_FILE_RESULT" },
+  });
+  expect(event.observation).toEqual({
+    invocation: action.action,
+    fileOperationResult: {
+      callId: "private-edit",
+      success: true,
+      path: "/workspace/repo/src/private.ts",
+      outcome: "OUTCOME_COMPLETED",
+      durationMs: "183",
+    },
+  });
+  expect(JSON.stringify(event)).not.toContain("SENSITIVE_");
+
+  const empty = privateAfter(action, { event: { ...edit.event, tool_response: "" } });
+  expect(empty.observation.fileOperationResult?.content).toBeUndefined();
+  expect(JSON.stringify(empty)).not.toContain("[redacted]");
+});
+
+test("private WebFetch structurally removes URL secrets while full mode remains rich", () => {
+  const web: ActivityInput = {
+    ...before,
+    event: {
+      tool_name: "WebFetch",
+      tool_use_id: "private-web",
+      tool_input: {
+        url: "https://SENSITIVE_URL_USERINFO:SENSITIVE_URL_PASSWORD@example.com:8443/search?q=SENSITIVE_URL_QUERY#SENSITIVE_URL_FRAGMENT",
+        prompt: "SENSITIVE_WEB_PROMPT",
+      },
+    },
+  };
+  const action = activityAction(privateInput(web));
+  const event = privateAfter(action, {
+    event: {
+      ...web.event,
+      tool_response: { status: 200, result: "SENSITIVE_WEB_RESULT" },
+    },
+  });
+  expect(action.action.webFetch).toEqual({
+    callId: "private-web",
+    url: "https://example.com:8443/search",
+  });
+  expect(event.observation).toEqual({
+    invocation: action.action,
+    webFetchOutput: {
+      callId: "private-web",
+      url: "https://example.com:8443/search",
+      code: 200,
+      outcome: "OUTCOME_COMPLETED",
+      durationMs: "183",
+    },
+  });
+  expect(JSON.stringify({ action, event })).not.toContain("SENSITIVE_");
+  expect(validateActivityEvent(event)).toEqual([]);
+
+  const full = after(activityAction(web), {
+    event: { ...web.event, tool_response: { status: 200, result: "SENSITIVE_WEB_RESULT" } },
+  });
+  expect(full.observation.invocation?.webFetch?.url).toBe(
+    "https://SENSITIVE_URL_USERINFO:SENSITIVE_URL_PASSWORD@example.com:8443/search?q=SENSITIVE_URL_QUERY#SENSITIVE_URL_FRAGMENT",
+  );
+  expect(full.observation.invocation?.webFetch?.prompt).toBe("SENSITIVE_WEB_PROMPT");
+  expect(full.observation.webFetchOutput?.result).toBe("SENSITIVE_WEB_RESULT");
+});
+
+test("private generic calls contain no arguments, results, or raw errors", () => {
+  const generic = privateInput({
+    ...before,
+    event: {
+      tool_name: "custom_tool",
+      tool_use_id: "private-generic",
+      tool_input: { pattern: "SENSITIVE_GENERIC_ARGUMENT" },
+    },
+  });
+  const action = activityAction(generic);
+  expect(action.action).toEqual({
+    toolCall: { callId: "private-generic", tool: "custom_tool" },
+  });
+  const event = privateAfter(action, {
+    stage: "PostToolUseFailure",
+    event: {
+      ...generic.event,
+      tool_response: { error: "SENSITIVE_RAW_ERROR", detail: "SENSITIVE_GENERIC_RESULT" },
+    },
+  });
+  expect(event.observation).toEqual({
+    invocation: action.action,
+    toolOutput: {
+      callId: "private-generic",
+      success: false,
+      outcome: "OUTCOME_FAILED",
+      durationMs: "183",
+    },
+  });
+  expect(JSON.stringify(event)).not.toContain("SENSITIVE_");
+  expect(validateActivityEvent(event)).toEqual([]);
+});
+
+test("unsafe private URLs fail closed to argument-free generic actions", () => {
+  for (const url of ["not a URL?SENSITIVE_URL_QUERY", "file:///tmp/SENSITIVE_FILE_URL"]) {
+    const event = activityAction(
+      privateInput({
+        ...before,
+        event: {
+          tool_name: "WebFetch",
+          tool_use_id: "unsafe-web",
+          tool_input: { url },
+        },
+      }),
+    );
+    expect(event.action).toEqual({
+      toolCall: { callId: "unsafe-web", tool: "WebFetch" },
+    });
+    expect(JSON.stringify(event)).not.toContain("SENSITIVE_");
+  }
 });

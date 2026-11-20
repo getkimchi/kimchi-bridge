@@ -29,6 +29,7 @@ export class ActivityCapacityError extends Error {
   readonly code = "activity_backpressure";
 }
 export type ActivityBatch = { batchId: string; events: WorkspaceActivityEvent[] };
+export type ActivityCaptureOptions = { includeSensitive?: boolean };
 export type ActivityReceipt = {
   eventId: string;
   status: "RECEIPT_STATUS_ACCEPTED" | "RECEIPT_STATUS_UNCHANGED" | "RECEIPT_STATUS_REJECTED";
@@ -293,9 +294,9 @@ export class ActivityStore {
       );
   }
 
-  observe(n: Native, source: ActivityInput["source"]): void {
+  observe(n: Native, source: ActivityInput["source"], options: ActivityCaptureOptions = {}): void {
     try {
-      this.observeInternal(n, source);
+      this.observeInternal(n, source, options);
     } catch (error) {
       if (error instanceof ActivityCapacityError || hasSqliteCode(error, "SQLITE_FULL")) {
         this.diagnostic("activity_backpressure");
@@ -305,11 +306,21 @@ export class ActivityStore {
       throw error;
     }
   }
-  private observeInternal(n: Native, source: ActivityInput["source"]): void {
+  private observeInternal(
+    n: Native,
+    source: ActivityInput["source"],
+    options: ActivityCaptureOptions,
+  ): void {
     const stage = n.stage || n.event.hook_event_name || "";
     const nativeStage = stage.startsWith("classic.") ? stage.slice("classic.".length) : stage;
     if (nativeStage === "PreToolUse" || nativeStage === "tool.before") {
-      const input = { ...n, source, stage: nativeStage, event: { ...n.event } } as ActivityInput;
+      const input = {
+        ...n,
+        source,
+        stage: nativeStage,
+        event: { ...n.event },
+        includeSensitive: options.includeSensitive === true,
+      } as ActivityInput;
       const action = activityAction(input);
       const trajectoryId = action.trajectoryId!;
       action.eventId = stableId("workspace-activity-action", source, trajectoryId, callId(action));
@@ -340,7 +351,13 @@ export class ActivityStore {
       return;
     }
     if (!["PostToolUse", "PostToolUseFailure", "tool.after"].includes(nativeStage)) return;
-    const input = { ...n, source, stage: nativeStage, event: { ...n.event } } as ActivityInput;
+    const input = {
+      ...n,
+      source,
+      stage: nativeStage,
+      event: { ...n.event },
+      includeSensitive: options.includeSensitive === true,
+    } as ActivityInput;
     const particle = activityAction({ ...input, occurredAt: "2026-11-16T00:00:00.000Z" });
     const id = callId(particle);
     const old = this.db

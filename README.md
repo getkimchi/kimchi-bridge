@@ -118,9 +118,35 @@ The plugins also follow Kimchi's PR reporting setting. If you turn it off with `
 
 ### Workspace activity tracking
 
-Workspace activity is an opt-in tool-trajectory recorder, separate from PR-cost reporting. It captures before-tool **Actions** and after-tool **Observations**, linked by native call ID and causation metadata. Shell commands, file operations, web fetches and unknown tools have typed or generic representations that preserve their arguments and results.
+Workspace activity is an opt-in tool-trajectory recorder, separate from PR-cost reporting. It captures before-tool **Actions** and after-tool **Observations**, linked by native call ID and causation metadata. Capture is private by default: typed events retain command/location and execution metadata without file contents or tool output. An explicit per-launch override enables full-detail capture.
 
 Workspace mode does not use a Kimchi account, OAuth, organization ID, Git attribution or the LLM gateway. Legacy PR-cost capture, sign-in, Git tracing and gateway hook commands are inactive while the profile is set.
+
+#### Private capture by default
+
+Private mode filters events before they enter the local SQLite ledger. Pending events, frozen batches, Action preimages, Observation invocations, exports, retries and the IMDS receiver all see the same limited representation:
+
+- Shell calls retain the exact command, working directory, exit code, outcome and duration; `stdout`, `stderr` and raw error text are omitted.
+- File operations retain the operation type, exact path, success, outcome and duration; old/new/returned file contents and raw errors are omitted.
+- Web fetches retain only the HTTP(S) URL's scheme, host, port and path, plus HTTP status, outcome and duration. URL userinfo, query strings and fragments, prompts and result bodies are omitted. Malformed or non-HTTP(S) URLs fall back to an argument-free generic call.
+- Generic or unknown tools retain only tool name, call identity, success, outcome and duration. Arguments, results and raw errors are omitted. Consequently, array-form shell commands and multi-file operations represented generically lose their command/path details.
+- Common event, trajectory, turn, agent, actor and causality metadata remains. An omitted field has no placeholder, redaction length or content hash; absence means unavailable, not empty output.
+
+**Commands and file paths are retained verbatim and can themselves contain credentials, customer names, source fragments or other sensitive text.** Private mode does not attempt best-effort secret-pattern scrubbing.
+
+To capture and store full tool details for a particular client launch, set this variable alongside the profile and activity URL before starting Claude Code or Codex:
+
+```sh
+export KIMCHI_BRIDGE_PROFILE=workspace
+export KIMCHI_BRIDGE_ACTIVITY_URL=http://__imds.kimchi.internal/imds/tool-calls:batchRecord
+export KIMCHI_BRIDGE_ACTIVITY_INCLUDE_SENSITIVE=1
+claude
+# or: codex
+```
+
+Full mode preserves complete tool arguments/results, file contents, web URLs and prompts, command output and provider errors as before. New launches are private again unless the variable is set; unset it with `unset KIMCHI_BRIDGE_ACTIVITY_INCLUDE_SENSITIVE`. This variable controls capture only, not whether delivery is enabled. In particular, full mode plus dry run stores rich records locally without contacting a receiver.
+
+Changing capture mode does not rewrite, quarantine or purge records that were already stored. A previously queued full-detail batch continues to deliver normally on a later hook, sync or explicit flush, even when the current mode is private.
 
 #### Enable capture and delivery
 
@@ -173,7 +199,7 @@ claude
 # or: codex
 ```
 
-No `KIMCHI_BRIDGE_ACTIVITY_URL` is required. Hook-triggered delivery is skipped, workspace sync performs only local maintenance, and `flush` reports `Dry run: pending activity records kept locally.` instead of uploading. `status` includes `dryRun: true`.
+No `KIMCHI_BRIDGE_ACTIVITY_URL` is required. Hook-triggered delivery is skipped, workspace sync performs only local maintenance, and `flush` reports `Dry run: pending activity records kept locally.` instead of uploading. `status` includes `dryRun: true` and reports the current process's `captureMode` as `private` or `full`.
 
 To resume delivery, unset dry run, set the loopback URL and restart the client. Previously captured events remain queued and subsequent hooks or syncs retry them. `kimchi-bridge flush` delivers all of them immediately:
 
@@ -185,7 +211,7 @@ kimchi-bridge flush
 
 #### Inspect status, export and SQLite
 
-Workspace status shows the dry-run state, ledger path, pending work, receipts, capture/delivery diagnostics and storage limits:
+Workspace status shows the capture mode, dry-run state, ledger path, pending work, receipts, capture/delivery diagnostics and storage limits:
 
 ```sh
 KIMCHI_BRIDGE_PROFILE=workspace kimchi-bridge status
@@ -211,7 +237,7 @@ sqlite3 -readonly ~/.local/state/kimchi-bridge/workspace-activity/activity.sqlit
 
 Capture and delivery run as short-lived hook/sync commands, not a resident reporting daemon. Claude's native mod also schedules sync every 30 seconds while Claude Code is open. Final hooks normally run on shutdown; anything left pending survives in SQLite until a later hook, session, sync or explicit flush.
 
-Activity can include exact commands, arguments, file paths, old/new file contents, URLs, web results, stdout/stderr, provider text and errors. Unlike PR-cost reporting, this is not a metadata-only stream. Generic payloads are bounded at 64 KiB with UTF-8-safe truncation, completeness markers and SHA-256 hashes. Each serialized event is limited to 256 KiB.
+With full capture enabled, activity can include exact commands, arguments, file paths, old/new file contents, URLs, web results, stdout/stderr, provider text and errors. Unlike PR-cost reporting, full capture is not a metadata-only stream. Generic payloads are bounded at 64 KiB with UTF-8-safe truncation, completeness markers and SHA-256 hashes; private events omit these generic payloads entirely. Each serialized event is limited to 256 KiB.
 
 Local maintenance runs from hooks, syncs and flushes. Completed Action preimages expire after seven days, receipts after 30 days, and the receipt cache holds at most 50,000 entries. Pending work is protected from pruning. Pending bodies have a 64 MiB budget, Action bodies have a preferred 64 MiB reclamation budget, and the main SQLite page count is capped at 256 MiB; exceeding capture capacity produces visible backpressure diagnostics instead of partially recording a preimage.
 

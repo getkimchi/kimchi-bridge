@@ -8,6 +8,11 @@ export function workspaceActivityDryRun(): boolean {
   return process.env.KIMCHI_BRIDGE_ACTIVITY_DRY_RUN === "1";
 }
 
+/** Rich tool payloads are an explicit per-launch exception to private capture. */
+export function workspaceActivityIncludeSensitive(): boolean {
+  return process.env.KIMCHI_BRIDGE_ACTIVITY_INCLUDE_SENSITIVE === "1";
+}
+
 /** Workspace capture never selects an account or reads Kimchi credentials. */
 export function workspaceActivityEnabled(): boolean {
   const profile = process.env.KIMCHI_BRIDGE_PROFILE ?? "";

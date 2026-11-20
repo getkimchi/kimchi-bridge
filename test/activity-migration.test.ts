@@ -8,6 +8,7 @@ import { ActivityStore } from "../src/work/activity-store.ts";
 import { activityAction, activityObservation } from "../src/work/activity.ts";
 import { stringifyJson } from "../src/work/protocol.ts";
 import { bodyText } from "../src/work/ledger.ts";
+import type { Native } from "../src/work/capture.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -50,6 +51,10 @@ CREATE TABLE receipts(
 CREATE TABLE diagnostics(code TEXT PRIMARY KEY,count INTEGER NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`;
 
+function observeFull(store: ActivityStore, native: Native, source: "claude-code"): void {
+  store.observe(native, source, { includeSensitive: true });
+}
+
 function legacyFixture(dir: string) {
   const native = {
     session_id: "legacy-session",
@@ -60,6 +65,7 @@ function legacyFixture(dir: string) {
   };
   const action = activityAction({
     source: "claude-code",
+    includeSensitive: true,
     stage: "PreToolUse",
     occurredAt: "2026-11-17T10:00:00.000Z",
     event: { ...native, hook_event_name: "PreToolUse" },
@@ -67,6 +73,7 @@ function legacyFixture(dir: string) {
   action.eventId = "11111111-1111-4111-8111-111111111111";
   const observation = activityObservation(action, {
     source: "claude-code",
+    includeSensitive: true,
     stage: "PostToolUse",
     occurredAt: "2026-11-17T10:00:00.060Z",
     event: {
@@ -121,7 +128,7 @@ test("v1 pending replay preserves the immutable frozen batch and original timest
   const dir = temporaryState();
   const fixture = legacyFixture(dir);
   const store = new ActivityStore(dir);
-  expect(() => store.observe(fixture.replay, "claude-code")).not.toThrow();
+  expect(() => observeFull(store, fixture.replay, "claude-code")).not.toThrow();
   const stored = store.db.query("SELECT body FROM batches WHERE id='legacy-batch'").get() as {
     body: Uint8Array;
   };
@@ -148,7 +155,7 @@ test("v1 replay remains idempotent after the migrated batch is acknowledged", ()
     ],
   });
   expect(store.pendingBatch()).toBeNull();
-  expect(() => store.observe(fixture.replay, "claude-code")).not.toThrow();
+  expect(() => observeFull(store, fixture.replay, "claude-code")).not.toThrow();
   expect(store.pendingBatch()).toBeNull();
   expect(
     store.db
@@ -171,8 +178,9 @@ test("a flattened generic tool retains its result when after-hook-only fields ap
     tool_use_id: "generic-call",
     payload: { message: "input" },
   };
-  store.observe({ stage: "PreToolUse", event: native }, "claude-code");
-  store.observe(
+  observeFull(store, { stage: "PreToolUse", event: native }, "claude-code");
+  observeFull(
+    store,
     {
       stage: "PostToolUse",
       event: {
@@ -196,7 +204,8 @@ test("changed legacy evidence gets a new linked event without replacing the froz
   const dir = temporaryState();
   const fixture = legacyFixture(dir);
   const store = new ActivityStore(dir);
-  store.observe(
+  observeFull(
+    store,
     {
       ...fixture.replay,
       event: {

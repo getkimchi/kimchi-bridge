@@ -23,6 +23,10 @@ function store(limits?: ActivityRetention): ActivityStore {
   });
   return value;
 }
+function observeFull(value: ActivityStore, native: Native, source: "claude-code"): void {
+  value.observe(native, source, { includeSensitive: true });
+}
+
 function call(value: ActivityStore, id: string): void {
   const event = {
     session_id: "retention-session",
@@ -31,8 +35,9 @@ function call(value: ActivityStore, id: string): void {
     tool_name: "Bash",
     tool_input: { command: "pwd" },
   };
-  value.observe({ stage: "PreToolUse", event }, "claude-code");
-  value.observe(
+  observeFull(value, { stage: "PreToolUse", event }, "claude-code");
+  observeFull(
+    value,
     {
       stage: "PostToolUse",
       event: {
@@ -170,7 +175,7 @@ test("pending byte budgets fail atomically and report visible backpressure", () 
     tool_name: "Bash",
     tool_input: { command: "pwd" },
   };
-  expect(() => value.observe({ stage: "PreToolUse", event }, "claude-code")).toThrow(
+  expect(() => observeFull(value, { stage: "PreToolUse", event }, "claude-code")).toThrow(
     ActivityCapacityError,
   );
   expect(value.status()).toMatchObject({ pending_events: 0, preimages: 0 });
@@ -191,7 +196,7 @@ test("status exposes missing preimages and diagnostics instead of a false health
       tool_response: { stdout: "/workspace/repo", stderr: "" },
     },
   };
-  value.observe(missing, "claude-code");
+  observeFull(value, missing, "claude-code");
   expect(value.status().diagnostics).toEqual({ activity_preimage_missing: 1 });
   expect(value.status()).toMatchObject({ rejected: 0, pending_events: 0 });
 });
@@ -205,13 +210,14 @@ test("an incomplete aged Action expires without inventing an outcome", () => {
     tool_name: "Bash",
     tool_input: { command: "pwd" },
   };
-  value.observe({ stage: "PreToolUse", event }, "claude-code");
+  observeFull(value, { stage: "PreToolUse", event }, "claude-code");
   accept(value);
   const now = Math.floor(Date.now() / 1000);
   value.db.query("UPDATE actions SET last_seen_at=?").run(now - value.limits.actionSeconds - 1);
   value.prune(now);
   expect(value.status()).toMatchObject({ preimages: 0, observations: 0, pending_events: 0 });
-  value.observe(
+  observeFull(
+    value,
     { stage: "PostToolUse", event: { ...event, tool_response: { stdout: "/workspace/repo" } } },
     "claude-code",
   );
@@ -230,7 +236,7 @@ test("database exhaustion returns typed backpressure without a partially credite
       tool_input: { command: "x".repeat(64 << 10) },
     };
     try {
-      value.observe({ stage: "PreToolUse", event }, "claude-code");
+      observeFull(value, { stage: "PreToolUse", event }, "claude-code");
     } catch (cause) {
       error = cause;
       break;
