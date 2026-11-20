@@ -211,8 +211,8 @@ test("buildCodexToml emits the provider block and top-level keys", () => {
   expect(out).toContain('http_headers = { Authorization = "Bearer bearer-x" }');
   expect(out).toContain('wire_api = "responses"');
   expect(out).not.toContain("supports_standalone_web_search");
-  expect(out).toContain('web_search = "live"');
-  expect(out).not.toContain("[features]\nstandalone_web_search = true");
+  expect(out).not.toContain("web_search");
+  expect(out).not.toContain("[features]");
 });
 
 test("buildCodexToml enables ChatGPT auth only for usable subscription rows", () => {
@@ -288,22 +288,25 @@ test("buildCodexCatalog maps feed providers, filters unusable rows, and deduplic
   );
   expect(available.models.find((model) => model.slug === "plain")?.display_name).toBe("plain");
   expect(new Set(available.models.map((model) => model.slug)).size).toBe(available.models.length);
-  expect(available.models.find((model) => model.slug === "plain")).toMatchObject({
-    supports_search_tool: true,
-    web_search_tool_type: "text",
-  });
+  expect(available.models.find((model) => model.slug === "plain")?.supports_search_tool).toBe(
+    false,
+  );
   const plainEntry = available.models.find((model) => model.slug === "plain");
-  expect(plainEntry?.web_search_provider).toBeUndefined();
-  expect(plainEntry?.use_responses_lite).toBeUndefined();
-  expect(plainEntry?.tool_mode).toBeUndefined();
+  expect(plainEntry?.web_search_tool_type).toBeUndefined();
+  expect(JSON.stringify(plainEntry)).not.toContain("web_search_provider");
+  expect(JSON.stringify(plainEntry)).not.toContain("use_responses_lite");
+  expect(JSON.stringify(plainEntry)).not.toContain("tool_mode");
   for (const slug of ["shared", "chat-only", "gpt-6.1-sol"])
     expect(available.models.find((model) => model.slug === slug)).toMatchObject({
       supports_search_tool: true,
       web_search_tool_type: "text_and_image",
-      web_search_provider: "search_mcp",
-      use_responses_lite: true,
-      tool_mode: "code_mode_only",
     });
+  for (const slug of ["shared", "chat-only", "gpt-6.1-sol"]) {
+    const entry = JSON.stringify(available.models.find((model) => model.slug === slug));
+    expect(entry).not.toContain("web_search_provider");
+    expect(entry).not.toContain("use_responses_lite");
+    expect(entry).not.toContain("tool_mode");
+  }
 
   const unavailable = buildCodexCatalog(feed, false);
   expect(unavailable.routes).toEqual({
@@ -409,7 +412,7 @@ multi_agent = true
   );
 });
 
-test("enable preserves an explicit search mode and restores it with the old feature value", async () => {
+test("enable leaves the person's search mode and feature settings untouched", async () => {
   process.env.KIMCHI_BASE_URL = modelsEndpoint();
   kimchiKey("castai_v1_key");
   mkdirSync(dirname(codexConfigPath()), { recursive: true });
@@ -434,13 +437,10 @@ local = true
   expect(first).toContain('web_search = "cached"');
   expect(first).not.toContain('web_search = "live"');
   expect(first.split("[features]").length - 1).toBe(1);
-  expect(first).not.toContain("standalone_web_search");
-  expect(first).toContain("multi_agent = true");
+  expect(first).toContain("[features]\nstandalone_web_search = true\nmulti_agent = true");
   expect(first).toContain("[plugins]\nlocal = true");
-  expect(messages.some((message) => message.includes("Removed the bridge-managed"))).toBe(true);
-  expect(messages.some((message) => message.includes("bridge did not select live search"))).toBe(
-    true,
-  );
+  expect(messages.some((message) => message.includes("web_search"))).toBe(false);
+  expect(messages.some((message) => message.includes("standalone_web_search"))).toBe(false);
   await disable();
   const restored = readFileSync(codexConfigPath(), "utf8");
   expect(restored).toContain('web_search = "cached"');
@@ -486,14 +486,8 @@ test("catalog and main-model resolution mirror Kimchi's selection", () => {
     "high",
   ]);
   expect(catalog.models[1].supports_reasoning_summaries).toBe(true);
-  expect(
-    catalog.models.every(
-      (model) =>
-        model.supports_search_tool &&
-        model.web_search_tool_type === "text" &&
-        model.web_search_provider === undefined,
-    ),
-  ).toBe(true);
+  expect(catalog.models.every((model) => model.supports_search_tool === false)).toBe(true);
+  expect(catalog.models.every((model) => model.web_search_tool_type === undefined)).toBe(true);
   expect(resolveMainModel(models).slug).toBe("minimax-m3");
   expect(
     resolveMainModel([
@@ -833,7 +827,7 @@ local = true
   expect(readFileSync(codexCatalogPath(), "utf8")).toBe(firstCatalog);
   expect(firstToml).toContain('http_headers = { Authorization = "Bearer kimchi-gateway" }');
   expect(firstToml).toContain("requires_openai_auth = true");
-  expect(firstToml).toContain('web_search = "live"');
+  expect(firstToml).not.toContain("web_search");
   expect(firstToml).toContain("[features]\nmulti_agent = true");
   expect(firstToml).not.toContain("standalone_web_search");
   expect(firstToml).not.toContain("castai_v1_key");
@@ -1595,16 +1589,17 @@ test("proxyRequest streams the upstream body through untouched", async () => {
   expect(await response.text()).toBe("data: one\n\ndata: two\n\ndata: [DONE]\n\n");
 });
 
-test("Codex 0.169 accepts backend web_search compatibility fixtures for ordinary inference", async () => {
+test("Codex >= 0.169 runs ordinary inference without advertising search", async () => {
   const codex = Bun.which("codex");
   if (!codex) {
     console.warn("SKIP actual backend search execution: codex is unavailable");
     return;
   }
   const version = Bun.spawnSync([codex, "--version"]).stdout.toString();
-  if (!version.includes("0.169.0")) {
+  const minor = Number.parseInt(version.trim().split(" ").at(-1)?.split(".")[1] ?? "", 10);
+  if (!Number.isFinite(minor) || minor < 169) {
     console.warn(
-      `SKIP actual backend search execution: expected Codex 0.169.0, got ${version.trim()}`,
+      `SKIP ordinary subprocess inference: expected Codex >= 0.169, got ${version.trim()}`,
     );
     return;
   }
@@ -1626,11 +1621,6 @@ test("Codex 0.169 accepts backend web_search compatibility fixtures for ordinary
     requests.push(body);
     const output = [
       {
-        id: "backend_search_item",
-        type: "web_search_call",
-        action: { type: "search", query: "synthetic backend result" },
-      },
-      {
         id: "msg_result",
         type: "message",
         status: "completed",
@@ -1638,16 +1628,14 @@ test("Codex 0.169 accepts backend web_search compatibility fixtures for ordinary
         content: [
           {
             type: "output_text",
-            text: "Synthetic sourced answer from the backend search result",
-            annotations: [
-              { type: "url_citation", url: "https://kimchi.dev/search", title: "Synthetic result" },
-            ],
+            text: "Synthetic ordinary inference answer",
+            annotations: [],
           },
         ],
       },
     ];
     const response = {
-      id: `resp_backend_search_${requests.length}`,
+      id: `resp_ordinary_${requests.length}`,
       object: "response",
       created_at: Math.floor(Date.now() / 1000),
       status: "completed",
@@ -1698,7 +1686,7 @@ test("Codex 0.169 accepts backend web_search compatibility fixtures for ordinary
       "never",
       "-C",
       join(root, "home"),
-      "Use backend web search to find the synthetic backend result, then state its sourced answer.",
+      "Reply with the synthetic ordinary inference answer and do not use tools.",
     ],
     { env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 40_000 },
   );
@@ -1706,13 +1694,15 @@ test("Codex 0.169 accepts backend web_search compatibility fixtures for ordinary
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
   expect({ exitCode, stdout, stderr }).toMatchObject({ exitCode: 0 });
-  expect(requests.length).toBeGreaterThanOrEqual(1);
-  expect(paths.every((path) => path === "/openai/v1/responses")).toBe(true);
-  const serializedTools = JSON.stringify(requests[0]?.tools ?? []);
-  expect(serializedTools).toContain('"type":"web_search"');
-  expect(serializedTools).not.toContain('"type":"namespace"');
-  expect(serializedTools).not.toContain("web.run");
-  expect(stdout + stderr).toContain("Synthetic sourced answer from the backend search result");
+  expect(paths.every((path) => path === "/openai/v1/responses" || path === "/v1/search")).toBe(
+    true,
+  );
+  expect(paths).not.toContain("/v1/search");
+  const generated = JSON.parse(readFileSync(codexCatalogPath(), "utf8"));
+  expect(generated.models).toHaveLength(1);
+  expect(generated.models[0]).toMatchObject({ slug: model.slug, supports_search_tool: false });
+  expect(JSON.stringify(generated.models[0])).not.toContain("web_search_tool_type");
+  expect(stdout + stderr).toContain("Synthetic ordinary inference answer");
 }, 50_000);
 
 test("search trace redacts sensitive request and response content for plain and zstd bodies", async () => {

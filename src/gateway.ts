@@ -66,7 +66,6 @@ export interface GatewayState {
     /** Claude Code's model picker block before the bridge wrote one: null absent, a string its JSON. */
     picker?: string | null;
     codexTopLevel?: Array<[string, string]>;
-    codexStandaloneWebSearch?: string | null;
     claudeDesktop?: Desktop3pPrevious;
   };
   /** The env values the bridge last wrote into the CLI configs, so later writes replace only its own. */
@@ -487,7 +486,7 @@ function tomlEscape(value: string): string {
     .replaceAll("\t", "\\t");
 }
 
-const CODEX_TOP_LEVEL_KEYS = ["model_provider", "model", "model_catalog_json", "web_search"];
+const CODEX_TOP_LEVEL_KEYS = ["model_provider", "model", "model_catalog_json"];
 
 /** Drop a trailing TOML comment from a would-be header line; a # inside quotes is content. */
 function withoutComment(line: string): string {
@@ -568,13 +567,11 @@ export function buildCodexToml(
   modelSlug: string,
   catalogPath: string,
   requiresOpenAIAuth = false,
-  searchMode = '"live"',
 ): string {
   const openAIAuth = requiresOpenAIAuth ? "requires_openai_auth = true\n" : "";
   return `model_provider = "${KIMCHI_PROVIDER}"
 model = "${tomlEscape(modelSlug)}"
 model_catalog_json = "${tomlEscape(catalogPath)}"
-web_search = ${searchMode}
 
 [model_providers.${KIMCHI_PROVIDER}]
 name = "${CODEX_PROVIDER_NAME}"
@@ -619,60 +616,6 @@ export function stripCodexToml(existingText: string): string {
   return collapsed.trim();
 }
 
-function tomlSection(line: string): string | undefined {
-  const trimmed = line.trim();
-  if (trimmed.startsWith("[[") || !trimmed.startsWith("[")) return undefined;
-  const core = withoutComment(trimmed);
-  return core.startsWith("[") && core.endsWith("]") ? core.slice(1, -1).trim() : undefined;
-}
-
-interface CodexFeatureSlice {
-  text: string;
-  header?: string;
-  body: string[];
-  previous?: string;
-}
-
-function splitCodexFeatures(text: string): CodexFeatureSlice {
-  const lines = classifyTomlLines(text);
-  const start = lines.findIndex(({ line }) => tomlSection(line) === "features");
-  if (start === -1) return { text: text.trim(), body: [] };
-  const after = lines.slice(start + 1);
-  const endOffset = after.findIndex(({ line }) => tomlSection(line) !== undefined);
-  const end = endOffset === -1 ? lines.length : start + 1 + endOffset;
-  const body: string[] = [];
-  let previous: string | undefined;
-  for (const { line } of lines.slice(start + 1, end)) {
-    const trimmed = line.trim();
-    const split = trimmed.indexOf("=");
-    const key = split === -1 ? "" : trimmed.slice(0, split).trim();
-    if (key === "standalone_web_search") {
-      previous = trimmed.slice(split + 1).trim();
-      continue;
-    }
-    body.push(line);
-  }
-  return {
-    text: [...lines.slice(0, start), ...lines.slice(end)]
-      .map(({ line }) => line)
-      .join("\n")
-      .trim(),
-    header: lines[start]!.line,
-    body,
-    previous,
-  };
-}
-
-function withCodexFeature(slice: CodexFeatureSlice, value: string | null): string {
-  const body = [...(value ? [`standalone_web_search = ${value}`] : []), ...slice.body].filter(
-    (line) => line.trim(),
-  );
-  if (!body.length) return slice.text.trim();
-  return [slice.text.trim(), `${slice.header ?? "[features]"}\n${body.join("\n")}`]
-    .filter(Boolean)
-    .join("\n\n");
-}
-
 /** Split TOML text at the first table header: top-level scalars and comments, then sections. */
 function splitTomlAtFirstHeader(text: string): { top: string; sections: string } {
   const lines = classifyTomlLines(text);
@@ -695,23 +638,13 @@ function splitTomlAtFirstHeader(text: string): { top: string; sections: string }
 /** Merge fresh kimchi TOML over a stripped existing config (user sections last). */
 export function mergeCodexToml(existingText: string, freshToml: string): string {
   const collapsed = stripCodexToml(existingText).trim();
-  const userFeatures = splitCodexFeatures(collapsed);
-  const freshFeatures = splitCodexFeatures(freshToml.trim());
-  const freshText = withCodexFeature(
-    {
-      ...freshFeatures,
-      header: userFeatures.header ?? freshFeatures.header,
-      body: [...freshFeatures.body, ...userFeatures.body],
-    },
-    null,
-  );
-  if (!collapsed) return `${freshText}\n`;
+  if (!collapsed) return freshToml.trim() + "\n";
   // Top-level scalars the person set (e.g. the CLI's openai_base_url) must stay
   // above the first table header: appended whole after the fresh block they
   // would land inside [model_providers.kimchi], silently changing meaning and
   // tripping codex's strict config parse.
-  const fresh = splitTomlAtFirstHeader(freshText);
-  const user = splitTomlAtFirstHeader(userFeatures.text);
+  const fresh = splitTomlAtFirstHeader(freshToml.trim());
+  const user = splitTomlAtFirstHeader(collapsed);
   return `${[fresh.top, user.top, fresh.sections, user.sections].filter(Boolean).join("\n\n")}\n`;
 }
 
@@ -803,10 +736,7 @@ interface CodexModelEntry {
   support_verbosity: boolean;
   supported_reasoning_levels: Array<{ effort: "low" | "medium" | "high"; description: string }>;
   supports_search_tool: boolean;
-  web_search_tool_type: "text" | "text_and_image";
-  web_search_provider?: "search_mcp";
-  use_responses_lite?: boolean;
-  tool_mode?: "code_mode_only";
+  web_search_tool_type?: "text_and_image";
 }
 
 export function buildCodexCatalog(
@@ -852,14 +782,9 @@ export function buildCodexCatalog(
       supports_reasoning_summaries: m.reasoning === true,
       support_verbosity: m.reasoning === true,
       supported_reasoning_levels: m.reasoning === true ? [...REASONING_LEVELS] : [],
-      supports_search_tool: true,
-      web_search_tool_type: route === CODEX_SUBSCRIPTION_ROUTE ? "text_and_image" : "text",
+      supports_search_tool: route === CODEX_SUBSCRIPTION_ROUTE,
       ...(route === CODEX_SUBSCRIPTION_ROUTE
-        ? {
-            web_search_provider: "search_mcp",
-            use_responses_lite: true,
-            tool_mode: "code_mode_only",
-          }
+        ? { web_search_tool_type: "text_and_image" as const }
         : {}),
     })),
     routes: Object.fromEntries(chosen.map(({ model, route }) => [model.slug, route])),
@@ -904,8 +829,6 @@ export function hasUsableChatGPTLogin(path = join(homeDir(), ".codex", "auth.jso
 
 interface CodexConfigWrite {
   previous?: Array<[string, string]>;
-  standaloneWebSearch: string | null;
-  searchMode: string;
 }
 
 function writeCodexConfig(
@@ -948,28 +871,13 @@ function writeCodexConfig(
   const main = resolveMainModel(selectedModels);
   const catalogPath = codexCatalogPath();
   const requiresOpenAIAuth = Object.values(catalog.routes).includes(CODEX_SUBSCRIPTION_ROUTE);
-  const searchMode = previous.find(([key]) => key === "web_search")?.[1] ?? '"live"';
-  const fresh = buildCodexToml(
-    base,
-    bearer,
-    main.slug,
-    catalogPath,
-    requiresOpenAIAuth,
-    searchMode,
-  );
+  const fresh = buildCodexToml(base, bearer, main.slug, catalogPath, requiresOpenAIAuth);
   writeAtomic(path, mergeCodexToml(existingText, fresh), 0o644);
   writeAtomic(catalogPath, JSON.stringify(catalog, null, 2) + "\n", 0o644);
-  return {
-    previous: previous.length ? previous : undefined,
-    standaloneWebSearch: splitCodexFeatures(existingText).previous ?? null,
-    searchMode,
-  };
+  return { previous: previous.length ? previous : undefined };
 }
 
-function restoreCodexConfig(
-  previous?: Array<[string, string]>,
-  standaloneWebSearch: string | null = null,
-): void {
+function restoreCodexConfig(previous?: Array<[string, string]>): void {
   const path = codexConfigPath();
   let existingText = "";
   try {
@@ -978,10 +886,7 @@ function restoreCodexConfig(
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   if (!existingText) return;
-  const stripped = withCodexFeature(
-    splitCodexFeatures(stripCodexToml(existingText)),
-    standaloneWebSearch,
-  );
+  const stripped = stripCodexToml(existingText);
   const restored = previous?.length
     ? `${previous.map(([k, v]) => `${k} = ${v}`).join("\n")}\n${stripped ? `\n${stripped}\n` : ""}`
     : `${stripped}\n`;
@@ -2102,19 +2007,10 @@ export async function enable(
             claude: claude.previous,
             picker: claude.pickerPrevious,
             ...(codexPrevious.previous ? { codexTopLevel: codexPrevious.previous } : {}),
-            codexStandaloneWebSearch: codexPrevious.standaloneWebSearch,
             ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),
           },
   };
   saveGatewayState(state);
-  if (codexPrevious.standaloneWebSearch && codexPrevious.standaloneWebSearch !== "false")
-    onMessage?.(
-      "Removed the bridge-managed standalone_web_search activation; search uses native discovery or the backend Responses tool.",
-    );
-  if (codexPrevious.searchMode !== '"live"')
-    onMessage?.(
-      `Preserved existing Codex web_search = ${codexPrevious.searchMode}; bridge did not select live search.`,
-    );
 
   let daemon: EnableResult["daemon"] = "off";
   let service: EnableResult["service"] = null;
@@ -2143,10 +2039,7 @@ export async function disable(onMessage?: (message: string) => void): Promise<vo
   const state = loadGatewayState();
   restoreClaudeConfig(state.previous?.claude);
   restoreClaudePicker(state.previous?.picker);
-  restoreCodexConfig(
-    state.previous?.codexTopLevel,
-    state.previous?.codexStandaloneWebSearch ?? null,
-  );
+  restoreCodexConfig(state.previous?.codexTopLevel);
   if (state.previous?.claudeDesktop) {
     restoreClaudeDesktopConfig(state.previous.claudeDesktop);
     onMessage?.("Restart the Claude app to leave third-party mode.");
