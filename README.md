@@ -126,14 +126,23 @@ Workspace mode does not use a Kimchi account, OAuth, organization ID, Git attrib
 
 Set both variables in the environment inherited by the Claude Code or Codex hook processes, then start a new client session:
 
+For a sidekick-enabled remote workspace, use the sidekick's IMDS destination:
+
 ```sh
 export KIMCHI_BRIDGE_PROFILE=workspace
-export KIMCHI_BRIDGE_ACTIVITY_URL=http://127.0.0.1:8765/imds/tool-calls:batchRecord
+export KIMCHI_BRIDGE_ACTIVITY_URL=http://__imds.kimchi.internal/imds/tool-calls:batchRecord
 claude
 # or: codex
 ```
 
-The receiver must use plain HTTP on `127.0.0.1`, `localhost` or `[::1]`, and the exact path `/imds/tool-calls:batchRecord`. Credentials, query strings, fragments and non-loopback destinations are rejected. The receiver is a separate service that you run; the bridge does not start it.
+For local development with a replay receiver, use its loopback address instead:
+
+```sh
+export KIMCHI_BRIDGE_PROFILE=workspace
+export KIMCHI_BRIDGE_ACTIVITY_URL=http://127.0.0.1:8765/imds/tool-calls:batchRecord
+```
+
+The receiver must be either `http://__imds.kimchi.internal` or plain HTTP on `127.0.0.1`, `localhost` or `[::1]`, with the exact path `/imds/tool-calls:batchRecord`. Credentials, query strings, fragments and other destinations are rejected. Sidekick supplies the remote IMDS receiver; for local replay the receiver is a separate service that you run, not the bridge.
 
 After a hook, the bridge attempts delivery to that receiver. Workspace `sync` retries pending batches, and explicit `kimchi-bridge flush` drains the whole queue. Each JSON batch contains up to 100 events and targets 1 MiB. It must be accepted with one receipt per event:
 
