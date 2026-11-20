@@ -5,7 +5,7 @@
 // request carries Kimchi's billing tag so its bill can be found, as Kimchi's
 // own requests do (CAST AI, Apache-2.0: src/integrations/claude-code.ts,
 // codex.ts, extensions/work-attribution/request-tags.ts).
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendFileSync,
   mkdirSync,
@@ -21,29 +21,37 @@ import type { Config } from "./settings.ts";
 import { stateRoot } from "./settings.ts";
 import type { SignIn } from "./kimchi.ts";
 import { baseUrl, kimchiSignIn } from "./kimchi.ts";
-import { cliEntry, lockSync } from "./platform.ts";
+import { cliEntry, lockSync, writeFileAtomic } from "./platform.ts";
 import {
+  bearerToken,
   endpointsForCredential,
   ensureFresh,
   gatewayHeaders,
   isInvalidGrant,
   loadCredential,
   normalizeEndpoint,
-  ORGANIZATION_HEADER,
   refreshOAuth,
   saveCredential,
   seedFromKimchi,
 } from "./oauth.ts";
 import { billingTags, noteSideCall, readResponseId, recordTag } from "./request-tags.ts";
+import { inspectRequest, requestModel } from "./request-body.ts";
+import { keyHeaders, planProxyAuth } from "./proxy-auth.ts";
+import {
+  buildCodexCatalog,
+  codexCatalogPath,
+  CodexInstallation,
+  hasUsableChatGPTLogin,
+} from "./codex.ts";
 
 const DEFAULT_PORT = 8766;
 const PORT_SCAN_SPAN = 10;
 const HEALTH_PATH = "/healthz";
 const HEALTH_MARKER = "kimchi-bridge-gateway";
-const KIMCHI_PROVIDER = "kimchi";
-const CODEX_PROVIDER_NAME = "Kimchi Gateway";
 /** Placeholder bearer for proxy mode; the proxy replaces it per request. */
 const PROXY_PLACEHOLDER = "kimchi-gateway";
+/** Bounds the file the daemon reads on every request; the picker snapshot used to exceed the old 16 KiB limit. */
+const MAX_GATEWAY_STATE_BYTES = 1 << 20;
 
 export type GatewayMode = "proxy" | "direct";
 
@@ -83,12 +91,6 @@ export function gatewayLogPath(root = stateRoot()): string {
 export function claudeSettingsPath(): string {
   return join(homeDir(), ".claude", "settings.json");
 }
-export function codexConfigPath(): string {
-  return join(homeDir(), ".codex", "config.toml");
-}
-export function codexCatalogPath(): string {
-  return join(homeDir(), ".codex", "model_catalog.json");
-}
 /**
  * The home the CLI configs live under. KIMCHI_BRIDGE_CONFIG_HOME isolates test
  * runs: Bun's os.homedir() does not react to a mid-process $HOME swap, so HOME
@@ -101,7 +103,7 @@ function homeDir(): string {
 export function loadGatewayState(path = gatewayStatePath()): GatewayState {
   try {
     const bytes = readFileSync(path);
-    if (bytes.length > 16 << 10) throw new Error("gateway state too large");
+    if (bytes.length > MAX_GATEWAY_STATE_BYTES) throw new Error("gateway state too large");
     const value = JSON.parse(bytes.toString("utf8"));
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("invalid gateway state");
@@ -112,19 +114,8 @@ export function loadGatewayState(path = gatewayStatePath()): GatewayState {
   }
 }
 
-function writeAtomic(path: string, content: string, mode: number): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
-  try {
-    writeFileSync(tmp, content, { mode });
-    renameSync(tmp, path);
-  } finally {
-    rmSync(tmp, { force: true });
-  }
-}
-
 export function saveGatewayState(state: GatewayState, path = gatewayStatePath()): void {
-  writeAtomic(path, JSON.stringify(state, null, 2) + "\n", 0o600);
+  writeFileAtomic(path, JSON.stringify(state, null, 2) + "\n", 0o600);
 }
 
 export function gatewayPort(state: GatewayState = loadGatewayState()): number {
@@ -162,7 +153,7 @@ function readJsonFile(path: string): Record<string, unknown> {
 }
 
 function writeJsonFile(path: string, value: Record<string, unknown>): void {
-  writeAtomic(path, JSON.stringify(value, null, 2) + "\n", 0o644);
+  writeFileAtomic(path, JSON.stringify(value, null, 2) + "\n", 0o644);
 }
 
 /**
@@ -348,7 +339,7 @@ function pickerRowOf(value: unknown): ClaudePickerRow | null {
  * Writes the gateway's catalog into Claude Code's model picker, mirroring the env rules: a row
  * whose model the person set is never replaced, ours refresh in place, one we wrote for a model
  * the catalog dropped leaves unless the person edited it after we wrote, and the whole block
- * leaves with the last of ours. Returns the model values → row JSON the bridge now owns.
+ * leaves with the last of ours. Returns the model values → row fingerprints the bridge now owns.
  */
 function applyClaudeModelPicker(
   settings: Record<string, unknown>,
@@ -372,14 +363,14 @@ function applyClaudeModelPicker(
   for (const row of rows) {
     const theirs = byModel.get(row.model);
     if (theirs && !ownedPrevious.has(row.model)) continue; // the person set this model: theirs stays
-    ownedNext[row.model] = JSON.stringify(row);
+    ownedNext[row.model] = rowFingerprint(row);
     if (theirs) dropped.add(row.model);
   }
   for (const [model, rowJson] of Object.entries(wrote ?? {})) {
     if (ownedNext[model]) continue; // still in the catalog, refreshed above
     const current = byModel.get(model);
     if (!current) continue;
-    if (JSON.stringify(current) !== rowJson) continue; // the person edited our row: keep theirs
+    if (!matchesFingerprint(current, rowJson)) continue; // the person edited our row: keep theirs
     dropped.add(model);
   }
   const kept = current.filter((row) => !dropped.has(row.model));
@@ -395,6 +386,15 @@ function applyClaudeModelPicker(
     replaceBuiltInOptions: existing?.replaceBuiltInOptions === true,
   };
   return ownedNext;
+}
+
+function rowFingerprint(row: ClaudePickerRow): string {
+  return createHash("sha256").update(JSON.stringify(row)).digest("hex").slice(0, 16);
+}
+
+/** Older bridges stored the whole row; both forms mean the same thing to the picker's ownership check. */
+function matchesFingerprint(row: ClaudePickerRow, stored: string): boolean {
+  return stored === rowFingerprint(row) || stored === JSON.stringify(row);
 }
 
 function restoreClaudePicker(previous?: string | null): void {
@@ -467,133 +467,10 @@ async function refreshClaudeModelEnv(
     });
 }
 
-// ---------------------------------------------------------------------------
-// Codex config (~/.codex/config.toml + model catalog)
-// ---------------------------------------------------------------------------
-
-function tomlEscape(value: string): string {
-  return value
-    .replaceAll("\\", "\\\\")
-    .replaceAll('"', '\\"')
-    .replaceAll("\n", "\\n")
-    .replaceAll("\r", "\\r")
-    .replaceAll("\t", "\\t");
-}
-
-const CODEX_TOP_LEVEL_KEYS = ["model_provider", "model", "model_catalog_json"];
-
-/** Drop a trailing TOML comment from a would-be header line; a # inside quotes is content. */
-function withoutComment(line: string): string {
-  const hash = line.indexOf("#");
-  if (hash === -1) return line;
-  const before = line.slice(0, hash);
-  if ((before.split('"').length - 1) % 2 === 1 || (before.split("'").length - 1) % 2 === 1)
-    return line;
-  return before.trimEnd();
-}
-
-function classifyTomlLine(line: string): "kimchi-header" | "header" | "array-header" | "body" {
-  const trimmed = line.trim();
-  if (trimmed.startsWith("[[")) return "array-header";
-  // A trailing comment after a table header is legal TOML (`[table] # note`).
-  // Lines stay the unit of classification: header-shaped lines inside multi-line
-  // strings are out of scope for codex's machine-managed config.
-  const core = trimmed.startsWith("[") ? withoutComment(trimmed) : trimmed;
-  if (core.startsWith("[") && core.endsWith("]")) {
-    const section = core.slice(1, -1).trim();
-    // The whole kimchi namespace is ours: [model_providers.kimchi] and any
-    // table nested under it re-defines the provider we replace.
-    if (
-      section === `model_providers.${KIMCHI_PROVIDER}` ||
-      section.startsWith(`model_providers.${KIMCHI_PROVIDER}.`)
-    )
-      return "kimchi-header";
-    return "header";
-  }
-  return "body";
-}
-
-export function buildCodexToml(
-  baseUrlValue: string,
-  bearer: string,
-  modelSlug: string,
-  catalogPath: string,
-): string {
-  return `model_provider = "${KIMCHI_PROVIDER}"
-model = "${tomlEscape(modelSlug)}"
-model_catalog_json = "${tomlEscape(catalogPath)}"
-
-[model_providers.${KIMCHI_PROVIDER}]
-name = "${CODEX_PROVIDER_NAME}"
-base_url = "${tomlEscape(baseUrlValue)}"
-http_headers = { Authorization = "Bearer ${tomlEscape(bearer)}" }
-wire_api = "responses"
-`;
-}
-
-/** Strip the kimchi top-level keys and provider section, keeping user sections. */
-export function stripCodexToml(existingText: string): string {
-  const kept: string[] = [];
-  let inKimchiSection = false;
-  let inAnySection = false;
-  for (const line of existingText.split("\n")) {
-    const kind = classifyTomlLine(line);
-    if (kind === "kimchi-header") {
-      inKimchiSection = true;
-      inAnySection = true;
-      continue;
-    }
-    if (kind === "header" || kind === "array-header") {
-      inKimchiSection = false;
-      inAnySection = true;
-      kept.push(line);
-      continue;
-    }
-    if (inKimchiSection) continue;
-    if (!inAnySection) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith("#")) {
-        const key = trimmed.slice(0, trimmed.indexOf("=")).trim();
-        if (CODEX_TOP_LEVEL_KEYS.includes(key)) continue;
-      }
-    }
-    kept.push(line);
-  }
-  let collapsed = "";
-  for (const line of kept) {
-    if (!line && (collapsed === "" || collapsed.endsWith("\n\n"))) continue;
-    collapsed += line + "\n";
-  }
-  return collapsed.trim();
-}
-
-/** Split TOML text at the first table header: top-level scalars and comments, then sections. */
-function splitTomlAtFirstHeader(text: string): { top: string; sections: string } {
-  const lines = text.split("\n");
-  const cut = lines.findIndex((line) => classifyTomlLine(line) !== "body");
-  if (cut === -1) return { top: text.trim(), sections: "" };
-  return {
-    top: lines.slice(0, cut).join("\n").trim(),
-    sections: lines.slice(cut).join("\n").trim(),
-  };
-}
-
-/** Merge fresh kimchi TOML over a stripped existing config (user sections last). */
-export function mergeCodexToml(existingText: string, freshToml: string): string {
-  const collapsed = stripCodexToml(existingText).trim();
-  if (!collapsed) return freshToml;
-  // Top-level scalars the person set (e.g. the CLI's openai_base_url) must stay
-  // above the first table header: appended whole after the fresh block they
-  // would land inside [model_providers.kimchi], silently changing meaning and
-  // tripping codex's strict config parse.
-  const fresh = splitTomlAtFirstHeader(freshToml.trim());
-  const user = splitTomlAtFirstHeader(collapsed);
-  return `${[fresh.top, user.top, fresh.sections, user.sections].filter(Boolean).join("\n\n")}\n`;
-}
-
 export interface GatewayModel {
   slug: string;
   display_name: string;
+  provider?: string;
   reasoning?: boolean;
   input_modalities?: string[];
   is_serverless?: boolean;
@@ -656,120 +533,6 @@ export async function fetchModels(
   return body.models.filter(
     (m) => typeof m?.slug === "string" && typeof m?.limits?.context_window === "number",
   );
-}
-
-interface CodexModelEntry {
-  slug: string;
-  display_name: string;
-  name: string;
-  model: string;
-  provider: string;
-  context_window: number;
-  truncation_policy: { mode: "tokens"; limit: number };
-  shell_type: "shell_command";
-  visibility: "list";
-  supported_in_api: boolean;
-  priority: number;
-  base_instructions: string;
-  supports_tools: boolean;
-  supports_parallel_tool_calls: boolean;
-  experimental_supported_tools: string[];
-  supports_reasoning_summaries: boolean;
-  support_verbosity: boolean;
-  supported_reasoning_levels: Array<{ effort: "low" | "medium" | "high"; description: string }>;
-}
-
-export function buildCodexCatalog(models: readonly GatewayModel[]): { models: CodexModelEntry[] } {
-  const REASONING_LEVELS = [
-    { effort: "low", description: "Low reasoning effort" },
-    { effort: "medium", description: "Medium reasoning effort" },
-    { effort: "high", description: "High reasoning effort" },
-  ] as const;
-  return {
-    models: models.map((m, index) => ({
-      slug: m.slug,
-      // The gateway's model registry currently serves empty display_name;
-      // codex's /model picker renders display_name, so fall back to the slug
-      // rather than showing blank rows (backend data-quality ticket open).
-      display_name: m.display_name || m.slug,
-      name: m.slug,
-      model: m.slug,
-      provider: KIMCHI_PROVIDER,
-      context_window: m.limits.context_window,
-      truncation_policy: { mode: "tokens" as const, limit: m.limits.context_window },
-      shell_type: "shell_command" as const,
-      visibility: "list" as const,
-      supported_in_api: true,
-      priority: (index + 1) * 10,
-      base_instructions: "You are a helpful coding assistant.",
-      supports_tools: true,
-      supports_parallel_tool_calls: true,
-      experimental_supported_tools: [],
-      supports_reasoning_summaries: m.reasoning === true,
-      support_verbosity: m.reasoning === true,
-      supported_reasoning_levels: m.reasoning === true ? [...REASONING_LEVELS] : [],
-    })),
-  };
-}
-
-function writeCodexConfig(
-  base: string,
-  bearer: string,
-  models: readonly GatewayModel[],
-): Array<[string, string]> | undefined {
-  const path = codexConfigPath();
-  let existingText = "";
-  try {
-    existingText = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  // Snapshot the user's top-level values our enable replaces.
-  const previous: Array<[string, string]> = [];
-  let inAnySection = false;
-  for (const line of existingText.split("\n")) {
-    const kind = classifyTomlLine(line);
-    if (kind !== "body") {
-      inAnySection = true;
-      continue;
-    }
-    if (!inAnySection) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith("#")) {
-        const split = trimmed.indexOf("=");
-        const key = trimmed.slice(0, split).trim();
-        const value = trimmed.slice(split + 1).trim();
-        if (CODEX_TOP_LEVEL_KEYS.includes(key) && value) previous.push([key, value]);
-      }
-    }
-  }
-  const main = resolveMainModel(models);
-  const catalogPath = codexCatalogPath();
-  const fresh = buildCodexToml(base, bearer, main.slug, catalogPath);
-  writeAtomic(path, mergeCodexToml(existingText, fresh), 0o644);
-  writeAtomic(catalogPath, JSON.stringify(buildCodexCatalog(models), null, 2) + "\n", 0o644);
-  return previous.length ? previous : undefined;
-}
-
-function restoreCodexConfig(previous?: Array<[string, string]>): void {
-  const path = codexConfigPath();
-  let existingText = "";
-  try {
-    existingText = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  if (!existingText) return;
-  const stripped = stripCodexToml(existingText);
-  const restored = previous?.length
-    ? `${previous.map(([k, v]) => `${k} = ${v}`).join("\n")}\n${stripped ? `\n${stripped}\n` : ""}`
-    : `${stripped}\n`;
-  writeAtomic(path, restored, 0o644);
-  try {
-    rmSync(codexCatalogPath(), { force: true });
-  } catch {
-    /* the catalog is ours to drop; ignore failures */
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -891,7 +654,11 @@ export function writeClaudeDesktopConfig(
     entryId: "",
   };
   config[DESKTOP_MODE_KEY] = "3p";
-  writeAtomic(join(appData, DESKTOP_CONFIG_FILE), JSON.stringify(config, null, 2) + "\n", 0o644);
+  writeFileAtomic(
+    join(appData, DESKTOP_CONFIG_FILE),
+    JSON.stringify(config, null, 2) + "\n",
+    0o644,
+  );
 
   const library = join(claudeDesktop3pData(), "configLibrary");
   mkdirSync(library, { recursive: true, mode: 0o700 });
@@ -918,8 +685,8 @@ export function writeClaudeDesktopConfig(
   previous.appliedId = isConfigId(meta.appliedId) ? meta.appliedId : null;
   meta.appliedId = previous.entryId;
   meta.entries = entries;
-  writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
-  writeAtomic(
+  writeFileAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+  writeFileAtomic(
     join(library, `${previous.entryId}.json`),
     JSON.stringify(
       {
@@ -972,7 +739,7 @@ export function rewriteClaudeDesktopConfig(anthropicBaseUrl: string): void {
       (model) => typeof model?.name === "string" && isClaudeModel(model.name),
     );
   const after = JSON.stringify(config, null, 2) + "\n";
-  if (after !== before) writeAtomic(path, after, 0o600);
+  if (after !== before) writeFileAtomic(path, after, 0o600);
 }
 
 /**
@@ -1007,7 +774,7 @@ export function restoreClaudeDesktopConfig(saved?: Desktop3pPrevious): void {
     if (config[DESKTOP_MODE_KEY] === "3p") {
       if (previous.mode === null) delete config[DESKTOP_MODE_KEY];
       else config[DESKTOP_MODE_KEY] = previous.mode;
-      writeAtomic(
+      writeFileAtomic(
         join(appData, DESKTOP_CONFIG_FILE),
         JSON.stringify(config, null, 2) + "\n",
         0o644,
@@ -1030,18 +797,18 @@ export function restoreClaudeDesktopConfig(saved?: Desktop3pPrevious): void {
       if (previous.appliedId && meta.entries.some((entry) => entry.id === previous.appliedId))
         meta.appliedId = previous.appliedId;
       else if (meta.appliedId === previous.entryId) delete meta.appliedId;
-      writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+      writeFileAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
     } else if (previous.entryContent !== undefined) {
       // A pre-existing entry we overwrote gets its original content and the
       // library's applied pointer back.
-      writeAtomic(join(library, `${previous.entryId}.json`), previous.entryContent, 0o600);
+      writeFileAtomic(join(library, `${previous.entryId}.json`), previous.entryContent, 0o600);
       try {
         const meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> } =
           JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
         if (meta.appliedId === previous.entryId) {
           if (previous.appliedId) meta.appliedId = previous.appliedId;
           else delete meta.appliedId;
-          writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+          writeFileAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
         }
       } catch {
         /* a library we cannot rewrite back is left as the app's */
@@ -1122,7 +889,7 @@ ${entry.map((part) => `    <string>${part}</string>`).join("\n")}
 </plist>
 `;
       const path = launchAgentPath();
-      writeAtomic(path, plist, 0o644);
+      writeFileAtomic(path, plist, 0o644);
       const uid = typeof process.getuid === "function" ? process.getuid() : 0;
       const result = spawnSync("launchctl", ["bootstrap", `gui/${uid}`, path], { stdio: "ignore" });
       if (result.status !== 0) {
@@ -1150,7 +917,7 @@ Restart=always
 WantedBy=default.target
 `;
       const path = systemdUnitPath();
-      writeAtomic(path, unit, 0o644);
+      writeFileAtomic(path, unit, 0o644);
       const reload = spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
       if (reload.error) return null;
       spawnSync("systemctl", ["--user", "enable", "--now", "kimchi-bridge-gateway"], {
@@ -1332,46 +1099,6 @@ function forwardHeaders(incoming: Headers, auth: Record<string, string>): Header
   return headers;
 }
 
-// The gateway's serving stack (LiteLLM in front of vLLM) only implements
-// client-executed function tools. Responses-API server-side built-ins such as
-// {"type":"web_search"} pass request validation but then kill the streaming
-// path mid-stream with a generic overloaded_error, which codex surfaces as
-// "stream disconnected before completion". Both proxied routes hard-fail on
-// these tools today (the anthropic route answers 503), so strip the known
-// broken built-ins to keep requests working; revisit when the backend learns
-// to serve or cleanly reject them.
-const UNSUPPORTED_SERVER_TOOLS = ["web_search", "web_search_preview"];
-
-export function stripUnsupportedServerTools(body: ArrayBuffer, pathname: string): ArrayBuffer {
-  let parsed: { tools?: unknown };
-  try {
-    parsed = JSON.parse(new TextDecoder().decode(body));
-  } catch {
-    return body;
-  }
-  if (!Array.isArray(parsed.tools)) return body;
-  const kept = parsed.tools.filter((tool) => !isUnsupportedTool(tool));
-  if (kept.length === parsed.tools.length) return body; // nothing to drop: byte-identical passthrough
-  const dropped = parsed.tools.filter(isUnsupportedTool).map(describeToolType);
-  log(`stripped unsupported server tool(s) ${dropped.join(", ")} from ${pathname}`);
-  parsed.tools = kept;
-  return new TextEncoder().encode(JSON.stringify(parsed)).buffer as ArrayBuffer;
-}
-
-function isUnsupportedTool(tool: unknown): boolean {
-  if (typeof tool !== "object" || tool === null) return false;
-  const type = (tool as { type?: unknown }).type;
-  return typeof type === "string" && UNSUPPORTED_SERVER_TOOLS.includes(type);
-}
-
-function describeToolType(tool: unknown): string {
-  if (typeof tool === "object" && tool !== null && "type" in tool) {
-    const type = (tool as { type?: unknown }).type;
-    if (typeof type === "string") return type;
-  }
-  return "unknown";
-}
-
 // The model requests the gateway bills; each carries its own billing tag.
 const BILLED_PATHS = [
   "/anthropic/v1/messages",
@@ -1405,13 +1132,6 @@ export function llmBaseFor(apiUrl: string): string | undefined {
   if (api === "https://api.cast.ai" || api === "https://app.kimchi.dev/api")
     return "https://llm.kimchi.dev";
   return undefined;
-}
-
-/** The gateway auth for Kimchi's API-key sign-in: its bearer, and its SSO organization when it has one. */
-function keyHeaders(signIn: SignIn): Record<string, string> {
-  const headers: Record<string, string> = { Authorization: `Bearer ${signIn.token}` };
-  if (signIn.organizationId) headers[ORGANIZATION_HEADER] = signIn.organizationId;
-  return headers;
 }
 
 /** Where the proxy forwards: the bridge's own OAuth sign-in, else Kimchi's API-key sign-in. */
@@ -1481,35 +1201,34 @@ function anthropicModelsResponse(url: URL): Response | undefined {
 
 export async function proxyRequest(request: Request, llmBase: string): Promise<Response> {
   const url = new URL(request.url);
-  const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
   const credential = loadCredential();
   const signIn = credential ? undefined : kimchiSignIn();
-  if (!credential && !signIn?.token)
+  const { body, json } = await inspectRequest(
+    request,
+    request.method === "POST" && BILLED_PATHS.includes(url.pathname),
+  );
+  const auth = planProxyAuth({
+    request,
+    pathname: url.pathname,
+    model: requestModel(json),
+    routeFor: (model) => new CodexInstallation().routeFor(model),
+    credential,
+    signIn,
+  });
+  if (auth.kind === "unauthenticated")
     return new Response("Kimchi sign-in required; run kimchi-bridge login\n", {
       status: 401,
       headers: { "content-type": "text/plain" },
     });
-  // Buffer the body so a 401 retry can re-send it; LLM request bodies are
-  // finite JSON, and one in-flight buffer per request is bounded.
-  const buffered =
-    request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
-  // Drop server-side built-in tools the backend cannot serve; everything else
-  // forwards byte-identical.
-  const body =
-    buffered === undefined ? undefined : stripUnsupportedServerTools(buffered, url.pathname);
-  let json: unknown;
-  if (request.method === "POST" && BILLED_PATHS.includes(url.pathname) && body !== undefined)
-    try {
-      json = JSON.parse(new TextDecoder().decode(body));
-    } catch {
-      // An unreadable body goes untagged, as in Kimchi.
-    }
+  if (auth.kind === "missing-subscription-credentials")
+    return new Response(
+      "this model requires Codex ChatGPT login and CAST AI SSO or a saved Kimchi API key; run kimchi bridge setup\n",
+      { status: 401, headers: { "content-type": "text/plain" } },
+    );
+  const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
   let requestId: string | undefined;
   const forward = async (): Promise<Response> => {
-    const headers = forwardHeaders(
-      request.headers,
-      credential ? gatewayHeaders(await ensureFresh()) : keyHeaders(signIn!),
-    );
+    const headers = forwardHeaders(request.headers, await auth.headers());
     // Every attempt gets its own tag, so a retry's bill never joins the first attempt's.
     const id = randomUUID();
     const tags = billingTags(headers, json, id);
@@ -1746,9 +1465,13 @@ export async function enable(
 
   let modelHeaders: Record<string, string>;
   let llmBase: string;
+  let subscriptionAvailable = false;
   if (credential) {
     modelHeaders = gatewayHeaders(credential);
     llmBase = endpointsForCredential(credential).llmBaseUrl;
+    subscriptionAvailable = Boolean(
+      credential.orgId && bearerToken(credential) && hasUsableChatGPTLogin(),
+    );
   } else {
     if (!signIn.token) throw new Error("run kimchi-bridge login before enabling the gateway");
     // The proxy reads Kimchi's saved sign-in; a key only in KIMCHI_API_KEY never reaches the daemon.
@@ -1764,10 +1487,14 @@ export async function enable(
       );
     modelHeaders = keyHeaders(saved);
     llmBase = base;
+    subscriptionAvailable = !saved.organizationId && hasUsableChatGPTLogin();
   }
 
   // Fetch the model list first: a failure leaves nothing written.
   const models = await fetchModels(llmBase, modelHeaders);
+  const codexCatalog = buildCodexCatalog(models, subscriptionAvailable);
+  if (!codexCatalog.models.length)
+    throw new Error("the gateway model list has no models usable with the saved sign-in");
   const claude = writeClaudeConfig(
     `http://127.0.0.1:${port}/anthropic`,
     PROXY_PLACEHOLDER,
@@ -1777,11 +1504,15 @@ export async function enable(
     previousState.enabled ? previousState.previous?.claude : undefined,
     previousState.wrote?.picker,
   );
-  const codexPrevious = writeCodexConfig(
-    `http://127.0.0.1:${port}/openai/v1`,
-    PROXY_PLACEHOLDER,
+  const codexPrevious = new CodexInstallation().apply({
+    baseUrl: `http://127.0.0.1:${port}/openai/v1`,
+    bearer: PROXY_PLACEHOLDER,
+    modelSlug: resolveMainModel(
+      models.filter((model) => codexCatalog.routes[model.slug] !== undefined),
+    ).slug,
     models,
-  );
+    subscriptionAvailable,
+  });
   // Claude Desktop ignores the CLI settings, so it is switched into its
   // third-party mode pointing at the same proxy; null when it is not installed
   // or its config cannot be written, which never blocks the CLI wiring.
@@ -1832,7 +1563,7 @@ export async function enable(
         : {
             claude: claude.previous,
             picker: claude.pickerPrevious,
-            ...(codexPrevious ? { codexTopLevel: codexPrevious } : {}),
+            ...(codexPrevious.topLevel ? { codexTopLevel: codexPrevious.topLevel } : {}),
             ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),
           },
   };
@@ -1865,7 +1596,7 @@ export async function disable(onMessage?: (message: string) => void): Promise<vo
   const state = loadGatewayState();
   restoreClaudeConfig(state.previous?.claude);
   restoreClaudePicker(state.previous?.picker);
-  restoreCodexConfig(state.previous?.codexTopLevel);
+  new CodexInstallation().restore({ topLevel: state.previous?.codexTopLevel });
   if (state.previous?.claudeDesktop) {
     restoreClaudeDesktopConfig(state.previous.claudeDesktop);
     onMessage?.("Restart the Claude app to leave third-party mode.");

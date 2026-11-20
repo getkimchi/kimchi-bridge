@@ -83,15 +83,25 @@ kimchi-bridge login
 
 This opens a browser sign-in, asks for your organization when the account has several, and saves the credential under `~/.local/state/kimchi-bridge`. Inside Claude Code run `/kimchi-login`, in Codex ask it to use the `kimchi-login` skill. When the Kimchi CLI is signed in, `kimchi-bridge login --from-kimchi` reuses its credential without another browser round-trip.
 
-A successful sign-in also routes Claude Code and Codex model requests through the Kimchi LLM gateway (`llm.kimchi.dev`): it writes `~/.claude/settings.json` and `~/.codex/config.toml`, and runs a small local proxy for every sign-in. The proxy keeps OAuth tokens fresh, adds your organization header or API key, and tags each model request with Kimchi's billing tag (`kimchi-request:<id>`), so its cost per PR comes from its own gateway bill. Revert anytime:
+A successful sign-in also routes Claude Code and Codex model requests through the Kimchi LLM gateway (`llm.kimchi.dev`): it writes `~/.claude/settings.json` and `~/.codex/config.toml`, and runs a small local proxy for every sign-in. The proxy keeps OAuth tokens fresh, adds your organization header or API key, and tags each model request with Kimchi's billing tag (`kimchi-request:<id>`), so its cost per PR comes from its own gateway bill.
+
+For Codex, `kimchi bridge setup` (or `kimchi-bridge gateway enable`) is the only setup step. It fetches the organization's model feed, writes `~/.codex/config.toml` with one loopback provider plus `~/.codex/model_catalog.json`, and makes the bridge's own sidecar available as that provider's upstream. The real Kimchi credential never appears in the generated TOML: the provider carries a placeholder and the sidecar supplies the live credential per request, so nothing is exported and no manual process step is involved.
+
+- **Sign-in.** A saved Kimchi API key, or a CAST AI SSO credential that carries an organization, serves ordinary models. Supported subscription models join the same picker once Codex itself is logged in to ChatGPT.
+- **Credentials per model.** Ordinary and unknown models use the Kimchi sign-in alone, and any ChatGPT credential on the request is dropped. Subscription models keep the incoming ChatGPT `Authorization` and add the Kimchi credential as `X-API-Key`, plus `X-CastAi-Organization-Id` under SSO. Every request uses `/openai/v1/responses`.
+- **Search.** Each catalogue entry sets `supports_search_tool = true`, with `web_search_tool_type = "text_and_image"` on subscription models and `"text"` on ordinary models. Search works only where the gateway can serve it; the bridge configures no search provider of its own, and `web_search` and `web_search_preview` request bodies pass through unchanged.
+- **What setup leaves alone.** Your own `web_search` mode, `[features]`, plugins and projects stay as they are, and repeated runs are idempotent: setup refreshes the catalogue, and disable restores the previous provider settings.
+- **Picker rows.** The bridge only refreshes rows it wrote. A row you edited stays yours, whether the stored snapshot is a compact fingerprint or the full row from an older state file.
+- **State.** Setup and the sidecar keep their state under `~/.local/state/kimchi-bridge`, and a gateway state file larger than 1 MiB is rejected rather than read partially.
+- **Login lifecycle.** `~/.codex/auth.json` belongs to Codex; logging in and refreshing tokens is its business.
+
+Run setup again and start a new Codex session after feed changes. Revert anytime:
 
 ```sh
 kimchi-bridge gateway disable
 ```
 
 A session reports to the account the sign-in verified when the session started. Sessions that start while signed out stay on your machine and are never uploaded.
-
-The plugins also follow Kimchi's PR reporting setting. If you turn it off with `/pr-reporting off` in Kimchi, turn off Kimchi's telemetry, or your organization turns usage reporting off, the plugins upload nothing, and sessions that start meanwhile stay on your machine. `kimchi-bridge status` shows the setting as `kimchiReporting`.
 
 The plugins also follow Kimchi's PR reporting setting. If you turn it off with `/pr-reporting off` in Kimchi, turn off Kimchi's telemetry, or your organization turns usage reporting off, the plugins upload nothing, and sessions that start meanwhile stay on your machine. `kimchi-bridge status` shows the setting as `kimchiReporting`.
 

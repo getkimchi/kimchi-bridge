@@ -6,10 +6,13 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
   type Stats,
 } from "node:fs";
 import { constants as osConstants } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type * as BunFFI from "bun:ffi";
 import type { Pointer } from "bun:ffi";
 import { Database } from "bun:sqlite";
@@ -26,6 +29,18 @@ export function cliEntry(): string[] {
     (entry.endsWith(".mjs") || entry.endsWith(".ts") || entry.endsWith(".js")) &&
     existsSync(entry);
   return isScript ? [process.execPath, entry] : [process.execPath];
+}
+
+/** Writes through a sibling temp file, so a reader never sees a half-written config. */
+export function writeFileAtomic(path: string, content: string, mode: number): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
+  try {
+    writeFileSync(tmp, content, { mode });
+    renameSync(tmp, path);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
 }
 
 const darwin = process.platform === "darwin";
