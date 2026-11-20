@@ -91,8 +91,6 @@ kimchi-bridge gateway disable
 
 A session reports to the account the sign-in verified when the session started. Sessions that start while signed out stay on your machine and are never uploaded.
 
-Local gateway logs also carry bounded `search-trace` JSON lines for diagnosed search routing: request method/path, slug, HTTP status, allowlisted schema/item categories, and counts. They deliberately exclude credentials, prompts, tool arguments, result text, and assistant responses. Ordinary web search remains unsupported in this scope; those traces are diagnostic evidence only, not a search guarantee.
-
 The plugins also follow Kimchi's PR reporting setting. If you turn it off with `/pr-reporting off` in Kimchi, turn off Kimchi's telemetry, or your organization turns usage reporting off, the plugins upload nothing, and sessions that start meanwhile stay on your machine. `kimchi-bridge status` shows the setting as `kimchiReporting`.
 
 The plugins also follow Kimchi's PR reporting setting. If you turn it off with `/pr-reporting off` in Kimchi, turn off Kimchi's telemetry, or your organization turns usage reporting off, the plugins upload nothing, and sessions that start meanwhile stay on your machine. `kimchi-bridge status` shows the setting as `kimchiReporting`.

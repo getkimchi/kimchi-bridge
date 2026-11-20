@@ -11,34 +11,35 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
-  buildCodexCatalog,
-  buildCodexToml,
   claudeDesktop3pData,
   claudeSettingsPath,
-  codexCatalogPath,
-  codexConfigPath,
   disable,
   enable,
   ensureClaudeAutoMode,
   gatewayPort,
-  gatewayLogPath,
   gatewayStatePath,
-  hasUsableChatGPTLogin,
   health,
   loadGatewayState,
   llmBaseFor,
-  mergeCodexToml,
   proxyRequest,
   resolveMainModel,
   rewriteClaudeDesktopConfig,
   runDaemon,
   saveGatewayState,
   status,
-  stripCodexToml,
   writeClaudeDesktopConfig,
   type GatewayModel,
   type GatewayState,
 } from "../src/gateway.ts";
+import {
+  buildCodexCatalog,
+  buildCodexToml,
+  codexCatalogPath,
+  codexConfigPath,
+  hasUsableChatGPTLogin,
+  mergeCodexToml,
+  stripCodexToml,
+} from "../src/codex.ts";
 import { credentialPath, loadCredential, saveCredential } from "../src/oauth.ts";
 import type { SignIn } from "../src/kimchi.ts";
 import { tagFor } from "../src/request-tags.ts";
@@ -1705,14 +1706,7 @@ test("Codex >= 0.169 runs ordinary inference without advertising search", async 
   expect(stdout + stderr).toContain("Synthetic ordinary inference answer");
 }, 50_000);
 
-test("search trace redacts sensitive request and response content for plain and zstd bodies", async () => {
-  const secrets = [
-    "sk-sensitive-auth",
-    "private-prompt-42",
-    "private-query-42",
-    "private-tool-label",
-    "private-result-text",
-  ];
+test("proxyRequest keeps plain and zstd payloads, tools and streaming intact", async () => {
   kimchiKey("castai_v1_key");
   catalogRoutes({ "minimax-m3": "kimchi-dev" });
   const tools = [
@@ -1782,16 +1776,6 @@ test("search trace redacts sensitive request and response content for plain and 
   expect(originalBodies).toHaveLength(2);
   for (const body of originalBodies)
     expect(body).toMatchObject({ model: "minimax-m3", input: "private-prompt-42", tools });
-  const trace = readFileSync(gatewayLogPath(), "utf8");
-  expect(trace).toContain('"event":"search_schema"');
-  expect(trace).toContain('"event":"search_items"');
-  expect(trace).toContain('"web_search_preview"');
-  expect(trace).toContain('"namespace_web_run"');
-  expect(trace).toContain('"web_search_call"');
-  expect(trace).toContain('"function_call_output"');
-  expect(trace).toContain('"unsupported_call_webrun"');
-  expect(trace).toContain('"otherTools":1');
-  for (const secret of secrets) expect(trace).not.toContain(secret);
 });
 
 test("proxyRequest preserves search tools and streamed answers for plain and zstd bodies", async () => {

@@ -21,7 +21,7 @@ import type { Config } from "./settings.ts";
 import { stateRoot } from "./settings.ts";
 import type { SignIn } from "./kimchi.ts";
 import { baseUrl, kimchiSignIn } from "./kimchi.ts";
-import { cliEntry, lockSync } from "./platform.ts";
+import { cliEntry, lockSync, writeFileAtomic } from "./platform.ts";
 import {
   bearerToken,
   endpointsForCredential,
@@ -36,20 +36,24 @@ import {
   seedFromKimchi,
 } from "./oauth.ts";
 import { billingTags, noteSideCall, readResponseId, recordTag } from "./request-tags.ts";
-import { observeSearchResponse, requestSearchTrace } from "./search-trace.ts";
+import {
+  buildCodexCatalog,
+  buildCodexToml,
+  CODEX_SUBSCRIPTION_ROUTE,
+  codexCatalogPath,
+  CodexInstallation,
+  hasUsableChatGPTLogin,
+  mergeCodexToml,
+  stripCodexToml,
+  type CodexSnapshot,
+} from "./codex.ts";
 
 const DEFAULT_PORT = 8766;
 const PORT_SCAN_SPAN = 10;
 const HEALTH_PATH = "/healthz";
 const HEALTH_MARKER = "kimchi-bridge-gateway";
-const KIMCHI_PROVIDER = "kimchi";
-const CODEX_PROVIDER_NAME = "Kimchi Gateway";
 /** Placeholder bearer for proxy mode; the proxy replaces it per request. */
 const PROXY_PLACEHOLDER = "kimchi-gateway";
-const CODEX_ORDINARY_ROUTE = "kimchi-dev";
-const CODEX_SUBSCRIPTION_ROUTE = "kimchi-dev/openai-codex";
-const CHATGPT_FEED_PROVIDER = "chatgpt";
-const UNSUPPORTED_SUBSCRIPTION_MODEL = "gpt-5.3-codex";
 
 export type GatewayMode = "proxy" | "direct";
 
@@ -89,12 +93,6 @@ export function gatewayLogPath(root = stateRoot()): string {
 export function claudeSettingsPath(): string {
   return join(homeDir(), ".claude", "settings.json");
 }
-export function codexConfigPath(): string {
-  return join(homeDir(), ".codex", "config.toml");
-}
-export function codexCatalogPath(): string {
-  return join(homeDir(), ".codex", "model_catalog.json");
-}
 /**
  * The home the CLI configs live under. KIMCHI_BRIDGE_CONFIG_HOME isolates test
  * runs: Bun's os.homedir() does not react to a mid-process $HOME swap, so HOME
@@ -118,19 +116,8 @@ export function loadGatewayState(path = gatewayStatePath()): GatewayState {
   }
 }
 
-function writeAtomic(path: string, content: string, mode: number): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
-  try {
-    writeFileSync(tmp, content, { mode });
-    renameSync(tmp, path);
-  } finally {
-    rmSync(tmp, { force: true });
-  }
-}
-
 export function saveGatewayState(state: GatewayState, path = gatewayStatePath()): void {
-  writeAtomic(path, JSON.stringify(state, null, 2) + "\n", 0o600);
+  writeFileAtomic(path, JSON.stringify(state, null, 2) + "\n", 0o600);
 }
 
 export function gatewayPort(state: GatewayState = loadGatewayState()): number {
@@ -168,7 +155,7 @@ function readJsonFile(path: string): Record<string, unknown> {
 }
 
 function writeJsonFile(path: string, value: Record<string, unknown>): void {
-  writeAtomic(path, JSON.stringify(value, null, 2) + "\n", 0o644);
+  writeFileAtomic(path, JSON.stringify(value, null, 2) + "\n", 0o644);
 }
 
 /**
@@ -473,181 +460,6 @@ async function refreshClaudeModelEnv(
     });
 }
 
-// ---------------------------------------------------------------------------
-// Codex config (~/.codex/config.toml + model catalog)
-// ---------------------------------------------------------------------------
-
-function tomlEscape(value: string): string {
-  return value
-    .replaceAll("\\", "\\\\")
-    .replaceAll('"', '\\"')
-    .replaceAll("\n", "\\n")
-    .replaceAll("\r", "\\r")
-    .replaceAll("\t", "\\t");
-}
-
-const CODEX_TOP_LEVEL_KEYS = ["model_provider", "model", "model_catalog_json"];
-
-/** Drop a trailing TOML comment from a would-be header line; a # inside quotes is content. */
-function withoutComment(line: string): string {
-  const hash = line.indexOf("#");
-  if (hash === -1) return line;
-  const before = line.slice(0, hash);
-  if ((before.split('"').length - 1) % 2 === 1 || (before.split("'").length - 1) % 2 === 1)
-    return line;
-  return before.trimEnd();
-}
-
-function classifyTomlLine(line: string): "kimchi-header" | "header" | "array-header" | "body" {
-  const trimmed = line.trim();
-  if (trimmed.startsWith("[[")) return "array-header";
-  // A trailing comment after a table header is legal TOML (`[table] # note`).
-  const core = trimmed.startsWith("[") ? withoutComment(trimmed) : trimmed;
-  if (core.startsWith("[") && core.endsWith("]")) {
-    const section = core.slice(1, -1).trim();
-    // The whole kimchi namespace is ours: [model_providers.kimchi] and any
-    // table nested under it re-defines the provider we replace.
-    if (
-      [KIMCHI_PROVIDER, "kimchi_chatgpt"].some(
-        (provider) =>
-          section === `model_providers.${provider}` ||
-          section.startsWith(`model_providers.${provider}.`),
-      )
-    )
-      return "kimchi-header";
-    return "header";
-  }
-  return "body";
-}
-
-function classifyTomlLines(
-  text: string,
-): Array<{ line: string; kind: ReturnType<typeof classifyTomlLine> }> {
-  let multiline: '"""' | "'''" | undefined;
-  return text.split("\n").map((line) => {
-    const kind = multiline ? "body" : classifyTomlLine(line);
-    let basic = false;
-    let literal = false;
-    for (let i = 0; i < line.length; i++) {
-      if (multiline) {
-        if (line.startsWith(multiline, i)) {
-          multiline = undefined;
-          i += 2;
-        } else if (multiline === '"""' && line[i] === "\\") {
-          i++;
-        }
-        continue;
-      }
-      if (basic) {
-        if (line[i] === "\\") i++;
-        else if (line[i] === '"') basic = false;
-        continue;
-      }
-      if (literal) {
-        if (line[i] === "'") literal = false;
-        continue;
-      }
-      if (line[i] === "#") break;
-      if (line.startsWith('"""', i) || line.startsWith("'''", i)) {
-        multiline = line.startsWith('"""', i) ? '"""' : "'''";
-        i += 2;
-      } else if (line[i] === '"') {
-        basic = true;
-      } else if (line[i] === "'") {
-        literal = true;
-      }
-    }
-    return { line, kind };
-  });
-}
-
-export function buildCodexToml(
-  baseUrlValue: string,
-  bearer: string,
-  modelSlug: string,
-  catalogPath: string,
-  requiresOpenAIAuth = false,
-): string {
-  const openAIAuth = requiresOpenAIAuth ? "requires_openai_auth = true\n" : "";
-  return `model_provider = "${KIMCHI_PROVIDER}"
-model = "${tomlEscape(modelSlug)}"
-model_catalog_json = "${tomlEscape(catalogPath)}"
-
-[model_providers.${KIMCHI_PROVIDER}]
-name = "${CODEX_PROVIDER_NAME}"
-base_url = "${tomlEscape(baseUrlValue)}"
-http_headers = { Authorization = "Bearer ${tomlEscape(bearer)}" }
-wire_api = "responses"
-${openAIAuth}`;
-}
-
-/** Strip the kimchi top-level keys and provider section, keeping user sections. */
-export function stripCodexToml(existingText: string): string {
-  const kept: string[] = [];
-  let inKimchiSection = false;
-  let inAnySection = false;
-  for (const { line, kind } of classifyTomlLines(existingText)) {
-    if (kind === "kimchi-header") {
-      inKimchiSection = true;
-      inAnySection = true;
-      continue;
-    }
-    if (kind === "header" || kind === "array-header") {
-      inKimchiSection = false;
-      inAnySection = true;
-      kept.push(line);
-      continue;
-    }
-    if (inKimchiSection) continue;
-    if (!inAnySection) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith("#")) {
-        const key = trimmed.slice(0, trimmed.indexOf("=")).trim();
-        if (CODEX_TOP_LEVEL_KEYS.includes(key)) continue;
-      }
-    }
-    kept.push(line);
-  }
-  let collapsed = "";
-  for (const line of kept) {
-    if (!line && (collapsed === "" || collapsed.endsWith("\n\n"))) continue;
-    collapsed += line + "\n";
-  }
-  return collapsed.trim();
-}
-
-/** Split TOML text at the first table header: top-level scalars and comments, then sections. */
-function splitTomlAtFirstHeader(text: string): { top: string; sections: string } {
-  const lines = classifyTomlLines(text);
-  const cut = lines.findIndex(({ kind }) => kind !== "body");
-  if (cut === -1) return { top: text.trim(), sections: "" };
-  return {
-    top: lines
-      .slice(0, cut)
-      .map(({ line }) => line)
-      .join("\n")
-      .trim(),
-    sections: lines
-      .slice(cut)
-      .map(({ line }) => line)
-      .join("\n")
-      .trim(),
-  };
-}
-
-/** Merge fresh kimchi TOML over a stripped existing config (user sections last). */
-export function mergeCodexToml(existingText: string, freshToml: string): string {
-  const collapsed = stripCodexToml(existingText).trim();
-  if (!collapsed) return freshToml.trim() + "\n";
-  // Top-level scalars the person set (e.g. the CLI's openai_base_url) must stay
-  // above the first table header: appended whole after the fresh block they
-  // would land inside [model_providers.kimchi], silently changing meaning and
-  // tripping codex's strict config parse.
-  const fresh = splitTomlAtFirstHeader(freshToml.trim());
-  const user = splitTomlAtFirstHeader(collapsed);
-  return `${[fresh.top, user.top, fresh.sections, user.sections].filter(Boolean).join("\n\n")}\n`;
-}
-
 export interface GatewayModel {
   slug: string;
   display_name: string;
@@ -714,188 +526,6 @@ export async function fetchModels(
   return body.models.filter(
     (m) => typeof m?.slug === "string" && typeof m?.limits?.context_window === "number",
   );
-}
-
-interface CodexModelEntry {
-  slug: string;
-  display_name: string;
-  name: string;
-  model: string;
-  provider: string;
-  context_window: number;
-  truncation_policy: { mode: "tokens"; limit: number };
-  shell_type: "shell_command";
-  visibility: "list";
-  supported_in_api: boolean;
-  priority: number;
-  base_instructions: string;
-  supports_tools: boolean;
-  supports_parallel_tool_calls: boolean;
-  experimental_supported_tools: string[];
-  supports_reasoning_summaries: boolean;
-  support_verbosity: boolean;
-  supported_reasoning_levels: Array<{ effort: "low" | "medium" | "high"; description: string }>;
-  supports_search_tool: boolean;
-  web_search_tool_type?: "text_and_image";
-}
-
-export function buildCodexCatalog(
-  models: readonly GatewayModel[],
-  subscriptionAvailable = false,
-): { models: CodexModelEntry[]; routes: Record<string, string> } {
-  const REASONING_LEVELS = [
-    { effort: "low", description: "Low reasoning effort" },
-    { effort: "medium", description: "Medium reasoning effort" },
-    { effort: "high", description: "High reasoning effort" },
-  ] as const;
-  const selected = new Map<string, { model: GatewayModel; route: string }>();
-  for (const model of models) {
-    const subscription = model.provider === CHATGPT_FEED_PROVIDER;
-    if (subscription && (!subscriptionAvailable || model.slug === UNSUPPORTED_SUBSCRIPTION_MODEL))
-      continue;
-    const route = subscription ? CODEX_SUBSCRIPTION_ROUTE : CODEX_ORDINARY_ROUTE;
-    const existing = selected.get(model.slug);
-    if (existing?.route === CODEX_SUBSCRIPTION_ROUTE || (existing && !subscription)) continue;
-    selected.set(model.slug, { model, route });
-  }
-  const chosen = [...selected.values()];
-  return {
-    models: chosen.map(({ model: m, route }, index) => ({
-      slug: m.slug,
-      // The gateway's model registry currently serves empty display_name;
-      // codex's /model picker renders display_name, so fall back to the slug
-      // rather than showing blank rows (backend data-quality ticket open).
-      display_name: m.display_name || m.slug,
-      name: m.slug,
-      model: m.slug,
-      provider: KIMCHI_PROVIDER,
-      context_window: m.limits.context_window,
-      truncation_policy: { mode: "tokens" as const, limit: m.limits.context_window },
-      shell_type: "shell_command" as const,
-      visibility: "list" as const,
-      supported_in_api: true,
-      priority: (index + 1) * 10,
-      base_instructions: "You are a helpful coding assistant.",
-      supports_tools: true,
-      supports_parallel_tool_calls: true,
-      experimental_supported_tools: [],
-      supports_reasoning_summaries: m.reasoning === true,
-      support_verbosity: m.reasoning === true,
-      supported_reasoning_levels: m.reasoning === true ? [...REASONING_LEVELS] : [],
-      supports_search_tool: route === CODEX_SUBSCRIPTION_ROUTE,
-      ...(route === CODEX_SUBSCRIPTION_ROUTE
-        ? { web_search_tool_type: "text_and_image" as const }
-        : {}),
-    })),
-    routes: Object.fromEntries(chosen.map(({ model, route }) => [model.slug, route])),
-  };
-}
-
-export function hasUsableChatGPTLogin(path = join(homeDir(), ".codex", "auth.json")): boolean {
-  try {
-    const bytes = readFileSync(path);
-    if (bytes.length > 1 << 20) return false;
-    const auth = JSON.parse(bytes.toString("utf8")) as {
-      auth_mode?: unknown;
-      OPENAI_API_KEY?: unknown;
-      tokens?: { access_token?: unknown };
-      personal_access_token?: unknown;
-    };
-    if (!auth || typeof auth !== "object" || Array.isArray(auth)) return false;
-    if (
-      (auth.auth_mode !== undefined &&
-        auth.auth_mode !== "chatgpt" &&
-        auth.auth_mode !== "chatgptAuthTokens" &&
-        auth.auth_mode !== "personalAccessToken") ||
-      (typeof auth.OPENAI_API_KEY === "string" && auth.OPENAI_API_KEY.length > 0)
-    )
-      return false;
-    if (
-      (auth.auth_mode === "personalAccessToken" || auth.auth_mode === undefined) &&
-      typeof auth.personal_access_token === "string" &&
-      auth.personal_access_token.trim().length > 0
-    )
-      return true;
-    const accessToken = auth.tokens?.access_token;
-    return (
-      typeof accessToken === "string" &&
-      accessToken.split(".").length === 3 &&
-      accessToken.split(".").every((part) => part.length > 0)
-    );
-  } catch {
-    return false;
-  }
-}
-
-interface CodexConfigWrite {
-  previous?: Array<[string, string]>;
-}
-
-function writeCodexConfig(
-  base: string,
-  bearer: string,
-  models: readonly GatewayModel[],
-  subscriptionAvailable: boolean,
-): CodexConfigWrite {
-  const path = codexConfigPath();
-  let existingText = "";
-  try {
-    existingText = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  // Snapshot the user's top-level values our enable replaces.
-  const previous: Array<[string, string]> = [];
-  let inAnySection = false;
-  for (const { line, kind } of classifyTomlLines(existingText)) {
-    if (kind !== "body") {
-      inAnySection = true;
-      continue;
-    }
-    if (!inAnySection) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith("#")) {
-        const split = trimmed.indexOf("=");
-        const key = trimmed.slice(0, split).trim();
-        const value = trimmed.slice(split + 1).trim();
-        const legacyProvider =
-          key === "model_provider" &&
-          ['"kimchi"', "'kimchi'", '"kimchi_chatgpt"', "'kimchi_chatgpt'"].includes(value);
-        if (CODEX_TOP_LEVEL_KEYS.includes(key) && value && !legacyProvider)
-          previous.push([key, value]);
-      }
-    }
-  }
-  const catalog = buildCodexCatalog(models, subscriptionAvailable);
-  const selectedModels = models.filter((model) => catalog.routes[model.slug] !== undefined);
-  const main = resolveMainModel(selectedModels);
-  const catalogPath = codexCatalogPath();
-  const requiresOpenAIAuth = Object.values(catalog.routes).includes(CODEX_SUBSCRIPTION_ROUTE);
-  const fresh = buildCodexToml(base, bearer, main.slug, catalogPath, requiresOpenAIAuth);
-  writeAtomic(path, mergeCodexToml(existingText, fresh), 0o644);
-  writeAtomic(catalogPath, JSON.stringify(catalog, null, 2) + "\n", 0o644);
-  return { previous: previous.length ? previous : undefined };
-}
-
-function restoreCodexConfig(previous?: Array<[string, string]>): void {
-  const path = codexConfigPath();
-  let existingText = "";
-  try {
-    existingText = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  if (!existingText) return;
-  const stripped = stripCodexToml(existingText);
-  const restored = previous?.length
-    ? `${previous.map(([k, v]) => `${k} = ${v}`).join("\n")}\n${stripped ? `\n${stripped}\n` : ""}`
-    : `${stripped}\n`;
-  writeAtomic(path, restored, 0o644);
-  try {
-    rmSync(codexCatalogPath(), { force: true });
-  } catch {
-    /* the catalog is ours to drop; ignore failures */
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +647,11 @@ export function writeClaudeDesktopConfig(
     entryId: "",
   };
   config[DESKTOP_MODE_KEY] = "3p";
-  writeAtomic(join(appData, DESKTOP_CONFIG_FILE), JSON.stringify(config, null, 2) + "\n", 0o644);
+  writeFileAtomic(
+    join(appData, DESKTOP_CONFIG_FILE),
+    JSON.stringify(config, null, 2) + "\n",
+    0o644,
+  );
 
   const library = join(claudeDesktop3pData(), "configLibrary");
   mkdirSync(library, { recursive: true, mode: 0o700 });
@@ -1044,8 +678,8 @@ export function writeClaudeDesktopConfig(
   previous.appliedId = isConfigId(meta.appliedId) ? meta.appliedId : null;
   meta.appliedId = previous.entryId;
   meta.entries = entries;
-  writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
-  writeAtomic(
+  writeFileAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+  writeFileAtomic(
     join(library, `${previous.entryId}.json`),
     JSON.stringify(
       {
@@ -1098,7 +732,7 @@ export function rewriteClaudeDesktopConfig(anthropicBaseUrl: string): void {
       (model) => typeof model?.name === "string" && isClaudeModel(model.name),
     );
   const after = JSON.stringify(config, null, 2) + "\n";
-  if (after !== before) writeAtomic(path, after, 0o600);
+  if (after !== before) writeFileAtomic(path, after, 0o600);
 }
 
 /**
@@ -1133,7 +767,7 @@ export function restoreClaudeDesktopConfig(saved?: Desktop3pPrevious): void {
     if (config[DESKTOP_MODE_KEY] === "3p") {
       if (previous.mode === null) delete config[DESKTOP_MODE_KEY];
       else config[DESKTOP_MODE_KEY] = previous.mode;
-      writeAtomic(
+      writeFileAtomic(
         join(appData, DESKTOP_CONFIG_FILE),
         JSON.stringify(config, null, 2) + "\n",
         0o644,
@@ -1156,18 +790,18 @@ export function restoreClaudeDesktopConfig(saved?: Desktop3pPrevious): void {
       if (previous.appliedId && meta.entries.some((entry) => entry.id === previous.appliedId))
         meta.appliedId = previous.appliedId;
       else if (meta.appliedId === previous.entryId) delete meta.appliedId;
-      writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+      writeFileAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
     } else if (previous.entryContent !== undefined) {
       // A pre-existing entry we overwrote gets its original content and the
       // library's applied pointer back.
-      writeAtomic(join(library, `${previous.entryId}.json`), previous.entryContent, 0o600);
+      writeFileAtomic(join(library, `${previous.entryId}.json`), previous.entryContent, 0o600);
       try {
         const meta: { appliedId?: string; entries?: Array<{ id: string; name: string }> } =
           JSON.parse(readFileSync(join(library, "_meta.json"), "utf8"));
         if (meta.appliedId === previous.entryId) {
           if (previous.appliedId) meta.appliedId = previous.appliedId;
           else delete meta.appliedId;
-          writeAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
+          writeFileAtomic(join(library, "_meta.json"), JSON.stringify(meta, null, 2) + "\n", 0o600);
         }
       } catch {
         /* a library we cannot rewrite back is left as the app's */
@@ -1248,7 +882,7 @@ ${entry.map((part) => `    <string>${part}</string>`).join("\n")}
 </plist>
 `;
       const path = launchAgentPath();
-      writeAtomic(path, plist, 0o644);
+      writeFileAtomic(path, plist, 0o644);
       const uid = typeof process.getuid === "function" ? process.getuid() : 0;
       const result = spawnSync("launchctl", ["bootstrap", `gui/${uid}`, path], { stdio: "ignore" });
       if (result.status !== 0) {
@@ -1276,7 +910,7 @@ Restart=always
 WantedBy=default.target
 `;
       const path = systemdUnitPath();
-      writeAtomic(path, unit, 0o644);
+      writeFileAtomic(path, unit, 0o644);
       const reload = spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
       if (reload.error) return null;
       spawnSync("systemctl", ["--user", "enable", "--now", "kimchi-bridge-gateway"], {
@@ -1565,22 +1199,6 @@ function anthropicModelsResponse(url: URL): Response | undefined {
   });
 }
 
-function codexRouteFor(model: unknown): string {
-  if (typeof model !== "string" || !model) return CODEX_ORDINARY_ROUTE;
-  try {
-    const bytes = readFileSync(codexCatalogPath());
-    if (bytes.length > 24 << 20) return CODEX_ORDINARY_ROUTE;
-    const catalog = JSON.parse(bytes.toString("utf8")) as { routes?: unknown };
-    const routes = catalog.routes;
-    if (!routes || typeof routes !== "object" || Array.isArray(routes)) return CODEX_ORDINARY_ROUTE;
-    return (routes as Record<string, unknown>)[model] === CODEX_SUBSCRIPTION_ROUTE
-      ? CODEX_SUBSCRIPTION_ROUTE
-      : CODEX_ORDINARY_ROUTE;
-  } catch {
-    return CODEX_ORDINARY_ROUTE;
-  }
-}
-
 function chatGPTAuthorization(request: Request): string | undefined {
   const authorization = request.headers.get("authorization");
   if (!authorization?.startsWith("Bearer ")) return undefined;
@@ -1631,7 +1249,8 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
       ? (json as { model?: unknown }).model
       : undefined;
   const subscription =
-    url.pathname === "/openai/v1/responses" && codexRouteFor(model) === CODEX_SUBSCRIPTION_ROUTE;
+    url.pathname === "/openai/v1/responses" &&
+    new CodexInstallation().routeFor(model) === CODEX_SUBSCRIPTION_ROUTE;
   const chatGPTAuth = subscription ? chatGPTAuthorization(request) : undefined;
   const subscriptionKey =
     subscription && !credential && signIn?.token && !signIn.organizationId
@@ -1645,8 +1264,6 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
       { status: 401, headers: { "content-type": "text/plain" } },
     );
   const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
-  const schemaTrace = requestSearchTrace(request.method, url.pathname, inspectedBody, model);
-  if (schemaTrace) log(`search-trace ${JSON.stringify(schemaTrace)}`);
   let requestId: string | undefined;
   const forward = async (): Promise<Response> => {
     let auth: Record<string, string>;
@@ -1701,18 +1318,6 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
     headers.set(key, value);
   }
   let reply = response.body;
-  if (BILLED_PATHS.includes(url.pathname) && reply) {
-    const [client, copy] = reply.tee();
-    reply = client;
-    void observeSearchResponse(
-      copy,
-      url.pathname,
-      response.status,
-      response.headers.get("content-type"),
-    )
-      .then((trace) => trace && log(`search-trace ${JSON.stringify(trace)}`))
-      .catch(() => {});
-  }
   const tagged = requestId;
   // Claude Code reports a call with the request ID its reply carried, and its title requests reach no transcript, so
   // the tag makes that report name the call's bill. Auto mode's checks are in neither; the proxy notes those itself.
@@ -1950,12 +1555,15 @@ export async function enable(
     previousState.enabled ? previousState.previous?.claude : undefined,
     previousState.wrote?.picker,
   );
-  const codexPrevious = writeCodexConfig(
-    `http://127.0.0.1:${port}/openai/v1`,
-    PROXY_PLACEHOLDER,
+  const codexPrevious = new CodexInstallation().apply({
+    baseUrl: `http://127.0.0.1:${port}/openai/v1`,
+    bearer: PROXY_PLACEHOLDER,
+    modelSlug: resolveMainModel(
+      models.filter((model) => codexCatalog.routes[model.slug] !== undefined),
+    ).slug,
     models,
     subscriptionAvailable,
-  );
+  });
   // Claude Desktop ignores the CLI settings, so it is switched into its
   // third-party mode pointing at the same proxy; null when it is not installed
   // or its config cannot be written, which never blocks the CLI wiring.
@@ -2006,7 +1614,7 @@ export async function enable(
         : {
             claude: claude.previous,
             picker: claude.pickerPrevious,
-            ...(codexPrevious.previous ? { codexTopLevel: codexPrevious.previous } : {}),
+            ...(codexPrevious.topLevel ? { codexTopLevel: codexPrevious.topLevel } : {}),
             ...(desktopPrevious ? { claudeDesktop: desktopPrevious } : {}),
           },
   };
@@ -2039,7 +1647,7 @@ export async function disable(onMessage?: (message: string) => void): Promise<vo
   const state = loadGatewayState();
   restoreClaudeConfig(state.previous?.claude);
   restoreClaudePicker(state.previous?.picker);
-  restoreCodexConfig(state.previous?.codexTopLevel);
+  new CodexInstallation().restore({ topLevel: state.previous?.codexTopLevel });
   if (state.previous?.claudeDesktop) {
     restoreClaudeDesktopConfig(state.previous.claudeDesktop);
     onMessage?.("Restart the Claude app to leave third-party mode.");
