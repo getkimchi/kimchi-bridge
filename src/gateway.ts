@@ -30,22 +30,18 @@ import {
   isInvalidGrant,
   loadCredential,
   normalizeEndpoint,
-  ORGANIZATION_HEADER,
   refreshOAuth,
   saveCredential,
   seedFromKimchi,
 } from "./oauth.ts";
 import { billingTags, noteSideCall, readResponseId, recordTag } from "./request-tags.ts";
+import { inspectRequest, requestModel } from "./request-body.ts";
+import { keyHeaders, planProxyAuth } from "./proxy-auth.ts";
 import {
   buildCodexCatalog,
-  buildCodexToml,
-  CODEX_SUBSCRIPTION_ROUTE,
   codexCatalogPath,
   CodexInstallation,
   hasUsableChatGPTLogin,
-  mergeCodexToml,
-  stripCodexToml,
-  type CodexSnapshot,
 } from "./codex.ts";
 
 const DEFAULT_PORT = 8766;
@@ -1127,13 +1123,6 @@ export function llmBaseFor(apiUrl: string): string | undefined {
   return undefined;
 }
 
-/** The gateway auth for Kimchi's API-key sign-in: its bearer, and its SSO organization when it has one. */
-function keyHeaders(signIn: SignIn): Record<string, string> {
-  const headers: Record<string, string> = { Authorization: `Bearer ${signIn.token}` };
-  if (signIn.organizationId) headers[ORGANIZATION_HEADER] = signIn.organizationId;
-  return headers;
-}
-
 /** Where the proxy forwards: the bridge's own OAuth sign-in, else Kimchi's API-key sign-in. */
 export function upstream():
   | { llmBase: string; region?: string; organizationId?: string }
@@ -1199,66 +1188,28 @@ function anthropicModelsResponse(url: URL): Response | undefined {
   });
 }
 
-function chatGPTAuthorization(request: Request): string | undefined {
-  const authorization = request.headers.get("authorization");
-  if (!authorization?.startsWith("Bearer ")) return undefined;
-  const token = authorization.slice("Bearer ".length);
-  if (
-    !token ||
-    token === PROXY_PLACEHOLDER ||
-    [...token].some((character) => character.trim().length === 0)
-  )
-    return undefined;
-  return authorization;
-}
-
 export async function proxyRequest(request: Request, llmBase: string): Promise<Response> {
   const url = new URL(request.url);
   const credential = loadCredential();
   const signIn = credential ? undefined : kimchiSignIn();
-  if (!credential && !signIn?.token)
+  const { body, json } = await inspectRequest(
+    request,
+    request.method === "POST" && BILLED_PATHS.includes(url.pathname),
+  );
+  const auth = planProxyAuth({
+    request,
+    pathname: url.pathname,
+    model: requestModel(json),
+    routeFor: (model) => new CodexInstallation().routeFor(model),
+    credential,
+    signIn,
+  });
+  if (auth.kind === "unauthenticated")
     return new Response("Kimchi sign-in required; run kimchi-bridge login\n", {
       status: 401,
       headers: { "content-type": "text/plain" },
     });
-  // Buffer the body so a 401 retry can re-send it; LLM request bodies are
-  // finite JSON, and one in-flight buffer per request is bounded.
-  const buffered =
-    request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
-  const body = buffered;
-  let inspectedBody: ArrayBuffer | Uint8Array | undefined = body;
-  if (body !== undefined && request.headers.get("content-encoding")?.toLowerCase() === "zstd")
-    try {
-      inspectedBody = await Bun.zstdDecompress(body);
-    } catch {
-      inspectedBody = body;
-    }
-  let json: unknown;
-  if (
-    request.method === "POST" &&
-    BILLED_PATHS.includes(url.pathname) &&
-    inspectedBody !== undefined
-  )
-    try {
-      json = JSON.parse(new TextDecoder().decode(inspectedBody));
-    } catch {
-      // An unreadable body goes untagged, as in Kimchi.
-    }
-  const model =
-    json && typeof json === "object" && !Array.isArray(json)
-      ? (json as { model?: unknown }).model
-      : undefined;
-  const subscription =
-    url.pathname === "/openai/v1/responses" &&
-    new CodexInstallation().routeFor(model) === CODEX_SUBSCRIPTION_ROUTE;
-  const chatGPTAuth = subscription ? chatGPTAuthorization(request) : undefined;
-  const subscriptionKey =
-    subscription && !credential && signIn?.token && !signIn.organizationId
-      ? signIn.token
-      : undefined;
-  const subscriptionCredentialAvailable =
-    subscriptionKey || (subscription && credential?.orgId && bearerToken(credential));
-  if (subscription && (!chatGPTAuth || !subscriptionCredentialAvailable))
+  if (auth.kind === "missing-subscription-credentials")
     return new Response(
       "this model requires Codex ChatGPT login and CAST AI SSO or a saved Kimchi API key; run kimchi bridge setup\n",
       { status: 401, headers: { "content-type": "text/plain" } },
@@ -1266,20 +1217,7 @@ export async function proxyRequest(request: Request, llmBase: string): Promise<R
   const upstream = `${baseUrl(llmBase)}${url.pathname}${url.search}`;
   let requestId: string | undefined;
   const forward = async (): Promise<Response> => {
-    let auth: Record<string, string>;
-    if (subscription && credential) {
-      const fresh = await ensureFresh();
-      auth = {
-        Authorization: chatGPTAuth!,
-        "X-API-Key": bearerToken(fresh),
-        [ORGANIZATION_HEADER]: fresh.orgId,
-      };
-    } else if (subscription) {
-      auth = { Authorization: chatGPTAuth!, "X-API-Key": subscriptionKey! };
-    } else {
-      auth = credential ? gatewayHeaders(await ensureFresh()) : keyHeaders(signIn!);
-    }
-    const headers = forwardHeaders(request.headers, auth);
+    const headers = forwardHeaders(request.headers, await auth.headers());
     // Every attempt gets its own tag, so a retry's bill never joins the first attempt's.
     const id = randomUUID();
     const tags = billingTags(headers, json, id);
