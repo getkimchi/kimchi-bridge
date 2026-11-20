@@ -15,22 +15,26 @@ export function workspaceActivityEnabled(): boolean {
   return profile === "workspace";
 }
 
-/** An explicit loopback route is required during this development increment. */
+/** Allow a loopback replay receiver or the sandbox sidekick's exact IMDS destination. */
 export function workspaceActivityURL(): string {
   const value = process.env.KIMCHI_BRIDGE_ACTIVITY_URL ?? "";
   if (!value || value.includes("\r") || value.includes("\n") || value.includes("\0"))
-    throw new Error("an explicit local activity endpoint is required");
+    throw new Error("an explicit local or sidekick activity endpoint is required");
   const url = new URL(value);
+  const loopback =
+    url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+  const sidekick = url.origin === "http://__imds.kimchi.internal";
   if (
-    url.protocol !== "http:" ||
-    !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+    (!loopback && !sidekick) ||
     url.username ||
     url.password ||
     url.search ||
     url.hash ||
     url.pathname !== workspaceActivityPath
   )
-    throw new Error("activity development replay requires a loopback record endpoint");
+    throw new Error(
+      "activity endpoint must be a loopback receiver or http://__imds.kimchi.internal/imds/tool-calls:batchRecord",
+    );
   return value;
 }
 

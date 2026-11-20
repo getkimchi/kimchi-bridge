@@ -185,7 +185,20 @@ test("bad receipts do not advance the queue and terminal rejection is not retrie
   expect(value.allEvents()).toHaveLength(0);
 });
 
-test("the explicit development route never accepts a non-loopback override", () => {
+test("workspace activity accepts the exact sidekick IMDS destination", () => {
+  const url = "http://__imds.kimchi.internal/imds/tool-calls:batchRecord";
+  process.env.KIMCHI_BRIDGE_ACTIVITY_URL = url;
+  expect(workspaceActivityURL()).toBe(url);
+});
+
+test("workspace activity rejects sidekick HTTPS and non-default ports", () => {
+  for (const origin of ["https://__imds.kimchi.internal", "http://__imds.kimchi.internal:8080"]) {
+    process.env.KIMCHI_BRIDGE_ACTIVITY_URL = `${origin}/imds/tool-calls:batchRecord`;
+    expect(() => workspaceActivityURL()).toThrow("activity endpoint must be");
+  }
+});
+
+test("workspace activity rejects a non-allowlisted remote override", () => {
   process.env.KIMCHI_BRIDGE_ACTIVITY_URL = "http://example.com/imds/tool-calls:batchRecord";
   expect(() => workspaceActivityURL()).toThrow("loopback");
 });
