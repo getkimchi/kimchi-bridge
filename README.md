@@ -194,7 +194,7 @@ After a hook, the bridge attempts delivery to that receiver. Workspace `sync` re
 }
 ```
 
-Valid statuses are `RECEIPT_STATUS_ACCEPTED`, `RECEIPT_STATUS_UNCHANGED` and `RECEIPT_STATUS_REJECTED`. Network failures and invalid or unsuccessful replies retain the exact batch for retry. HTTP 413 splits it in causal order; HTTP 409 rebuilds it under a new batch ID.
+Valid statuses are `RECEIPT_STATUS_ACCEPTED`, `RECEIPT_STATUS_UNCHANGED` and `RECEIPT_STATUS_REJECTED`. Network failures and invalid or unsuccessful replies retain the exact batch for retry. HTTP 413 splits it in causal order; HTTP 409 rebuilds it under a new batch ID. A structured KCP 400 response with `invalid_activity_batch` or `control_not_recording` is terminal instead: the frozen batch's events become local `REJECTED` receipts with a bounded reason code, which unblocks later batches. Unrecognized, HTML, or text 400 responses are not terminal evidence and retain that frozen batch for retry.
 
 Changing the shell environment does not update an already-running client. Restart Claude Code or Codex after changing these settings, or run `kimchi-bridge flush` yourself with the new environment.
 
