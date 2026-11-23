@@ -20,4 +20,10 @@ beforeEach(() => {
   closeBackends();
   useBackendFactory(() => createMemoryRecords());
 });
-afterEach(() => closeBackends());
+// Kimchi's vitest setup only closes; each test file there runs in its own module environment.
+// Bun shares one process across every file, so the setup must also restore the default SQLite
+// factory afterwards, or the in-memory backend would leak into suites that expect SQLite.
+afterEach(() => {
+  closeBackends();
+  useBackendFactory(null);
+});

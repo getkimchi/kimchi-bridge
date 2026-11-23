@@ -20,13 +20,18 @@
  *   listfiles      print every file path under <agentDir> (zero-write evidence)
  *
  * Kimchi-only commands (native-usage*, producer, legacy-freeze, read-work-records,
- * read-history*, summary-*, known-async-*, pr-checks, note, remove-note) stay in Kimchi's
+ * read-history*, pr-checks, note, remove-note) stay in Kimchi's
  * tests/e2e/tui/support/ledger-driver.ts: they exercise code that has not moved to the
- * bridge (pull-request-status, queue.js, worker.js, work-attribution hydration).
+ * bridge (pull-request-status, queue.js, worker.js, work-attribution hydration such as
+ * readWorkRecordsAsync and flushWorkSummaries). The removed scenarios whose core operations
+ * are moved ledger code run in the bridge's own suites instead: the capture-stage rollback
+ * (capture-atomic.test.ts), the async stored reader (stored-read-regressions.test.ts), and the
+ * gated competing writer below (summary-writer.test.ts). summary-writer keeps the gated
+ * putHead dance but drops the flushWorkSummaries tail, which is Kimchi-only hydration.
  */
 
 import { Database } from "bun:sqlite";
-import { mkdirSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, readSync, statSync, writeSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, relative } from "node:path";
 import { createInterface } from "node:readline";
@@ -1223,6 +1228,69 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return Buffer.from(left).equals(Buffer.from(right));
 }
 
+function summaryState(agent: string, workId: string): void {
+  const store = openStore(agent);
+  try {
+    out({
+      authority: store.db
+        .query("SELECT * FROM work_records WHERE work_id = ? ORDER BY rowid")
+        .all(workId),
+      markers: store.db
+        .query("SELECT * FROM pending_translation WHERE work_id = ? ORDER BY record_hash")
+        .all(workId),
+      head:
+        store.db
+          .query<{ body: string }, [string]>(
+            "SELECT body FROM work_projection_head WHERE work_id = ?",
+          )
+          .get(workId)?.body ?? null,
+      rows: store.db
+        .query("SELECT * FROM work_projection_rows WHERE work_id = ? ORDER BY log, pos")
+        .all(workId),
+    });
+  } finally {
+    store.close();
+  }
+}
+
+/** A synchronous pipe gate holds a real transaction after its head write, never across await.
+ * Writing 'r' cancels the writer after its head publish (the capture rolls back); 'c' lets it
+ * commit. The rolled-back writer stays alive across a competing writer's commit, then closes. */
+async function summaryWriter(agent: string, json: string): Promise<void> {
+  const { backendFor, closeBackends } = await import("../../src/ledger/records.js");
+  const { record } = JSON.parse(json) as { record: WorkRecord };
+  const backend = backendFor(agent);
+  const publish = backend.putHead;
+  const cancelled = new Error("writer ownership cancelled before commit");
+  const gate = () => {
+    const byte = Buffer.alloc(1);
+    if (readSync(0, byte, 0, 1, null) !== 1) throw new Error("Missing writer release");
+    return byte[0] === 99;
+  };
+  const signal = (phase: string) => writeSync(1, `${JSON.stringify({ phase })}\n`);
+  backend.putHead = (head) => {
+    publish(head);
+    signal("pending");
+    if (!gate()) throw cancelled;
+  };
+  try {
+    signal("ready");
+    try {
+      capture(agent, record, "summary-native");
+    } catch (error) {
+      if (error !== cancelled) throw error;
+      signal("rolled-back");
+      // Stay alive while the competing writer commits: the cancelled head must never reappear.
+      gate();
+      return;
+    }
+    signal("committed");
+  } finally {
+    backend.putHead = publish;
+    closeBackends();
+  }
+}
+
 async function knownRecordRegressions(agent: string, recordJson: string): Promise<void> {
   const { backendFor, closeBackends, ledgerSessionInfo, recoverDirty } = await import(
     "../../src/ledger/records.js"
@@ -1701,6 +1769,8 @@ const commands: Record<string, (agent: string, arg?: string) => void | Promise<v
     out({ imported: result.imported, modes: result.files.map((file) => file.mode) });
   },
   listfiles: (agent) => listFiles(agent),
+  "summary-state": (agent, workId) => summaryState(agent, workId ?? ""),
+  "summary-writer": (agent, json) => summaryWriter(agent, json ?? "{}"),
   "known-record-regressions": (agent, json) => knownRecordRegressions(agent, json ?? "{}"),
   "known-schema-race": (agent) => knownSchemaRace(agent),
   "known-schema-race-open": (agent) => knownSchemaRaceOpen(agent),
