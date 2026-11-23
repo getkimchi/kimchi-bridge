@@ -1,5 +1,12 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, it } from "bun:test";
-import * as ledger from "../../src/ledger/index.js";
+// Imported through the package specifier, not the source path: this is the exact resolution
+// Kimchi and later reconcile chunks depend on (package.json `exports`). If the exports mapping
+// were removed or pointed at the wrong file, this import would fail before any assertion runs,
+// and `pnpm typecheck` would fail to resolve the specifier in this typechecked file either way.
+import * as ledger from "@getkimchi/kimchi-bridge/ledger";
+import * as sourceBarrel from "../../src/ledger/index.js";
 
 /**
  * The barrel is the public surface Kimchi consumes as `@getkimchi/kimchi-bridge/ledger`
@@ -59,4 +66,16 @@ it("exports the public ledger API through the package barrel", () => {
   ]) {
     expect(ledger, `barrel export ${name}`).toHaveProperty(name);
   }
+});
+
+it("resolves the package specifier to the source barrel it exports", () => {
+  expect(ledger.capture).toBe(sourceBarrel.capture);
+  expect(ledger.createMemoryRecords).toBe(sourceBarrel.createMemoryRecords);
+});
+
+it("typechecks a consumer importing through the package specifier", () => {
+  const dbPath: string = ledger.ledgerDbPath(
+    join(tmpdir(), "kimchi-bridge-ledger-export-consumer"),
+  );
+  expect(dbPath.endsWith("ledger.db")).toBe(true);
 });
