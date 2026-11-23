@@ -7,6 +7,10 @@
     "./ledger": {
       "types": "./src/ledger/index.ts",
       "default": "./src/ledger/index.ts"
+    },
+    "./reconcile": {
+      "types": "./src/reconcile/index.ts",
+      "default": "./src/reconcile/index.ts"
     }
   },
   "packageManager": "pnpm@10.33.0",
