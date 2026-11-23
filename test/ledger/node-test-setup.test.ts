@@ -1,27 +1,20 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "bun:test";
-import { createMemoryRecords } from "../../src/ledger/memory-records.js";
-import {
-  backendFor,
-  capture,
-  closeBackends,
-  readRecords,
-  useBackendFactory,
-} from "../../src/ledger/records.js";
+import { backendFor, capture, closeBackends, readRecords } from "../../src/ledger/records.js";
+// Importing the setup installs its hooks for this file, the role Kimchi's vitest setupFiles
+// list plays for tests/setup/work-ledger.ts.
+import "./node-test-setup.js";
 
-// Adapted from Kimchi's vitest node-test-setup suite: bun:test has no vi.resetModules, so the
-// module-reset loop became repeated reads against the same in-process backend. What stays under
-// test is the part the bridge owns: a memory backend keeps seeded history readable without ever
-// opening the SQLite file. Kimchi's vitest still runs the original module-reset variant.
-
-const agentDir = join(tmpdir(), "kimchi-bridge-ledger-setup");
+const agentDir = join(tmpdir(), "kimchi-bridge-node-ledger-setup");
 const WORK = "11111111-1111-4111-8111-111111111111";
+const sqliteDir = mkdtempSync(join(tmpdir(), "kimchi-bridge-node-ledger-fresh-"));
 
-it.each([1, 2])("keeps seeded history across %i re-reads without opening SQLite", (reads) => {
-  useBackendFactory(() => createMemoryRecords());
-  try {
+it.each([1, 2])(
+  "keeps seeded Node history across %i module re-imports without opening SQLite",
+  async (reimports) => {
+    rmSync(join(agentDir, "pr-cost-reporting"), { recursive: true, force: true });
     const backend = backendFor(agentDir);
     expect(backend.recordCount()).toBe(0);
     capture(
@@ -29,13 +22,47 @@ it.each([1, 2])("keeps seeded history across %i re-reads without opening SQLite"
       { version: 1, type: "work", workId: WORK, sessionId: "node-test" },
       "node-test",
     );
-    for (let count = 0; count < reads; count++) {
-      const reloaded = readRecords(agentDir);
-      expect(reloaded).toHaveLength(1);
+    // Bun keeps one module registry for the whole run: re-importing the same specifier returns
+    // the identical module, so the backend the setup installed stays reachable from every
+    // re-import. This is the closest equivalent of Kimchi's vi.resetModules() loop, which Bun
+    // has no counterpart for.
+    for (let count = 0; count < reimports; count++) {
+      const reloaded = await import("../../src/ledger/records.js");
+      expect(reloaded.backendFor(agentDir)).toBe(backend);
+      expect(reloaded.readRecords(agentDir)).toEqual(readRecords(agentDir));
+      expect(reloaded.readRecords(agentDir)).toHaveLength(1);
     }
     expect(existsSync(join(agentDir, "pr-cost-reporting", "ledger.db"))).toBe(false);
-  } finally {
-    closeBackends();
-    rmSync(join(agentDir, "pr-cost-reporting"), { recursive: true, force: true });
-  }
+  },
+);
+
+it("resets the in-memory backend between tests", () => {
+  // The history seeded by the test above must not leak into this one.
+  expect(backendFor(agentDir).recordCount()).toBe(0);
+  expect(readRecords(agentDir)).toEqual([]);
+  expect(existsSync(join(agentDir, "pr-cost-reporting", "ledger.db"))).toBe(false);
+});
+
+it("keeps SQLite for module instances the setup never installed", async () => {
+  // Bun cannot reset modules, so a genuinely fresh instance is simulated with a cache-busting
+  // dynamic import. It is a separate module with its own factory slot, which the setup above
+  // never touched: the memory backend cannot follow it there, and it opens the real SQLite
+  // backend instead. That is why this setup installs the memory factory once per process
+  // rather than surviving module resets like Kimchi's vitest wrapper.
+  const fresh = await import(`../../src/ledger/records.ts?fresh=${Date.now()}`);
+  const backend = fresh.backendFor(sqliteDir);
+  fresh.capture(
+    sqliteDir,
+    { version: 1, type: "work", workId: WORK, sessionId: "fresh-instance" },
+    "node-test",
+  );
+  expect(backend.recordCount()).toBe(1);
+  expect(existsSync(join(sqliteDir, "pr-cost-reporting", "ledger.db"))).toBe(true);
+  fresh.closeBackends();
+  rmSync(sqliteDir, { recursive: true, force: true });
+});
+
+// Close any backend the reset assertions may have cached before the process ends.
+it("leaves no backend open", () => {
+  closeBackends();
 });
