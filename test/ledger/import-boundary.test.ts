@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "bun:test";
 
@@ -140,9 +140,14 @@ describe("ledger import boundary", () => {
       if (seen.has(file)) continue;
       seen.add(file);
       expect(file === PLATFORM, `${relative(ROOT, file)} reaches src/platform.ts`).toBe(false);
-      const insideBoundary = BOUNDARY_DIRS.some(
-        (dir) => file === dir || file.startsWith(`${dir}/`),
-      );
+      // Containment must use native path semantics: a forward-slash prefix check would reject
+      // every file on Windows, where separators are backslashes.
+      const insideBoundary = BOUNDARY_DIRS.some((dir) => {
+        const under = relative(dir, file);
+        return (
+          under !== "" && !isAbsolute(under) && !under.startsWith(`..${sep}`) && under !== ".."
+        );
+      });
       expect(insideBoundary, `${relative(ROOT, file)} escapes src/ledger|src/reconcile`).toBe(true);
       for (const { specifier } of importsOf(file)) {
         if (specifier.startsWith("./") || specifier.startsWith("../")) {
