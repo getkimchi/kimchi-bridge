@@ -1,8 +1,10 @@
-/** Minimal shape of Kimchi's WorkPullRequest that pullRequestLabel names; the full type stays in Kimchi. */
+/** Minimal shape of Kimchi's WorkPullRequest that pullRequestLabel names; the full type stays in Kimchi.
+ * The state and provider unions mirror the original in Kimchi's pull-request-status/pull-requests.ts,
+ * and `provider` stays optional so records saved before it was captured remain valid inputs. */
 interface WorkPullRequest {
-  provider: string;
+  provider?: "github" | "gitlab";
   number: number;
-  state: string;
+  state: "open" | "closed" | "merged";
 }
 
 interface PullRequestObservation {
