@@ -20,7 +20,6 @@ import type * as Sqlite from "bun:sqlite"
 import { closeSync, mkdirSync, openSync } from "node:fs"
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
-import { reportingDirectory } from "../queue.js"
 import {
 	LEDGER_ADDITIVE_SCHEMA,
 	LEDGER_REQUIRED_SCHEMA,
@@ -63,7 +62,9 @@ function bunSqlite(): typeof Sqlite {
 
 /** The ledger lives beside the legacy state.json queue, inheriting its directory's lock discipline. */
 export function ledgerDbPath(agentDir: string): string {
-	return join(reportingDirectory(agentDir), "ledger.db")
+	// Mirrors Kimchi's queue.reportingDirectory (agentDir/pr-cost-reporting); kept local so the
+	// ledger library needs no Kimchi imports.
+	return join(agentDir, "pr-cost-reporting", "ledger.db")
 }
 
 /** Pure version decision, unit-tested without a database. */

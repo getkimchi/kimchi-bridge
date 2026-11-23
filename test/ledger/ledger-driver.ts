@@ -18,20 +18,24 @@
  *   head           print the saved projection head for work <arg>
  *   rows           print the saved projection view for work <arg>
  *   listfiles      print every file path under <agentDir> (zero-write evidence)
+ *
+ * Kimchi-only commands (native-usage*, producer, legacy-freeze, read-work-records,
+ * read-history*, summary-*, known-async-*, pr-checks, note, remove-note) stay in Kimchi's
+ * tests/e2e/tui/support/ledger-driver.ts: they exercise code that has not moved to the
+ * bridge (pull-request-status, queue.js, worker.js, work-attribution hydration).
  */
 
 import { Database } from "bun:sqlite"
-import { mkdirSync, readdirSync, readSync, statSync, writeSync } from "node:fs"
+import { mkdirSync, readdirSync, statSync } from "node:fs"
 import { createRequire } from "node:module"
 import { dirname, join, relative } from "node:path"
 import { createInterface } from "node:readline"
-import { importJournals } from "../../../../src/extensions/pr-cost-reporting/ledger/import.js"
+import { importJournals } from "../../src/ledger/import.js"
 import {
 	backendFor,
 	capture,
 	closeBackends,
 	fingerprint,
-	getNote,
 	OUTBOX_DELIVERY_STATUS_SQL,
 	outboxClaimsSql,
 	readRecords,
@@ -40,15 +44,9 @@ import {
 	readWorkHead,
 	readWorkSummary,
 	workRecordsImportedPresent,
-} from "../../../../src/extensions/pr-cost-reporting/ledger/records.js"
-import { ledgerDbPath, openStore } from "../../../../src/extensions/pr-cost-reporting/ledger/store.js"
-import { reportingDirectory } from "../../../../src/extensions/pr-cost-reporting/queue.js"
-import {
-	readWorkRecords,
-	readWorkRecordsAsync,
-	type WorkRecord,
-	type WorkRecordProblem,
-} from "../../../../src/extensions/work-attribution/summary.js"
+} from "../../src/ledger/records.js"
+import { ledgerDbPath, openStore } from "../../src/ledger/store.js"
+import type { WorkRecord } from "../../src/ledger/work-record.js"
 
 const [, , command, agentDir, arg] = process.argv
 
@@ -163,7 +161,7 @@ async function planSince(agent: string, seed?: string): Promise<void> {
 }
 
 async function schemaCheck(agent: string): Promise<void> {
-	const listFrom = (db: { query: <T>(sql: string) => { all: () => T[] } }): string[] =>
+	const listFrom = (db: { query: <T, P>(sql: string) => { all: () => T[] } }): string[] =>
 		db
 			.query<{ name: string }, []>(
 				"SELECT name FROM sqlite_master WHERE type='index' AND (name LIKE 'outbox_%' OR name = 'work_records_imported')",
@@ -262,665 +260,15 @@ async function importJournalsCommand(agent: string): Promise<void> {
 	out(await importJournals(agent))
 }
 
-async function nativeUsage(agent: string, anthropic = false, common = false, delivery = false): Promise<void> {
-	process.env.PI_CODING_AGENT_DIR = agent
-	if (delivery) {
-		process.env.KIMCHI_API_KEY = "fake-reporting"
-		process.env.KIMCHI_REMOTE_ENDPOINT = "https://api.cast.ai"
-		process.env.KIMCHI_TELEMETRY_ENABLED = "true"
-	}
-	const { ModelRuntime } = await import("@earendil-works/pi-coding-agent")
-	const { installGlobalFetchInstrumentation } = await import("../../../../src/http/instrument-fetch.js")
-	const { getWorkId, prepareProviderRequest, recordProviderRequest, recordProviderResponse, setWorkId } = await import(
-		"../../../../src/extensions/work-attribution.js"
-	)
-	const { withNativeUsage } = await import("../../../../src/extensions/work-attribution/native-usage.js")
-	const { closeBackends } = await import("../../../../src/extensions/pr-cost-reporting/ledger/records.js")
-	let sessionId = "sdk-original"
-	const ctx = { cwd: agent, sessionManager: { getSessionId: () => sessionId } }
-	const calls: { id: string | null; persisted: boolean }[] = []
-	globalThis.fetch = async (_url, options) => {
-		const id = new Headers(options?.headers).get("X-Request-Id")
-		calls.push({
-			id,
-			persisted: readRecords(agent).some((row) => row.type === "request_dispatch" && row.requestId === id),
-		})
-		if (calls.length === 1) {
-			sessionId = "sdk-next"
-			setWorkId(ctx)
-			return Response.json({ error: { message: "retry" } }, { status: 503, headers: { "Retry-After": "0" } })
-		}
-		if (anthropic) {
-			const accounting = delivery
-				? {
-						service_tier: "standard",
-						inference_geo: "global",
-						cache_read_input_tokens: 0,
-						cache_creation_input_tokens: 0,
-					}
-				: {}
-			const events = [
-				{
-					type: "message_start",
-					message: {
-						id: "msg-sdk",
-						type: "message",
-						role: "assistant",
-						model: "sdk-primary",
-						content: [],
-						stop_reason: null,
-						usage: { input_tokens: 100, output_tokens: 1, ...accounting },
-					},
-				},
-				{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
-				{ type: "content_block_stop", index: 0 },
-				{
-					type: "message_delta",
-					delta: { stop_reason: "end_turn" },
-					usage: {
-						...accounting,
-						input_tokens: 90,
-						output_tokens: 7,
-						iterations: [
-							{ type: "message", model: "sdk-primary", input_tokens: 100, output_tokens: 0, ...accounting },
-							{ type: "fallback_message", model: "sdk-fallback", input_tokens: 90, output_tokens: 7, ...accounting },
-						],
-					},
-				},
-				{ type: "message_stop" },
-			]
-			return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
-				headers: { "Content-Type": "text/event-stream" },
-			})
-		}
-		return new Response(
-			`data: ${JSON.stringify({
-				id: "chat-sdk",
-				model: "sdk-responding",
-				choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }],
-			})}\n\ndata: ${JSON.stringify({
-				id: "chat-sdk",
-				model: "sdk-responding",
-				choices: [],
-				usage: { prompt_tokens: 100, completion_tokens: 7 },
-			})}\n\ndata: [DONE]\n\n`,
-			{ headers: { "Content-Type": "text/event-stream" } },
-		)
-	}
-	installGlobalFetchInstrumentation({
-		userAgent: "native-usage-test",
-		onModelRequest: prepareProviderRequest,
-		onModelResponse: recordProviderResponse,
-	})
-	const runtime = await withNativeUsage(ModelRuntime.create.bind(ModelRuntime))({
-		authPath: join(agent, "auth.json"),
-		modelsPath: join(agent, "models.json"),
-		refreshOnCreate: false,
-		allowModelNetwork: false,
-	})
-	const provider = common ? "anthropic" : "native-test"
-	runtime.registerProvider(provider, {
-		api: anthropic ? "anthropic-messages" : "openai-completions",
-		baseUrl: "https://native.invalid/v1",
-		models: [
-			{
-				id: "requested",
-				name: "requested",
-				reasoning: false,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 10000,
-				maxTokens: 1000,
-			},
-		],
-	})
-	await runtime.setRuntimeApiKey(provider, "fake")
-	await runtime.refresh({ allowNetwork: false })
-	const model = runtime.getModel(provider, "requested")
-	if (!model) throw new Error("Missing registered native model")
-	if (common) {
-		const { saveNewWorkScope } = await import("../../../../src/extensions/work-attribution/scope.js")
-		saveNewWorkScope(getWorkId(ctx), {
-			repository: agent,
-			account: {
-				apiUrl: "https://api.cast.ai",
-				organizationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-				userId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-			},
-		})
-	}
-	const original = recordProviderRequest(ctx, model)
-	const message = await runtime.completeSimple(
-		model,
-		{ messages: [{ role: "user", content: "Say ok", timestamp: Date.now() }] },
-		{
-			maxRetries: 1,
-			maxRetryDelayMs: 1,
-			transformHeaders: (headers) => ({ ...headers, "X-Request-Id": original.requestId }),
-		},
-	)
-	closeBackends()
-	const captured = readRecords(agent).filter((row) => row.nativeUsage)
-	if (delivery) {
-		await nativeDelivery(agent)
-		return
-	}
-	if (common) {
-		const { buildEvents } = await import("../../../../src/extensions/pr-cost-reporting/events.js")
-		const { backendFor, readStoredRecordsAsync } = await import(
-			"../../../../src/extensions/pr-cost-reporting/ledger/records.js"
-		)
-		const { effectiveClaims, observeEvents, pendingBatch } = await import(
-			"../../../../src/extensions/pr-cost-reporting/ledger/outbox.js"
-		)
-		const { accountKey } = await import("../../../../src/extensions/pr-cost-reporting/snapshot.js")
-		const { readWorkCostReport } = await import("../../../../src/extensions/work-attribution/cost-sync.js")
-		const backend = backendFor(agent)
-		let claimReads = 0
-		const claimRows = backend.outboxClaims
-		backend.outboxClaims = (accountKey, entityIds) => {
-			claimReads++
-			return claimRows(accountKey, entityIds)
-		}
-		const stored = await readStoredRecordsAsync(agent, () => {})
-		const { report } = readWorkCostReport(
-			agent,
-			stored.map((row) => JSON.parse(row.body)),
-		)
-		const producer = "33333333-3333-4333-8333-333333333333"
-		const built = await buildEvents(
-			stored,
-			report,
-			new Map([[agent, { provider: "github", host: "github.com", id: "999", name: "fork/repo" }]]),
-			producer,
-			() => {},
-			(key, ids) => effectiveClaims(backend, key, ids),
-		)
-		for (const group of built.accounts)
-			observeEvents(agent, accountKey(group.account), group.facts, group.recordHashes, () => {})
-		if (built.accounts.length !== 1) throw new Error("Missing original SDK reporting account")
-		const key = accountKey(built.accounts[0].account)
-		const first = pendingBatch(agent, key, () => {})
-		if (!first) throw new Error("Missing native SDK delta batch")
-		closeBackends()
-		const reopened = pendingBatch(agent, key, () => {})
-		if (!reopened) throw new Error("Missing reopened native SDK delta batch")
-		out({
-			original,
-			calls,
-			captured,
-			body: JSON.parse(Buffer.from(first.body).toString()),
-			reopened: Buffer.from(first.body).equals(Buffer.from(reopened.body)),
-			unresolved: built.unresolved,
-			claimReads,
-		})
-		closeBackends()
-		return
-	}
-	out({ original, calls, stopReason: message.stopReason, captured })
-	closeBackends()
-}
-
-async function nativeDelivery(agent: string): Promise<void> {
-	const { isWorkScope } = await import("../../../../src/extensions/work-attribution/scope.js")
-	const request = readRecords(agent).find((row) => row.type === "request" && isWorkScope(row.scope))
-	if (
-		!request ||
-		!isWorkScope(request.scope) ||
-		typeof request.requestId !== "string" ||
-		typeof request.startedAt !== "string"
-	)
-		throw new Error("Missing original native scope")
-	const account = request.scope.account
-	const { backendFor, closeBackends } = await import("../../../../src/extensions/pr-cost-reporting/ledger/records.js")
-	const { deliverEvents, reconcileReporting } = await import("../../../../src/extensions/pr-cost-reporting/worker.js")
-	const { pendingBatch, observeEvents } = await import("../../../../src/extensions/pr-cost-reporting/ledger/outbox.js")
-	const { accountKey } = await import("../../../../src/extensions/pr-cost-reporting/snapshot.js")
-	const { queueSnapshots, readReportingState, setReportingEnabled } = await import(
-		"../../../../src/extensions/pr-cost-reporting/queue.js"
-	)
-	const key = accountKey(account)
-	const check = () => {}
-	const posts: { url: string; body: string }[] = []
-	let mode = "success"
-	let redirected = false
-	let legacyInterleaved = false
-	let racedLegacy = false
-	let abandonedSignal: AbortSignal | null | undefined
-	let verifications = 0
-	globalThis.fetch = async (input, init) => {
-		const url = String(input)
-		redirected ||= init?.redirect !== "error"
-		if (url.endsWith("api-keys:verify")) {
-			verifications++
-			if (mode === "rejected") return new Response("{}", { status: 401 })
-			if (mode === "key-change") process.env.KIMCHI_API_KEY = "changed-key"
-			return Response.json({
-				organizationId: account.organizationId,
-				userId: mode === "other-user" ? "cccccccc-cccc-4ccc-8ccc-cccccccccccc" : account.userId,
-			})
-		}
-		if (!url.startsWith(account.apiUrl)) throw new Error("Unexpected network destination")
-		const body = String(init?.body)
-		posts.push({ url, body })
-		const parsed = JSON.parse(body)
-		if (url.endsWith("pr-cost-snapshots"))
-			return Response.json({ status: "accepted", revision: parsed.revision, receivedAt: new Date().toISOString() })
-		if (!url.endsWith("pr-cost-events:batchIngest")) throw new Error("Unexpected reporting route")
-		if (mode === "lease-loss") {
-			abandonedSignal = init?.signal
-			return new Promise((_resolve, reject) => {
-				abandonedSignal?.addEventListener("abort", () => reject(new Error("aborted held upload")), { once: true })
-			})
-		}
-		if (mode === "interleave" && legacyInterleaved) racedLegacy = true
-		if (mode === "lost") throw new Error("ACK lost")
-		if (mode === "invalid") return Response.json({ batchId: "wrong", receipts: [] })
-		if (mode === "off") await setReportingEnabled(agent, false)
-		return Response.json({
-			batchId: parsed.batch.id,
-			generation: "1",
-			receiveTime: new Date().toISOString(),
-			receipts: parsed.batch.events.map(({ id, revision }: { id: string; revision: string }) => ({
-				id,
-				revision,
-				status: "accepted",
-			})),
-		})
-	}
-	await setReportingEnabled(agent, true)
-	await queueSnapshots(agent, [
-		{
-			account,
-			content: {
-				repository: { provider: "github", host: "github.com", id: "999" },
-				pullRequests: [],
-				requests: [
-					{
-						requestId: request.requestId,
-						startedAt: request.startedAt,
-						billingRecordIds: [],
-						allocation: { kind: "unlinked", pullRequestIds: [], method: "native" },
-					},
-				],
-				coverage: { observedRequests: 1, unpricedRequests: 1, historyComplete: true },
-			},
-		},
-	])
-	const originalLegacy = JSON.stringify(Object.values((await readReportingState(agent)).entries)[0].pending)
-	await reconcileReporting(agent, agent, new AbortController().signal, check)
-	const initial = posts.filter((post) => post.url.endsWith("pr-cost-events:batchIngest"))
-	const initialEvents = initial.flatMap((post) => JSON.parse(post.body).batch.events)
-	const after = await readReportingState(agent)
-	const initialPending = backendFor(agent).pendingOutboxEvents(key, 1000).length
-	const capturedByWorker = initialEvents.filter((event: { usage?: object }) => event.usage)
-	const run = () => deliverEvents(agent, agent, new AbortController().signal, check)
-	const verifiedAfterInitial = verifications
-	await run()
-	const idle = verifications === verifiedAfterInitial
-	const seed = () =>
-		observeEvents(
-			agent,
-			key,
-			[
-				{
-					entityId: crypto.randomUUID(),
-					source: "kimchi",
-					sourceVersion: "test",
-					deviceId: request.workId,
-					observeTime: new Date().toISOString(),
-					coverage: { code: "fixture", count: "1" },
-				},
-			],
-			[],
-			check,
-		)
-	const body = () => {
-		const batch = pendingBatch(agent, key, check)
-		if (!batch) throw new Error("Missing pending worker batch")
-		return Buffer.from(batch.body).toString()
-	}
-	seed()
-	mode = "lost"
-	await run()
-	const lostBody = body()
-	closeBackends()
-	const reopened = body() === lostBody
-	const attempts = posts.length
-	const verifiedBeforeBackoff = verifications
-	mode = "success"
-	await run()
-	const backoff = posts.length === attempts && verifications === verifiedBeforeBackoff && body() === lostBody
-	const retry = JSON.parse(backendFor(agent).getNote("pr-cost-delivery", key) ?? "null")
-	const clock = Date.now
-	Date.now = () => retry.retryAt + 1
-	try {
-		await run()
-	} finally {
-		Date.now = clock
-	}
-	const replayed = posts.at(-1)?.body === lostBody && !backendFor(agent).getOutboxBatch(key)
-	seed()
-	mode = "invalid"
-	await run()
-	const invalidBody = body()
-	mode = "success"
-	await setReportingEnabled(agent, true)
-	await run()
-	const invalidAckRetained = posts.at(-1)?.body === invalidBody && !backendFor(agent).getOutboxBatch(key)
-	seed()
-	mode = "off"
-	await run()
-	const offBody = body()
-	mode = "success"
-	await setReportingEnabled(agent, true)
-	await run()
-	const optOutRetained = posts.at(-1)?.body === offBody && !backendFor(agent).getOutboxBatch(key)
-	seed()
-	const originalBody = body()
-	mode = "other-user"
-	const beforeOther = posts.length
-	await run()
-	const accountFenced = posts.length === beforeOther && body() === originalBody
-	// Events of an account that is not signed in wait like a failed upload instead of verifying every pass.
-	const verifiedBeforeOther = verifications
-	await run()
-	const otherBackoff = verifications === verifiedBeforeOther
-	mode = "rejected"
-	await setReportingEnabled(agent, true)
-	const verifiedBeforeRejection = verifications
-	await run()
-	await run()
-	const rejectedBackoff = verifications === verifiedBeforeRejection + 1 && body() === originalBody
-	mode = "key-change"
-	await setReportingEnabled(agent, true)
-	let keyFenced = false
-	try {
-		await run()
-	} catch {
-		keyFenced = posts.length === beforeOther && body() === originalBody
-	}
-	process.env.KIMCHI_API_KEY = "fake-reporting"
-	mode = "success"
-	await run()
-	const { readFileSync, writeFileSync, existsSync } = await import("node:fs")
-	const { lockSync } = await import("proper-lockfile")
-	const queueDirectory = join(agent, "pr-cost-reporting")
-	const statePath = join(queueDirectory, "state.json")
-	const drainedState = readFileSync(statePath)
-	// The older writer's inventory keeps the acknowledged request, so its new revision is pending rather than held.
-	await queueSnapshots(agent, [
-		{
-			account,
-			content: {
-				repository: { provider: "github", host: "github.com", id: "999" },
-				pullRequests: [],
-				requests: [request.startedAt, new Date().toISOString()].map((startedAt, index) => ({
-					requestId: index ? crypto.randomUUID() : request.requestId,
-					startedAt,
-					billingRecordIds: [],
-					allocation: { kind: "unlinked", pullRequestIds: [], method: "native" },
-				})),
-				coverage: { observedRequests: 2, unpricedRequests: 2, historyComplete: true },
-			},
-		},
-	])
-	const oldWriterState = readFileSync(statePath)
-	const oldWriterPending = Object.values(JSON.parse(oldWriterState.toString()).entries).some(
-		(entry) => (entry as { pending?: unknown; held?: boolean }).pending && !(entry as { held?: boolean }).held,
-	)
-	writeFileSync(statePath, drainedState)
-	seed()
-	// An older writer queues a legacy snapshot while events go out; they do not wait for it.
-	mode = "interleave"
-	await deliverEvents(agent, agent, new AbortController().signal, () => {
-		if (legacyInterleaved || existsSync(`${queueDirectory}.lock`)) return
-		const release = lockSync(queueDirectory)
-		try {
-			writeFileSync(statePath, oldWriterState)
-		} finally {
-			release()
-		}
-		legacyInterleaved = true
-	})
-	mode = "success"
-	const { deliverSnapshots } = await import("../../../../src/extensions/pr-cost-reporting/worker.js")
-	await deliverSnapshots(agent, agent, new AbortController().signal, check)
-	await run()
-	seed()
-	const abandonedBody = body()
-	mode = "lease-loss"
-	try {
-		await deliverEvents(agent, agent, new AbortController().signal, () => {
-			if (abandonedSignal) throw new Error("lease lost after dispatch")
-		})
-	} catch {}
-	const failedPassAborted = abandonedSignal?.aborted === true
-	const abandonedRetained = body() === abandonedBody
-	mode = "success"
-	await run()
-	out({
-		capturedByWorker,
-		initialBody: initial[0]?.body,
-		initialPending,
-		legacyExact: posts[0]?.body === originalLegacy,
-		legacyFirst: posts[0]?.url.endsWith("pr-cost-snapshots"),
-		noNewLegacy: Object.values(after.entries).every((entry) => entry.revision === "1" && !entry.pending),
-		reopened,
-		backoff,
-		idle,
-		replayed,
-		invalidAckRetained,
-		optOutRetained,
-		accountFenced,
-		otherBackoff,
-		rejectedBackoff,
-		keyFenced,
-		legacyBeside: oldWriterPending && legacyInterleaved && racedLegacy,
-		failedPassAborted,
-		abandonedRetained,
-		redirectsRejected: !redirected,
-		finalPending: backendFor(agent).pendingOutboxEvents(key, 1000).length,
-	})
-	closeBackends()
-}
-
-async function readWorkRecordsCommand(agent: string): Promise<void> {
-	out(readWorkRecords(agent))
-}
-
-async function legacyFreezeScenario(agent: string): Promise<void> {
-	const { readFileSync, writeFileSync } = await import("node:fs")
-	const {
-		acknowledgeFrozenSnapshot,
-		freezeSnapshots,
-		pendingFrozenSnapshots,
-		queueSnapshots,
-		readReportingState,
-		reportingStatePath,
-		setReportingEnabled,
-	} = await import("../../../../src/extensions/pr-cost-reporting/queue.js")
-	const { backendFor, closeBackends } = await import("../../../../src/extensions/pr-cost-reporting/ledger/records.js")
-	const check = () => {}
-	const path = reportingStatePath(agent)
-	const originalState = readFileSync(path)
-	const initial = Object.values((await readReportingState(agent)).entries)[0]
-	if (!initial.pending) throw new Error("Missing original legacy fixture")
-	const originalBody = JSON.stringify(initial.pending)
-	const all = () => pendingFrozenSnapshots(agent, check, Date.now() + 30_000)
-	await freezeSnapshots(agent, check)
-	const [first] = await all()
-	if (!first || first.body !== originalBody) throw new Error("Legacy bytes changed during freeze")
-	const backend = backendFor(agent)
-	const remove = backend.deleteNote.bind(backend)
-	let removed = false
-	backend.deleteNote = (workId, name) => {
-		remove(workId, name)
-		removed = true
-		throw new Error("after actual pending deletion")
-	}
-	let rejected = false
-	try {
-		await acknowledgeFrozenSnapshot(
-			agent,
-			first,
-			{ status: "accepted", revision: "1", receivedAt: new Date().toISOString() },
-			check,
-		)
-	} catch (error) {
-		rejected = error instanceof Error && error.message === "after actual pending deletion"
-	} finally {
-		backend.deleteNote = remove
-	}
-	const ackRollback =
-		removed &&
-		rejected &&
-		(await all())[0]?.body === originalBody &&
-		backend.readNotePage("legacy-pr-cost-snapshot-receipts", "", 64).length === 0
-	if (!ackRollback) throw new Error("Frozen ACK did not roll back")
-	await acknowledgeFrozenSnapshot(
-		agent,
-		first,
-		{ status: "accepted", revision: "1", receivedAt: new Date().toISOString() },
-		check,
-	)
-	const receipt = backend.getNote("legacy-pr-cost-snapshot-receipts", first.id)
-	if (receipt === undefined) throw new Error("Missing completed legacy receipt")
-	const { ack: _ack, ...invalidReceipt } = JSON.parse(receipt)
-	backend.putNote("legacy-pr-cost-snapshot-receipts", first.id, JSON.stringify(invalidReceipt))
-	writeFileSync(path, originalState)
-	let receiptCorruptionRejected = false
-	try {
-		await freezeSnapshots(agent, check)
-	} catch {
-		receiptCorruptionRejected = readFileSync(path).equals(originalState)
-	}
-	backend.putNote("legacy-pr-cost-snapshot-receipts", first.id, receipt)
-	await freezeSnapshots(agent, check)
-	const cleanupReplay =
-		(await all()).length === 0 && !Object.values((await readReportingState(agent)).entries)[0].pending
-	for (let index = 0; index < 20; index++) {
-		await queueSnapshots(agent, [
-			{
-				account: initial.account,
-				content: {
-					repository: initial.pending.repository,
-					pullRequests: initial.pending.pullRequests,
-					coverage: initial.pending.coverage,
-					requests: initial.pending.requests.map((request) => ({
-						...request,
-						allocation: { ...request.allocation, kind: index % 2 ? "unlinked" : "unknown" },
-					})),
-				},
-			},
-		])
-		await freezeSnapshots(agent, check)
-	}
-	const [partial] = await pendingFrozenSnapshots(agent, check, Date.now() - 1)
-	closeBackends()
-	const [next] = await pendingFrozenSnapshots(agent, check, Date.now() - 1)
-	const partialScanProgress = !!partial && !!next && partial.id !== next.id
-	const pending = await all()
-	if (pending.length !== 20) throw new Error(`Expected twenty frozen versions, got ${pending.length}`)
-	const latest = pending.reduce((a, b) => (BigInt(a.entry.revision) > BigInt(b.entry.revision) ? a : b))
-	for (const frozen of pending) {
-		if (frozen.id === latest.id) continue
-		await acknowledgeFrozenSnapshot(
-			agent,
-			frozen,
-			{
-				status: "accepted",
-				revision: frozen.entry.revision,
-				receivedAt: new Date().toISOString(),
-			},
-			check,
-		)
-	}
-	const reopened = backendFor(agent)
-	const page = reopened.readNotePage.bind(reopened)
-	const namespaces: string[] = []
-	reopened.readNotePage = (workId, after, limit) => {
-		namespaces.push(workId)
-		return page(workId, after, limit)
-	}
-	await setReportingEnabled(agent, true)
-	const resumeScans = namespaces.length
-	const remaining = await all()
-	const receiptScan = namespaces.some((name) => name === "legacy-pr-cost-snapshot-receipts")
-	reopened.readNotePage = page
-	const receipts = page("legacy-pr-cost-snapshot-receipts", "", 64)
-	const archived = receipts.map((row) => JSON.parse(row.body))
-	out({
-		initialBytes: first.body === originalBody,
-		ackRollback,
-		receiptCorruptionRejected,
-		cleanupReplay,
-		partialScanProgress,
-		retainedReceipts: receipts.length,
-		archivedOriginalBytes: archived.some((row) => row.body === originalBody),
-		pendingAfterArchive: remaining.length,
-		latestRetained: remaining[0]?.body === latest.body,
-		receiptScan,
-		resumeScans,
-		reopened: true,
-	})
-	closeBackends()
-}
-
-async function producerScenario(agent: string): Promise<void> {
-	const { readReportingState, reportingProducer } = await import(
-		"../../../../src/extensions/pr-cost-reporting/queue.js"
-	)
-	const { backendFor, closeBackends } = await import("../../../../src/extensions/pr-cost-reporting/ledger/records.js")
-	const { observeEvents, pendingBatch } = await import("../../../../src/extensions/pr-cost-reporting/ledger/outbox.js")
-	const { machineFingerprint } = await import("../../../../src/extensions/pr-cost-reporting/machine.js")
-	const { accountKey } = await import("../../../../src/extensions/pr-cost-reporting/snapshot.js")
-	const state = await readReportingState(agent)
-	const entry = Object.values(state.entries)[0]
-	if (!entry?.pending) throw new Error("Missing legacy pending producer fixture")
-	const account = accountKey(entry.account)
-	const current = () => {}
-	observeEvents(
-		agent,
-		account,
-		[
-			{
-				entityId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-				source: "kimchi",
-				sourceVersion: "test",
-				deviceId: state.producerId,
-				observeTime: "2026-10-24T00:00:00Z",
-				coverage: { code: "observed", count: "1" },
-			},
-		],
-		[],
-		current,
-	)
-	const frozen = pendingBatch(agent, account, current)
-	if (!frozen) throw new Error("Missing frozen producer fixture")
-	const producerId = await reportingProducer(agent, current)
-	const pending = pendingBatch(agent, account, current)
-	out({
-		producerId,
-		machineKnown: !!(await machineFingerprint()),
-		note: JSON.parse(backendFor(agent).getNote("agent", "reporting-producer") ?? "null"),
-		legacyRetained: JSON.stringify(await readReportingState(agent)) === JSON.stringify(state),
-		batchRetained: pending?.id === frozen.id && sameBytes(pending.body, frozen.body),
-		frozenProducer: JSON.parse(Buffer.from(frozen.body).toString("utf8")).batch.events[0].deviceId,
-	})
-	closeBackends()
-}
-
 async function outboxScenario(agent: string, mode: string): Promise<void> {
 	const { observeEvents, pendingBatch, acknowledgeBatch, readOutboxStatus } = await import(
-		"../../../../src/extensions/pr-cost-reporting/ledger/outbox.js"
+		"../../src/ledger/outbox.js"
 	)
 	const { backendFor, closeBackends, recordHashOf, useBackendFactory } = await import(
-		"../../../../src/extensions/pr-cost-reporting/ledger/records.js"
+		"../../src/ledger/records.js"
 	)
-	const { createMemoryRecords } = await import("../../../../src/extensions/pr-cost-reporting/ledger/memory-records.js")
-	const { encodeBatch } = await import("../../../../src/extensions/pr-cost-reporting/protocol.js")
+	const { createMemoryRecords } = await import("../../src/ledger/memory-records.js")
+	const { encodeBatch } = await import("../../src/ledger/protocol.js")
 	const { createHash } = await import("node:crypto")
 	if (mode === "memory") useBackendFactory(() => createMemoryRecords())
 	const backend = backendFor(agent)
@@ -1518,12 +866,12 @@ async function outboxScenario(agent: string, mode: string): Promise<void> {
  * asserts the probe queries stay bounded by the covering indexes. */
 async function deliveryStatusScenario(agent: string, mode: string): Promise<void> {
 	const { outboxDeliveryStatus, readOutboxStatus } = await import(
-		"../../../../src/extensions/pr-cost-reporting/ledger/outbox.js"
+		"../../src/ledger/outbox.js"
 	)
 	const { backendFor, closeBackends, useBackendFactory } = await import(
-		"../../../../src/extensions/pr-cost-reporting/ledger/records.js"
+		"../../src/ledger/records.js"
 	)
-	const { createMemoryRecords } = await import("../../../../src/extensions/pr-cost-reporting/ledger/memory-records.js")
+	const { createMemoryRecords } = await import("../../src/ledger/memory-records.js")
 	const { createHash } = await import("node:crypto")
 	if (mode === "memory") useBackendFactory(() => createMemoryRecords())
 	const backend = backendFor(agent)
@@ -1603,10 +951,10 @@ async function deliveryStatusScenario(agent: string, mode: string): Promise<void
 	}
 	let plans: { sendable: string[]; firstBatch: string[] } | undefined
 	if (mode !== "memory") {
-		const db = new Database(join(reportingDirectory(agent), "ledger.db"), { readonly: true })
+		const db = new Database(ledgerDbPath(agent), { readonly: true })
 		const explain = (sql: string) =>
 			db
-				.prepare(`EXPLAIN QUERY PLAN ${sql}`)
+			.prepare<{ detail: string }, []>(`EXPLAIN QUERY PLAN ${sql}`)
 				.all()
 				.map((row) => String(row.detail))
 		plans = {
@@ -1626,9 +974,9 @@ async function deliveryStatusScenario(agent: string, mode: string): Promise<void
 
 async function outboxTransport(agent: string): Promise<void> {
 	const { observeEvents, pendingBatch, acknowledgeBatch } = await import(
-		"../../../../src/extensions/pr-cost-reporting/ledger/outbox.js"
+		"../../src/ledger/outbox.js"
 	)
-	const { closeBackends } = await import("../../../../src/extensions/pr-cost-reporting/ledger/records.js")
+	const { closeBackends } = await import("../../src/ledger/records.js")
 	const current = () => {}
 	const coverage = {
 		entityId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1711,249 +1059,9 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 	return Buffer.from(left).equals(Buffer.from(right))
 }
 
-async function knownAsyncReadRegressions(agent: string, recordJson: string, stored = false): Promise<void> {
-	const { backendFor, closeBackends, recordHashOf, readStoredRecordsAsync, rebuildWork } = await import(
-		"../../../../src/extensions/pr-cost-reporting/ledger/records.js"
-	)
-	const readAsync = stored
-		? async (signal: AbortSignal): Promise<WorkRecord[]> =>
-				(await readStoredRecordsAsync(agent, () => signal.throwIfAborted())).map((row) => JSON.parse(row.body))
-		: (signal: AbortSignal) => readWorkRecordsAsync(agent, signal)
-	const base = JSON.parse(recordJson) as WorkRecord
-	const native = [
-		base,
-		...Array.from(
-			{ length: 1024 },
-			(_, index): WorkRecord => ({
-				...base,
-				type: "request",
-				requestId: `native-${index}`,
-				scope: null,
-				padding: "x".repeat(1024),
-			}),
-		),
-	]
-	const sourcePath = join(agent, "work-attribution", `${encodeURIComponent(base.sessionId)}.jsonl`)
-	const backend = backendFor(agent)
-	backend.tx(() => {
-		for (const record of native) {
-			const recordHash = recordHashOf(record)
-			backend.insertRecord({
-				recordHash,
-				type: record.type,
-				workId: record.workId,
-				sessionId: record.sessionId,
-				body: JSON.stringify(record),
-				sourcePath,
-				sourceGeneration: 0,
-				sourceOffset: null,
-				importedAt: Date.now(),
-			})
-			backend.upsertMarker(recordHash, record.workId, record.type)
-		}
-	})
-	rebuildWork(agent, base.workId)
-	const read = backend.readRecords.bind(backend)
-	const page = backend.readRecordPage.bind(backend)
-	const before = read({})
-	const controller = new AbortController()
-	const sentinel = new Error("native reader closed")
-	let visited = 0
-	let callbackRan = false
-	let rowsAtAbort = 0
-	backend.readRecordPage = (after, through, limit, checkBudget) => {
-		return page(after, through, limit, () => {
-			if (++visited === 2)
-				setImmediate(() => {
-					callbackRan = true
-					rowsAtAbort = visited
-					controller.abort(sentinel)
-				})
-			checkBudget?.()
-		})
-	}
-	let cancelled = false
-	try {
-		await readAsync(controller.signal)
-	} catch (error) {
-		if (error !== sentinel) throw error
-		cancelled = true
-	} finally {
-		await new Promise<void>((resolve) => setImmediate(resolve))
-		backend.readRecordPage = page
-	}
-	const sameConnectionComplete = JSON.stringify(read({})) === JSON.stringify(before)
-	const added: WorkRecord = { ...base, type: "request", requestId: "native-after-abort", scope: null }
-	capture(agent, added, sourcePath)
-	const committed = read({})
-	let insertedDuringRead = false
-	backend.readRecordPage = (after, through, limit, checkBudget) => {
-		const rows = page(after, through, limit, checkBudget)
-		if (!insertedDuringRead) {
-			insertedDuringRead = true
-			setImmediate(() => capture(agent, { ...added, requestId: "native-during-page" }, sourcePath))
-		}
-		return rows
-	}
-	const snapshot = await readAsync(new AbortController().signal)
-	backend.readRecordPage = page
-	const next = await readAsync(new AbortController().signal)
-	const afterCapture = read({})
-	closeBackends()
-	const reopened = backendFor(agent).readRecords({})
-	out({
-		observerEntered: visited > 0,
-		callbackRan,
-		cancelled,
-		nativeRows: before.length,
-		rowsAtAbort,
-		sameConnectionComplete,
-		captureCommitted: committed.length === before.length + 1,
-		snapshotComplete: JSON.stringify(snapshot) === JSON.stringify(committed.map((row) => JSON.parse(row.body))),
-		nextReadSeesCapture: next.length === snapshot.length + 1 && next.at(-1)?.requestId === "native-during-page",
-		reopenedComplete: JSON.stringify(reopened) === JSON.stringify(afterCapture),
-		noLegacyJournal: !readdirSync(agent).includes("work-attribution"),
-	})
-	closeBackends()
-}
-
-function summaryState(agent: string, workId: string) {
-	const store = openStore(agent)
-	try {
-		return store.db
-			.transaction(() => ({
-				authority: store.db.query("SELECT * FROM work_records WHERE work_id = ? ORDER BY rowid").all(workId),
-				markers: store.db.query("SELECT * FROM pending_translation WHERE work_id = ? ORDER BY record_hash").all(workId),
-				head:
-					store.db
-						.query<{ body: string }, [string]>("SELECT body FROM work_projection_head WHERE work_id = ?")
-						.get(workId)?.body ?? null,
-				rows: store.db.query("SELECT * FROM work_projection_rows WHERE work_id = ? ORDER BY log, pos").all(workId),
-			}))
-			.deferred()
-	} finally {
-		store.close()
-	}
-}
-
-async function summaryAtomic(agent: string, json: string): Promise<void> {
-	const { backendFor, closeBackends } = await import("../../../../src/extensions/pr-cost-reporting/ledger/records.js")
-	const { record, failure, failedWorkId } = JSON.parse(json) as {
-		record: WorkRecord
-		failure: "authority" | "translation" | "projection"
-		failedWorkId: string
-	}
-	capture(agent, { ...record, type: "work" }, "summary-native")
-	capture(agent, { ...record, requestId: "prior" }, "summary-native")
-	const before = summaryState(agent, record.workId)
-	const backend = backendFor(agent)
-	const insert = backend.insertRecord
-	const mark = backend.upsertMarker
-	const publish = backend.putHead
-	const sentinel = new Error("after-write cancellation")
-	let mutations = 0
-	if (failure === "authority")
-		backend.insertRecord = (row) => {
-			const inserted = insert(row)
-			if (inserted) {
-				mutations++
-				throw sentinel
-			}
-			return inserted
-		}
-	if (failure === "translation")
-		backend.upsertMarker = (...args) => {
-			mark(...args)
-			mutations++
-			throw sentinel
-		}
-	if (failure === "projection")
-		backend.putHead = (head) => {
-			publish(head)
-			mutations++
-			throw sentinel
-		}
-	let rejected = 0
-	try {
-		for (const next of [record, { ...record, type: "work" as const, workId: failedWorkId }]) {
-			try {
-				capture(agent, next, "summary-native")
-			} catch (error) {
-				if (error !== sentinel) throw error
-				rejected++
-			}
-		}
-	} finally {
-		backend.insertRecord = insert
-		backend.upsertMarker = mark
-		backend.putHead = publish
-		closeBackends()
-	}
-	const after = summaryState(agent, record.workId)
-	const failedHeader = summaryState(agent, failedWorkId)
-	capture(agent, record, "summary-native")
-	capture(agent, record, "summary-native")
-	closeBackends()
-	out({ before, after, failedHeader, mutations, rejected, recovered: summaryState(agent, record.workId) })
-}
-
-/** A synchronous pipe gate holds a real transaction after its head write, never across await. */
-async function summaryWriter(agent: string, json: string): Promise<void> {
-	const { backendFor, closeBackends } = await import("../../../../src/extensions/pr-cost-reporting/ledger/records.js")
-	const { flushWorkSummaries } = await import("../../../../src/extensions/work-attribution/summary.js")
-	const {
-		record,
-		count = 1,
-		beforeFlush = false,
-	} = JSON.parse(json) as {
-		record: WorkRecord
-		count?: number
-		beforeFlush?: boolean
-	}
-	const backend = backendFor(agent)
-	const publish = backend.putHead
-	const cancelled = new Error("writer ownership cancelled before commit")
-	const gate = () => {
-		const byte = Buffer.alloc(1)
-		if (readSync(0, byte, 0, 1, null) !== 1) throw new Error("Missing writer release")
-		return byte[0] === 99
-	}
-	const signal = (phase: string) => writeSync(1, `${JSON.stringify({ phase })}\n`)
-	backend.putHead = (head) => {
-		publish(head)
-		signal("pending")
-		if (!gate()) throw cancelled
-	}
-	try {
-		signal("ready")
-		for (let index = 0; index < count; index++) {
-			try {
-				capture(
-					agent,
-					count === 1 ? record : { ...record, requestId: `${record.sessionId}-${index}` },
-					"summary-native",
-				)
-			} catch (error) {
-				if (error !== cancelled) throw error
-				signal("rolled-back")
-				// Stay alive while the competing writer commits: the cancelled head must never reappear.
-				gate()
-				return
-			}
-			signal("committed")
-		}
-		if (beforeFlush && !gate()) throw new Error("Missing flush release")
-		await flushWorkSummaries()
-		signal("flushed")
-	} finally {
-		backend.putHead = publish
-		closeBackends()
-	}
-}
-
 async function knownRecordRegressions(agent: string, recordJson: string): Promise<void> {
 	const { backendFor, closeBackends, ledgerSessionInfo, recoverDirty } = await import(
-		"../../../../src/extensions/pr-cost-reporting/ledger/records.js"
+		"../../src/ledger/records.js"
 	)
 	const base = JSON.parse(recordJson) as WorkRecord
 	const requestId = "22222222-2222-4222-8222-222222222222"
@@ -2199,7 +1307,7 @@ async function knownSchemaRace(agent: string): Promise<void> {
 	}
 }
 
-const commands: Record<string, (agent: string, arg?: string) => Promise<void>> = {
+const commands: Record<string, (agent: string, arg?: string) => void | Promise<void>> = {
 	probe: (agent) => probe(agent),
 	"foreign-check": (agent) => foreignCheck(agent),
 	"hold-writer": (agent, ms) => holdWriter(agent, ms === "release" ? ms : Number(ms ?? "0")),
@@ -2211,28 +1319,6 @@ const commands: Record<string, (agent: string, arg?: string) => Promise<void>> =
 	capture: (agent, json) => captureRecord(agent, json ?? "{}"),
 	head: (agent, workId) => printHead(agent, workId ?? ""),
 	rows: (agent, workId) => printRows(agent, workId ?? ""),
-	note: async (agent, json) => {
-		const [workId, name] = JSON.parse(json ?? "[]")
-		out(getNote(agent, workId, name) ?? null)
-	},
-	"pr-checks": async (agent) => {
-		process.env.PI_CODING_AGENT_DIR = agent
-		const { reconcileWorkPullRequests } = await import(
-			"../../../../src/extensions/pull-request-status/pull-requests.js"
-		)
-		await reconcileWorkPullRequests(agent, new AbortController().signal, () => {})
-		out({ note: getNote(agent, "agent", "pr-checks"), records: readRecords(agent).length })
-	},
-	"remove-note": async (agent, json) => {
-		const [workId, name] = JSON.parse(json ?? "[]")
-		const store = openStore(agent)
-		try {
-			store.db.query("DELETE FROM bookkeeping WHERE work_id = ? AND name = ?").run(workId, name)
-			out(null)
-		} finally {
-			store.close()
-		}
-	},
 	records: (agent, workId) => printRecords(agent, workId || undefined),
 	"transition-repositories": async (agent, damaged) => {
 		if (damaged) {
@@ -2251,7 +1337,7 @@ const commands: Record<string, (agent: string, arg?: string) => Promise<void>> =
 		// applies must not run in the holder, so the contended reader sees the pre-migration
 		// schema exactly.
 		const { Database } = createRequire(import.meta.url)("bun:sqlite") as typeof import("bun:sqlite")
-		const db = new Database(join(reportingDirectory(agent), "ledger.db"))
+		const db = new Database(ledgerDbPath(agent))
 		db.exec("BEGIN IMMEDIATE")
 		out({ held: true })
 		await new Promise((resolve) => setTimeout(resolve, Number(ms ?? "0")))
@@ -2260,9 +1346,9 @@ const commands: Record<string, (agent: string, arg?: string) => Promise<void>> =
 	},
 	"claims-parity": async (agent) => {
 		const { createHash } = await import("node:crypto")
-		const { backendFor } = await import("../../../../src/extensions/pr-cost-reporting/ledger/records.js")
+		const { backendFor } = await import("../../src/ledger/records.js")
 		const { effectiveClaims, effectiveClaimsAsync } = await import(
-			"../../../../src/extensions/pr-cost-reporting/ledger/outbox.js"
+			"../../src/ledger/outbox.js"
 		)
 		const backend = backendFor(agent)
 		const entities: string[] = []
@@ -2406,68 +1492,17 @@ const commands: Record<string, (agent: string, arg?: string) => Promise<void>> =
 		out(repositories)
 	},
 	"import-journals": (agent) => importJournalsCommand(agent),
-	"native-usage": (agent) => nativeUsage(agent),
-	"native-usage-anthropic": (agent) => nativeUsage(agent, true),
-	"native-common-events": (agent) => nativeUsage(agent, true, true),
-	"native-common-delivery": (agent) => nativeUsage(agent, true, true, true),
-	producer: (agent) => producerScenario(agent),
-	"legacy-freeze": (agent) => legacyFreezeScenario(agent),
 	outbox: (agent, mode) => outboxScenario(agent, mode ?? "sqlite"),
 	"delivery-status": (agent, mode) => deliveryStatusScenario(agent, mode ?? "sqlite"),
 	"outbox-transport": (agent) => outboxTransport(agent),
-	"read-work-records": (agent) => readWorkRecordsCommand(agent),
 	"import-capture": async (agent) => {
-		const { importJournals } = await import("../../../../src/extensions/pr-cost-reporting/ledger/import.js")
+		const { importJournals } = await import("../../src/ledger/import.js")
 		let result = await importJournals(agent, { verifyCapturePrefix: true })
 		while (result.pending) result = await importJournals(agent, { verifyCapturePrefix: true })
 		out({ imported: result.imported, modes: result.files.map((file) => file.mode) })
 	},
-	"read-history": async (agent) => {
-		const problems: WorkRecordProblem[] = []
-		const records = readWorkRecords(agent, undefined, undefined, (problem) => problems.push(problem))
-		out({ records, problems })
-	},
-	"read-history-async": async (agent) => {
-		const problems: WorkRecordProblem[] = []
-		let turns = 0
-		let reading = true
-		const spin = () => {
-			turns++
-			if (reading) setImmediate(spin)
-		}
-		setImmediate(spin)
-		try {
-			const records = await readWorkRecordsAsync(agent, new AbortController().signal, (problem) =>
-				problems.push(problem),
-			)
-			out({
-				records: records.length,
-				requestIds: records.filter((row) => row.type === "request").map((row) => row.requestId),
-				problems,
-				turns,
-			})
-		} finally {
-			reading = false
-		}
-	},
 	listfiles: (agent) => listFiles(agent),
-	"summary-state": async (agent, workId) => out(summaryState(agent, workId ?? "")),
-	"summary-reader": async (agent, workId) => {
-		// Process startup must finish before the test holds any writer transaction.
-		summaryState(agent, workId ?? "")
-		const input = createInterface({ input: process.stdin })
-		out({ phase: "ready" })
-		try {
-			for await (const _ of input) out({ phase: "snapshot", state: summaryState(agent, workId ?? "") })
-		} finally {
-			input.close()
-		}
-	},
-	"summary-atomic": (agent, json) => summaryAtomic(agent, json ?? "{}"),
-	"summary-writer": (agent, json) => summaryWriter(agent, json ?? "{}"),
 	"known-record-regressions": (agent, json) => knownRecordRegressions(agent, json ?? "{}"),
-	"known-async-read-regressions": (agent, json) => knownAsyncReadRegressions(agent, json ?? "{}"),
-	"known-async-stored-read-regressions": (agent, json) => knownAsyncReadRegressions(agent, json ?? "{}", true),
 	"known-schema-race": (agent) => knownSchemaRace(agent),
 	"known-schema-race-open": (agent) => knownSchemaRaceOpen(agent),
 }

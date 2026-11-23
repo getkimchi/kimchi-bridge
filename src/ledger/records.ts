@@ -11,8 +11,8 @@ import {
 	summaryLatest,
 	type WorkHead,
 	type WorkSummaryView,
-} from "../../work-attribution/row-log.js"
-import type { WorkRecord } from "../../work-attribution/summary.js"
+} from "./row-log.js"
+import type { WorkRecord } from "./work-record.js"
 import { mergeRecordsInto, type SummaryRows } from "./merge.js"
 import { ensureProjectionVersion, type LedgerStore, openStore } from "./store.js"
 

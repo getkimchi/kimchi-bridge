@@ -4,9 +4,9 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { afterEach, describe, expect, it, onTestFinished } from "vitest"
-import type { WorkRecord } from "../../work-attribution/summary.js"
-import { createMemoryRecords } from "./memory-records.js"
+import { afterEach, describe, expect, it, onTestFinished } from "bun:test"
+import type { WorkRecord } from "../../src/ledger/work-record.js"
+import { createMemoryRecords } from "../../src/ledger/memory-records.js"
 import {
 	capture,
 	closeBackends,
@@ -20,15 +20,15 @@ import {
 	rebuildWork,
 	seedProjectionRows,
 	useBackendFactory,
-} from "./records.js"
+} from "../../src/ledger/records.js"
 
 /**
  * One scenario folded through BOTH the in-memory test backend and the real SQLite backend via the Bun
  * driver; identical observable results keep the test seam honest (Decision 9).
  */
 
-const ROOT = fileURLToPath(new URL("../../../../", import.meta.url))
-const DRIVER = join(ROOT, "tests/e2e/tui/support/ledger-driver.ts")
+const ROOT = fileURLToPath(new URL("../../", import.meta.url))
+const DRIVER = join(ROOT, "test/ledger/ledger-driver.ts")
 const isBun = !!process.versions.bun
 
 const WORK = "11111111-1111-4111-8111-111111111111"
@@ -299,7 +299,9 @@ it("projects distinct transition repositories, without including other record ty
 	expect(readTransitionRepositories(dir)).toEqual(["/a", "/b"])
 })
 
-describe("records conformance (SQLite via Bun driver)", { skip: isBun, timeout: 90_000 }, () => {
+describe("records conformance (SQLite via Bun driver)", () => {
+	// Ported from vitest describe-level { timeout: 90_000 }: bun:test has no describe options,
+	// so each test carries its own budget.
 	it("matches distinct repository projection including duplicate and non-transition records", () => {
 		const dir = agentDir()
 		try {
@@ -314,7 +316,7 @@ describe("records conformance (SQLite via Bun driver)", { skip: isBun, timeout: 
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 	it("a held writer during a pre-migration open waits for the repository set instead of failing", async () => {
 		const dir = agentDir()
 		let holder: ReturnType<typeof spawn> | undefined
@@ -338,7 +340,7 @@ describe("records conformance (SQLite via Bun driver)", { skip: isBun, timeout: 
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("a held writer during an index-absent open reads unhinted instead of erroring", async () => {
 		const dir = agentDir()
@@ -358,7 +360,7 @@ describe("records conformance (SQLite via Bun driver)", { skip: isBun, timeout: 
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("backfills the materialized repository set for a ledger written before it existed", () => {
 		const dir = agentDir()
@@ -375,7 +377,7 @@ describe("records conformance (SQLite via Bun driver)", { skip: isBun, timeout: 
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 	it("capture folds identically to the memory backend and writes no legacy files", () => {
 		const dir = agentDir()
 		try {
@@ -401,7 +403,7 @@ describe("records conformance (SQLite via Bun driver)", { skip: isBun, timeout: 
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("SQLite dedups by record hash across processes", () => {
 		const dir = agentDir()
@@ -416,7 +418,7 @@ describe("records conformance (SQLite via Bun driver)", { skip: isBun, timeout: 
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("a killed writer leaves no partial transaction (WAL, FULL sync)", async () => {
 		const dir = agentDir()
@@ -444,7 +446,7 @@ describe("records conformance (SQLite via Bun driver)", { skip: isBun, timeout: 
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 })
 
 it("known regression: memory rollback restores records, projection and bookkeeping", () => {

@@ -14,8 +14,7 @@ import {
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { afterEach, describe, expect, it, vi } from "vitest"
-import { readWorkRecords } from "../../work-attribution/summary.js"
+import { afterEach, describe, expect, it, vi } from "bun:test"
 import {
 	boundaryHashOf,
 	completeLines,
@@ -23,8 +22,8 @@ import {
 	importJournals,
 	journalDecision,
 	reportJournalProblems,
-} from "./import.js"
-import { createMemoryRecords } from "./memory-records.js"
+} from "../../src/ledger/import.js"
+import { createMemoryRecords } from "../../src/ledger/memory-records.js"
 import {
 	backendFor,
 	capture,
@@ -33,12 +32,14 @@ import {
 	readRecords,
 	readWorkRows,
 	useBackendFactory,
-} from "./records.js"
+} from "../../src/ledger/records.js"
 
-vi.mock("node:fs", async (original) => ({ ...(await original<typeof fs>()) }))
+// Ported from Kimchi's vitest suite: under bun:test, vi.spyOn(fs, ...) on the shared node:fs
+// module object intercepts the library's own fs calls directly, so vitest's passthrough
+// vi.mock("node:fs") is not needed (verified: spies see readSync/openSync from import.js).
 
-const ROOT = fileURLToPath(new URL("../../../../", import.meta.url))
-const DRIVER = join(ROOT, "tests/e2e/tui/support/ledger-driver.ts")
+const ROOT = fileURLToPath(new URL("../../", import.meta.url))
+const DRIVER = join(ROOT, "test/ledger/ledger-driver.ts")
 const isBun = !!process.versions.bun
 
 const WORK = "11111111-1111-4111-8111-111111111111"
@@ -946,11 +947,19 @@ describe("capture prefix verification (memory backend)", () => {
 		const first = await importJournals(dir, { verifyCapturePrefix: true, until: Date.now() - 1 })
 		expect(first.pending).toBe(true)
 		expect(first.imported).toBe(1)
-		expect(readRecords(dir).map((row) => row.requestId)).toEqual(["req-a"])
+		// readdir order is runtime-dependent (bun and node disagree here), so the budget window's
+		// one imported journal may be either sibling; what matters is that only one made it in.
+		const firstImported = readRecords(dir).map((row) => row.requestId)
+		expect(firstImported).toHaveLength(1)
+		expect(["req-a", "req-b"]).toContain(firstImported[0] as string)
 		let next = await importJournals(dir, { verifyCapturePrefix: true })
 		while (next.pending) next = await importJournals(dir, { verifyCapturePrefix: true })
 		expect(next.pending).toBeUndefined()
-		expect(readRecords(dir).map((row) => row.requestId)).toEqual(["req-a", "req-b"])
+		expect(
+			readRecords(dir)
+				.map((row) => row.requestId)
+				.sort(),
+		).toEqual(["req-a", "req-b"])
 	})
 
 	it("defers same-size rewritten siblings when the time budget expires", async () => {
@@ -1008,42 +1017,8 @@ describe("capture prefix verification (memory backend)", () => {
 	})
 })
 
-describe("A2 hydration before history-dependent reads", () => {
-	const dirs: string[] = []
-	afterEach(() => {
-		useBackendFactory(null)
-		closeBackends()
-		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
-	})
-
-	it("folds legacy journals in before the first history-dependent read, files stay untouched", () => {
-		const dir = agentDir()
-		dirs.push(dir)
-		useBackendFactory(() => createMemoryRecords())
-		const folder = journal(dir)
-		const file = join(folder, "parent.jsonl")
-		const original = line(work()) + line(request("req-1"))
-		writeFileSync(file, original)
-		const records = readWorkRecords(dir, undefined, () => {})
-		expect(records.map((record) => record.type).sort()).toEqual(["request", "work"])
-		// Legacy files are read-only inputs: hydration never deletes, converts, or rewrites them.
-		expect(readFileSync(file, "utf8")).toBe(original)
-	})
-
-	it("re-hydration over an identical journal imports nothing new and advances no cursor", () => {
-		const dir = agentDir()
-		dirs.push(dir)
-		useBackendFactory(() => createMemoryRecords())
-		const folder = journal(dir)
-		writeFileSync(join(folder, "parent.jsonl"), line(work()) + line(request("req-1")))
-		expect(importJournalSlice(dir)).toBe(false)
-		expect(readRecords(dir)).toHaveLength(2)
-		expect(importJournalSlice(dir)).toBe(false)
-		expect(readRecords(dir)).toHaveLength(2)
-	})
-})
-
-describe("legacy journals import into SQLite via the Bun driver", { skip: isBun, timeout: 90_000 }, () => {
+describe("legacy journals import into SQLite via the Bun driver", () => {
+	// Ported from vitest describe-level { timeout: 90_000 }: bun:test has no describe options.
 	async function driver(...args: string[]): Promise<unknown> {
 		const stdout = execFileSync("bun", [DRIVER, ...args], { cwd: ROOT, encoding: "utf8", timeout: 60_000 })
 		return JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}")
@@ -1065,19 +1040,7 @@ describe("legacy journals import into SQLite via the Bun driver", { skip: isBun,
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
-
-	it("read-work-records hydrates legacy journals before a history-dependent read", async () => {
-		const dir = agentDir()
-		try {
-			mkdirSync(join(dir, "work-attribution"), { recursive: true })
-			writeFileSync(join(dir, "work-attribution", "parent.jsonl"), line(work()) + line(request("req-1")))
-			const records = (await driver("read-work-records", dir)) as { type: string }[]
-			expect(records.map((record) => record.type).sort()).toEqual(["request", "work"])
-		} finally {
-			rmSync(dir, { recursive: true, force: true })
-		}
-	})
+	}, 90_000)
 
 	it("a fresh process cannot inherit verified prefix state: an append after restart imports through verification", async () => {
 		const dir = agentDir()
@@ -1094,7 +1057,7 @@ describe("legacy journals import into SQLite via the Bun driver", { skip: isBun,
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("fresh + append + re-import over unchanged files insert nothing new", async () => {
 		const dir = agentDir()
@@ -1132,7 +1095,7 @@ describe("legacy journals import into SQLite via the Bun driver", { skip: isBun,
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("anomaly matrix: replace-larger, shrink, and remove never delete imported rows", async () => {
 		const dir = agentDir()
@@ -1178,7 +1141,7 @@ describe("legacy journals import into SQLite via the Bun driver", { skip: isBun,
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("malformed lines and unknown types surface as coverage problems; valid rows still import", async () => {
 		const dir = agentDir()
@@ -1207,7 +1170,7 @@ describe("legacy journals import into SQLite via the Bun driver", { skip: isBun,
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("scope:null in a journal line replays as null through the real backend", async () => {
 		const dir = agentDir()
@@ -1221,7 +1184,7 @@ describe("legacy journals import into SQLite via the Bun driver", { skip: isBun,
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("imports journals from the transitions subdirectory too", async () => {
 		const dir = agentDir()
@@ -1234,7 +1197,7 @@ describe("legacy journals import into SQLite via the Bun driver", { skip: isBun,
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 
 	it("refuses nothing when only the agent dir exists; empty import is a clean no-op", async () => {
 		const dir = agentDir()
@@ -1249,5 +1212,5 @@ describe("legacy journals import into SQLite via the Bun driver", { skip: isBun,
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
-	})
+	}, 90_000)
 })

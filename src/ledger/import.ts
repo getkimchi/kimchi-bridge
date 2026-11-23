@@ -8,7 +8,7 @@ import {
 	type WorkRecord,
 	type WorkRecordProblem,
 	workJournals,
-} from "../../work-attribution/summary.js"
+} from "./work-record.js"
 import {
 	backendFor,
 	diagnostic,

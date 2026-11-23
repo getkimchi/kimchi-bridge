@@ -1,4 +1,4 @@
-import type { LogName, Row, WorkHead } from "../../work-attribution/row-log.js"
+import type { LogName, Row, WorkHead } from "./row-log.js"
 import type {
 	DeliveryAccountStatus,
 	JournalCursor,

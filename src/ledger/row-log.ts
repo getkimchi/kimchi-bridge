@@ -1,4 +1,4 @@
-import { mergePullRequestLinks } from "../pull-request-status/links.js"
+import { mergePullRequestLinks } from "./links.js"
 
 /*
  * Pure summary types and helpers. Persistence lives in the ledger (pr-cost-reporting/ledger/records.ts): the

@@ -1,15 +1,15 @@
 import { execFileSync, spawn } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { afterEach, describe, expect, onTestFinished, test } from "vitest"
-import { readRecordsSincePageSql, readRecordsSinceSql } from "./records.js"
-import { LEDGER_ADDITIVE_SCHEMA } from "./schema.js"
-import { classifyUserVersion, LedgerUnavailableError, ledgerDbPath, openStore, retryOnBusy } from "./store.js"
+import { afterEach, describe, expect, onTestFinished, test } from "bun:test"
+import { readRecordsSincePageSql, readRecordsSinceSql } from "../../src/ledger/records.js"
+import { LEDGER_ADDITIVE_SCHEMA } from "../../src/ledger/schema.js"
+import { classifyUserVersion, LedgerUnavailableError, ledgerDbPath, openStore, retryOnBusy } from "../../src/ledger/store.js"
 
-const ROOT = fileURLToPath(new URL("../../../../", import.meta.url))
-const DRIVER = join(ROOT, "tests/e2e/tui/support/ledger-driver.ts")
+const ROOT = fileURLToPath(new URL("../../", import.meta.url))
+const DRIVER = join(ROOT, "test/ledger/ledger-driver.ts")
 const isBun = typeof (process.versions as Record<string, string | undefined>).bun === "string"
 
 const dirs: string[] = []
@@ -43,7 +43,7 @@ describe("classifyUserVersion (pure)", () => {
 		[1, "open"],
 		[2, "foreign"],
 		[777, "foreign"],
-	])("user_version %i → %s", (version, action) => {
+	] as const)("user_version %i → %s", (version, action) => {
 		expect(classifyUserVersion(version)).toBe(action)
 	})
 })
@@ -112,7 +112,9 @@ describe("retryOnBusy (pure)", () => {
 })
 
 describe("Node runtime", () => {
-	test("module import is safe and openStore throws the coded error", { skip: isBun }, () => {
+	// Node-only: under Bun, bun:sqlite loads and openStore succeeds. Kimchi's vitest still runs
+	// the Node variant of this test against the same library code.
+	test.skipIf(isBun)("module import is safe and openStore throws the coded error", () => {
 		let thrown: unknown
 		try {
 			openStore(agentDir())
@@ -131,39 +133,9 @@ test("ledger path sits in the reporting directory", () => {
 describe("open via Bun driver", () => {
 	// Three cold `bun` starts of the ledger module graph (~370 ms each on a CI runner)
 	// plus SQLite work; the default 5 s budget is too tight when four workers share the box.
-	test("PR lookup backoff migrates once and survives a real SQLite reopen", { timeout: 30_000 }, () => {
-		const dir = agentDir()
-		const repository = join(dir, "removed-worktree", ".git")
-		const sha = "a".repeat(40)
-		const now = Date.now()
-		driver(
-			"capture",
-			dir,
-			JSON.stringify({
-				version: 1,
-				type: "commit",
-				workId: "11111111-1111-4111-8111-111111111111",
-				sessionId: "writer",
-				cwd: join(dir, "removed-worktree"),
-				worktree: join(dir, "removed-worktree"),
-				repository,
-				sha,
-				recordedAt: new Date(now - 24 * 60 * 60 * 1000).toISOString(),
-				prLookup: { status: "pending", checkedAt: new Date(now - 2 * 60 * 60 * 1000).toISOString() },
-				pullRequests: [],
-			}),
-		)
-		mkdirSync(join(dir, "work-attribution"))
-		const path = join(dir, "work-attribution", "pr-checks.json")
-		const body = `${JSON.stringify({ [repository]: { [sha]: new Date(now).toISOString() } })}\n`
-		writeFileSync(path, body)
-		expect(driver("pr-checks", dir)).toEqual({ note: body, records: 1 })
-		expect(readFileSync(path, "utf8")).toBe(body)
-		writeFileSync(path, "{}\n")
-		expect(driver("pr-checks", dir)).toEqual({ note: body, records: 1 })
-		expect(readFileSync(path, "utf8")).toBe("{}\n")
-	})
-	test("fresh open creates dir/file with modes, schema version and tables", { timeout: 60_000 }, () => {
+	// (The PR-lookup-backoff reopen test stayed in Kimchi: it drives reconcileWorkPullRequests,
+	// which is not part of the moved ledger library.)
+	test("fresh open creates dir/file with modes, schema version and tables", () => {
 		const result = driver("probe", agentDir())
 		expect(result.version).toBe(1)
 		expect(result.dirMode).toBe(0o700)
@@ -183,19 +155,19 @@ describe("open via Bun driver", () => {
 			"work_projection_rows",
 			"work_records",
 		])
-	})
+	}, 60_000)
 
-	test("foreign user_version is refused and left untouched", { timeout: 60_000 }, () => {
+	test("foreign user_version is refused and left untouched", () => {
 		const result = driver("foreign-check", agentDir())
 		expect(result.opened).toBe(false)
 		expect(result.code).toBe("pr-cost-ledger/future-schema")
 		expect(result.version).toBe(777)
 		expect(result.tables).toBe(0)
-	})
+	}, 60_000)
 
-	test("WAL: concurrent reader works while a writer holds; a second writer surfaces the busy timeout", {
-		timeout: 90_000,
-	}, async () => {
+	test(
+		"WAL: concurrent reader works while a writer holds; a second writer surfaces the busy timeout",
+		async () => {
 		const agent = agentDir()
 		driver("probe", agent) // create schema so the writer doesn't race on creation
 		const holder = spawn("bun", [DRIVER, "hold-writer", agent, "release"], { cwd: ROOT })
@@ -234,20 +206,20 @@ describe("open via Bun driver", () => {
 		}
 		// The committed insert is visible afterwards.
 		expect(driver("read-only", agent).count).toBe(1)
-	})
+	}, 90_000)
 })
 
 test("agentDir stays inside the OS temp dir for tests", () => {
 	mkdirSync(agentDir(), { recursive: true })
 })
 
-test("known regression: initialization rechecks a future version after obtaining the lock", { timeout: 60_000 }, () => {
+test("known regression: initialization rechecks a future version after obtaining the lock", () => {
 	const result = driver("known-schema-race", agentDir())
 	expect(result.opened).toBe(false)
 	expect(result.code).toBe("pr-cost-ledger/future-schema")
 	expect(result.version).toBe(777)
 	expect(result.tables).toEqual(["future_only"])
-})
+}, 60_000)
 
 test("the outbox status aggregate has covering indexes available to every open", () => {
 	// LEDGER_SCHEMA only executes at database creation; pre-existing ledgers receive indexes through the
@@ -294,7 +266,7 @@ test("the paged windowed read hints its first page onto the imported index; late
 	expect(readRecordsSincePageSql(false)).toContain("rowid > ?")
 })
 
-test("a busy-deferred additive apply self-heals on the cached backend within one process", { timeout: 60_000 }, () => {
+test("a busy-deferred additive apply self-heals on the cached backend within one process", () => {
 	// The driver holds the writer lock while a witness store and the cached backend open (both defer
 	// the additive apply), releases, then runs one windowed read through the cached backend. The read
 	// retries the apply on its live connection, so the index appears without any reopen.
@@ -303,7 +275,7 @@ test("a busy-deferred additive apply self-heals on the cached backend within one
 	expect(result.presentDuringLock).toBe(false)
 	expect(result.sameBackend).toBe(true)
 	expect(result.presentAfterRead).toBe(true)
-})
+}, 60_000)
 
 test("the planner answers the windowed read from the index, not a full scan (bun driver)", () => {
 	const dir = agentDir()

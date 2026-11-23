@@ -1,4 +1,9 @@
-import type { WorkPullRequest } from "./pull-requests.js"
+/** Minimal shape of Kimchi's WorkPullRequest that pullRequestLabel names; the full type stays in Kimchi. */
+interface WorkPullRequest {
+	provider: string
+	number: number
+	state: string
+}
 
 interface PullRequestObservation {
 	provider?: unknown

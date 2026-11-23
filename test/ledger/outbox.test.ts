@@ -4,10 +4,10 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { expect, it } from "vitest"
-import { createMemoryRecords } from "./memory-records.js"
-import { effectiveClaims, effectiveClaimsAsync, outboxDeliveryStatus } from "./outbox.js"
-import { useBackendFactory } from "./records.js"
+import { expect, it } from "bun:test"
+import { createMemoryRecords } from "../../src/ledger/memory-records.js"
+import { effectiveClaims, effectiveClaimsAsync, outboxDeliveryStatus } from "../../src/ledger/outbox.js"
+import { useBackendFactory } from "../../src/ledger/records.js"
 
 /** Seed entities x revisions of claim-shaped events, with blocked rows interleaved. */
 function seedClaims(backend: ReturnType<typeof createMemoryRecords>, entities: string[]): void {
@@ -64,7 +64,7 @@ it("the breathing claim resolution matches the synchronous one across chunk and 
 it("sqlite: the rowid cursor pages claim history to the same result (bun driver)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "kimchi-claims-parity-"))
 	try {
-		const driver = fileURLToPath(new URL("../../../../tests/e2e/tui/support/ledger-driver.ts", import.meta.url))
+		const driver = fileURLToPath(new URL("../../test/ledger/ledger-driver.ts", import.meta.url))
 		const result = JSON.parse(
 			execFileSync("bun", [driver, "claims-parity", dir], { encoding: "utf8", timeout: 60_000 }),
 		)
@@ -78,7 +78,7 @@ it("sqlite: the rowid cursor pages claim history to the same result (bun driver)
 it("sqlite: multi-entity claim reads use the entity index (bun driver)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "kimchi-claims-plan-"))
 	try {
-		const driver = fileURLToPath(new URL("../../../../tests/e2e/tui/support/ledger-driver.ts", import.meta.url))
+		const driver = fileURLToPath(new URL("../../test/ledger/ledger-driver.ts", import.meta.url))
 		const result = JSON.parse(
 			execFileSync("bun", [driver, "claim-plan", dir], { encoding: "utf8", timeout: 30_000 }),
 		) as Record<string, string[]>
@@ -94,7 +94,7 @@ it("sqlite: multi-entity claim reads use the entity index (bun driver)", () => {
 it("sqlite: delivery status reaches each account through the index, not a scan of every event (bun driver)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "kimchi-delivery-plan-"))
 	try {
-		const driver = fileURLToPath(new URL("../../../../tests/e2e/tui/support/ledger-driver.ts", import.meta.url))
+		const driver = fileURLToPath(new URL("../../test/ledger/ledger-driver.ts", import.meta.url))
 		const result = JSON.parse(
 			execFileSync("bun", [driver, "delivery-plan", dir], { encoding: "utf8", timeout: 30_000 }),
 		) as {
@@ -119,12 +119,10 @@ it("sqlite: delivery status reaches each account through the index, not a scan o
 	}
 })
 
-it.each(["memory", "sqlite"])("preserves per-account CAS, frozen batches and atomic rollback (%s)", {
-	timeout: 30_000,
-}, (mode) => {
+it.each(["memory", "sqlite"])("preserves per-account CAS, frozen batches and atomic rollback (%s)", (mode) => {
 	const dir = mkdtempSync(join(tmpdir(), "kimchi-outbox-"))
 	try {
-		const driver = fileURLToPath(new URL("../../../../tests/e2e/tui/support/ledger-driver.ts", import.meta.url))
+		const driver = fileURLToPath(new URL("../../test/ledger/ledger-driver.ts", import.meta.url))
 		const result = JSON.parse(execFileSync("bun", [driver, "outbox", dir, mode], { encoding: "utf8", timeout: 30_000 }))
 		expect(result).toEqual({
 			revisions: ["1", "2", "3"],
@@ -165,7 +163,7 @@ it.each(["memory", "sqlite"])("preserves per-account CAS, frozen batches and ato
 	} finally {
 		rmSync(dir, { recursive: true, force: true })
 	}
-})
+}, 30_000)
 
 /** Seed every account shape the delivery-status projection must distinguish. */
 function seedDeliveryShapes(backend: ReturnType<typeof createMemoryRecords>): void {
@@ -293,12 +291,10 @@ it("delivery status reads and enriches retry state in one backend transaction", 
 it.each([
 	"memory",
 	"sqlite",
-])("the delivery-only status survives a cold reopen and its probes stay index-bounded (%s)", {
-	timeout: 30_000,
-}, (mode) => {
+])("the delivery-only status survives a cold reopen and its probes stay index-bounded (%s)", (mode) => {
 	const dir = mkdtempSync(join(tmpdir(), "kimchi-delivery-status-"))
 	try {
-		const driver = fileURLToPath(new URL("../../../../tests/e2e/tui/support/ledger-driver.ts", import.meta.url))
+		const driver = fileURLToPath(new URL("../../test/ledger/ledger-driver.ts", import.meta.url))
 		const result = JSON.parse(
 			execFileSync("bun", [driver, "delivery-status", dir, mode], { encoding: "utf8", timeout: 60_000 }),
 		)
@@ -312,12 +308,12 @@ it.each([
 	} finally {
 		rmSync(dir, { recursive: true, force: true })
 	}
-})
+}, 30_000)
 
-it("freezes UTC protobuf timestamps and builds the next revision on the previous event ID", { timeout: 30_000 }, () => {
+it("freezes UTC protobuf timestamps and builds the next revision on the previous event ID", () => {
 	const dir = mkdtempSync(join(tmpdir(), "kimchi-outbox-transport-"))
 	try {
-		const driver = fileURLToPath(new URL("../../../../tests/e2e/tui/support/ledger-driver.ts", import.meta.url))
+		const driver = fileURLToPath(new URL("../../test/ledger/ledger-driver.ts", import.meta.url))
 		const result = JSON.parse(
 			execFileSync("bun", [driver, "outbox-transport", dir], { encoding: "utf8", timeout: 30_000 }),
 		)
@@ -336,4 +332,4 @@ it("freezes UTC protobuf timestamps and builds the next revision on the previous
 	} finally {
 		rmSync(dir, { recursive: true, force: true })
 	}
-})
+}, 30_000)

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
-import { isWorkId } from "../../../shared/work-id.js"
-import { object } from "../../work-attribution/summary.js"
+import { isWorkId } from "./work-id.js"
+import { object } from "./work-record.js"
 import {
 	type Acknowledgement,
 	type Batch,
@@ -16,7 +16,7 @@ import {
 	Version,
 	validateIngestBatch,
 	validateIngestEvent,
-} from "../protocol.js"
+} from "./protocol.js"
 import {
 	backendFor,
 	type DeliveryAccountStatus,

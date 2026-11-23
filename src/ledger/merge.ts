@@ -1,6 +1,6 @@
-import { mergePullRequestLinks } from "../../pull-request-status/links.js"
-import { type Collection, ROW_KEYS } from "../../work-attribution/row-log.js"
-import type { WorkRecord } from "../../work-attribution/summary.js"
+import { mergePullRequestLinks } from "./links.js"
+import { type Collection, ROW_KEYS } from "./row-log.js"
+import type { WorkRecord } from "./work-record.js"
 
 /**
  * Storage-agnostic merge core shared by capture and import. Extracted from summary.ts so the ledger can fold
