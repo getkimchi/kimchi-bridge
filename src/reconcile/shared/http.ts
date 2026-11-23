@@ -1,3 +1,4 @@
+import type { HostFetch } from "../host.js"
 // Cloudflare 520-522 (origin failures) are transient for the
 // Cloudflare-fronted gateway, alongside 524 (origin timeout).
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504, 520, 521, 522, 524])
@@ -24,7 +25,7 @@ export interface FetchWithRetryOptions {
 	/** Retries after the initial attempt. */
 	retry?: { maxRetries?: number }
 	signal?: AbortSignal
-	fetchImpl?: typeof globalThis.fetch
+	fetchImpl?: HostFetch
 }
 
 /**

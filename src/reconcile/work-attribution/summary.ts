@@ -1,24 +1,21 @@
 import { readdir, stat } from "node:fs/promises"
 import { join } from "node:path"
 import { setImmediate, setTimeout } from "node:timers/promises"
-import { getAgentDir } from "@earendil-works/pi-coding-agent"
-import { isWorkId } from "../../shared/work-id.js"
+import { isWorkId } from "../../ledger/work-id.js"
 import {
 	IMPORT_SLICE_MS,
 	importJournalSlice,
 	importJournals,
-	importSessionJournal,
 	reportJournalProblems,
-} from "../pr-cost-reporting/ledger/import.js"
+} from "../../ledger/import.js"
 import {
 	readRecords as ledgerReadRecords,
 	readRecordsAsync as ledgerReadRecordsAsync,
 	readRecordsSinceAsync as ledgerReadRecordsSinceAsync,
 	readTransitionRepositories as ledgerTransitionRepositories,
 	fingerprint as recordsFingerprint,
-	recoverDirty,
 	type WindowedRecord,
-} from "../pr-cost-reporting/ledger/records.js"
+} from "../../ledger/records.js"
 import { debugWorkAttribution } from "./diagnostics.js"
 
 interface SummaryEntry {
@@ -336,20 +333,6 @@ function hydrate(agentDir: string): void {
 		}
 	})()
 	importing.set(agentDir, run)
-}
-/**
- * Projections commit with their records; recovery folds stranded intents and imports a resumed session's own journal
- * at once. The rest of the legacy history imports in the background.
- */
-export function recoverWorkSummaries(journal?: string): void {
-	try {
-		const agentDir = getAgentDir()
-		if (journal) importSessionJournal(agentDir, journal)
-		hydrate(agentDir)
-		recoverDirty(agentDir)
-	} catch (error) {
-		debugWorkAttribution("Work summary recovery unavailable:", error)
-	}
 }
 /** Waits for the background import of legacy history. */
 export async function flushWorkSummaries(): Promise<void> {

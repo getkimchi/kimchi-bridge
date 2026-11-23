@@ -5,13 +5,12 @@ import { mkdir, open, readFile, stat } from "node:fs/promises"
 import { join } from "node:path"
 import { setImmediate } from "node:timers/promises"
 import { lock } from "proper-lockfile"
-import { writeFileDurably } from "../../config/json.js"
-import { isWorkId } from "../../shared/work-id.js"
-import { isTelemetryEnabled } from "../../telemetry-policy.js"
-import { trackPRCostMetric } from "../telemetry/pr-cost.js"
+import { writeFileDurably } from "../shared/durable-write.js"
+import { isWorkId } from "../../ledger/work-id.js"
+import { hostPorts } from "../host-ports.js"
 import { isWorkAccount, type WorkAccount } from "../work-attribution/scope.js"
 import { object, SHA256_HEX } from "../work-attribution/summary.js"
-import { backendFor, diagnostic } from "./ledger/records.js"
+import { backendFor, diagnostic } from "../../ledger/records.js"
 import { machineFingerprint } from "./machine.js"
 import {
 	accountKey,
@@ -225,7 +224,7 @@ export function snapshotMarkers(content: SnapshotContent): string[] {
 function empty(): ReportingState {
 	return {
 		version: 1,
-		enabled: isTelemetryEnabled(),
+		enabled: hostPorts().telemetryConsent(),
 		followsTelemetry: true,
 		producerId: randomUUID(),
 		entries: {},
@@ -294,7 +293,7 @@ export async function readReportingStateFresh(
 		signature.ino === cached.signature.ino
 	) {
 		// Telemetry config lives outside state.json; re-derive the toggle on a cache hit.
-		if (cached.state.followsTelemetry) cached.state.enabled = isTelemetryEnabled()
+		if (cached.state.followsTelemetry) cached.state.enabled = hostPorts().telemetryConsent()
 		return { state: cached.state, signature: cached.signature }
 	}
 	const state = await readReportingState(agentDir)
@@ -467,15 +466,15 @@ async function loadReportingState(agentDir: string): Promise<{ state: ReportingS
 				))
 		)
 			throw new Error("Invalid PR reporting state")
-		if (value.followsTelemetry) value.enabled = isTelemetryEnabled()
-		trackPRCostMetric({
+		if (value.followsTelemetry) value.enabled = hostPorts().telemetryConsent()
+		hostPorts().metric({
 			kind: "queueDepth",
 			value: Object.values(value.entries).filter((entry) => entry.pending || entry.pendingId).length,
 		})
 		return { state: value, text }
 	} catch (error) {
 		if (object(error) && error.code === "ENOENT") {
-			trackPRCostMetric({ kind: "queueDepth", value: 0 })
+			hostPorts().metric({ kind: "queueDepth", value: 0 })
 			return { state: empty() }
 		}
 		throw new Error("PR reporting state is unreadable; queued reports were not replaced", { cause: error })
@@ -530,7 +529,7 @@ async function update(
 		} finally {
 			await parent.close()
 		}
-		trackPRCostMetric({
+		hostPorts().metric({
 			kind: "queueDepth",
 			value: Object.values(state.entries).filter((entry) => entry.pending || entry.pendingId).length,
 		})
@@ -806,8 +805,8 @@ export async function queueSnapshots(
 		assertCurrent,
 	)
 	if (largest) {
-		trackPRCostMetric({ kind: "snapshotRequests", value: largest.requests })
-		trackPRCostMetric({ kind: "snapshotBytes", value: largest.bytes })
+		hostPorts().metric({ kind: "snapshotRequests", value: largest.requests })
+		hostPorts().metric({ kind: "snapshotBytes", value: largest.bytes })
 	}
 	return state
 }
@@ -1276,10 +1275,10 @@ export async function withReportingConsent(
 		(state, check) => {
 			if (!state.enabled) return
 			check()
-			if (state.followsTelemetry && !isTelemetryEnabled()) return
+			if (state.followsTelemetry && !hostPorts().telemetryConsent()) return
 			const consent = () => {
 				check()
-				if (state.followsTelemetry && !isTelemetryEnabled()) throw new Error("PR reporting is disabled")
+				if (state.followsTelemetry && !hostPorts().telemetryConsent()) throw new Error("PR reporting is disabled")
 			}
 			action(consent)
 			consent()

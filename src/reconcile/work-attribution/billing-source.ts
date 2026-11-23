@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto"
-import { resolveEndpoints } from "../../config.js"
-import { canonicalPlatformApiUrl } from "../../regions.js"
-import { isWorkId } from "../../shared/work-id.js"
-import { plainURL } from "../../utils/url.js"
+import { hostPorts } from "../host-ports.js"
+import { canonicalPlatformApiUrl } from "../shared/platform-url.js"
+import { isWorkId } from "../../ledger/work-id.js"
+import { plainURL } from "../shared/url.js"
 import { object, SHA256_HEX } from "./summary.js"
 
 // Billing identity captured when a request is dispatched, and the exact tag that later finds its bill.
@@ -82,7 +82,7 @@ export function captureBillingSource(headers: Headers, url: string, cwd: string)
 		return undefined
 	}
 	if (!httpUrl(gatewayUrl)) return undefined
-	const endpoints = resolveEndpoints({ cwd })
+	const endpoints = hostPorts().endpoints(cwd)
 	const configured = [
 		endpoints.llmEndpoint,
 		endpoints.openAiBaseUrl,

@@ -1,5 +1,6 @@
-import { isWorkId } from "../../shared/work-id.js"
-import { boundedResponse } from "../../utils/http.js"
+import { isWorkId } from "../../ledger/work-id.js"
+import type { HostFetch } from "../host.js"
+import { boundedResponse } from "../shared/http.js"
 import type { BillingSelector } from "./billing-source.js"
 import { decimalNanos, time } from "./costs.js"
 import { object } from "./summary.js"
@@ -147,7 +148,7 @@ export async function lookupRows(
 	userId: string | undefined,
 	requestSelector: BillingSelector,
 	apiKey: string,
-	fetchBounded: typeof fetch,
+	fetchBounded: HostFetch,
 	rows: BillingRow[],
 	onPage: () => void,
 ): Promise<void> {

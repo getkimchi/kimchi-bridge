@@ -1,8 +1,8 @@
-import { isWorkId } from "../../shared/work-id.js"
+import { isWorkId } from "../../ledger/work-id.js"
 import { isWorkScope, sameWorkScope, type WorkScope } from "../work-attribution/scope.js"
 import { object, type WorkRecord } from "../work-attribution/summary.js"
-import type { StoredRecord } from "./ledger/records.js"
-import { type RawUsage, timeNanos, validateAccountingRaw } from "./protocol.js"
+import type { StoredRecord } from "../../ledger/records.js"
+import { type RawUsage, timeNanos, validateAccountingRaw } from "../../ledger/protocol.js"
 
 export interface NativeObservation {
 	requestId: string

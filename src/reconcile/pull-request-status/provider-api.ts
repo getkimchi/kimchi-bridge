@@ -4,7 +4,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { homedir, tmpdir } from "node:os"
 import { isAbsolute, join } from "node:path"
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml"
-import { readGitToken } from "../../config.js"
+import { readGitToken } from "../shared/git-token.js"
+import { hostPorts } from "../host-ports.js"
 import { object } from "../work-attribution/summary.js"
 import { httpsURL, LookupError, label, providerId, type Repository, repositoryPath } from "./provider-records.js"
 
@@ -275,7 +276,7 @@ export async function requestJSON(
 		let url = initialURL
 		for (let redirects = 0; ; redirects++) {
 			sameOrigin(url, origin)
-			const response = await fetch(url, {
+			const response = await hostPorts().fetch(url, {
 				method: body ? "POST" : "GET",
 				body: body ? JSON.stringify(body) : undefined,
 				redirect: "manual",

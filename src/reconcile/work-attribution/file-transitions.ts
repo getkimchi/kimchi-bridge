@@ -4,22 +4,14 @@ import { createHash, randomUUID } from "node:crypto"
 import { constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { access, mkdir, open, readdir, readFile, stat, writeFile } from "node:fs/promises"
 import { basename, dirname, isAbsolute, join, relative } from "node:path"
-import {
-	createEditTool,
-	createWriteTool,
-	type EditOperations,
-	getAgentDir,
-	type WriteOperations,
-} from "@earendil-works/pi-coding-agent"
-import { isWorkId } from "../../shared/work-id.js"
-import { fileMatchStrength } from "../pr-cost-reporting/ledger/merge.js"
-import { getNote, setNote } from "../pr-cost-reporting/ledger/records.js"
+import { isWorkId } from "../../ledger/work-id.js"
+import { fileMatchStrength } from "../../ledger/merge.js"
+import { getNote, setNote } from "../../ledger/records.js"
 import { SHA } from "../pull-request-status/provider-records.js"
+import { hostPorts } from "../host-ports.js"
 import {
 	appendWorkRecord,
-	getToolRequest,
-	getWorkId,
-	pinWorkContext,
+	getAgentDir,
 	tryWorkAttribution,
 	tryWorkAttributionAsync,
 	type WorkContext,
@@ -89,7 +81,7 @@ async function git(
 ): Promise<string> {
 	return (await gitBytes(cwd, args, options)).toString("utf8").trimEnd()
 }
-function digest(data: Buffer): string {
+export function digest(data: Buffer): string {
 	return createHash("sha256").update(data).digest("hex")
 }
 function same(a: FileState | null, b: FileState | null): boolean {
@@ -120,7 +112,7 @@ function snapshotObjects(repository: string): string {
 	return join(getAgentDir(), "work-attribution", "objects", createHash("sha256").update(repository).digest("hex"))
 }
 /** Git commits an ignored file only when forced, so its text is not worth keeping. A failed check keeps none either. */
-async function ignored(worktree: string, path: string): Promise<boolean> {
+export async function ignored(worktree: string, path: string): Promise<boolean> {
 	try {
 		return Boolean(await git(worktree, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", path]))
 	} catch {
@@ -132,7 +124,7 @@ async function ignored(worktree: string, path: string): Promise<boolean> {
  * repository's Git directory, a small text snapshot is kept for later hunk matching. With `committed`, the file's blob
  * in HEAD, it is hashed first and kept only when neither the repository nor the store has it yet.
  */
-async function diskState(
+export async function diskState(
 	path: string,
 	data?: Buffer,
 	retainIn?: string,
@@ -234,13 +226,13 @@ async function treeState(
 	if (kind !== "blob" || (mode !== "100644" && mode !== "100755")) throw new Error("Unsupported Git file mode")
 	return { blob: object, mode }
 }
-async function reflog(worktree: string, signal?: AbortSignal): Promise<Buffer> {
+export async function reflog(worktree: string, signal?: AbortSignal): Promise<Buffer> {
 	const path = await git(worktree, ["rev-parse", "--path-format=absolute", "--git-path", "logs/HEAD"], { signal })
 	if (!existsSync(path)) return Buffer.alloc(0)
 	if (statSync(path).size > MAX_FILE_BYTES) throw new Error("Work attribution reflog exceeds limit")
 	return readFileSync(path)
 }
-async function repositoryFile(path: string) {
+export async function repositoryFile(path: string) {
 	const parent = realpathSync(dirname(path))
 	let worktree: string
 	try {
@@ -272,7 +264,7 @@ async function repositoryFile(path: string) {
 		branch,
 	}
 }
-async function referenceTips(repository: string, baseline: string | null): Promise<string[]> {
+export async function referenceTips(repository: string, baseline: string | null): Promise<string[]> {
 	// rev-list peels annotated tags and ignores refs to trees or blobs.
 	const refs = await git(repository, ["rev-list", "--all", "--no-walk"])
 	const worktrees = await git(repository, ["worktree", "list", "--porcelain", "-z"])
@@ -312,87 +304,21 @@ async function readHistoryBoundary(id: string): Promise<string[]> {
 	return parseHistoryBoundary(await readFile(path, "utf8"), id)
 }
 /** Publish immutable, shared evidence before a transition references it. Repeated edits stay small. */
-async function saveHistoryBoundary(refTips: string[]): Promise<string> {
+export async function saveHistoryBoundary(refTips: string[]): Promise<string> {
 	const id = digest(Buffer.from(JSON.stringify(refTips)))
 	// A5: one atomic note publishes the snapshot; identical content is not rewritten, damaged content is repaired.
 	setNote(getAgentDir(), REF_TIPS_NOTES, id, `${JSON.stringify({ version: 1, refTips })}\n`)
 	return id
 }
-/** Native tools invoke these operations inside their existing file mutation queue. */
-function operations(ctx: WorkContext, toolCallId: string): EditOperations & WriteOperations {
-	const pinned = pinWorkContext(ctx)
-	const request = getToolRequest(pinned, toolCallId)
-	const workId = tryWorkAttribution(() => request?.workId ?? getWorkId(pinned))
-	let readDigest: string | undefined
-	return {
-		async readFile(path) {
-			const data = await readFile(path)
-			readDigest = digest(data)
-			return data
-		},
-		access: (path) => access(path, constants.R_OK | constants.W_OK),
-		mkdir: async (path) => {
-			await mkdir(path, { recursive: true })
-		},
-		async writeFile(path, content) {
-			const evidence = workId
-				? await tryWorkAttributionAsync(async () => {
-						const repo = await repositoryFile(path)
-						if (!repo) return
-						const before = await diskState(
-							path,
-							undefined,
-							repo.baselineFile !== null ? repo.repository : undefined,
-							repo.baselineFile?.blob,
-						)
-						if (before === undefined) return
-						if (readDigest !== undefined && readDigest !== digest(readFileSync(path))) return
-						return { ...repo, before }
-					})
-				: undefined
-			await writeFile(path, content, "utf8")
-			if (evidence && workId)
-				await tryWorkAttributionAsync(async () => {
-					const written = existsSync(path) ? readFileSync(path) : undefined
-					if (!written?.equals(Buffer.from(content))) return
-					// A file absent from HEAD keeps its text from the write that creates it, for when it is first committed.
-					const retain =
-						evidence.baselineFile === null
-							? !(await ignored(evidence.worktree, evidence.path))
-							: evidence.before !== null
-					const after = await diskState(path, written, retain ? evidence.repository : undefined)
-					if (!after || same(evidence.before, after)) return
-					const log = await reflog(evidence.worktree)
-					// A cursor after the successful mutation excludes pre-existing matching history.
-					if (log.length && log[log.length - 1] !== 10) return
-					const historyBoundaryId = await tryWorkAttributionAsync(async () =>
-						saveHistoryBoundary(await referenceTips(evidence.repository, evidence.baseline)),
-					)
-					appendWorkRecord(
-						pinned,
-						{
-							type: "file_transition",
-							transitionId: randomUUID(),
-							toolCallId,
-							...(request && { requestId: request.requestId }),
-							...evidence,
-							after,
-							cursor: { bytes: log.length, digest: digest(log) },
-							...(historyBoundaryId && { historyBoundaryId }),
-						},
-						workId,
-						transitionJournal(evidence.repository, evidence.worktree),
-					)
-				})
-		},
-	}
-}
-export function createTrackedEditTool(ctx: WorkContext, toolCallId: string) {
-	return createEditTool(ctx.cwd, { operations: operations(ctx, toolCallId) })
-}
-export function createTrackedWriteTool(ctx: WorkContext, toolCallId: string) {
-	return createWriteTool(ctx.cwd, { operations: operations(ctx, toolCallId) })
-}
+/**
+ * The tracked edit/write tool wrappers (operations(), createTrackedEditTool,
+ * createTrackedWriteTool) stay in Kimchi: they wrap the pi SDK's tool factories and
+ * resolve the session's live request/work identity (getToolRequest, getWorkId,
+ * pinWorkContext), none of which crosses into the reconcile library. Kimchi's
+ * wrapper rebuilds them on the exported helpers above (diskState, repositoryFile,
+ * ignored, reflog, referenceTips, saveHistoryBoundary, transitionJournal, digest).
+ */
+
 function isState(value: unknown): value is FileState | null {
 	return (
 		value === null ||
@@ -431,7 +357,7 @@ function isTransition(value: Record<string, unknown>): value is Record<string, u
 		typeof value.cursor.digest === "string"
 	)
 }
-function transitionJournal(repository: string, worktree: string): string {
+export function transitionJournal(repository: string, worktree: string): string {
 	return join(
 		getAgentDir(),
 		"work-attribution",

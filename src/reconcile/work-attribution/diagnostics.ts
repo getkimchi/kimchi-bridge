@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
 import { format } from "node:util"
-import { getAgentDir } from "@earendil-works/pi-coding-agent"
+import { hostPorts } from "../host-ports.js"
 
 /** Opt-in diagnostics must never write through the live TUI or ACP transport. */
 export function debugWorkAttribution(message: string, ...details: unknown[]): void {
@@ -12,7 +12,7 @@ export function debugWorkAttribution(message: string, ...details: unknown[]): vo
 		.replace(/,/g, "$|^")
 	if (!new RegExp(`^${namespaces}$`, "i").test("kimchi:work-attribution")) return
 	try {
-		const directory = join(getAgentDir(), "logs")
+		const directory = join(hostPorts().agentDir, "logs")
 		mkdirSync(directory, { recursive: true, mode: 0o700 })
 		appendFileSync(
 			join(directory, "work-attribution.log"),

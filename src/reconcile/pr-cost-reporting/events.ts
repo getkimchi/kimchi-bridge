@@ -1,4 +1,4 @@
-import { isWorkId } from "../../shared/work-id.js"
+import { isWorkId } from "../../ledger/work-id.js"
 import { pullRequestAuthor, pullRequestTitle } from "../pull-request-status/provider-records.js"
 import type { PullRequestCostReport } from "../work-attribution/costs.js"
 import {
@@ -9,8 +9,8 @@ import {
 	type WorkScope,
 } from "../work-attribution/scope.js"
 import { object, SHA256_HEX, type WorkRecord } from "../work-attribution/summary.js"
-import { type Fact, validateClaimUpdate } from "./ledger/outbox.js"
-import type { StoredRecord } from "./ledger/records.js"
+import { type Fact, validateClaimUpdate } from "../../ledger/outbox.js"
+import type { StoredRecord } from "../../ledger/records.js"
 import { nativeObservations } from "./native.js"
 import { preludeStretch } from "./prelude.js"
 import {
@@ -23,7 +23,7 @@ import {
 	timeNanos,
 	type Usage,
 	validateIngestEvent,
-} from "./protocol.js"
+} from "../../ledger/protocol.js"
 import {
 	accountKey,
 	allocationFor,

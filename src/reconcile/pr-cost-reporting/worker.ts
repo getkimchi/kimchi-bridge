@@ -1,17 +1,13 @@
 import { createHash } from "node:crypto"
 import { setImmediate } from "node:timers/promises"
-import { verifyApiKey } from "../../api/organizations.js"
-import { GATEWAY_ORGANIZATION_HEADER, resolveGatewayCredentials } from "../../auth/gateway-credentials.js"
-import { loadConfig } from "../../config.js"
-import { canonicalPlatformApiUrl } from "../../regions.js"
-import { type StatPoller, startStatPoller } from "../../shared/stat-poller.js"
-import { isTelemetryEnabled } from "../../telemetry-policy.js"
-import { boundedResponse, parseRetryAfterMs } from "../../utils/http.js"
-import { plainURL } from "../../utils/url.js"
-import { pullRequestKey } from "../pull-request-status/links.js"
+import { GATEWAY_ORGANIZATION_HEADER, verifyApiKey } from "../shared/verify-api-key.js"
+import { canonicalPlatformApiUrl } from "../shared/platform-url.js"
+import { type StatPoller, startStatPoller } from "../shared/stat-poller.js"
+import { boundedResponse, parseRetryAfterMs } from "../shared/http.js"
+import { plainURL } from "../shared/url.js"
+import { pullRequestKey } from "../../ledger/links.js"
 import { lookupRepositoryIdentity } from "../pull-request-status/provider-api.js"
 import { LookupError } from "../pull-request-status/provider-records.js"
-import { trackPRCostMetric } from "../telemetry/pr-cost.js"
 import { readWorkCostReportAsync } from "../work-attribution/cost-sync.js"
 import type { PullRequestCostReport } from "../work-attribution/costs.js"
 import {
@@ -22,8 +18,10 @@ import {
 	type WorkAccount,
 } from "../work-attribution/scope.js"
 import { importWorkRecordsAsync, object, type WorkRecord } from "../work-attribution/summary.js"
+import type { HostFetch } from "../host.js"
+import { hostPorts } from "../host-ports.js"
 import { buildEvents, type EventUnit } from "./events.js"
-import { legacyInputSignature } from "./ledger/import.js"
+import { legacyInputSignature } from "../../ledger/import.js"
 import {
 	acknowledgeBatch,
 	deliveryRetry,
@@ -32,10 +30,10 @@ import {
 	observeEvents,
 	outboxDeliveryStatus,
 	pendingBatch,
-} from "./ledger/outbox.js"
-import { backendFor, type OutboxBatch, type RecordBackend, type StoredRecord } from "./ledger/records.js"
+} from "../../ledger/outbox.js"
+import { backendFor, type OutboxBatch, type RecordBackend, type StoredRecord } from "../../ledger/records.js"
 import { preludeStretch } from "./prelude.js"
-import type { Acknowledgement } from "./protocol.js"
+import type { Acknowledgement } from "../../ledger/protocol.js"
 import {
 	ACCOUNT_SCOPES,
 	acknowledgeFrozenSnapshot,
@@ -244,7 +242,7 @@ export function deliverSnapshots(
 		// HTTP call binds state+signature itself.
 		let queueFile: FreshReportingState = { state }
 		/** The configured credential: API key, or the SSO token from auth.json. */
-		const configuredCredentials = () => resolveGatewayCredentials(loadConfig({ cwd }))
+		const configuredCredentials = () => hostPorts().credentials(cwd)
 		const configuredKey = configuredCredentials().token
 		const configuredEndpoint = platformApiUrl(cwd)
 		// Compare endpoints canonically: snapshots queued before the platform API
@@ -346,7 +344,7 @@ export function deliverSnapshots(
 				combined.throwIfAborted()
 			}
 
-			const fetchBounded: typeof fetch = async (input, init) => {
+			const fetchBounded: HostFetch = async (input, init) => {
 				assertCurrent()
 				const fresh = await readReportingStateFresh(agentDir, queueFile)
 				queueFile = fresh
@@ -354,7 +352,7 @@ export function deliverSnapshots(
 				assertCurrent()
 				if (!current.enabled || current.entries[job.key]?.held || !frozenSnapshotPending(agentDir, job))
 					throw new Error("PR reporting snapshot changed")
-				const response = await fetch(input, { ...init, redirect: "error", signal: combined })
+				const response = await hostPorts().fetch(input, { ...init, redirect: "error", signal: combined })
 				assertCurrent()
 				status = response.status
 				retryAfterMs = parseRetryAfterMs(response)
@@ -429,9 +427,9 @@ export function deliverSnapshots(
 				assertCurrent()
 				await acknowledgeFrozenSnapshot(agentDir, job, ack, assertCurrent)
 				dueMarks.set(job.id, null)
-				trackPRCostMetric({ kind: "delivery", outcome: "success" })
+				hostPorts().metric({ kind: "delivery", outcome: "success" })
 			} catch {
-				trackPRCostMetric({ kind: "delivery", outcome: combined.aborted ? "canceled" : "failed" })
+				hostPorts().metric({ kind: "delivery", outcome: combined.aborted ? "canceled" : "failed" })
 				if (signal.aborted) return
 				try {
 					assertOwnership()
@@ -562,12 +560,12 @@ export function deliverEvents(
 			(status) => (status.sendable || status.hasBatch) && (status.retry?.retryAt ?? 0) <= Date.now(),
 		)
 		if (!due.length) return
-		const { token: key, organizationId } = resolveGatewayCredentials(loadConfig({ cwd }))
+		const { token: key, organizationId } = hostPorts().credentials(cwd)
 		const apiUrl = platformApiUrl(cwd)
 		if (!key || !safeEndpoint(apiUrl)) return
 		const assertOwnership = () => {
 			assertLease()
-			if (resolveGatewayCredentials(loadConfig({ cwd })).token !== key || platformApiUrl(cwd) !== apiUrl)
+			if (hostPorts().credentials(cwd).token !== key || platformApiUrl(cwd) !== apiUrl)
 				throw new Error("PR reporting credentials changed")
 		}
 		const assertCurrent = () => {
@@ -595,14 +593,14 @@ export function deliverEvents(
 			assertCurrent()
 			return bounded
 		}
-		const fetchBounded: typeof fetch = async (input, init) => {
+		const fetchBounded: HostFetch = async (input, init) => {
 			assertCurrent()
 			const fresh = await readReportingStateFresh(agentDir, queueFile)
 			queueFile = fresh
 			const current = fresh.state
 			assertCurrent()
 			if (!current.enabled) throw new Error("PR reporting is disabled")
-			return readResponse(await fetch(input, { ...init, redirect: "error", signal: combined }))
+			return readResponse(await hostPorts().fetch(input, { ...init, redirect: "error", signal: combined }))
 		}
 		const resume = backend.getNote("agent", "legacy-snapshot-resume")
 		/** Each waiting account backs off on its own schedule, as each legacy snapshot did. */
@@ -670,7 +668,7 @@ export function deliverEvents(
 									throw new Error("PR cost event batch changed")
 								fence()
 								// Launch under the old-writer lock; await network and body reads after releasing it.
-								dispatched = fetch(
+								dispatched = hostPorts().fetch(
 									`${apiUrl}/ai-optimizer/v1beta/organizations/${account.organizationId}/pr-cost-events:batchIngest`,
 									{
 										method: "POST",
@@ -713,9 +711,9 @@ export function deliverEvents(
 						!acknowledged
 					)
 						return
-					trackPRCostMetric({ kind: "delivery", outcome: "success" })
+					hostPorts().metric({ kind: "delivery", outcome: "success" })
 				} catch {
-					trackPRCostMetric({ kind: "delivery", outcome: combined.aborted ? "canceled" : "failed" })
+					hostPorts().metric({ kind: "delivery", outcome: combined.aborted ? "canceled" : "failed" })
 					if (signal.aborted) return
 					try {
 						assertOwnership()
@@ -811,7 +809,7 @@ function probeLedgerSlots(agentDir: string): string {
 
 /** True when this stamp says any frozen snapshot could match the delivery loop's selection this tick. */
 function gateHasDue(gate: PassGate, now: number): boolean {
-	const enabled = gate.followsTelemetry ? isTelemetryEnabled() : gate.enabled
+	const enabled = gate.followsTelemetry ? hostPorts().telemetryConsent() : gate.enabled
 	if (!enabled) return false
 	if (gate.nextLookupRetryAt !== undefined && now >= gate.nextLookupRetryAt) return true
 	if (!gate.captureDone) return true

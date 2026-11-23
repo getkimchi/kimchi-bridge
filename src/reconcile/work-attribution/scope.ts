@@ -4,13 +4,11 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync } from "node:f
 import { realpath } from "node:fs/promises"
 import { join } from "node:path"
 import { promisify } from "node:util"
-import { getAgentDir } from "@earendil-works/pi-coding-agent"
-import { type VerifyApiKeyResponse, verifyApiKey } from "../../api/organizations.js"
-import { resolveGatewayCredentials } from "../../auth/gateway-credentials.js"
-import { loadConfig, resolveEndpoints } from "../../config.js"
-import { canonicalPlatformApiUrl } from "../../regions.js"
-import { isWorkId } from "../../shared/work-id.js"
-import { backendFor, getNote, hasNote, setNote } from "../pr-cost-reporting/ledger/records.js"
+import { hostPorts } from "../host-ports.js"
+import { type VerifyApiKeyResponse, verifyApiKey } from "../shared/verify-api-key.js"
+import { canonicalPlatformApiUrl } from "../shared/platform-url.js"
+import { isWorkId } from "../../ledger/work-id.js"
+import { backendFor, getNote, hasNote, setNote } from "../../ledger/records.js"
 import { object } from "./summary.js"
 
 export interface WorkAccount {
@@ -83,7 +81,7 @@ export async function captureWorkScope(cwd: string): Promise<WorkScopeSnapshot |
 
 function scopePath(workId: string): string {
 	if (!isWorkId(workId)) throw new Error("Invalid work UUID")
-	return join(getAgentDir(), "work", workId, "scope.json")
+	return join(hostPorts().agentDir, "work", workId, "scope.json")
 }
 
 function parseWorkScope(text: string, workId: string): WorkScope | undefined {
@@ -105,7 +103,7 @@ function parseWorkScope(text: string, workId: string): WorkScope | undefined {
 
 export function readWorkScope(workId: string): WorkScope | undefined {
 	// A5: the note is the authority for new works; a legacy scope.json still answers for old installs.
-	const note = getNote(getAgentDir(), workId, "scope")
+	const note = getNote(hostPorts().agentDir, workId, "scope")
 	if (note !== undefined) return parseWorkScope(note, workId)
 	let fd: number | undefined
 	try {
@@ -122,10 +120,10 @@ export function readWorkScope(workId: string): WorkScope | undefined {
 /** Only call for a work created in this process. Its original account and repository are immutable. */
 export function saveNewWorkScope(workId: string, scope: WorkScope): void {
 	// A5: first write wins, like the old exclusive create — an existing note or legacy file is never replaced.
-	backendFor(getAgentDir()).tx(() => {
-		if (hasNote(getAgentDir(), workId, "scope")) return
+	backendFor(hostPorts().agentDir).tx(() => {
+		if (hasNote(hostPorts().agentDir, workId, "scope")) return
 		if (existsSync(scopePath(workId))) return
-		setNote(getAgentDir(), workId, "scope", `${JSON.stringify({ version: 1, workId, ...scope })}\n`)
+		setNote(hostPorts().agentDir, workId, "scope", `${JSON.stringify({ version: 1, workId, ...scope })}\n`)
 	})
 }
 
@@ -146,6 +144,7 @@ function verifyIdentity(entry: CachedIdentity): void {
 	const pending = verifyApiKey(entry.key, {
 		endpoint: entry.apiUrl,
 		organizationId: entry.organizationId,
+		fetch: hostPorts().fetch,
 		signal: AbortSignal.timeout(1000),
 		retry: { maxRetries: 0 },
 	})
@@ -181,16 +180,15 @@ export function sameWorkAccount(left: WorkAccount, right: WorkAccount): boolean 
 
 /** The configured platform API without a trailing slash, as accounts and reports compare it. */
 export function platformApiUrl(cwd: string): string {
-	return resolveEndpoints({ cwd }).platformApiUrl.replace(/\/+$/, "")
+	return hostPorts().endpoints(cwd).platformApiUrl.replace(/\/+$/, "")
 }
 
-/** The configured credential (API key or SSO) and platform API, from one read of the configuration. */
+/** The configured credential (API key or SSO) and platform API, from one read of the host's configuration. */
 function credentialOf(cwd: string): { key: string; apiUrl: string; organizationId?: string } {
-	const config = loadConfig({ cwd })
-	const credentials = resolveGatewayCredentials(config)
+	const credentials = hostPorts().credentials(cwd)
 	return {
 		key: credentials.token,
-		apiUrl: resolveEndpoints({ cwd, config }).platformApiUrl.replace(/\/+$/, ""),
+		apiUrl: credentials.apiUrl,
 		organizationId: credentials.organizationId,
 	}
 }

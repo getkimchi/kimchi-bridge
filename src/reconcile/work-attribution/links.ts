@@ -1,13 +1,10 @@
 import { createHash, randomUUID } from "node:crypto"
 import { readFileSync, realpathSync } from "node:fs"
 import { join } from "node:path"
-import { getAgentDir } from "@earendil-works/pi-coding-agent"
-import { preludeStretch } from "../../shared/prelude-stretch.js"
-import { isWorkId } from "../../shared/work-id.js"
-import { appendWorkRecord, getWorkId, isWorkSegment, type WorkContext } from "../work-attribution.js"
-import type { WorkContinuation } from "./continuation.js"
+import { preludeStretch } from "../shared/prelude-stretch.js"
+import { isWorkId } from "../../ledger/work-id.js"
+import { appendWorkRecord, isWorkSegment, type WorkContinuation } from "../work-attribution.js"
 import {
-	captureWorkScope,
 	isWorkAccount,
 	isWorkScope,
 	readWorkScope,
@@ -449,17 +446,10 @@ function continuationLink(
 	}
 }
 
-/** Confirm the producer's input after a verified continuation; never override an existing correction. */
-export function confirmWorkContinuation(
-	ctx: WorkContext,
-	continuation: WorkContinuation,
-	scope: WorkScope,
-	history: ContinuationHistory,
-): void {
-	if (getWorkId(ctx) !== continuation.workId) return
-	const link = continuationLink(continuation, scope, workIndex(history, continuation.workId))
-	if (link) appendWorkRecord(ctx, link, continuation.workId)
-}
+/**
+ * confirmWorkContinuation stays in Kimchi: it resolves the live session's current work
+ * identity (getWorkId) and writes on its behalf during input attribution.
+ */
 
 function acceptedContinuation(row: WorkRecord): WorkContinuation | undefined {
 	if (row.type !== "work" || !row.continuation || typeof row.continuation !== "object") return
@@ -790,109 +780,7 @@ export async function reconcileWorkContinuations(
 	}
 }
 
-/** Explicit repair chooses one input segment; choosing its current work confirms an uncertain assignment. */
-export async function correctWorkLink(ctx: WorkContext, args: string): Promise<string> {
-	const [command, id, segmentId, ...extra] = args.split(/\s+/)
-	if (
-		!isWorkId(id) ||
-		extra.length ||
-		(command === "link" ? !isWorkId(segmentId) : command !== "unlink" || segmentId !== undefined)
-	)
-		throw new Error("Use /work link <source-work-id> <segment-id> or /work unlink <link-id>")
-	const targetWorkId = getWorkId(ctx)
-	const cwd = ctx.cwd
-	const captured = await captureWorkScope(cwd)
-	const targetScope = readWorkScope(targetWorkId)
-	if (
-		!captured?.isCurrent() ||
-		ctx.cwd !== cwd ||
-		!targetScope ||
-		!sameWorkScope(targetScope, captured.scope) ||
-		getWorkId(ctx) !== targetWorkId
-	)
-		throw new Error("Work correction needs the original account and repository")
-	const records = readWorkRecords(getAgentDir())
-	let existing: WorkRecord[]
-	let requestIds: string[]
-	let sourceWorkId: string
-	let evidence: unknown
-	if (command === "link") {
-		const sourceScope = readWorkScope(id)
-		const selected = records.filter(
-			(row) =>
-				row.type === "request" && row.workId === id && isWorkSegment(row.segment) && row.segment.id === segmentId,
-		)
-		if (
-			!sourceScope ||
-			!sameWorkScope(sourceScope, captured.scope) ||
-			!selected.length ||
-			!selected.every(
-				(row) => isWorkId(row.requestId) && isWorkScope(row.scope) && sameWorkScope(row.scope, captured.scope),
-			)
-		)
-			throw new Error("The selected requests need matching account and repository evidence")
-		requestIds = [...new Set(selected.map((row) => String(row.requestId)))].sort()
-		sourceWorkId = id
-		const overlapping = new Set(
-			records
-				.filter(
-					(row) =>
-						row.type === "work_link" &&
-						Array.isArray(row.requestIds) &&
-						row.requestIds.some((requestId) => requestIds.includes(requestId)),
-				)
-				.map((row) => row.linkId),
-		)
-		existing = records.filter((row) => row.type === "work_link" && overlapping.has(row.linkId))
-		evidence = { source: "work-command", segmentId }
-	} else {
-		// A later /work link can move this correction elsewhere; only the work of its newest revision may revoke it.
-		existing = records.filter((row) => row.type === "work_link" && row.linkId === id)
-		const revision = Math.max(0, ...existing.map((row) => (typeof row.revision === "number" ? row.revision : 0)))
-		const latest = existing.filter((row) => row.revision === revision)
-		if (latest.some((row) => row.targetWorkId !== targetWorkId))
-			throw new Error("A later revision moved this correction to another work; unlink it there")
-		const previous = latest[0]
-		if (
-			!previous ||
-			!isWorkId(previous.sourceWorkId) ||
-			!Array.isArray(previous.requestIds) ||
-			!previous.requestIds.every(isWorkId)
-		)
-			throw new Error("No matching correction in the current work")
-		requestIds = [
-			...new Set(existing.flatMap((row) => (Array.isArray(row.requestIds) ? row.requestIds.filter(isWorkId) : []))),
-		].sort()
-		sourceWorkId = previous.sourceWorkId
-		evidence = previous.evidence
-	}
-	if (
-		existing.some(
-			(row) =>
-				!isWorkId(row.linkId) ||
-				row.sourceWorkId !== sourceWorkId ||
-				typeof row.revision !== "number" ||
-				!Number.isSafeInteger(row.revision) ||
-				row.revision < 1,
-		)
-	)
-		throw new Error("Existing work correction is damaged")
-	const linkIds = existing.length ? [...new Set(existing.map((row) => String(row.linkId)))] : [randomUUID()]
-	if (!captured.isCurrent() || getWorkId(ctx) !== targetWorkId) throw new Error("Work changed during correction")
-	for (const linkId of linkIds) {
-		const revision =
-			1 + Math.max(0, ...existing.filter((row) => row.linkId === linkId).map((row) => Number(row.revision)))
-		appendWorkRecord(ctx, {
-			type: "work_link",
-			linkId,
-			revision,
-			sourceWorkId,
-			targetWorkId,
-			requestIds,
-			scope: captured.scope,
-			status: command === "link" ? "active" : "revoked",
-			evidence,
-		})
-	}
-	return `Work correction ${command === "link" ? "saved" : "revoked"}: ${linkIds.join(", ")}. Original request IDs are unchanged.`
-}
+/**
+ * correctWorkLink stays in Kimchi: it is the /work link|unlink command handler, which
+ * captures the live session scope and resolves its current work identity.
+ */

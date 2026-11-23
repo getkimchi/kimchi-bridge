@@ -1,13 +1,11 @@
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { setImmediate } from "node:timers/promises"
-import { type VerifyApiKeyResponse, verifyApiKey } from "../../api/organizations.js"
-import { resolveGatewayCredentials } from "../../auth/gateway-credentials.js"
-import { loadConfig } from "../../config.js"
-import { isWorkId } from "../../shared/work-id.js"
-import { readE2eSeam } from "../e2e-seam.js"
-import { getNote, hasNote, setNote } from "../pr-cost-reporting/ledger/records.js"
-import { trackPRCostMetric } from "../telemetry/pr-cost.js"
+import { type VerifyApiKeyResponse, verifyApiKey } from "../shared/verify-api-key.js"
+import type { HostFetch } from "../host.js"
+import { hostPorts } from "../host-ports.js"
+import { isWorkId } from "../../ledger/work-id.js"
+import { getNote, hasNote, setNote } from "../../ledger/records.js"
 import { appendWorkRecord } from "../work-attribution.js"
 import { BEFORE_PAGE_TIMEOUT_MESSAGE, type BillingRow, billingResponse, lookupRows } from "./billing-api.js"
 import {
@@ -228,7 +226,7 @@ const REPORT_REFRESH_MS = 5 * 60_000
 /** When this process last refreshed each work's full report. Its first pass refreshes every report. */
 const reportRefreshes = new Map<string, number>()
 function reportRefreshMs(): number {
-	const value = Number(readE2eSeam("KIMCHI_E2E_COST_REPORT_REFRESH_MS") ?? Number.NaN)
+	const value = Number(hostPorts().e2eSeam("KIMCHI_E2E_COST_REPORT_REFRESH_MS") ?? Number.NaN)
 	return Number.isSafeInteger(value) && value >= 0 ? value : REPORT_REFRESH_MS
 }
 async function publishReports(
@@ -237,7 +235,7 @@ async function publishReports(
 	polls: Record<string, BillingPoll>,
 	assertLease: () => void,
 ): Promise<boolean> {
-	trackPRCostMetric({
+	hostPorts().metric({
 		kind: "unpriced",
 		value: report.requests.filter((request) => request.priceStatus !== "priced").length,
 	})
@@ -343,12 +341,12 @@ export async function reconcileWorkCosts(
 	const boundedSignal = AbortSignal.any([signal, controller.signal])
 	let calls = 0
 	let processed = 0
-	const fetchBounded: typeof fetch = async (input, init) => {
+	const fetchBounded: HostFetch = async (input, init) => {
 		assertLease()
 		boundedSignal.throwIfAborted()
 		if (Date.now() >= deadline) throw new Error(BEFORE_PAGE_TIMEOUT_MESSAGE)
 		if (++calls > MAX_CALLS) throw new Error("Billing lookup request limit exceeded")
-		const response = await fetch(input, { ...init, signal: boundedSignal, redirect: "error" })
+		const response = await hostPorts().fetch(input, { ...init, signal: boundedSignal, redirect: "error" })
 		return billingResponse(response, boundedSignal)
 	}
 
@@ -406,7 +404,7 @@ export async function reconcileWorkCosts(
 					// in auth.json when no key is configured. The dispatch-time
 					// credentialHash (billing-source) fingerprints the same token the
 					// provider sent, so lookups stay pinned to the requesting account.
-					const { token: key } = cwd ? resolveGatewayCredentials(loadConfig({ cwd })) : { token: "" }
+					const { token: key } = cwd ? hostPorts().credentials(cwd) : { token: "" }
 					credential = {
 						key,
 						source: cwd

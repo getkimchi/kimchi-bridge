@@ -1,10 +1,10 @@
 /** Discovers the PRs and MRs of recorded commits: lookup scheduling, the check cache and the journal updates. */
 import { readFileSync } from "node:fs"
 import { join, resolve } from "node:path"
-import { backendFor, getNote, readRecords, setNote } from "../pr-cost-reporting/ledger/records.js"
+import { backendFor, getNote, readRecords, setNote } from "../../ledger/records.js"
 import { importWorkRecordsAsync, object, workJournalFingerprint } from "../work-attribution/summary.js"
 import { appendWorkRecord } from "../work-attribution.js"
-import { mergePullRequestLinks as mergePullRequests, pullRequestKey } from "./links.js"
+import { mergePullRequestLinks as mergePullRequests, pullRequestKey } from "../../ledger/links.js"
 import { api, credential, pages, repositoryIdentity, requestJSON } from "./provider-api.js"
 import {
 	LookupError,
