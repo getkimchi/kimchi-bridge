@@ -7,13 +7,13 @@
  * runs, Windows included.
  */
 export interface HostPorts {
-	/** Kimchi's agent directory (`KIMCHI_CODING_AGENT_DIR`); ledger paths derive from it. */
-	readonly agentDir: string
-	/**
-	 * Kimchi's e2e seam: reads a `KIMCHI_E2E_*` variable only inside a test harness and
-	 * returns undefined in any other process, so a stray variable cannot misroute the user.
-	 */
-	readonly e2eSeam: (name: string) => string | undefined
-	/** Wall clock, injectable for deterministic tests. */
-	readonly now: () => number
+  /** Kimchi's agent directory (`KIMCHI_CODING_AGENT_DIR`); ledger paths derive from it. */
+  readonly agentDir: string;
+  /**
+   * Kimchi's e2e seam: reads a `KIMCHI_E2E_*` variable only inside a test harness and
+   * returns undefined in any other process, so a stray variable cannot misroute the user.
+   */
+  readonly e2eSeam: (name: string) => string | undefined;
+  /** Wall clock, injectable for deterministic tests. */
+  readonly now: () => number;
 }

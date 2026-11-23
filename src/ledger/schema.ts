@@ -17,7 +17,7 @@
  *   pass deletes it once its work group's events are in `outbox_events`, so a crash
  *   between the two never loses the intent and an unchanged work is never rebuilt.
  */
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 1;
 
 export const LEDGER_SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS bookkeeping (
 CREATE TABLE IF NOT EXISTS work_dirty (
 	work_id TEXT PRIMARY KEY
 );
-`
+`;
 
 /**
  * Additive INDEXES applied on EVERY open, not just at creation: LEDGER_SCHEMA executes only when a
@@ -127,7 +127,7 @@ CREATE INDEX IF NOT EXISTS outbox_batches_by_account ON outbox_batches(account_k
 -- The reconcile incremental read filters WHERE imported_at >= ? on the full authority: without this,
 -- every pass scans six-figure row count to extract the few fresh ones.
 CREATE INDEX IF NOT EXISTS work_records_imported ON work_records(imported_at);
-`
+`;
 
 /**
  * REQUIRED additive objects: unlike the indexes above, backend construction reads
@@ -148,7 +148,7 @@ WHEN NEW.type = 'file_transition' AND json_valid(NEW.body) AND json_type(NEW.bod
 BEGIN
 	INSERT OR IGNORE INTO transition_repositories (repository) VALUES (json_extract(NEW.body, '$.repository'));
 END;
-`
+`;
 
 /**
  * One-time population of transition_repositories when the additive block first creates it: a
@@ -161,9 +161,9 @@ INSERT OR IGNORE INTO transition_repositories (repository)
 SELECT DISTINCT json_extract(body, '$.repository') AS repository
 FROM work_records
 WHERE type = 'file_transition' AND json_valid(body) AND json_type(body, '$.repository') = 'text'
-`
+`;
 
 /** Meta key. */
-export const META_PROJECTION_VERSION = "projectionVersion"
+export const META_PROJECTION_VERSION = "projectionVersion";
 /** Current derived-projection format; bump when the projection layout changes (forces rebuild). */
-export const PROJECTION_VERSION = 1
+export const PROJECTION_VERSION = 1;
