@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest"
-import { matchesFileHunks } from "./file-hunks.js"
+import { describe, expect, it } from "bun:test"
+import { matchesFileHunks } from "../../../src/reconcile/work-attribution/file-hunks.js"
 
 const parent = "heading\none\ntwo\nnative-before\nfour\nfive\nhuman-before\nseven\n"
 const after = parent.replace("native-before", "native-after")

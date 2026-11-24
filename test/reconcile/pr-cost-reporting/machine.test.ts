@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest"
-import { macMachineId, windowsMachineId } from "./machine.js"
+import { describe, expect, it } from "bun:test"
+import { macMachineId, windowsMachineId } from "../../../src/reconcile/pr-cost-reporting/machine.js"
 
 describe("machine identity", () => {
 	it("reads the hardware UUID from ioreg output", () => {

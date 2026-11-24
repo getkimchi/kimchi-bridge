@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest"
-import { mergePullRequestLinks } from "./links.js"
+import { describe, expect, it } from "bun:test"
+import { mergePullRequestLinks } from "../../../src/ledger/links.js"
 
 describe("saved provider links", () => {
 	const old = {

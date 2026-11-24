@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest"
-import { type BillingSource, sameBillingSource } from "./billing-source.js"
+import { describe, expect, it } from "bun:test"
+import { type BillingSource, sameBillingSource } from "../../../src/reconcile/work-attribution/billing-source.js"
 
 const source = (apiUrl: string): BillingSource => ({
 	apiUrl,

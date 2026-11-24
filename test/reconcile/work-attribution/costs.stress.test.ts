@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest"
-import { createWorkScopeSnapshot } from "../__mocks__/work-scope.js"
-import type { WorkPullRequest } from "../pull-request-status/pull-requests.js"
-import { calculatePullRequestCosts } from "./costs.js"
-import type { WorkRecord } from "./summary.js"
+import { describe, expect, it } from "bun:test"
+import { createWorkScopeSnapshot } from "../mocks/work-scope.js"
+import type { WorkPullRequest } from "../../../src/reconcile/pull-request-status/pull-requests.js"
+import { calculatePullRequestCosts } from "../../../src/reconcile/work-attribution/costs.js"
+import type { WorkRecord } from "../../../src/reconcile/work-attribution/summary.js"
 
 /**
  * Adversarial stress suite for the time-split and first-linked narrowing introduced by

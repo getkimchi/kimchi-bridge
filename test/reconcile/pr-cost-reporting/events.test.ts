@@ -4,12 +4,12 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { expect, it, vi } from "vitest"
-import type { PullRequestCostReport } from "../work-attribution/costs.js"
-import { buildEvents, type CommonEvents } from "./events.js"
+import { expect, it, mock } from "bun:test"
+import type { PullRequestCostReport } from "../../../src/reconcile/work-attribution/costs.js"
+import { buildEvents, type CommonEvents } from "../../../src/reconcile/pr-cost-reporting/events.js"
 
 it("breathes the stretcher while parsing and attributing masses of requests", async () => {
-	const stretch = vi.fn(async () => {})
+	const stretch = mock(async () => {})
 	const many = Array.from({ length: 2_003 }, (_, index) => ({
 		...records[0],
 		requestId: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
@@ -73,56 +73,9 @@ it("breathes the stretcher while parsing and attributing masses of requests", as
 	expect(stretch.mock.calls.length).toBeGreaterThanOrEqual(2_003)
 })
 
-it("uploads real SDK capture through the worker with exact legacy drainage and account/consent-safe retries", {
-	timeout: 30_000,
-}, () => {
-	const directory = mkdtempSync(join(tmpdir(), "kimchi-worker-events-"))
-	try {
-		const driver = fileURLToPath(new URL("../../../tests/e2e/tui/support/ledger-driver.ts", import.meta.url))
-		const result = JSON.parse(
-			execFileSync("bun", [driver, "native-common-delivery", directory], { encoding: "utf8", timeout: 30_000 }),
-		)
-		expect(result).toMatchObject({
-			initialPending: 0,
-			finalPending: 0,
-			legacyExact: true,
-			legacyFirst: true,
-			noNewLegacy: true,
-			reopened: true,
-			backoff: true,
-			idle: true,
-			replayed: true,
-			invalidAckRetained: true,
-			optOutRetained: true,
-			accountFenced: true,
-			otherBackoff: true,
-			rejectedBackoff: true,
-			keyFenced: true,
-			redirectsRejected: true,
-			legacyBeside: true,
-			failedPassAborted: true,
-			abandonedRetained: true,
-		})
-		expect(result.capturedByWorker).toHaveLength(2)
-		expect(
-			result.capturedByWorker.filter((event: { usage: { schema: string } }) => event.usage.schema === "unknown"),
-		).toHaveLength(1)
-		const native = result.capturedByWorker.find(
-			(event: { usage: { schema: string } }) => event.usage.schema === "anthropic-messages-v1",
-		)
-		expect(native.usage).toMatchObject({
-			serviceTier: "standard",
-			region: "global",
-			attemptsComplete: false,
-			iterations: [
-				{ model: "sdk-primary", raw: { inputTokens: "100", outputTokens: "0" } },
-				{ model: "sdk-fallback", raw: { inputTokens: "90", outputTokens: "7" } },
-			],
-		})
-	} finally {
-		rmSync(directory, { recursive: true, force: true })
-	}
-})
+// "uploads real SDK capture through the worker ..." stays in Kimchi: it drives the e2e
+// ledger-driver's native-common-delivery scenario against the full Kimchi stack; Kimchi
+// chunk K1 repoints that driver at the bridge build, like B1's deferred scenarios.
 
 const requestId = "11111111-1111-4111-8111-111111111111"
 const workId = "22222222-2222-4222-8222-222222222222"
@@ -201,7 +154,7 @@ function build(
 			[
 				"--eval",
 				`
-import {buildEvents} from ${JSON.stringify(new URL("./events.ts", import.meta.url).href)};
+import {buildEvents} from ${JSON.stringify(new URL("../../../src/reconcile/pr-cost-reporting/events.ts", import.meta.url).href)};
 const input = await Bun.stdin.json();
 let claims = 0;
 const touched = input.touched && { requests: new Set(input.touched.requests), records: new Set(input.touched.records) };
@@ -266,6 +219,9 @@ it("exports captured tool, file, plan and commit facts with explicit snapshot co
 	expect(result.unresolved).toEqual([])
 	const group = result.accounts[0]
 	const usage = group.facts.find((fact) => fact.usage)
+	// Bun's toMatchObject replaces matched fields with the expect.any matcher object,
+	// so the callId is captured first for the identity check below.
+	const callId = group.facts.find((fact) => fact.tool)?.tool?.callId
 	expect(group.facts.find((fact) => fact.tool)?.tool).toMatchObject({
 		callId: expect.any(String),
 		name: "edit",
@@ -274,9 +230,7 @@ it("exports captured tool, file, plan and commit facts with explicit snapshot co
 		durationMs: "12",
 		requestEntityId: usage?.entityId,
 	})
-	expect(group.facts.find((fact) => fact.file)?.file?.toolCallId).toBe(
-		group.facts.find((fact) => fact.tool)?.tool?.callId,
-	)
+	expect(group.facts.find((fact) => fact.file)?.file?.toolCallId).toBe(callId)
 	expect(group.facts.filter((fact) => fact.file).map((fact) => [fact.file?.operation, fact.file?.quality])).toEqual([
 		["modified", "observed"],
 		["created", "ambiguous"],
@@ -642,47 +596,8 @@ it("keeps genuine historical bill identity without manufacturing native counters
 	})
 })
 
-it("feeds both physical requests from an actual SDK retry into the durable common outbox", () => {
-	const agent = mkdtempSync(join(tmpdir(), "kimchi-sdk-common-events-"))
-	try {
-		const driver = fileURLToPath(new URL("../../../tests/e2e/tui/support/ledger-driver.ts", import.meta.url))
-		const result = JSON.parse(
-			execFileSync("bun", [driver, "native-common-events", agent], { encoding: "utf8", timeout: 30_000 }),
-		)
-		expect(result.reopened).toBe(true)
-		expect(result.claimReads).toBe(1)
-		expect(result.calls).toHaveLength(2)
-		const events = result.body.batch.events as {
-			usage?: {
-				requestId: string
-				raw: unknown
-				attemptsComplete: boolean
-				iterations?: { id: string; model: string; raw: unknown }[]
-				finalIterationId?: string
-			}
-		}[]
-		const usage = events.flatMap((event) => (event.usage ? [event.usage] : []))
-		expect(usage).toHaveLength(2)
-		expect(usage.find((value) => value.requestId === result.calls[0].id)).toMatchObject({
-			raw: {},
-			schema: "unknown",
-			attemptsComplete: false,
-		})
-		const success = usage.find((value) => value.requestId === result.calls[1].id)
-		expect(success).toMatchObject({
-			attemptsComplete: false,
-			iterations: [
-				{ model: "sdk-primary", raw: { inputTokens: "100", outputTokens: "0" } },
-				{ model: "sdk-fallback", raw: { inputTokens: "90", outputTokens: "7" } },
-			],
-		})
-		expect(success?.finalIterationId).toBe(success?.iterations?.[1].id)
-		expect(result.unresolved).toEqual([])
-		expect(JSON.stringify(result.body)).not.toContain("Say ok")
-	} finally {
-		rmSync(agent, { recursive: true, force: true })
-	}
-})
+// "feeds both physical requests from an actual SDK retry ..." stays in Kimchi for the same
+// reason: it drives the ledger-driver's native-common-events scenario end to end.
 
 it("does not assign contradictory response ownership to an account", () => {
 	const result = build([...records, { ...records[2], sessionId: "other-session", nativeUsage: undefined }])
@@ -709,10 +624,10 @@ it.each([
 				[
 					"--eval",
 					`
-import {buildEvents} from ${JSON.stringify(new URL("./events.ts", import.meta.url).href)};
-import {capture,readStoredRecordsAsync,closeBackends,backendFor} from ${JSON.stringify(new URL("./ledger/records.ts", import.meta.url).href)};
-import {observeEvents,pendingBatch,effectiveClaim,effectiveClaims} from ${JSON.stringify(new URL("./ledger/outbox.ts", import.meta.url).href)};
-import {accountKey} from ${JSON.stringify(new URL("./snapshot.ts", import.meta.url).href)};
+import {buildEvents} from ${JSON.stringify(new URL("../../../src/reconcile/pr-cost-reporting/events.ts", import.meta.url).href)};
+import {capture,readStoredRecordsAsync,closeBackends,backendFor} from ${JSON.stringify(new URL("../../../src/ledger/records.ts", import.meta.url).href)};
+import {observeEvents,pendingBatch,effectiveClaim,effectiveClaims} from ${JSON.stringify(new URL("../../../src/ledger/outbox.ts", import.meta.url).href)};
+import {accountKey} from ${JSON.stringify(new URL("../../../src/reconcile/pr-cost-reporting/snapshot.ts", import.meta.url).href)};
 const input=await Bun.stdin.json();
 for(const row of input.records)capture(input.agent,row,input.agent+"/native-observations.jsonl");
 const stored=await readStoredRecordsAsync(input.agent,()=>{});
@@ -763,11 +678,11 @@ function withLedger(rows: unknown[], steps: string, extra: object = {}) {
 				[
 					"--eval",
 					`
-import {buildEvents} from ${JSON.stringify(new URL("./events.ts", import.meta.url).href)};
-import {capture,readStoredRecordsAsync,closeBackends,backendFor} from ${JSON.stringify(new URL("./ledger/records.ts", import.meta.url).href)};
-import {observeEvents,effectiveClaim,effectiveClaims} from ${JSON.stringify(new URL("./ledger/outbox.ts", import.meta.url).href)};
-import {accountKey} from ${JSON.stringify(new URL("./snapshot.ts", import.meta.url).href)};
-import {calculatePullRequestCosts} from ${JSON.stringify(new URL("../work-attribution/costs.ts", import.meta.url).href)};
+import {buildEvents} from ${JSON.stringify(new URL("../../../src/reconcile/pr-cost-reporting/events.ts", import.meta.url).href)};
+import {capture,readStoredRecordsAsync,closeBackends,backendFor} from ${JSON.stringify(new URL("../../../src/ledger/records.ts", import.meta.url).href)};
+import {observeEvents,effectiveClaim,effectiveClaims} from ${JSON.stringify(new URL("../../../src/ledger/outbox.ts", import.meta.url).href)};
+import {accountKey} from ${JSON.stringify(new URL("../../../src/reconcile/pr-cost-reporting/snapshot.ts", import.meta.url).href)};
+import {calculatePullRequestCosts} from ${JSON.stringify(new URL("../../../src/reconcile/work-attribution/costs.ts", import.meta.url).href)};
 const input=await Bun.stdin.json();
 for(const row of input.rows)capture(input.agent,row,input.agent+"/native-observations.jsonl");
 const stored=await readStoredRecordsAsync(input.agent,()=>{});

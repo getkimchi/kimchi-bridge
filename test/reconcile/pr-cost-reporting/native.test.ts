@@ -3,9 +3,9 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { beforeAll, expect, it } from "vitest"
-import type { WorkRecord } from "../work-attribution/summary.js"
-import type { nativeObservations } from "./native.js"
+import { beforeAll, expect, it } from "bun:test"
+import type { WorkRecord } from "../../../src/reconcile/work-attribution/summary.js"
+import type { nativeObservations } from "../../../src/reconcile/pr-cost-reporting/native.js"
 
 const requestId = "11111111-1111-4111-8111-111111111111"
 const workId = "22222222-2222-4222-8222-222222222222"
@@ -230,7 +230,7 @@ changed("iterations-invalid-raw", (rows) => {
 	rows[2].nativeUsage = { ...nativeUsage, iterations: [{ type: "message", raw: { inputTokens: -1 } }] }
 })
 beforeAll(() => {
-	const moduleUrl = new URL("./native.ts", import.meta.url).href
+	const moduleUrl = new URL("../../../src/reconcile/pr-cost-reporting/native.ts", import.meta.url).href
 	actual = JSON.parse(
 		execFileSync(
 			"bun",
@@ -419,9 +419,9 @@ it("fulfills exact imported-line markers only with a durable outbox observation,
 }, () => {
 	const agent = mkdtempSync(join(tmpdir(), "kimchi-native-import-"))
 	try {
-		const moduleUrl = new URL("./native.ts", import.meta.url).href
-		const recordsUrl = new URL("./ledger/records.ts", import.meta.url).href
-		const outboxUrl = new URL("./ledger/outbox.ts", import.meta.url).href
+		const moduleUrl = new URL("../../../src/reconcile/pr-cost-reporting/native.ts", import.meta.url).href
+		const recordsUrl = new URL("../../../src/ledger/records.ts", import.meta.url).href
+		const outboxUrl = new URL("../../../src/ledger/outbox.ts", import.meta.url).href
 		const output = JSON.parse(
 			execFileSync(
 				"bun",

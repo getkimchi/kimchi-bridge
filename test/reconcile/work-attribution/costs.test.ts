@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from "vitest"
-import { createWorkScopeSnapshot } from "../__mocks__/work-scope.js"
-import type { WorkPullRequest } from "../pull-request-status/pull-requests.js"
+import { describe, expect, it, mock } from "bun:test"
+import { createWorkScopeSnapshot } from "../mocks/work-scope.js"
+import type { WorkPullRequest } from "../../../src/reconcile/pull-request-status/pull-requests.js"
 import {
 	calculatePullRequestCosts,
 	calculatePullRequestCostsAsync,
@@ -8,8 +8,8 @@ import {
 	type RequestCostObservation,
 	roundedUsd,
 	usd,
-} from "./costs.js"
-import type { WorkRecord } from "./summary.js"
+} from "../../../src/reconcile/work-attribution/costs.js"
+import type { WorkRecord } from "../../../src/reconcile/work-attribution/summary.js"
 
 const time = (minutes: number) => new Date(Date.UTC(2026, 9, 2, 10, minutes)).toISOString()
 const testScope = createWorkScopeSnapshot("/repo/.git").scope
@@ -1964,7 +1964,7 @@ describe("time split across a work's PRs", () => {
 describe("breathing twin of the reporting calculation", () => {
 	it("produces the identical report, and lets the loop breathe past the step budget", { timeout: 30_000 }, async () => {
 		// Real macrotask waits: the drain's interleaving matches the production capture pass.
-		const stretch = vi.fn(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
+		const stretch = mock(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
 		const records = [commit(), ...Array.from({ length: 2_050 }, (_, index) => request(`req-${index}`))]
 		const observations = [charge("req-0", "1.25"), charge("req-1", null)]
 		const rejected = new Set<string>()
