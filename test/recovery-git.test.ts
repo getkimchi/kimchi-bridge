@@ -1295,6 +1295,38 @@ test("an SSH host alias names its provider through ssh's own config, as Kimchi r
   });
 }, 30_000);
 
+// A hanging `ssh -G` must not stall every capture that resolves the alias: the first
+// lookup is bounded by the spawn timeout (tolerant of a loaded machine), and a failed
+// resolution is remembered for a short negative TTL instead of being retried on every
+// capture or cached forever.
+test("a failed SSH alias resolution backs off instead of stalling every capture", () => {
+  const { base, root } = fixture();
+  git(root, "init", "--initial-branch=main");
+  const bin = join(base, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "ssh"), "#!/bin/sh\nsleep 30\n", { mode: 0o700 });
+  const prior = process.env.PATH;
+  process.env.PATH = `${bin}:${prior}`;
+  cleanups.push(() => {
+    process.env.PATH = prior;
+  });
+  git(root, "remote", "add", "origin", "git@ssh-hang-alias:testOrg/widgets.git");
+  // The first resolution pays the bounded spawn wait (the load-tolerant 5 s ceiling); the
+  // unresolved alias stands in for the host, exactly as one unresolved lookup always has.
+  const firstStart = Date.now();
+  expect(repository(root)[2]).toMatchObject({ host: "ssh-hang-alias" });
+  const firstElapsed = Date.now() - firstStart;
+  expect(firstElapsed).toBeGreaterThanOrEqual(4000);
+  expect(firstElapsed).toBeLessThan(15_000);
+  // The repeated lookups inside the negative TTL do not spawn ssh again: they return in
+  // milliseconds instead of stalling the capture path for another bounded wait each.
+  for (let round = 0; round < 3; round++) {
+    const start = Date.now();
+    expect(repository(root)[2]).toMatchObject({ host: "ssh-hang-alias" });
+    expect(Date.now() - start).toBeLessThan(1000);
+  }
+}, 30_000);
+
 function withBridgeHome<T>(base: string, run: () => T): T {
   const previous = process.env.KIMCHI_BRIDGE_HOME;
   const previousConfig = process.env.KIMCHI_BRIDGE_CONFIG_HOME;

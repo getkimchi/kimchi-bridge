@@ -87,6 +87,12 @@ const emptyFile = (): FileState => ({ hash: "", exists: false, complete: false }
 const knownHost = (host: string) =>
   ["github.com", "gitlab.com", process.env.GH_HOST, process.env.GITLAB_HOST].includes(host);
 const sshHosts = new Map<string, string>();
+/** When a failed alias resolution may next retry. A hanging or unreachable `ssh -G` must not
+ *  stall every capture for the spawn's full 5 s bound again and again, but a failure is also
+ *  not remembered forever (the infinite negative cache the review rejected): the alias stands
+ *  in until the backoff elapses, then one re-resolution retries the config. */
+const SSH_NEGATIVE_TTL_MS = 60_000;
+const sshFailedAt = new Map<string, number>();
 /**
  * The provider host an SSH alias stands for (~/.ssh/config: Host github-work, HostName github.com), read without
  * connecting, as Kimchi resolves it (pull-request-status/provider-api.ts sshHostName).
@@ -95,6 +101,8 @@ function sshHost(alias: string): string {
   if (knownHost(alias) || alias.startsWith("-")) return alias;
   let host = sshHosts.get(alias);
   if (host === undefined) {
+    const failedAt = sshFailedAt.get(alias);
+    if (failedAt !== undefined && Date.now() - failedAt < SSH_NEGATIVE_TTL_MS) return alias;
     const result = spawnSync("ssh", ["-G", alias], {
       encoding: "utf8",
       // A responsive `ssh -G` prints its parsed config in milliseconds; the bound only stops a
@@ -104,9 +112,13 @@ function sshHost(alias: string): string {
     });
     const line = (result.stdout ?? "").split("\n").find((l) => l.startsWith("hostname "));
     host = line ? line.slice("hostname ".length).trim() : alias;
-    // A failed or timed-out resolution is not cached: the alias stands in for this call, and
-    // the next capture retries the config instead of keeping the unresolved alias forever.
-    if (!result.error) sshHosts.set(alias, host);
+    // A failed or timed-out resolution is remembered only for the negative TTL above: the alias
+    // stands in for this call and the backoff window, then the config is retried — repeated
+    // failed lookups cannot stall every capture, and a later `~/.ssh/config` fix is picked up.
+    if (!result.error) {
+      sshHosts.set(alias, host);
+      sshFailedAt.delete(alias);
+    } else sshFailedAt.set(alias, Date.now());
   }
   return knownHost(host) ? host : alias;
 }
