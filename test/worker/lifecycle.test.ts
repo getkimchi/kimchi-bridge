@@ -876,7 +876,7 @@ test("several messages in one chunk and a line split across chunks both parse", 
   expect(await worker.exited()).toBe(0);
 }, 15000);
 
-test("a reply larger than the pipe buffer fails the channel instead of truncating", async () => {
+test("a reply larger than the pipe buffer fails the request instead of truncating", async () => {
   const dir = agentDir();
   seedRecord(dir);
   const worker = spawnWorker(dir);
@@ -889,19 +889,20 @@ test("a reply larger than the pipe buffer fails the channel instead of truncatin
     deadlineMs: 60000,
     epoch: 1,
   });
-  // A well-formed credentials answer whose token alone dwarfs the 64 KiB
-  // shared reply slot: the worker must fail the channel, never use a cut.
-  // Consent is granted so the credentials request actually happens.
+  // A consent answer padded past the 64 KiB shared reply slot: the worker
+  // must fail the request with the typed oversized error, never use a cut of
+  // the line. The consent failure propagates out of the reporting channel's
+  // state gate, so the rejection is observable on the wire.
   const huge = "x".repeat(70_000);
   let done: DoneMessage | undefined;
   for (;;) {
     const message = await worker.next();
     if (message.type === "request") {
       const result =
-        message.kind === "credentials"
-          ? { token: huge, apiUrl: NO_NETWORK_API }
-          : message.kind === "consent"
-            ? { consent: true }
+        message.kind === "consent"
+          ? { consent: true, pad: huge }
+          : message.kind === "credentials"
+            ? { token: FAKE_TOKEN, apiUrl: NO_NETWORK_API }
             : REPLIES[message.kind];
       worker.send({ type: "reply", rid: message.rid, result });
       continue;
@@ -913,6 +914,10 @@ test("a reply larger than the pipe buffer fails the channel instead of truncatin
   }
   expect(done.result.outcome).toBe("failed");
   expect(done.result.channels.reporting?.outcome).toBe("failed");
+  if (done.result.channels.reporting?.error) {
+    expect(done.result.channels.reporting.error).toContain("exceeded");
+    expect(done.result.channels.reporting.error).toContain("pipe buffer");
+  }
   // The oversized payload never leaked into the failure report either.
   for (const line of worker.lines()) expect(line.includes("xxxxx")).toBe(false);
   worker.end();

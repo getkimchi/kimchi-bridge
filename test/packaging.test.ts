@@ -110,7 +110,7 @@ test("the release tarball ships the reconciliation worker next to the bridge bun
       .toString()
       .trim()
       .split("\n")
-      .map((name) => name.replace(/^\.\//, ""));
+      .map((name) => (name.startsWith("./") ? name.slice(2) : name));
     expect(names).toContain("lib/kimchi-bridge.mjs");
     expect(names).toContain("lib/worker.mjs");
     // The documented launch path matches the tarball layout: the archive's

@@ -145,10 +145,10 @@ describe("protocol round trip", () => {
   test("the encoder refuses to emit a message the strict parser would reject", () => {
     expect(() =>
       encodeParentMessage({ type: "pass", id: 0, channels: {}, deadlineMs: 10, epoch: 0 }),
-    ).toThrow(/invalid message/);
+    ).toThrow("invalid message");
     expect(() =>
       encodeWorkerMessage({ type: "metric", metric: { kind: "nonsense" as never } }),
-    ).toThrow(/invalid message/);
+    ).toThrow("invalid message");
   });
 });
 

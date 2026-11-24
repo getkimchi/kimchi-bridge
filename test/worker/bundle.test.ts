@@ -99,12 +99,16 @@ test("the worker bundle refuses a parent with a different build and exits non-ze
   const first = await firstLine(child);
   const message = JSON.parse(first);
   expect(message.type).toBe("error");
-  if (message.type === "error") expect(message.message).toMatch(/build mismatch/);
+  if (message.type === "error") expect(message.message.includes("build mismatch")).toBe(true);
   child.end();
   expect(await child.exited()).not.toBe(0);
   // Nothing but the refusal was emitted; a build id is public, a token never is.
   expect(child.lines().length).toBe(1);
-  expect(JSON.stringify(child.lines())).not.toMatch(/"?token"?|Bearer /i);
+  // A build id is public, a token never is: neither a quoted or bare "token"
+  // field nor a bearer header may appear in the refusal.
+  const emitted = JSON.stringify(child.lines()).toLowerCase();
+  expect(emitted.includes("token")).toBe(false);
+  expect(emitted.includes("bearer ")).toBe(false);
 }, 60000);
 
 test("the worker bundle accepts its own build and exits on stdin EOF", async () => {
