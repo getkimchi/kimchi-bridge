@@ -181,6 +181,46 @@ it("a claim that grew past its cursor is kept for the next import, never unlinke
   expect(readdirSync(directory).filter((name) => name.endsWith(".jsonl"))).toHaveLength(0);
 });
 
+it("a hardlink added after the pre-claim check keeps the claim and is reported", async () => {
+  const dir = agentDir();
+  const path = seededSpool(dir, "linked-after-lstat");
+  const directory = dirname(path);
+  const outside = join(dir, "outside.jsonl");
+  const content = readFileSync(path, "utf8");
+  // The link lands after retirement's lstat single-link check and before its claim rename, so
+  // the claimed inode is reachable at the unscanned external name too.
+  renameHook = (from, to) => {
+    if (from !== path || !basename(String(to)).startsWith("claim-")) return;
+    renameHook = undefined;
+    linkSync(path, outside);
+  };
+  importer.importSpool(dir);
+  renameHook = undefined;
+  // The record was imported exactly once, but the claim is never unlinked: it stays in the
+  // spool directory as a scannable file (the next pass re-imports it with line-hash dedup),
+  // the external name keeps its raw bytes, and the unsafe inode is reported.
+  expect(records.readRecords(dir).map((row) => row.requestId)).toEqual(["linked-after-lstat"]);
+  const claims = readdirSync(directory).filter((name) => name.startsWith("claim-"));
+  expect(claims).toHaveLength(1);
+  expect(readFileSync(join(directory, claims[0]), "utf8")).toBe(content);
+  expect(readFileSync(outside, "utf8")).toBe(content);
+  expect(statSync(outside).nlink).toBe(2);
+  importer.importSpool(dir);
+  expect(records.readRecords(dir).map((row) => row.requestId)).toEqual(["linked-after-lstat"]);
+  expect(readdirSync(directory).filter((name) => name.endsWith(".jsonl"))).toHaveLength(1);
+  const { openStore } = (await import(
+    new URL("../../src/ledger/store.js?retire-race", import.meta.url).href
+  )) as typeof import("../../src/ledger/store.js");
+  const store = openStore(dir);
+  try {
+    expect(
+      store.db.query("SELECT count AS n FROM diagnostics WHERE code = 'spool-unsafe-inode'").get(),
+    ).toEqual({ n: 2 });
+  } finally {
+    store.close();
+  }
+});
+
 it("a hardlinked spool is never retired, so the external name keeps its bytes", async () => {
   const dir = agentDir();
   const path = seededSpool(dir, "shared-record");

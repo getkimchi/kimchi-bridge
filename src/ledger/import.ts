@@ -1,6 +1,7 @@
 import { createHash, randomUUID, type Hash } from "node:crypto";
 import {
   closeSync,
+  constants,
   fstatSync,
   lstatSync,
   mkdirSync,
@@ -62,6 +63,8 @@ export interface ImportResult {
 }
 
 const EMPTY_HASH = createHash("sha256").digest("hex");
+/** O_NOFOLLOW where the platform has it, so a claimed spool file is never opened through a symlink. */
+const O_NOFOLLOW = (constants.O_NOFOLLOW ?? 0) as number;
 const COVERAGE_NOTES = "journal-coverage";
 const TAIL_NOTES = "journal-tail";
 const REVERIFY_NOTES = "journal-reverify";
@@ -959,11 +962,16 @@ export function spoolQuarantineDirectory(agentDir: string): string {
  * second importer's rename then claims the replacement, and the identity check fails: the claim
  * is left in the spool directory (still scanned and imported as its own file), never deleted. A
  * capture that appended through a still-open descriptor after the validation lands in the
- * claim's growth, and the size check keeps that claim too. An inode that is not this user's
- * private single-link regular file is never unlinked: it is reported and left in place. A file
- * whose cursor covers the whole file but whose saved problems are non-empty (a corrupt or
- * unknown-type line, never a pending incomplete tail) moves to quarantine instead of being
- * unlinked. */
+ * claim's growth, and the size check keeps that claim too. The claim itself is re-validated
+ * through an O_NOFOLLOW descriptor immediately before any deletion: an inode that is not this
+ * user's private single-link regular file — a hardlink added after the pre-claim check, whose
+ * raw record stays reachable at the external name — is never unlinked or quarantined, only
+ * reported and left in place as a scannable spool file (line-hash dedup keeps its re-imports
+ * exactly-once). A residual window remains where a link is added between that fstat and the
+ * unlink itself; it cannot lose data for the same reason — the claim's bytes stay on disk at
+ * every name that holds them. A file whose cursor covers the whole file but whose saved
+ * problems are non-empty (a corrupt or unknown-type line, never a pending incomplete tail)
+ * moves to quarantine instead of being unlinked. */
 function retireImportedSpool(agentDir: string, files: string[], checkBudget?: () => void): void {
   const backend = backendFor(agentDir);
   for (const path of files) {
@@ -988,22 +996,50 @@ function retireImportedSpool(agentDir: string, files: string[], checkBudget?: ()
       assertLedgerWritable(agentDir);
       const claim = join(dirname(path), `claim-${randomUUID()}-${basename(path)}`);
       renameSync(path, claim);
-      const claimed = statSync(claim);
-      if (
-        claimed.dev !== stat.dev ||
-        claimed.ino !== stat.ino ||
-        // A capture appended through its still-open descriptor after the validation above: the
-        // claim now holds a line no importer has committed, so it is never unlinked. It stays a
-        // scannable spool file and the next pass imports it as its own file (line-hash dedup
-        // keeps the re-scanned lines exactly-once), retiring it once its own cursor reaches its
-        // end.
-        claimed.size !== cursor.offset
-      ) {
-        // A replacement a capture created after this validation, or a growth inside the claim:
-        // leave the claim in the spool directory; the next pass imports it as its own file
-        // (line-hash dedup keeps it exactly-once) and retires it when its own cursor reaches its
-        // end.
+      // The claim is inspected through a non-following descriptor immediately before anything is
+      // deleted: a hardlink added after the pre-claim check above leaves the claim reachable at
+      // the unscanned external name, so retiring it would report the spool drained while the
+      // raw record survives there.
+      let fd: number;
+      try {
+        fd = openSync(claim, constants.O_RDONLY | O_NOFOLLOW);
+      } catch {
+        // The claim stays in the spool directory; the next pass imports it as its own file
+        // (line-hash dedup keeps it exactly-once) and retries the retirement.
         continue;
+      }
+      try {
+        const claimed = fstatSync(fd);
+        if (
+          claimed.dev !== stat.dev ||
+          claimed.ino !== stat.ino ||
+          // A capture appended through its still-open descriptor after the validation above: the
+          // claim now holds a line no importer has committed, so it is never unlinked. It stays a
+          // scannable spool file and the next pass imports it as its own file (line-hash dedup
+          // keeps the re-scanned lines exactly-once), retiring it once its own cursor reaches its
+          // end.
+          claimed.size !== cursor.offset
+        ) {
+          // A replacement a capture created after this validation, or a growth inside the claim:
+          // leave the claim in the spool directory; the next pass imports it as its own file
+          // (line-hash dedup keeps it exactly-once) and retires it when its own cursor reaches its
+          // end.
+          continue;
+        }
+        if (
+          !claimed.isFile() ||
+          claimed.nlink !== 1 ||
+          (uid !== undefined && claimed.uid !== uid)
+        ) {
+          // A hardlink planted after the pre-claim check (or a foreign owner): never unlink.
+          // Removing the claim's directory entry cannot remove the external name's copy
+          // anyway, and keeping the claim leaves the bytes in a scannable spool file while the
+          // diagnostic reports the unsafe inode.
+          diagnostic(agentDir, "spool-unsafe-inode");
+          continue;
+        }
+      } finally {
+        closeSync(fd);
       }
       const problems =
         coverageProblems(backend, path).length + coverageProblems(backend, path, TAIL_NOTES).length;
