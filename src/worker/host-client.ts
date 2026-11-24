@@ -329,18 +329,26 @@ export class StdioTransport {
       Math.ceil(Math.max(remaining, 0)),
     );
     if (waited === "timed-out") {
-      Atomics.compareExchange(this.slots, STATE, STATE_WAITING, STATE_IDLE);
-      if (this.#deadlineAt > 0 && Date.now() >= this.#deadlineAt)
+      // The compare-exchange is the race's referee: this thread is the only
+      // writer that may move WAITING to IDLE, so a value other than WAITING
+      // back means the reader thread stored a terminal state (a reply, a
+      // cancel, or parent death) after the wait expired but before this
+      // exchange. That state wins over the timeout and is handled below —
+      // never misreported as one.
+      const observed = Atomics.compareExchange(this.slots, STATE, STATE_WAITING, STATE_IDLE);
+      if (observed === STATE_WAITING) {
+        if (this.#deadlineAt > 0 && Date.now() >= this.#deadlineAt)
+          throw new HostRequestError(
+            `the pass deadline expired while the ${kind} request was pending`,
+            kind,
+            "deadline",
+          );
         throw new HostRequestError(
-          `the pass deadline expired while the ${kind} request was pending`,
+          `the parent did not answer the ${kind} request within ${REQUEST_TIMEOUT_MS} ms`,
           kind,
-          "deadline",
+          "timeout",
         );
-      throw new HostRequestError(
-        `the parent did not answer the ${kind} request within ${REQUEST_TIMEOUT_MS} ms`,
-        kind,
-        "timeout",
-      );
+      }
     }
     const state = Atomics.load(this.slots, STATE);
     if (state === STATE_PARENT_GONE)
