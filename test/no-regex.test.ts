@@ -7,9 +7,10 @@ import ts from "typescript";
 // behavior, proven by its own moved tests and (in Kimchi chunk K1) equivalence against the
 // pre-move build. Rewriting its parsers to drop regex literals would change behavior, so the
 // no-regex policy for bridge-native code does not reach into it. The exemption is an explicit
-// allowlist of moved files (from .kimchi/docs/b1-move-map.tsv and b2-move-map.tsv), not a
-// whole-directory carve-out: any new bridge-native file — host ports, the pass entry, the
-// barrel, vendored extractions, tests — must not use regex literals.
+// allowlist of moved files (from .kimchi/docs/b1-move-map.tsv and b2-move-map.tsv) and moved
+// test files (MOVED_TESTS below), not a whole-directory carve-out: any new bridge-native
+// file — host ports, the pass entry, the barrel, vendored extractions, tests — must not use
+// regex literals.
 const MOVED: readonly string[] = [
   "src/ledger/import.ts",
   "src/ledger/index.ts",
@@ -60,16 +61,32 @@ function normalized(name: string): string {
   return name.split(sep).join("/");
 }
 
-test("runtime and build scripts use native APIs and parsers without local regexes", () => {
+/**
+ * Ported Kimchi test files that contain regex literals. Their assertions were written against
+ * Kimchi's regex-using modules and moved byte-identically or near-identically; rewriting their
+ * matchers would change what they assert. Any new bridge-native test must not use regexes.
+ */
+const MOVED_TESTS: readonly string[] = [
+  "test/ledger/outbox.test.ts",
+  "test/reconcile/pr-cost-reporting/queue.test.ts",
+  "test/reconcile/pr-cost-reporting/worker.test.ts",
+  "test/reconcile/pull-request-status/pull-requests.test.ts",
+  "test/reconcile/work-attribution/file-transitions.test.ts",
+  "test/reconcile/work-attribution/links.test.ts",
+];
+
+test("runtime, build scripts and tests use native APIs and parsers without local regexes", () => {
   const found: string[] = [];
   const moved = new Set(MOVED);
-  for (const dir of ["src", "scripts"])
+  const movedTests = new Set(MOVED_TESTS);
+  for (const dir of ["src", "scripts", "test"])
     for (const file of readdirSync(join(import.meta.dir, "..", dir), {
       recursive: true,
       encoding: "utf8",
     })) {
       if (!file.endsWith(".ts")) continue;
       if (dir === "src" && moved.has(`src/${normalized(file)}`)) continue;
+      if (dir === "test" && movedTests.has(`test/${normalized(file)}`)) continue;
       const path = join(dir, file),
         source = ts.createSourceFile(
           path,

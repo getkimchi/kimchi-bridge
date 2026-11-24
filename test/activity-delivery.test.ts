@@ -7,6 +7,18 @@ import { flushActivity, flushAllActivities } from "../src/work/activity-delivery
 import { parseJson } from "../src/work/protocol.ts";
 import { workspaceActivityURL } from "../src/work/workspace.ts";
 import type { Native } from "../src/work/capture.ts";
+/** UUID-shaped event ids, checked without a regex literal. */
+function isUuidLike(value: string): boolean {
+  return (
+    value.length === 36 &&
+    [...value].every(
+      (character) =>
+        character === "-" ||
+        (character >= "0" && character <= "9") ||
+        (character >= "a" && character <= "f"),
+    )
+  );
+}
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -60,8 +72,8 @@ test("actual captured hooks become linked paired events and retain absence", () 
   recordFixture(value);
   const events = value.allEvents();
   expect(events).toHaveLength(4);
-  expect(events[0].eventId).toMatch(/^[0-9a-f-]{36}$/);
-  expect(events[1].eventId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(isUuidLike(events[0].eventId)).toBe(true);
+  expect(isUuidLike(events[1].eventId)).toBe(true);
   expect(events[1].eventId).not.toBe(events[0].eventId);
   expect(events[1].causality?.causationId).toBe(events[0].eventId);
   expect(events[1].observation?.shellCommandOutput).toMatchObject({

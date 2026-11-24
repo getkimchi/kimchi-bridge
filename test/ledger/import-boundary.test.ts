@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import ts from "typescript";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "bun:test";
@@ -88,13 +89,24 @@ function stripComments(text: string): string {
 function importsOf(file: string): Import[] {
   const text = stripComments(readFileSync(file, "utf8"));
   const specifiers = new Set<string>();
-  for (const [pattern, group] of [
-    [/\bfrom\s*"([^"]+)"/g, 1] as const,
-    [/\bimport\s*"([^"]+)"/g, 1] as const,
-    [/\bimport\(\s*"([^"]+)"/g, 1] as const,
-  ]) {
-    for (const match of text.matchAll(pattern)) specifiers.add(match[group]);
-  }
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+  const visit = (node: ts.Node) => {
+    if (
+      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+      node.moduleSpecifier &&
+      ts.isStringLiteralLike(node.moduleSpecifier)
+    )
+      specifiers.add(node.moduleSpecifier.text);
+    if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      node.arguments.length === 1 &&
+      ts.isStringLiteralLike(node.arguments[0])
+    )
+      specifiers.add(node.arguments[0].text);
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
   return [...specifiers].map((specifier) => ({ specifier, file }));
 }
 

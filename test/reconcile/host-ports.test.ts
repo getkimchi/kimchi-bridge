@@ -126,7 +126,7 @@ afterEach(() => {
 
 test("hostPorts throws when no host is bound, so no call site silently guesses", () => {
   setDefaultHostPorts(undefined);
-  expect(() => hostPorts()).toThrow(/HostPorts/);
+  expect(() => hostPorts()).toThrow("requires HostPorts");
 });
 
 test("withHostPorts scopes a host to its async context", async () => {
