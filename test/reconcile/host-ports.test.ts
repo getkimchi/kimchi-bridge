@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +8,7 @@ import type { HostMetric, HostPorts } from "../../src/reconcile/host.js";
 import { hostPorts, setDefaultHostPorts, withHostPorts } from "../../src/reconcile/host-ports.js";
 import { reconcileWorkCosts } from "../../src/reconcile/work-attribution/cost-sync.js";
 import { deliverEvents } from "../../src/reconcile/pr-cost-reporting/worker.js";
-import { runReconciliationPass } from "../../src/reconcile/pass.js";
+import { ReconcileLeaseLostError, runReconciliationPass } from "../../src/reconcile/pass.js";
 
 /**
  * Contract test for the HostPorts seam: a fake host counts every call, and the
@@ -282,4 +283,115 @@ test("the resource gate consults the org policy port", async () => {
   // With the resource disabled, attribution records nothing through the wrapper.
   expect(tryWorkAttribution(() => writes.push(1))).toBeUndefined();
   expect(writes).toHaveLength(0);
+});
+
+test("a lease assertion failure mid-pass aborts the pass with a typed error and writes nothing after the loss", async () => {
+  const dir = agentDir();
+  const workId = "22222222-2222-4222-8222-222222222222";
+  const requestId = "11111111-1111-4111-8111-111111111111";
+  const startedAt = "2026-10-24T08:00:00.000Z";
+  const dispatchedAt = "2026-10-24T08:00:01.000Z";
+  const backend = backendFor(dir);
+  // The own-commit counter plus the row watermark sees every ledger write this process makes.
+  const ledgerState = () =>
+    [
+      backend.dataVersion(),
+      backend.recordWatermark(),
+      backend.dirtyWorks().length,
+      backend.outboxDeliveryStatus().length,
+    ].join(":");
+  let lost = false;
+  let stateAtLoss: string | undefined;
+  let verifies = 0;
+  const fake = fakeHost(dir, async (input) => {
+    const url = String(input);
+    if (url.endsWith("/api-keys:verify")) {
+      verifies += 1;
+      // The lease is lost while the costs channel's account verification is in flight.
+      lost = true;
+      stateAtLoss = ledgerState();
+      return Response.json({ organizationId: ORG, userId: USER });
+    }
+    if (lost) throw new Error("no network work may run after the lease was lost");
+    return Response.json({
+      items: [{ id: workId, totalPrice: "0.123456789", castaiApiKeyOwnerId: USER }],
+      totalCount: 1,
+    });
+  });
+  backend.insertRecord({
+    recordHash: "a".repeat(64),
+    type: "request",
+    workId,
+    sessionId: "session",
+    body: JSON.stringify({
+      version: 1,
+      type: "request",
+      workId,
+      sessionId: "session",
+      requestId,
+      cwd: "/project",
+      startedAt,
+      scope: { account: { apiUrl: ENDPOINT, organizationId: ORG, userId: USER } },
+    }),
+    sourcePath: join(dir, "work-attribution", "session.jsonl"),
+    sourceGeneration: 0,
+    sourceOffset: 0,
+    importedAt: Date.now(),
+  });
+  backend.insertRecord({
+    recordHash: "b".repeat(64),
+    type: "request_dispatch",
+    workId,
+    sessionId: "session",
+    body: JSON.stringify({
+      version: 1,
+      type: "request_dispatch",
+      workId,
+      sessionId: "session",
+      requestId,
+      cwd: "/project",
+      startedAt,
+      dispatchedAt,
+      billingSource: {
+        apiUrl: ENDPOINT,
+        gatewayUrl: "https://llm.example/openai/v1/chat/completions",
+        // The dispatch-time fingerprint of the fake host's configured key, so the costs
+        // channel's lookup runs for this request instead of reporting an account change.
+        credentialHash: createHash("sha256").update("api-key").digest("hex"),
+      },
+      billingSelector: {
+        type: "tag",
+        tag: `kimchi-request:${requestId}`,
+        startTime: "2026-10-23T20:00:01.000Z",
+        endTime: "2026-11-25T08:00:01.000Z",
+      },
+    }),
+    sourcePath: join(dir, "work-attribution", "session.jsonl"),
+    sourceGeneration: 0,
+    sourceOffset: 0,
+    importedAt: Date.now(),
+  });
+  const failure = await runReconciliationPass(
+    { costs: true, reporting: { cwd: "/project" } },
+    fake.host,
+    {
+      signal: new AbortController().signal,
+      assertLease: () => {
+        if (lost) throw new Error("lease lost mid-pass");
+      },
+    },
+  ).then(
+    () => {
+      throw new Error("the pass must reject when the lease is lost mid-pass");
+    },
+    (error: unknown) => error,
+  );
+  expect(failure).toBeInstanceOf(ReconcileLeaseLostError);
+  expect(String((failure as ReconcileLeaseLostError).cause)).toContain("lease lost mid-pass");
+  // The costs channel's own verification ran; the reporting channel never started.
+  expect(verifies).toBe(1);
+  expect(fake.fetches.filter((url) => url.includes("/pr-cost"))).toHaveLength(0);
+  // Nothing was committed after the loss: the ledger is exactly as it was at that moment.
+  if (stateAtLoss === undefined) throw new Error("the loss moment must be recorded");
+  expect(ledgerState()).toBe(stateAtLoss);
 });

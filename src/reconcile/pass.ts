@@ -50,12 +50,26 @@ export interface PassInput {
   progress?: ContinuationProgress;
 }
 
+/**
+ * A pass ended because io.assertLease threw: the lease was lost or compromised mid-pass.
+ * The original failure is carried as `cause`.
+ */
+export class ReconcileLeaseLostError extends Error {
+  constructor(cause: unknown) {
+    super("Work attribution reconciliation lease was lost", { cause });
+  }
+}
+
 export interface PassResult {
   /** The repository the next files channel starts from. */
   nextRepository?: string;
 }
 
-/** Runs one pass. Never resolves while the lease is compromised: assertLease throws first. */
+/**
+ * Runs one pass. The first io.assertLease failure aborts the whole pass: the failure is
+ * rethrown to the caller as ReconcileLeaseLostError, no further channel runs and nothing
+ * is written after the loss.
+ */
 export function runReconciliationPass(
   input: PassInput,
   host: HostPorts,
@@ -63,8 +77,23 @@ export function runReconciliationPass(
 ): Promise<PassResult> {
   return withHostPorts(host, async () => {
     const agentDir = host.agentDir;
-    const signal = io.signal;
-    const assertLease = io.assertLease;
+    let leaseFailure: ReconcileLeaseLostError | undefined;
+    // Kimchi's supervisor aborted its lease signal in the same callback that marked the
+    // lease compromised, so a lost lease always stopped later work. io.assertLease carries
+    // no such guarantee, so the pass aborts its own internal signal on the first assertion
+    // failure and rethrows that failure instead of treating it as a channel error.
+    const leaseLost = new AbortController();
+    const signal = AbortSignal.any([io.signal, leaseLost.signal]);
+    const assertLease = () => {
+      if (leaseFailure) throw leaseFailure;
+      try {
+        io.assertLease();
+      } catch (error) {
+        leaseFailure = new ReconcileLeaseLostError(error);
+        leaseLost.abort();
+        throw leaseFailure;
+      }
+    };
     const directory = join(agentDir, "work-attribution");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const deadline = Date.now() + PASS_BUDGET_MS;
@@ -85,6 +114,7 @@ export function runReconciliationPass(
       handlers: ((error: unknown) => void)[] | undefined,
       label: string,
     ) => {
+      if (leaseFailure) throw leaseFailure;
       if (signal.aborted) return;
       if (handlers?.length) for (const handler of handlers) handler(error);
       else debug(label, error);
@@ -110,11 +140,13 @@ export function runReconciliationPass(
               shared,
             );
           } catch (error) {
+            if (leaseFailure) throw leaseFailure;
             if (error === exhausted || signal.aborted) throw error;
             debug("Could not reconcile repository %s: %o", repositories[index], error);
           }
         }
       } catch (error) {
+        if (leaseFailure) throw leaseFailure;
         if (error !== exhausted && !signal.aborted)
           debug("Could not discover repositories: %o", error);
       }
@@ -122,6 +154,7 @@ export function runReconciliationPass(
     // Network lookup has its own deadline. A slow local repository must not starve it,
     // and Bash-only commits have no transition repository to visit above.
     if (input.pullRequests) {
+      if (leaseFailure) throw leaseFailure;
       const channel = input.pullRequests;
       try {
         await reconcileWorkPullRequests(agentDir, signal, assertChannel, (update) =>
@@ -136,6 +169,7 @@ export function runReconciliationPass(
       }
     }
     if (input.costs) {
+      if (leaseFailure) throw leaseFailure;
       try {
         await reconcileWorkCosts(agentDir, signal, assertChannel);
       } catch (error) {
@@ -144,13 +178,16 @@ export function runReconciliationPass(
     }
     // Historical repair is local and has its own budget; PR and billing work run first.
     if (input.files) {
+      if (leaseFailure) throw leaseFailure;
       try {
         await reconcileWorkContinuations(agentDir, signal, assertLease, input.progress);
       } catch (error) {
+        if (leaseFailure) throw leaseFailure;
         if (!signal.aborted) debug("Could not reconcile work continuations: %o", error);
       }
     }
     if (input.reporting) {
+      if (leaseFailure) throw leaseFailure;
       try {
         await reconcileReporting(agentDir, input.reporting.cwd, signal, assertChannel);
       } catch (error) {
