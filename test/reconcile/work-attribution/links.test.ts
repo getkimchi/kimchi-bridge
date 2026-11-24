@@ -1,0 +1,1451 @@
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import {
+  backendFor,
+  capture,
+  closeBackends,
+  setNote,
+  useBackendFactory,
+} from "../../../src/ledger/records.js";
+import { createMemoryRecords } from "../../../src/ledger/memory-records.js";
+import type { HostPorts } from "../../../src/reconcile/host.js";
+import { setDefaultHostPorts } from "../../../src/reconcile/host-ports.js";
+import {
+  appendWorkRecord,
+  workLedgerPath,
+  type WorkContinuation,
+  type WorkContext,
+  type WorkSegment,
+} from "../../../src/reconcile/work-attribution.js";
+import { calculatePullRequestCosts } from "../../../src/reconcile/work-attribution/costs.js";
+import {
+  pinWorkContinuation,
+  readContinuationHistory,
+  readContinuationHistoryAsync,
+  reconcileWorkContinuations,
+  requestWorkLinks,
+  type ContinuationProgress,
+} from "../../../src/reconcile/work-attribution/links.js";
+import * as scope from "../../../src/reconcile/work-attribution/scope.js";
+import * as summary from "../../../src/reconcile/work-attribution/summary.js";
+import {
+  flushWorkSummaries,
+  readWorkRecords,
+  type WorkRecord,
+} from "../../../src/reconcile/work-attribution/summary.js";
+import { createWorkScopeSnapshot } from "../mocks/work-scope.js";
+
+/**
+ * Ported from Kimchi's src/extensions/work-attribution/links.test.ts. The continuation
+ * repair pass (reconcileWorkContinuations), its history index/incremental read machinery,
+ * pinWorkContinuation and requestWorkLinks are bridge code, so their suites port in full.
+ *
+ * The suites that drive the Kimchi-side session wrapper stay in Kimchi's vitest:
+ * confirmWorkContinuation and correctWorkLink resolve the session's live work identity
+ * (getWorkId, captureWorkScope, account verification) and write the link through the same
+ * session API the /work command uses — they never moved. That is every "live" mode of the
+ * mode loops below plus the confirm/correct suites at the top of Kimchi's file, and the
+ * one test whose setup confirms receipts through confirmWorkContinuation.
+ *
+ * Kimchi's vitest mocks (PI_CODING_AGENT_DIR, the node test setup's memory ledger) map to a
+ * fake HostPorts agentDir and the in-memory backend; vi.useFakeTimers({ toFake: ["Date"] })
+ * + setSystemTime map to the local clock helper.
+ */
+
+/** Replaces vi.useFakeTimers({ toFake: ["Date"] }) + vi.setSystemTime. */
+const RealDate = Date;
+let fakeNow: number | undefined;
+// biome-ignore lint/suspicious/noExplicitAny: test-only Date stand-in
+class ClockDate extends RealDate {
+  constructor(...args: any[]) {
+    super(args.length ? (args[0] as number | string | Date) : (fakeNow as number));
+  }
+  static now(): number {
+    return fakeNow as number;
+  }
+}
+function setSystemTime(at: number): void {
+  if (fakeNow === undefined)
+    (globalThis as { Date: DateConstructor }).Date = ClockDate as unknown as DateConstructor;
+  fakeNow = at;
+}
+function restoreClock(): void {
+  fakeNow = undefined;
+  (globalThis as { Date: DateConstructor }).Date = RealDate;
+}
+
+const host: HostPorts = {
+  get agentDir() {
+    return dir;
+  },
+  e2eSeam: () => undefined,
+  now: () => Date.now(),
+  credentials: () => ({ token: "api-key", apiUrl: "https://account.example" }),
+  endpoints: () => ({
+    llmEndpoint: "https://llm.example",
+    openAiBaseUrl: "https://llm.example/openai/v1",
+    anthropicBaseUrl: "https://llm.example/anthropic",
+    experimentalOpenAiBaseUrl: "https://llm.example/experimental/openai/v1",
+    platformApiUrl: "https://account.example",
+  }),
+  orgPolicy: () => ({ resourceEnabled: () => true }),
+  telemetryConsent: () => false,
+  metric: () => {},
+  fetch: async () => new Response("{}", { status: 200 }),
+};
+
+let dir: string;
+/** Kimchi's getWorkId: one stable work id per session, created on first use. */
+const workIds = new Map<string, string>();
+function context(name = "original"): WorkContext {
+  return { cwd: dir, sessionManager: { getSessionId: () => name } };
+}
+function workIdOf(ctx: WorkContext): string {
+  const session = ctx.sessionManager.getSessionId();
+  let id = workIds.get(session);
+  if (!id) {
+    id = randomUUID();
+    workIds.set(session, id);
+  }
+  return id;
+}
+/** Kimchi's test segments; the bridge's WorkSegment also allows "explicit", unused here. */
+type Segment = WorkSegment;
+/** Kimchi's recordProviderRequest, without the session-side pending-match machinery. */
+function recordProviderRequest(
+  ctx: WorkContext,
+  segment?: Segment,
+): {
+  requestId: string;
+  workId: string;
+} {
+  const workId = workIdOf(ctx);
+  const requestId = randomUUID();
+  appendWorkRecord(
+    ctx,
+    {
+      type: "request",
+      requestId,
+      startedAt: new Date().toISOString(),
+      segment,
+      scope: scope.readWorkScope(workId) ?? null,
+    },
+    workId,
+  );
+  return { requestId, workId };
+}
+const MAX_SLUG_LENGTH = 48;
+const DEFAULT_SLUG = "untitled-plan";
+function slugifyPlanName(name: string): string {
+  return (
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, MAX_SLUG_LENGTH)
+      .replace(/-+$/, "") || DEFAULT_SLUG
+  );
+}
+/** Kimchi's savePlanMarkdown (shared/planning/plan-markdown.ts): the editable plan plus its retained snapshot. */
+function savePlanMarkdown(opts: { cwd: string; name: string; planText: string; workId?: string }): {
+  path: string;
+  snapshotPath?: string;
+  contentHash?: string;
+} {
+  const plansDir = resolve(opts.cwd, ".kimchi/plans");
+  mkdirSync(plansDir, { recursive: true });
+  const filePath = resolve(plansDir, `${slugifyPlanName(opts.name)}.md`);
+  const header = `<!-- kimchi-work-id: ${opts.workId} -->`;
+  const content = `${header}\n${opts.planText}`;
+  fs.writeFileSync(filePath, content, "utf8");
+  const plans = join(dir, "work", opts.workId as string, "plans");
+  mkdirSync(plans, { recursive: true, mode: 0o700 });
+  const hash = createHash("sha256").update(content).digest("hex");
+  const snapshotPath = join(plans, `${slugifyPlanName(opts.name)}-${hash}.md`);
+  fs.writeFileSync(snapshotPath, content);
+  return { path: filePath, snapshotPath, contentHash: hash };
+}
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "kimchi-work-link-"));
+  workIds.clear();
+  setDefaultHostPorts(host);
+  closeBackends();
+  useBackendFactory(() => createMemoryRecords());
+  // Explicit legacy inputs are fixtures, not files created by the new capture path.
+  fs.mkdirSync(join(dir, "work-attribution"));
+});
+afterEach(async () => {
+  await flushWorkSummaries();
+  restoreClock();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  closeBackends();
+  useBackendFactory(null);
+  setDefaultHostPorts(undefined);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+it.each([
+  ["accepts", null],
+  ["rejects", "88888888-8888-4888-8888-888888888888"],
+] as const)("%s a link into a work whose other request has %s scope", (outcome, organizationId) => {
+  const source = "11111111-1111-4111-8111-111111111111";
+  const target = "22222222-2222-4222-8222-222222222222";
+  const workScope = createWorkScopeSnapshot(join(dir, ".git")).scope;
+  const request = (requestId: string, workId: string, reqScope: unknown = workScope) =>
+    ({
+      version: 1,
+      type: "request",
+      workId,
+      sessionId: workId,
+      requestId,
+      scope: reqScope,
+    }) as WorkRecord;
+  const moved = randomUUID();
+  const links = requestWorkLinks([
+    request(moved, source),
+    // A new work's first input stays unscoped when its account check was unavailable.
+    request(
+      randomUUID(),
+      target,
+      organizationId && { ...workScope, account: { ...workScope.account, organizationId } },
+    ),
+    request(randomUUID(), target),
+    {
+      version: 1,
+      type: "work_link",
+      workId: target,
+      sessionId: target,
+      linkId: randomUUID(),
+      revision: 1,
+      sourceWorkId: source,
+      targetWorkId: target,
+      requestIds: [moved],
+      scope: workScope,
+      status: "active",
+      evidence: { source: "work-command" },
+    } as WorkRecord,
+  ]);
+  expect(links.get(moved)).toMatchObject({
+    workIds: new Set([target]),
+    unresolved: outcome === "rejects",
+  });
+});
+
+function acceptedContinuation(
+  kind: "plan" | "artifact" = "plan",
+  name = "planner",
+  options: {
+    omitOrigin?: boolean;
+    accept?: (
+      receipt: Pick<WorkContinuation, "source" | "evidence">,
+    ) => Pick<WorkContinuation, "source" | "evidence">;
+  } = {},
+) {
+  const ctx = context(name);
+  const workId = workIdOf(ctx);
+  const originalScope = createWorkScopeSnapshot(join(dir, ".git")).scope;
+  scope.saveNewWorkScope(workId, originalScope);
+  const segment = {
+    id: randomUUID(),
+    attribution: "unknown",
+    reason: "unresolved-reference",
+  } as const;
+  const unrelated = recordProviderRequest(ctx, { ...segment, id: randomUUID() }).requestId;
+  const research = recordProviderRequest(ctx, segment).requestId;
+  const producer = recordProviderRequest(ctx, segment).requestId;
+  const saved = savePlanMarkdown({ cwd: dir, name, planText: "# Implement export\n", workId });
+  if (!saved.snapshotPath || !saved.contentHash) throw new Error("Missing retained plan");
+  const transitionId = randomUUID();
+  const origin =
+    kind === "plan"
+      ? { type: "plan", ...saved, requestId: producer }
+      : {
+          type: "file_transition",
+          transitionId,
+          toolCallId: "write",
+          repository: originalScope.repository,
+          worktree: dir,
+          path: "docs/adr.md",
+          requestId: producer,
+        };
+  const originRecord = {
+    ...origin,
+    version: 1,
+    workId,
+    sessionId: ctx.sessionManager.getSessionId(),
+    cwd: dir,
+    recordedAt: new Date().toISOString(),
+  } as WorkRecord;
+  if (!options.omitOrigin) appendWorkRecord(ctx, origin, workId);
+  const accepted: Pick<WorkContinuation, "source" | "evidence"> = {
+    source: kind === "plan" ? "saved-plan" : "named-artifact",
+    evidence: {
+      path: saved.snapshotPath,
+      ...originalScope,
+      segmentId: randomUUID(),
+      requestId: producer,
+      ...(kind === "plan" ? { contentHash: saved.contentHash } : { transitionId }),
+    },
+  };
+  const continuation = options.accept ? options.accept(accepted) : accepted;
+  const consumer = context(`${name}-consumer`);
+  appendWorkRecord(consumer, { type: "work", continuation }, workId);
+  return {
+    ctx,
+    consumer,
+    workId,
+    originalScope,
+    segment,
+    unrelated,
+    research,
+    producer,
+    saved,
+    origin,
+    originRecord,
+    continuation,
+  };
+}
+function repair(progress: { nextContinuation?: string } = {}, assertLease = () => {}) {
+  return reconcileWorkContinuations(dir, new AbortController().signal, assertLease, progress);
+}
+function links(): WorkRecord[] {
+  return readWorkRecords(dir).filter((row) => row.type === "work_link");
+}
+
+it.each(["plan", "artifact"] as const)(
+  "repairs an accepted %s after restart without changing requests or prices",
+  async (kind) => {
+    const flow = acceptedContinuation(kind);
+    const original = readWorkRecords(dir).filter((row) => row.type === "request");
+    appendWorkRecord(
+      flow.ctx,
+      {
+        type: "commit",
+        sha: "a".repeat(40),
+        repository: flow.originalScope.repository,
+        worktree: dir,
+        pullRequests: [
+          {
+            provider: "github",
+            host: "github.com",
+            repository: "example/repo",
+            number: 1,
+            url: "https://github.com/example/repo/pull/1",
+            state: "merged",
+            headSha: "a".repeat(40),
+            mergeCommitSha: "b".repeat(40),
+            mergedAt: "2030-01-01T00:00:00Z",
+            closedAt: null,
+            checkedAt: "2030-01-01T00:00:00Z",
+          },
+        ],
+      },
+      flow.workId,
+    );
+    const prices = [flow.unrelated, flow.research, flow.producer].map((requestId) => ({
+      requestId,
+      billingRecordId: requestId,
+      costUsd: "0.125",
+      account: flow.originalScope.account,
+    }));
+    const before = calculatePullRequestCosts(readWorkRecords(dir), prices);
+    // Repair must not read today's account; the bridge library imports getWorkId for no
+    // call site at all (the Kimchi-side spy from the original cannot exist here).
+    const account = vi
+      .spyOn(scope, "captureWorkScope")
+      .mockRejectedValue(new Error("Must not read today's account"));
+    await repair();
+    await repair();
+    expect(account).not.toHaveBeenCalled();
+    expect(links()).toMatchObject([
+      {
+        sessionId: flow.consumer.sessionManager.getSessionId(),
+        workId: flow.workId,
+        sourceWorkId: flow.workId,
+        targetWorkId: flow.workId,
+        scope: flow.originalScope,
+        requestIds: [flow.research, flow.producer].sort(),
+        evidence: { segmentId: flow.segment.id },
+      },
+    ]);
+    expect(readWorkRecords(dir).filter((row) => row.type === "request")).toEqual(original);
+    const after = calculatePullRequestCosts(readWorkRecords(dir), prices);
+    expect(
+      after.requests.map(({ requestId, totalCostUsd }) => ({ requestId, totalCostUsd })),
+    ).toEqual(before.requests.map(({ requestId, totalCostUsd }) => ({ requestId, totalCostUsd })));
+    expect(after.pullRequests[0].knownCostUsd).toBe("0.250000000");
+    expect(after.requests.find((row) => row.requestId === flow.unrelated)?.allocation).toBe(
+      "unknown",
+    );
+  },
+);
+
+it("retries an accepted continuation when its original producer record is restored", async () => {
+  const flow = acceptedContinuation("plan", "planner", { omitOrigin: true });
+  await repair();
+  expect(links()).toEqual([]);
+  capture(dir, flow.originRecord, workLedgerPath(flow.ctx));
+  await repair();
+  expect(links()).toHaveLength(1);
+});
+
+it("can use restored pre-acceptance production when no producer identity was available at acceptance", async () => {
+  setSystemTime(Date.parse("2026-10-05T09:00:00Z"));
+  const flow = acceptedContinuation("plan", "planner", {
+    omitOrigin: true,
+    accept: ({ source, evidence: { requestId: _requestId, ...evidence } }) => {
+      setSystemTime(Date.parse("2026-10-05T09:01:00Z"));
+      return { source, evidence };
+    },
+  });
+  await repair();
+  expect(links()).toEqual([]);
+  capture(dir, flow.originRecord, workLedgerPath(flow.ctx));
+  await repair();
+  expect(links()).toHaveLength(1);
+});
+
+it("uses accepted plan bytes after the editable path changes, without confirming its new producer", async () => {
+  const flow = acceptedContinuation();
+  appendWorkRecord(
+    flow.consumer,
+    {
+      type: "work",
+      continuation: {
+        ...flow.continuation,
+        evidence: { ...flow.continuation.evidence, path: flow.saved.path },
+      },
+    },
+    flow.workId,
+  );
+  const later = recordProviderRequest(flow.ctx, { ...flow.segment, id: randomUUID() });
+  const replacement = savePlanMarkdown({
+    cwd: dir,
+    name: "planner",
+    planText: "# A later task\n",
+    workId: flow.workId,
+  });
+  appendWorkRecord(
+    flow.ctx,
+    { type: "plan", ...replacement, requestId: later.requestId },
+    flow.workId,
+  );
+  await repair();
+  expect(links()).toHaveLength(1);
+  expect(links()[0].requestIds).toEqual([flow.research, flow.producer].sort());
+});
+
+it.each([
+  "legacy-plan",
+  "edited-restored",
+  "semantic",
+  "scope-missing",
+  "receipt-account",
+  "receipt-repository",
+  "request-account",
+  "request-unscoped",
+  "ambiguous-producer",
+  "missing-segment",
+])("leaves %s history unknown", async (kind) => {
+  const flow = acceptedContinuation("plan", "planner", {
+    accept: (receipt) => {
+      if (kind === "legacy-plan") receipt.evidence.contentHash = undefined;
+      if (kind === "edited-restored")
+        receipt.evidence.contentHash = createHash("sha256")
+          .update("different accepted bytes")
+          .digest("hex");
+      if (kind === "semantic") receipt.source = "semantic";
+      if (kind === "receipt-account" && receipt.evidence.account)
+        receipt.evidence.account = { ...receipt.evidence.account, organizationId: randomUUID() };
+      if (kind === "receipt-repository") receipt.evidence.repository = join(dir, "other.git");
+      return receipt;
+    },
+  });
+  if (kind === "scope-missing") setNote(dir, flow.workId, "scope", "null");
+  const request = readWorkRecords(dir).find(
+    (row) => row.type === "request" && row.requestId === flow.producer,
+  );
+  if (!request) throw new Error("Missing producer");
+  if (kind === "request-account")
+    appendWorkRecord(
+      flow.ctx,
+      {
+        ...request,
+        scope: {
+          ...flow.originalScope,
+          account: { ...flow.originalScope.account, userId: randomUUID() },
+        },
+      },
+      flow.workId,
+    );
+  if (kind === "request-unscoped")
+    appendWorkRecord(flow.ctx, { ...request, scope: null }, flow.workId);
+  if (kind === "missing-segment")
+    appendWorkRecord(flow.ctx, { ...request, segment: undefined }, flow.workId);
+  if (kind === "ambiguous-producer")
+    appendWorkRecord(flow.ctx, { ...flow.origin, requestId: flow.unrelated }, flow.workId);
+  await repair();
+  expect(links()).toEqual([]);
+});
+
+// Kimchi runs this over both modes; the "live" half (confirmWorkContinuation) stayed in Kimchi.
+it.each([
+  ["confirms", null],
+  ["refuses", "88888888-8888-4888-8888-888888888888"],
+] as const)(
+  "repair %s a plan whose work has an earlier request with %s scope",
+  async (outcome, organizationId) => {
+    const ctx = context("planner");
+    const workId = workIdOf(ctx);
+    const originalScope = createWorkScopeSnapshot(join(dir, ".git")).scope;
+    // The first input ran before account verification finished, so its request kept no scope.
+    const early = recordProviderRequest(ctx, {
+      id: randomUUID(),
+      attribution: "session",
+      reason: "matching-disabled",
+    });
+    scope.saveNewWorkScope(workId, originalScope);
+    if (organizationId)
+      appendWorkRecord(
+        ctx,
+        {
+          type: "request",
+          requestId: randomUUID(),
+          scope: { ...originalScope, account: { ...originalScope.account, organizationId } },
+        },
+        workId,
+      );
+    const segment = {
+      id: randomUUID(),
+      attribution: "session",
+      reason: "matching-disabled",
+    } as const;
+    const producer = recordProviderRequest(ctx, segment).requestId;
+    const plan = savePlanMarkdown({ cwd: dir, name: "export", planText: "# Export\n", workId });
+    appendWorkRecord(ctx, { type: "plan", ...plan, requestId: producer }, workId);
+    expect(readWorkRecords(dir).find((row) => row.requestId === early.requestId)?.scope).toBeNull();
+    const accepted: Pick<WorkContinuation, "source" | "evidence"> = {
+      source: "saved-plan",
+      evidence: {
+        path: plan.path,
+        contentHash: plan.contentHash,
+        requestId: producer,
+        segmentId: randomUUID(),
+        ...originalScope,
+      },
+    };
+    const consumer = context("consumer");
+    appendWorkRecord(consumer, { type: "work", continuation: accepted }, workId);
+    await repair();
+    const resolved = requestWorkLinks(readWorkRecords(dir)).get(producer);
+    if (outcome === "refuses") expect(resolved).toBeUndefined();
+    else expect(resolved).toMatchObject({ workIds: new Set([workId]), unresolved: false });
+    expect(links()).toMatchObject(outcome === "refuses" ? [] : [{ requestIds: [producer] }]);
+  },
+);
+
+it.each(["session", "inferred"] as const)(
+  "confirms the restored %s planning input only",
+  async (attribution) => {
+    const flow = acceptedContinuation();
+    const requests = readWorkRecords(dir).filter((row) => row.type === "request");
+    for (const row of requests.filter((row) => row.requestId !== flow.unrelated)) {
+      appendWorkRecord(
+        flow.ctx,
+        { ...row, segment: { ...flow.segment, attribution } },
+        flow.workId,
+      );
+    }
+    await repair();
+    expect(links()).toHaveLength(1);
+    expect(links()[0].requestIds).toEqual([flow.research, flow.producer].sort());
+    expect(requestWorkLinks(readWorkRecords(dir)).has(flow.unrelated)).toBe(false);
+  },
+);
+
+it("repairs a legacy native transition receipt using only its original scope", async () => {
+  acceptedContinuation("artifact", "planner", {
+    accept: ({
+      source,
+      evidence: { account: _account, segmentId: _segmentId, requestId: _requestId, ...evidence },
+    }) => ({
+      source,
+      evidence,
+    }),
+  });
+  await repair();
+  expect(links()).toHaveLength(1);
+});
+
+it.each(["active", "revoked"])("never replaces an existing %s correction", async (status) => {
+  const flow = acceptedContinuation();
+  appendWorkRecord(
+    flow.ctx,
+    {
+      type: "work_link",
+      linkId: randomUUID(),
+      revision: 1,
+      status,
+      sourceWorkId: flow.workId,
+      targetWorkId: flow.workId,
+      requestIds: [flow.research],
+      scope: flow.originalScope,
+      evidence: { source: "work-command", segmentId: flow.segment.id },
+    },
+    flow.workId,
+  );
+  await repair();
+  expect(links()).toHaveLength(1);
+  expect(links()[0].status).toBe(status);
+});
+
+it("does not use a partial ledger scan and retries the complete scan later", async () => {
+  acceptedContinuation();
+  await flushWorkSummaries();
+  const failure = vi.spyOn(backendFor(dir), "readRecordPage").mockImplementationOnce(() => {
+    throw new Error("Could not read work ledger: Denied");
+  });
+  await expect(repair()).rejects.toThrow("Could not read work ledger");
+  failure.mockRestore();
+  expect(links()).toEqual([]);
+  await repair();
+  expect(links()).toHaveLength(1);
+});
+
+for (const mode of ["pin", "history"] as const) {
+  // Kimchi also runs "live" (confirmWorkContinuation) here; that half stayed in Kimchi.
+  it.each(["truncated-correction", "invalid-correction", "invalid-producer"])(
+    `${mode} preserves hard %s coverage after its source is rewritten`,
+    async (kind) => {
+      const flow = acceptedContinuation();
+      await flushWorkSummaries();
+      const requests = readWorkRecords(dir).filter((row) => row.type === "request");
+      const correction = {
+        version: 1,
+        type: "work_link",
+        workId: flow.workId,
+        sessionId: "correction",
+        linkId: randomUUID(),
+        revision: 2,
+        status: "revoked",
+        sourceWorkId: flow.workId,
+        targetWorkId: flow.workId,
+        requestIds: [flow.producer],
+        scope: flow.originalScope,
+        evidence: { source: "work-command", segmentId: flow.segment.id },
+      };
+      const line =
+        kind === "truncated-correction"
+          ? JSON.stringify(correction).slice(0, -1)
+          : JSON.stringify(
+              kind === "invalid-correction"
+                ? { ...correction, targetWorkId: null }
+                : {
+                    version: 1,
+                    workId: flow.workId,
+                    sessionId: "second-producer",
+                    ...flow.origin,
+                    path: null,
+                    requestId: flow.unrelated,
+                  },
+            );
+      const damaged = join(dir, "work-attribution", "damaged.jsonl");
+      fs.writeFileSync(damaged, `${line}\n`);
+      const continuation = { ...flow.continuation, workId: flow.workId };
+      const invoke = () =>
+        mode === "pin" ? pinWorkContinuation(continuation, readContinuationHistory(dir)) : repair();
+      await expect(Promise.resolve().then(invoke as () => Promise<unknown>)).rejects.toThrow(
+        `Incomplete work history contains invalid records in ${damaged}:1`,
+      );
+      expect(links()).toEqual([]);
+      // Deliberate immutable-history contract change: 65dfefb12 cleared damage on a whitespace rewrite.
+      // A rewrite can hide a correction or producer; only append-based tail recovery can clear a repairable cut.
+      fs.writeFileSync(damaged, "\n \t\r\n");
+      await expect(Promise.resolve().then(invoke as () => Promise<unknown>)).rejects.toThrow(
+        `Incomplete work history contains invalid records in ${damaged}:1`,
+      );
+      expect(links()).toEqual([]);
+      expect(readWorkRecords(dir).filter((row) => row.type === "request")).toEqual(requests);
+      const report = calculatePullRequestCosts(readWorkRecords(dir), [
+        {
+          requestId: flow.producer,
+          billingRecordId: flow.producer,
+          costUsd: "0.125",
+          account: flow.originalScope.account,
+        },
+      ]);
+      expect(report.requests.find((row) => row.requestId === flow.producer)?.totalCostUsd).toBe(
+        "0.125000000",
+      );
+    },
+  );
+
+  it.each(["other work", "continued work", "continued work's request"])(
+    `${mode} handles an unknown record type that names the %s`,
+    async (named) => {
+      const flow = acceptedContinuation();
+      const sibling = acceptedContinuation("plan", "sibling");
+      await flushWorkSummaries();
+      // A newer Kimchi sharing this history wrote a record type that this version cannot interpret.
+      const newer = join(dir, "work-attribution", "newer.jsonl");
+      const record = {
+        version: 1,
+        type: "work_checkpoint",
+        workId:
+          (
+            { "other work": sibling.workId, "continued work": flow.workId } as Record<
+              string,
+              string
+            >
+          )[named] ?? randomUUID(),
+        sessionId: "newer",
+        ...(named === "continued work's request" ? { requests: { [flow.research]: "moved" } } : {}),
+      };
+      fs.writeFileSync(newer, `${JSON.stringify(record)}\n`);
+      const { requestId: _requestId, ...evidence } = flow.continuation.evidence;
+      const continuation = { ...flow.continuation, workId: flow.workId, evidence };
+      const invoke = () =>
+        mode === "pin" ? pinWorkContinuation(continuation, readContinuationHistory(dir)) : repair();
+      if (named === "other work") {
+        const pinned = await invoke();
+        if (mode === "pin")
+          expect(pinned).toMatchObject({ evidence: { requestId: flow.producer } });
+        else expect(links()).toMatchObject([{ workId: flow.workId }]);
+      } else if (mode === "history") {
+        // Only the named work waits; the other receipt is still confirmed in the same pass.
+        await repair();
+        expect(links()).toMatchObject([{ workId: sibling.workId }]);
+      } else {
+        await expect(Promise.resolve().then(invoke as () => Promise<unknown>)).rejects.toThrow(
+          `Work history contains unknown record types in ${newer}:1`,
+        );
+        expect(links()).toEqual([]);
+      }
+    },
+  );
+
+  it.each(["present", "missing", "changed"])(
+    `${mode} keeps both matching producers unresolved when one retained plan is %s`,
+    async (kind) => {
+      setSystemTime(Date.parse("2026-10-05T09:00:00Z"));
+      const flow = acceptedContinuation("plan", "planner", {
+        accept: ({ source, evidence: { requestId: _requestId, ...evidence } }) => ({
+          source,
+          evidence,
+        }),
+      });
+      await flushWorkSummaries();
+      const snapshotPath = join(dir, "other-retained.md");
+      if (kind !== "missing")
+        fs.writeFileSync(
+          snapshotPath,
+          kind === "present" ? fs.readFileSync(flow.continuation.evidence.path) : "changed",
+        );
+      appendWorkRecord(
+        flow.ctx,
+        { ...flow.origin, snapshotPath, requestId: flow.unrelated },
+        flow.workId,
+      );
+      const { requestId: _requestId, ...evidence } = flow.continuation.evidence;
+      const continuation: WorkContinuation = {
+        ...flow.continuation,
+        workId: flow.workId,
+        evidence: { ...evidence, path: flow.saved.path },
+      };
+      setSystemTime(Date.parse("2026-10-05T09:01:00Z"));
+      appendWorkRecord(flow.consumer, { type: "work", continuation }, flow.workId);
+      const producers = readWorkRecords(dir).filter(
+        (row) =>
+          row.type === "plan" &&
+          row.path === continuation.evidence.path &&
+          row.contentHash === evidence.contentHash,
+      );
+      expect(new Set(producers.map((row) => row.requestId)).size).toBe(2);
+      if (mode === "pin")
+        expect(
+          pinWorkContinuation(continuation, readContinuationHistory(dir)).evidence.requestId,
+        ).toBeUndefined();
+      else await repair();
+      expect(links()).toEqual([]);
+    },
+  );
+}
+
+it("retries a failed append without recording history as complete", async () => {
+  acceptedContinuation();
+  await flushWorkSummaries();
+  const backend = backendFor(dir);
+  const insert = backend.insertRecord.bind(backend);
+  const failure = vi.spyOn(backend, "insertRecord").mockImplementation((record) => {
+    if (record.type === "work_link") throw new Error("Disk full");
+    return insert(record);
+  });
+  await expect(repair()).rejects.toThrow("Disk full");
+  failure.mockRestore();
+  expect(links()).toEqual([]);
+  await repair();
+  expect(links()).toHaveLength(1);
+});
+
+it("stops before publishing when the lease is lost", async () => {
+  acceptedContinuation();
+  await expect(
+    repair({}, () => {
+      throw new Error("Lease lost");
+    }),
+  ).rejects.toThrow("Lease lost");
+  expect(links()).toEqual([]);
+});
+
+it.each(["later request", "earlier request"])(
+  "never uses a later same-hash plan produced by a %s",
+  async (kind) => {
+    setSystemTime(Date.parse("2026-10-05T09:00:00Z"));
+    const flow = acceptedContinuation("plan", "planner", {
+      omitOrigin: true,
+      accept: ({ source, evidence: { requestId: _requestId, ...evidence } }) => ({
+        source,
+        evidence,
+      }),
+    });
+    expect(readWorkRecords(dir).filter((row) => row.type === "plan")).toEqual([]);
+    expect(flow.continuation.evidence.requestId).toBeUndefined();
+    setSystemTime(Date.parse("2026-10-05T09:01:00Z"));
+    const requestId =
+      kind === "earlier request"
+        ? flow.unrelated
+        : recordProviderRequest(flow.ctx, { ...flow.segment, id: randomUUID() }).requestId;
+    appendWorkRecord(flow.ctx, { ...flow.origin, requestId }, flow.workId);
+    await repair();
+    expect(links()).toEqual([]);
+  },
+);
+
+it("abandons an over-budget source scan before writing and retries it later", async () => {
+  acceptedContinuation();
+  await flushWorkSummaries();
+  let now = 0;
+  setSystemTime(now);
+  const backend = backendFor(dir);
+  const read = backend.readRecordPage.bind(backend);
+  const slow = vi
+    .spyOn(backend, "readRecordPage")
+    .mockImplementation((after, through, limit, checkBudget) => {
+      now += 4000;
+      setSystemTime(now);
+      return read(after, through, limit, checkBudget);
+    });
+  await expect(repair()).rejects.toThrow("time limit");
+  slow.mockRestore();
+  expect(links()).toEqual([]);
+  await repair();
+  expect(links()).toHaveLength(1);
+});
+
+it("moves a slow receipt behind its sibling on the next bounded pass", async () => {
+  acceptedContinuation("plan", "first");
+  acceptedContinuation("plan", "second");
+  await flushWorkSummaries();
+  let now = 0;
+  setSystemTime(now);
+  let slowPath: string | undefined;
+  const read = fs.readFileSync;
+  const slow = vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+    const path = String(args[0]);
+    if (path.endsWith(".md")) {
+      slowPath ??= path;
+      if (path === slowPath) {
+        now += 4000;
+        setSystemTime(now);
+      }
+    }
+    return (read as (...values: unknown[]) => string | Buffer)(...args);
+  }) as typeof fs.readFileSync);
+  const progress = {};
+  await expect(repair(progress)).rejects.toThrow("time limit");
+  expect(links()).toHaveLength(0);
+  await expect(repair(progress)).rejects.toThrow("time limit");
+  expect(links()).toHaveLength(1);
+  slow.mockRestore();
+  await repair(progress);
+  expect(links()).toHaveLength(2);
+});
+
+it("recovers a large receipt set over bounded passes without permanently skipping a receipt", async () => {
+  for (let index = 0; index < 26; index++) acceptedContinuation("plan", `planner-${index}`);
+  const progress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(25);
+  await repair(progress);
+  expect(links()).toHaveLength(26);
+  await repair(progress);
+  expect(links()).toHaveLength(26);
+});
+
+it("reads ledger history once and no retained plan in a full pass over confirmed receipts", async () => {
+  for (let index = 0; index < 30; index++) acceptedContinuation("plan", `planner-${index}`);
+  const progress = {};
+  await repair(progress);
+  await repair(progress);
+  expect(links()).toHaveLength(30);
+  await flushWorkSummaries();
+  const backend = backendFor(dir);
+  const count = backend.recordCount();
+  const history = vi.spyOn(backend, "readRecordPage");
+  const read = vi.spyOn(fs, "readFileSync");
+  // A restarted process has no progress, so it reads the whole authority once, paged and from position zero.
+  await repair();
+  expect(history.mock.calls[0][0]).toBe(0);
+  expect(history.mock.results.flatMap((result) => result.value as unknown[])).toHaveLength(count);
+  expect(
+    read.mock.calls.map(([path]) => String(path)).filter((path) => path.endsWith(".md")),
+  ).toEqual([]);
+  expect(links()).toHaveLength(30);
+});
+
+it("skips unchanged history after a pass that examined every receipt without writing, until a record arrives", async () => {
+  const flow = acceptedContinuation("plan", "planner", { omitOrigin: true });
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  expect(links()).toEqual([]);
+  const read = vi.spyOn(backendFor(dir), "readRecordPage");
+  const windowed = vi.spyOn(backendFor(dir), "readRecords");
+  await repair(progress);
+  // A settled pass performs no ledger read at all — neither the paged rebuild walk nor a windowed increment.
+  expect(read).not.toHaveBeenCalled();
+  expect(windowed).not.toHaveBeenCalled();
+  read.mockRestore();
+  windowed.mockRestore();
+  // A newly available producer changes the authority fingerprint and makes the receipt eligible again.
+  capture(dir, flow.originRecord, workLedgerPath(flow.ctx));
+  await repair(progress);
+  expect(links()).toHaveLength(1);
+});
+
+it("does not retry plan receipts saved without an acceptance hash, so their history can settle", async () => {
+  for (let index = 0; index < 30; index++) {
+    // Releases before acceptance hashes saved receipts that can never name their producer.
+    acceptedContinuation("plan", `planner-${index}`, {
+      accept: ({
+        source,
+        evidence: { contentHash: _contentHash, requestId: _requestId, ...evidence },
+      }) => ({
+        source,
+        evidence,
+      }),
+    });
+  }
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  const read = vi.spyOn(backendFor(dir), "readRecordPage");
+  const windowed = vi.spyOn(backendFor(dir), "readRecords");
+  await repair(progress);
+  // A settled pass performs no ledger read at all — neither the paged rebuild walk nor a windowed increment.
+  expect(read).not.toHaveBeenCalled();
+  expect(windowed).not.toHaveBeenCalled();
+  read.mockRestore();
+  windowed.mockRestore();
+  expect(links()).toEqual([]);
+});
+
+it("reads only new records between passes while linkable work remains, not the whole ledger", async () => {
+  // More linkable candidates than one pass can process: the backlog spans several passes, and
+  // every pass after the first must read only what changed since the previous one.
+  for (let index = 0; index < 30; index++) acceptedContinuation("plan", `planner-${index}`);
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  const backend = backendFor(dir);
+  const original = backend.readRecordPage.bind(backend);
+  const read = vi
+    .spyOn(backend, "readRecordPage")
+    .mockImplementation((...args) => original(...args));
+  const windowed = vi.spyOn(backend, "readRecords");
+  await repair(progress);
+  await repair(progress);
+  const calls = read.mock.calls;
+  const windowedCalls = windowed.mock.calls;
+  read.mockRestore();
+  windowed.mockRestore();
+  // Incremental ledger reads never touch the paged whole-authority walk …
+  expect(calls).toHaveLength(0);
+  // … but they do read, always pinned to a time window after the previous pass.
+  expect(windowedCalls.length).toBeGreaterThan(0);
+  expect(windowedCalls.every(([query]) => query?.modifiedSince !== undefined)).toBe(true);
+  expect(links()).toHaveLength(30);
+});
+
+it("rebuilds the accumulated history from scratch after a journal is rewritten, not appended", async () => {
+  acceptedContinuation("plan", "planner");
+  // A legacy-style journal file on disk: its stats are part of the pass fingerprint.
+  const journal = join(dir, "work-attribution", "00000000-rewrite-signal.jsonl");
+  fs.writeFileSync(
+    journal,
+    `${JSON.stringify({
+      version: 1,
+      type: "work",
+      workId: randomUUID(),
+      sessionId: "00000000-rewrite-signal",
+      recordedAt: new Date().toISOString(),
+      cwd: dir,
+    })}\n`,
+  );
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(1);
+  // A second receipt keeps the next pass from settling into the quiet fast path.
+  acceptedContinuation("plan", "planner-after");
+  await flushWorkSummaries();
+  // A same-size mtime change is a rewrite signal: appends only ever grow a journal.
+  const now = new Date();
+  fs.utimesSync(journal, now, now);
+  const backend = backendFor(dir);
+  const original = backend.readRecordPage.bind(backend);
+  const read = vi
+    .spyOn(backend, "readRecordPage")
+    .mockImplementation((...args) => original(...args));
+  await repair(progress);
+  const calls = read.mock.calls;
+  read.mockRestore();
+  // The rewrite signal must force a full rebuild, not an incremental merge.
+  expect(calls.some(([after]) => after === 0)).toBe(true);
+  expect(links()).toHaveLength(2);
+});
+
+it("withholds a work named by an unknown record type that arrived between passes", async () => {
+  acceptedContinuation("plan", "planner");
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(1);
+  // A second receipt arrives AFTER the first pass, alongside an unknown-type record naming its work.
+  const later = acceptedContinuation("plan", "planner-later");
+  const unknownRecord = {
+    version: 1,
+    type: "future_record_kind",
+    workId: later.workId,
+    sessionId: "00000000-future-session",
+    recordedAt: new Date().toISOString(),
+    cwd: dir,
+  };
+  fs.appendFileSync(
+    join(dir, "work-attribution", "00000000-future-session.jsonl"),
+    `${JSON.stringify(unknownRecord)}\n`,
+  );
+  await flushWorkSummaries();
+  await repair(progress);
+  await repair(progress);
+  // The first pass may have rebuilt (journal growth); whichever path runs, the unknown-type
+  // gate must keep the later work's receipt unconfirmed until the history explains the record.
+  expect(links().every((row) => row.workId !== later.workId)).toBe(true);
+  expect(links()).toHaveLength(1);
+});
+
+it("fails loudly when an invalid journal line arrives between passes, writing no new links", async () => {
+  acceptedContinuation("plan", "planner");
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(1);
+  acceptedContinuation("plan", "planner-invalid");
+  fs.appendFileSync(join(dir, "work-attribution", "00000000-damaged.jsonl"), "{ broken json\n");
+  await flushWorkSummaries();
+  await expect(repair(progress)).rejects.toThrow(/invalid records/);
+  expect(links()).toHaveLength(1);
+});
+
+it("withholds a receipt that was already pending when an unknown record type later names its work", async () => {
+  // A receipt pending from pass 1 (its producer evidence is missing), then the evidence
+  // arrives TOGETHER with an unknown-type record naming the same work: the incremental
+  // pass must not confirm what the rebuild branch would withhold.
+  const pending = acceptedContinuation("plan", "planner-pending", { omitOrigin: true });
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(0);
+  // Restore the producer evidence (the origin record the receipt was waiting on) and add
+  // the unknown-type record naming the work.
+  appendWorkRecord(pending.ctx, pending.origin, pending.workId);
+  fs.appendFileSync(
+    join(dir, "work-attribution", "00000000-later-unknown.jsonl"),
+    `${JSON.stringify({
+      version: 1,
+      type: "future_record_kind",
+      workId: pending.workId,
+      sessionId: "00000000-later-unknown",
+      recordedAt: new Date().toISOString(),
+      cwd: dir,
+    })}\n`,
+  );
+  await flushWorkSummaries();
+  await repair(progress);
+  await repair(progress);
+  expect(links().every((row) => row.workId !== pending.workId)).toBe(true);
+});
+
+it("an incremental pass over a spanning backlog breathes through the fresh-window merge", async () => {
+  // Pass 1 completes 25 of 30 receipts and the cap leaves 5 pending, so quiet is NOT set, the
+  // incremental state is retained, and pass 2 runs the incremental branch over a 2,500-record
+  // backlog, breathing once per fresh row on top of the paged windowed read.
+  for (let index = 0; index < 30; index++) acceptedContinuation("plan", `planner-${index}`);
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(25);
+  const lines: string[] = [];
+  for (let index = 0; index < 2_500; index++) {
+    const workId = `cccccccc-0000-4000-8000-${String(index).padStart(12, "0")}`;
+    lines.push(
+      JSON.stringify({
+        version: 1,
+        type: "request",
+        workId,
+        sessionId: "backlog-session",
+        requestId: `dddddddd-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        recordedAt: "2026-10-05T12:00:00.000Z",
+      }),
+    );
+  }
+  fs.appendFileSync(
+    join(dir, "work-attribution", "00000000-backlog.jsonl"),
+    `${lines.join("\n")}\n`,
+  );
+  await flushWorkSummaries();
+  const stretch = vi.fn(async () => {});
+  await reconcileWorkContinuations(dir, new AbortController().signal, () => {}, progress, stretch);
+  // The fresh-window read pages the backlog and the merge breathes once per fresh row, on top
+  // of the slack-tail re-reads: with a window this size the per-row share dominates.
+  expect(stretch.mock.calls.length).toBeGreaterThanOrEqual(2_500);
+});
+
+it("a rebuild retains only the recent slack tail of merged identities, as fixed-size hashes", async () => {
+  // The retained identity set holds only rows a future pass's window can still re-read: after a
+  // rebuild over rows imported well before the pass, the set is empty — never the whole history —
+  // and identities are fixed-size record hashes, never serialized bodies.
+  setSystemTime(Date.parse("2026-10-05T09:00:00Z"));
+  const flow = acceptedContinuation("plan", "planner-tail", { omitOrigin: true });
+  // Force the journal→ledger import to run at the early time, so the flow's rows carry an
+  // import stamp an hour before the pass (appendWorkRecord writes journals; the ledger
+  // import itself runs lazily on first read).
+  readWorkRecords(dir);
+  await flushWorkSummaries();
+  // The pass runs an hour later: nothing imported within the slack tail can be re-read by a
+  // future window, so the retained identity set is empty — not the whole history.
+  setSystemTime(Date.parse("2026-10-05T10:00:00Z"));
+  const progress: ContinuationProgress = {};
+  await repair(progress);
+  expect(progress.historyIndex).toBeDefined(); // the receipt stays pending, state is retained
+  expect(progress.historyMerged?.size ?? 0).toBe(0);
+  // Identities are ledger record hashes — fixed-size, never serialized bodies.
+  for (const identity of progress.historyMerged ?? []) expect(identity).toMatch(/^[a-f\d]{64}$/);
+  // A fresh append inside the tail is indexed by the incremental merge and confirms the receipt:
+  // with every key settled the pass takes its quiet exit and releases the accumulated state —
+  // merged included — so the durable outcome is the written link, not a retained set.
+  setSystemTime(Date.parse("2026-10-05T10:00:34Z"));
+  appendWorkRecord(flow.ctx, flow.origin, flow.workId);
+  setSystemTime(Date.parse("2026-10-05T10:00:35Z"));
+  await repair(progress);
+  expect(links()).toHaveLength(1);
+});
+
+it("releases the accumulated incremental state past the retained-row cap; the next pass rebuilds and still links", async () => {
+  const flow = acceptedContinuation("plan", "planner-cap", { omitOrigin: true });
+  await flushWorkSummaries();
+  const progress: ContinuationProgress = {};
+  // The first pass runs with a zero cap: the rebuild still indexes and sweeps, but the
+  // accumulated state is released at its end — a permanently pending receipt cannot grow
+  // the index without bound.
+  await reconcileWorkContinuations(
+    dir,
+    new AbortController().signal,
+    () => {},
+    progress,
+    async () => {},
+    0,
+  );
+  expect(links()).toHaveLength(0);
+  expect(progress.historyIndex).toBeUndefined();
+  expect(progress.historyCandidates).toBeUndefined();
+  expect(progress.historyMerged).toBeUndefined();
+  // The next pass rebuilds from the full read, recovers the pending candidate, and the
+  // restored producer evidence confirms through the rebuilt state.
+  appendWorkRecord(flow.ctx, flow.origin, flow.workId);
+  await flushWorkSummaries();
+  await repair(progress);
+  expect(links()).toHaveLength(1);
+});
+
+it("a record captured during a rebuild pass is indexed by the next incremental pass", async () => {
+  // merged identities come from the same snapshot the rebuild indexed: a record captured mid-pass
+  // (after the history read resolved) is absent from both the index and the merged set, so the
+  // next incremental pass indexes it — never skips it as already merged, which would silently
+  // lose its link.
+  const flow = acceptedContinuation("plan", "planner-race", { omitOrigin: true });
+  await flushWorkSummaries();
+  const progress: ContinuationProgress = {};
+  const read = summary.readWorkRecordsForHistoryAsync;
+  const spy = vi
+    .spyOn(summary, "readWorkRecordsForHistoryAsync")
+    .mockImplementation(async (...args) => {
+      const anchored = await read(...args);
+      // Captured after the snapshot the index builds from, mid-pass: the race window.
+      appendWorkRecord(flow.ctx, flow.origin, flow.workId);
+      return anchored;
+    });
+  try {
+    await repair(progress);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(links()).toHaveLength(0); // the rebuild's snapshot predates the capture
+  // The next pass runs the incremental branch over the captured record: it must index it —
+  // not skip it as already merged — and confirm the link.
+  await repair(progress);
+  expect(links()).toHaveLength(1);
+});
+
+it("an over-cap history retains its rebuilt state instead of re-reading the whole history every pass", async () => {
+  const flow = acceptedContinuation("plan", "planner-rearm", { omitOrigin: true });
+  await flushWorkSummaries();
+  const progress: ContinuationProgress = {};
+  // A zero cap releases the accumulated state at the first rebuild's end and remembers the
+  // release point.
+  await reconcileWorkContinuations(
+    dir,
+    new AbortController().signal,
+    () => {},
+    progress,
+    async () => {},
+    0,
+  );
+  expect(progress.historyIndex).toBeUndefined();
+  expect(progress.historyEvictedRows).toBeGreaterThan(0);
+  // A journal change forces another rebuild — but the cap re-arms at the release point, so the
+  // freshly rebuilt state is retained: incremental work resumes instead of a full read per pass.
+  appendWorkRecord(flow.ctx, { type: "request", requestId: randomUUID() }, flow.workId);
+  await flushWorkSummaries();
+  const cap = progress.historyEvictedRows ?? 0;
+  await reconcileWorkContinuations(
+    dir,
+    new AbortController().signal,
+    () => {},
+    progress,
+    async () => {},
+    cap,
+  );
+  expect(progress.historyIndex).toBeDefined();
+  // Growth past the release point plus the cap evicts again.
+  for (let index = 0; index <= cap; index++)
+    appendWorkRecord(flow.ctx, { type: "request", requestId: randomUUID() }, flow.workId);
+  await flushWorkSummaries();
+  await reconcileWorkContinuations(
+    dir,
+    new AbortController().signal,
+    () => {},
+    progress,
+    async () => {},
+    cap,
+  );
+  expect(progress.historyIndex).toBeUndefined();
+});
+
+it("an incremental pass over a spanning backlog fails loudly on fresh damage", async () => {
+  // 30 linkable receipts: pass 1 completes 25 and the cap leaves 5 pending, so quiet is
+  // NOT set, the incremental state is retained, and pass 2 runs the incremental branch.
+  for (let index = 0; index < 30; index++) acceptedContinuation("plan", `planner-${index}`);
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(25);
+  fs.appendFileSync(join(dir, "work-attribution", "00000000-damaged-mid.jsonl"), "{ broken json\n");
+  await flushWorkSummaries();
+  const backend = backendFor(dir);
+  const original = backend.readRecordPage.bind(backend);
+  const read = vi
+    .spyOn(backend, "readRecordPage")
+    .mockImplementation((...args) => original(...args));
+  await expect(repair(progress)).rejects.toThrow(/invalid records/);
+  const calls = read.mock.calls;
+  read.mockRestore();
+  // The rejecting pass must be the incremental branch itself, not a full rebuild.
+  expect(calls.some(([after]) => after === 0)).toBe(false);
+});
+
+it("an incremental pass over a spanning backlog withholds a work named by a fresh unknown record", async () => {
+  const flows = Array.from({ length: 30 }, (_, index) =>
+    acceptedContinuation("plan", `planner-${index}`),
+  );
+  await flushWorkSummaries();
+  const progress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(25);
+  const remaining = flows
+    .map((flow) => flow.workId)
+    .filter((workId) => !links().some((row) => row.workId === workId));
+  expect(remaining).toHaveLength(5);
+  // The unknown record names one of the receipts the backlog has not reached yet.
+  fs.appendFileSync(
+    join(dir, "work-attribution", "00000000-unknown-mid.jsonl"),
+    `${JSON.stringify({
+      version: 1,
+      type: "future_record_kind",
+      workId: remaining[0],
+      sessionId: "00000000-unknown-mid",
+      recordedAt: new Date().toISOString(),
+      cwd: dir,
+    })}\n`,
+  );
+  await flushWorkSummaries();
+  const backend = backendFor(dir);
+  const original = backend.readRecordPage.bind(backend);
+  const read = vi
+    .spyOn(backend, "readRecordPage")
+    .mockImplementation((...args) => original(...args));
+  await repair(progress);
+  const calls = read.mock.calls;
+  read.mockRestore();
+  expect(calls.some(([after]) => after === 0)).toBe(false);
+  // The named work stays unconfirmed; the other pending receipts may proceed.
+  expect(links().every((row) => row.workId !== remaining[0])).toBe(true);
+});
+
+it("a missing stats snapshot forces a full rebuild instead of a vacuous grew-only check", async () => {
+  // Without the gate, an empty previous map makes journalGrewOnly trivially true, so a
+  // rewrite between passes could be merged incrementally with no stat comparison at all.
+  // Spanning backlog keeps the pass active so the incremental gate decides the shape.
+  for (let index = 0; index < 30; index++) acceptedContinuation("plan", `planner-stats-${index}`);
+  await flushWorkSummaries();
+  const progress: ContinuationProgress = {};
+  await repair(progress);
+  expect(links()).toHaveLength(25);
+  progress.journalStats = undefined;
+  acceptedContinuation("plan", "planner-stats-late");
+  await flushWorkSummaries();
+  const backend = backendFor(dir);
+  const original = backend.readRecordPage.bind(backend);
+  const read = vi
+    .spyOn(backend, "readRecordPage")
+    .mockImplementation((...args) => original(...args));
+  await repair(progress);
+  const calls = read.mock.calls;
+  read.mockRestore();
+  // Strictly a full read: the vacuous path is not a substitute for stat comparison.
+  expect(calls.some(([after]) => after === 0)).toBe(true);
+});
+
+it("reads only new ledger records since the last pass once no receipt can still link", async () => {
+  setSystemTime(Date.parse("2026-10-05T09:00:00Z"));
+  for (let index = 0; index < 3; index++) acceptedContinuation("plan", `planner-${index}`);
+  const progress = {};
+  await repair(progress);
+  setSystemTime(Date.parse("2026-10-05T09:01:00Z"));
+  await repair(progress);
+  expect(links()).toHaveLength(3);
+  await flushWorkSummaries();
+  setSystemTime(Date.parse("2026-10-05T09:02:00Z"));
+  const active = context("active");
+  const request = recordProviderRequest(active);
+  await flushWorkSummaries();
+  const backend = backendFor(dir);
+  const original = backend.readRecords.bind(backend);
+  let records: ReturnType<typeof original> = [];
+  const read = vi
+    .spyOn(backend, "readRecords")
+    .mockImplementation((...args: Parameters<typeof original>) => {
+      records = original(...args);
+      return records;
+    });
+  await repair(progress);
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read.mock.calls[0][0]).toMatchObject({ modifiedSince: expect.any(Number) });
+  expect(records.length).toBeGreaterThan(0);
+  expect(records.every((row) => row.sessionId === "active")).toBe(true);
+  expect(
+    records.filter((row) => row.type === "request").map((row) => JSON.parse(row.body).requestId),
+  ).toEqual([request.requestId]);
+  read.mockRestore();
+  expect(links()).toHaveLength(3);
+});
+
+it("keeps a concurrent revocation authoritative when its append follows the repair snapshot", async () => {
+  const flow = acceptedContinuation();
+  await flushWorkSummaries();
+  const read = fs.readFileSync;
+  let revoked = false;
+  const linkId = randomUUID();
+  const correction = {
+    type: "work_link",
+    linkId,
+    sourceWorkId: flow.workId,
+    targetWorkId: flow.workId,
+    requestIds: [flow.research, flow.producer].sort(),
+    scope: flow.originalScope,
+    evidence: { source: "work-command", segmentId: flow.segment.id },
+  };
+  vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+    const value = (read as (...values: unknown[]) => string | Buffer)(...args);
+    if (!revoked && args[0] === flow.saved.snapshotPath) {
+      revoked = true;
+      // A different harness process can append while this process reads the retained file.
+      appendWorkRecord(flow.ctx, { ...correction, revision: 1, status: "active" }, flow.workId);
+      appendWorkRecord(flow.ctx, { ...correction, revision: 2, status: "revoked" }, flow.workId);
+    }
+    return value;
+  }) as typeof fs.readFileSync);
+  await repair();
+  expect(revoked).toBe(true);
+  expect(links().filter((row) => row.linkId === linkId)).toMatchObject([
+    { revision: 1, status: "active" },
+    { revision: 2, status: "revoked" },
+  ]);
+  const report = calculatePullRequestCosts(readWorkRecords(dir), [
+    {
+      requestId: flow.producer,
+      billingRecordId: flow.producer,
+      costUsd: "0.125",
+      account: flow.originalScope.account,
+    },
+  ]);
+  expect(report.requests.find((row) => row.requestId === flow.producer)).toMatchObject({
+    allocation: "unknown",
+    reason: "work-link-unresolved",
+    totalCostUsd: "0.125000000",
+  });
+});
+
+it("breathes the stretcher while reading, indexing and collecting a massive history", async () => {
+  const stretch = vi.fn(async () => {});
+  const lines: string[] = [];
+  for (let index = 0; index < 2_050; index++) {
+    const workId = `aaaaaaaa-0000-4000-8000-${String(index).padStart(12, "0")}`;
+    lines.push(
+      JSON.stringify({
+        version: 1,
+        type: "request",
+        workId,
+        sessionId: "stretch-session",
+        requestId: `bbbbbbbb-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        recordedAt: "2026-10-04T12:00:00.000Z",
+      }),
+    );
+  }
+  fs.appendFileSync(join(dir, "work-attribution", "source.jsonl"), `${lines.join("\n")}\n`);
+  const history = await readContinuationHistoryAsync(dir, () => {}, stretch);
+  expect(history.records).toHaveLength(2_050);
+  // The index build breathes once per record: without it the count collapses to ledger pages only.
+  expect(stretch.mock.calls.length).toBeGreaterThanOrEqual(2_050);
+
+  stretch.mockClear();
+  await reconcileWorkContinuations(dir, new AbortController().signal, () => {}, {}, stretch);
+  // The receipt sweep breathes on top of read and index: with records at this scale both contribute.
+  expect(stretch.mock.calls.length).toBeGreaterThanOrEqual(2 * 2_050);
+});
