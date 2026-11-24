@@ -20,7 +20,9 @@ import type { HostPorts } from "../../../src/reconcile/host.js";
  * host, real SQLite) translates a whole work group of request triples under a slow transaction
  * clock, so the translation chunk sizer shrinks its chunks far below the historic fixed size,
  * and the observed end state — every event id, hash and body, the claim/revision units that
- * landed, the translation markers and the work projection — is identical to a fixed-size
+ * landed, including the non-initial revision a re-claimed work entity carries after a second
+ * pass translates a changed fact, the translation markers and the work projection — is
+ * identical to a fixed-size
  * control run over the same records. Claim/revision units are never split by the shrinking:
  * every event keeps a valid revision chain, and the final claim event of both runs is the same
  * bytes.
@@ -184,14 +186,33 @@ it("translation chunks shrink under slow transactions and the observed units sta
       let now = 0;
       useTxClock(() => (now += 300));
     }
-    const result = await withHostPorts(host(dir), () =>
-      runReconciliationPass({ reporting: { cwd: dir } }, host(dir), {
-        signal: new AbortController().signal,
-        assertLease: () => {},
-      }),
+    let transactions = 0;
+    const pass = async () => {
+      const result = await withHostPorts(host(dir), () =>
+        runReconciliationPass({ reporting: { cwd: dir } }, host(dir), {
+          signal: new AbortController().signal,
+          assertLease: () => {},
+        }),
+      );
+      transactions += result.txDurations?.count ?? 0;
+    };
+    await pass();
+    // A changed fact after the first translation: the work gains an issue key, captured as a
+    // second request record for an already-translated request (same identity, plus the issue
+    // chosen for the work behind it). The next pass re-translates that request's unit, whose
+    // shared work fact now names the issue, so the work entity is re-claimed on top of the
+    // revision-1 event the first pass stored — a real revision chain under the same chunking.
+    capture(
+      dir,
+      {
+        ...requestTriple(0)[0],
+        issue: { key: "ABC-123" },
+      },
+      "summary-native",
     );
+    await pass();
     useTxClock(null);
-    return { transactions: result.txDurations?.count ?? 0, ...observedEndState(dir) };
+    return { transactions, ...observedEndState(dir) };
   };
   const control = await run(false);
   const adaptive = await run(true);
@@ -204,10 +225,52 @@ it("translation chunks shrink under slow transactions and the observed units sta
   expect(adaptive.summary).toEqual(control.summary);
   expect(control.events.length).toBeGreaterThan(0);
   // Claim/revision units were never split into invalid states: every event body carries a
-  // positive revision, and every revision above the first builds on a base event id.
+  // positive revision, and every entity's revisions chain exactly — each revision above the
+  // first names the entity's previous event id in baseEventId and its revision in baseRevision,
+  // and a first revision carries no base at all.
+  const chains = new Map<string, typeof adaptive.events>();
   for (const event of adaptive.events) {
-    const body = event.bodyJson as { revision?: string; baseEventId?: string };
+    const body = event.bodyJson as {
+      revision?: string;
+      baseRevision?: string;
+      baseEventId?: string;
+    };
     expect(Number(body.revision)).toBeGreaterThan(0);
-    if (body.revision !== "1") expect(body.baseEventId).not.toBe("");
+    const list = chains.get(event.entity_id) ?? [];
+    list.push(event);
+    chains.set(event.entity_id, list);
   }
+  for (const events of chains.values()) {
+    events.sort(
+      (a, b) =>
+        Number((a.bodyJson as { revision?: string }).revision) -
+        Number((b.bodyJson as { revision?: string }).revision),
+    );
+    const first = events[0].bodyJson as {
+      revision?: string;
+      baseRevision?: string;
+      baseEventId?: string;
+    };
+    expect(first.revision).toBe("1");
+    // The encoding omits an empty base revision and base event id on a first revision.
+    expect(first.baseRevision ?? "0").toBe("0");
+    expect(first.baseEventId ?? "").toBe("");
+    for (let index = 1; index < events.length; index++) {
+      const body = events[index].bodyJson as {
+        revision?: string;
+        baseRevision?: string;
+        baseEventId?: string;
+      };
+      expect(body.baseEventId).toBe(events[index - 1].id);
+      expect(body.baseRevision).toBe(
+        (events[index - 1].bodyJson as { revision?: string }).revision,
+      );
+    }
+  }
+  // The second pass really re-claimed an already-translated entity: at least one chain grew
+  // past its first revision under the same adaptive chunking.
+  const reclaims = [...chains.values()].filter((events) => events.length > 1);
+  expect(reclaims.length).toBeGreaterThan(0);
+  for (const events of reclaims)
+    expect((events[1].bodyJson as { revision?: string }).revision).toBe("2");
 }, 60_000);
