@@ -1456,29 +1456,31 @@ function summaryState(
 } {
   const store = openStore(agent);
   try {
-    return {
-      authority: store.db
-        .query<Record<string, unknown>, [string]>(
-          "SELECT * FROM work_records WHERE work_id = ? ORDER BY rowid",
-        )
-        .all(workId),
-      markers: store.db
-        .query<Record<string, unknown>, [string]>(
-          "SELECT * FROM pending_translation WHERE work_id = ? ORDER BY record_hash",
-        )
-        .all(workId),
-      head:
-        store.db
-          .query<{ body: string }, [string]>(
-            "SELECT body FROM work_projection_head WHERE work_id = ?",
+    return store.db
+      .transaction(() => ({
+        authority: store.db
+          .query<Record<string, unknown>, [string]>(
+            "SELECT * FROM work_records WHERE work_id = ? ORDER BY rowid",
           )
-          .get(workId)?.body ?? null,
-      rows: store.db
-        .query<Record<string, unknown>, [string]>(
-          "SELECT * FROM work_projection_rows WHERE work_id = ? ORDER BY log, pos",
-        )
-        .all(workId),
-    };
+          .all(workId),
+        markers: store.db
+          .query<Record<string, unknown>, [string]>(
+            "SELECT * FROM pending_translation WHERE work_id = ? ORDER BY record_hash",
+          )
+          .all(workId),
+        head:
+          store.db
+            .query<{ body: string }, [string]>(
+              "SELECT body FROM work_projection_head WHERE work_id = ?",
+            )
+            .get(workId)?.body ?? null,
+        rows: store.db
+          .query<Record<string, unknown>, [string]>(
+            "SELECT * FROM work_projection_rows WHERE work_id = ? ORDER BY log, pos",
+          )
+          .all(workId),
+      }))
+      .deferred();
   } finally {
     store.close();
   }
