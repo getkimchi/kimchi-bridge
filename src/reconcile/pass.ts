@@ -13,6 +13,7 @@
  */
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { importSpool } from "../ledger/import.js";
 import { fenceLedgerWrites, ledgerTxDurations, resetLedgerTxDurations } from "../ledger/records.js";
 import type { TxDurations } from "../ledger/store.js";
 import type { HostPorts } from "./host.js";
@@ -183,6 +184,9 @@ export function runReconciliationPass(
     if (input.files) {
       channels.files = { outcome: "ok" };
       try {
+        // The spool first: records capture parked while the writer was busy import exactly once
+        // before any channel reads them.
+        importSpool(agentDir, checkBudget);
         // One whole-type read serves every repository of the pass, not one full table scan each.
         const shared: SharedTypeReads = {};
         const repositories = await knownTransitionRepositories(checkBudget);

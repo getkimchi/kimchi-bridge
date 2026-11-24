@@ -36,6 +36,10 @@ it("exports the public ledger API through the package barrel", () => {
     "importJournals",
     "importJournalSlice",
     "importSessionJournal",
+    "importSpool",
+    "spoolFiles",
+    "spoolDirectory",
+    "spoolFilePath",
     "workJournals",
     // outbox delivery
     "readOutboxStatus",

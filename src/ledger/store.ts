@@ -135,7 +135,10 @@ export function acquireWriterEpoch(store: LedgerStore): number {
 }
 
 /** Per-connection busy timeout. */
-const BUSY_TIMEOUT_MS = 5000;
+export const BUSY_TIMEOUT_MS = 5000;
+/** Capture's busy wait before the record parks in the spool: bounded, so a held writer in another
+ * process cannot stall the session's event loop (plan chunk B4). */
+export const CAPTURE_BUSY_TIMEOUT_MS = 250;
 /**
  * Open-retry window. The loser of the fresh-database WAL-upgrade race only waits for the winner to
  * finish the upgrade and schema create: measured max 19ms over 120 three-way contended opens, so 1s
@@ -149,6 +152,11 @@ function sleepSync(ms: number): void {
 
 function isBusy(error: unknown): boolean {
   return String((error as { code?: unknown } | null)?.code ?? "").startsWith("SQLITE_BUSY");
+}
+
+/** True when the error is any SQLITE_BUSY* result — the signal capture's spool path keys on. */
+export function isBusyError(error: unknown): boolean {
+  return isBusy(error);
 }
 
 /** Additive-schema apply errors that mean "another writer holds the lock": retriable, never fatal. */

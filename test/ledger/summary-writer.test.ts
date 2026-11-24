@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "bun:test";
+import { importSpool } from "../../src/ledger/import.js";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
 import { closeBackends, readRecords, readWorkSummary } from "../../src/ledger/records.js";
 import type { WorkHead } from "../../src/ledger/row-log.js";
@@ -296,20 +297,28 @@ it("rolls back a cancelled native publisher before a competing writer commits", 
     expect(await winner.next()).toBe("ready");
     // The cancelled writer's head is published only inside its open transaction: invisible.
     expect(driver("summary-state", dir, workId)).toEqual(before);
+    // The cancelled publisher holds the writer lock, so the winner cannot commit either: capture
+    // returns inside its short busy window with the record spooled (chunk B4) — committed nothing,
+    // dropped nothing. The spool import below lands it exactly once once the lock is free.
+    const spooled = Date.now();
+    expect(await winner.next()).toBe("committed");
+    expect(Date.now() - spooled).toBeLessThan(2_000);
+    expect(driver("summary-state", dir, workId)).toEqual(before);
+    await winner.done;
     cancelled.child.stdin?.write("r");
     expect(await cancelled.next()).toBe("rolled-back");
-    expect(await winner.next()).toBe("pending");
     expect(driver("summary-state", dir, workId)).toEqual(before);
-    winner.child.stdin?.write("c");
-    expect(await winner.next()).toBe("committed");
-    await winner.done;
-    const committed = driver("summary-state", dir, workId);
+    // The spool import lands the winner's record exactly once, and the projection it folds keeps
+    // the newer response (a duplicate line never applies an older body over captured state).
+    importSpool(dir);
+    importSpool(dir);
     const view = readWorkSummary(dir, workId);
     expect(view?.requests).toEqual([
       expect.objectContaining({ requestId: base.requestId, responseId: "newer" }),
     ]);
     expect([...(view?.sessions ?? [])].sort()).toEqual(["seed", "winner"]);
     expect(readRecords(dir, { workId })).toHaveLength(2);
+    const committed = driver("summary-state", dir, workId);
     // Closing the still-live cancelled owner cannot republish its old head after the winner.
     expect(cancelled.child.exitCode).toBeNull();
     cancelled.child.stdin?.write("c");

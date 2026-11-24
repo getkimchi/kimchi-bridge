@@ -1,6 +1,15 @@
-import { createHash, type Hash } from "node:crypto";
-import { closeSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { createHash, randomUUID, type Hash } from "node:crypto";
+import {
+  closeSync,
+  fstatSync,
+  openSync,
+  readdirSync,
+  readSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import {
   journalParser,
@@ -16,6 +25,7 @@ import {
   importBatchInTx,
   type JournalCursor,
   type RecordBackend,
+  spoolDirectory,
 } from "./records.js";
 import { createTxChunkSizer, type TxChunkSizer } from "./tx-budget.js";
 
@@ -907,6 +917,62 @@ export async function importJournals(
 export function importJournalSlice(agentDir: string, checkBudget?: () => void): boolean {
   const options = { checkBudget, until: Date.now() + IMPORT_SLICE_MS };
   return importJournalFiles(agentDir, syncWorkJournals(agentDir), options, true).pending === true;
+}
+
+/** The capture spool's session files, rotation leftovers included. */
+export function spoolFiles(agentDir: string): string[] {
+  const directory = spoolDirectory(agentDir);
+  const paths: string[] = [];
+  try {
+    for (const file of readdirSync(directory, { withFileTypes: true }))
+      if (file.isFile() && file.name.endsWith(".jsonl")) paths.push(join(directory, file.name));
+  } catch (error) {
+    if (!object(error) || error.code !== "ENOENT") throw error;
+  }
+  return paths;
+}
+
+/** Deletes a spool file whose committed cursor reached its end — rename first, so a capture
+ * appending at that instant still lands its line somewhere the next import scans: the renamed
+ * file stays a .jsonl in the spool when it grew, and a capture whose append went into it
+ * re-verifies its line against the live path and re-appends. The line-hash dedup keeps every
+ * re-import exactly-once, so a rotation never loses or duplicates a record. */
+function retireImportedSpool(agentDir: string, files: string[], checkBudget?: () => void): void {
+  const backend = backendFor(agentDir);
+  for (const path of files) {
+    checkBudget?.();
+    try {
+      const cursor = backend.getJournalCursor(path);
+      const stat = statSync(path);
+      if (
+        !cursor ||
+        cursor.offset !== stat.size ||
+        cursor.dev !== stat.dev ||
+        cursor.ino !== stat.ino
+      )
+        continue;
+      // The rows and the cursor are committed and the cursor covers the whole file: rotate the
+      // name away from capture, forget its cursor, then delete the bytes.
+      const rotated = join(dirname(path), `retired-${randomUUID()}-${basename(path)}`);
+      renameSync(path, rotated);
+      backend.tx(() => backend.deleteJournalCursor(path));
+      if (statSync(rotated).size === cursor.offset) unlinkSync(rotated);
+    } catch {
+      // A failed rename or unlink (an open handle, permissions) retries next pass; a re-import
+      // is deduped, so nothing is lost or duplicated either way.
+    }
+  }
+}
+
+/** The reconciliation files channel's spool step: imports every spool file through the cursor
+ * importer (line-hash dedup makes each record exactly-once, against native capture too), then
+ * deletes the files whose cursor reached their end. */
+export function importSpool(agentDir: string, checkBudget?: () => void): ImportResult {
+  checkBudget?.();
+  const files = spoolFiles(agentDir);
+  const result = importJournalFiles(agentDir, files, { checkBudget }, true);
+  retireImportedSpool(agentDir, files, checkBudget);
+  return result;
 }
 
 /**

@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readSync, writeSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import {
   COLLECTIONS,
@@ -15,7 +17,10 @@ import {
 import type { WorkRecord } from "./work-record.js";
 import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
+  BUSY_TIMEOUT_MS,
+  CAPTURE_BUSY_TIMEOUT_MS,
   ensureProjectionVersion,
+  isBusyError,
   type LedgerStore,
   openStore,
   type TxDurations,
@@ -113,6 +118,10 @@ export interface RecordBackend {
   txDurations?(): TxDurations;
   /** Zeroes the connection's duration histogram; a pass scopes its report this way. */
   resetTxDurations?(): void;
+  /** Capture's contended write: runs commit() under the short busy timeout and returns false when
+   * the writer was busy for that whole window (the caller parks the record in the spool);
+   * absent on backends whose store cannot be busy. */
+  tryCaptureTx?(commit: () => void): boolean;
   /** True when a NEW row was inserted; false when the record hash already exists (import dedup). */
   insertRecord(row: StoredRecord): boolean;
   upsertMarker(recordHash: string, workId: string, type: string): void;
@@ -253,31 +262,128 @@ export function recordHashOf(record: WorkRecord): string {
   return createHash("sha256").update(JSON.stringify(record)).digest("hex");
 }
 
+/** The capture spool: where capture parks records it could not commit while another process held
+ * the ledger's writer. Plain append with fsync, no locks, so it is safe on every platform. */
+export function spoolDirectory(agentDir: string): string {
+  return join(agentDir, "work-attribution", "spool");
+}
+
+/** The session's spool file; the id is encoded so any character set stays filename-safe. */
+export function spoolFilePath(agentDir: string, sessionId: string): string {
+  return join(spoolDirectory(agentDir), `${encodeURIComponent(sessionId)}.jsonl`);
+}
+
+/** True when the file is empty or ends on a line boundary; a truncated earlier append must not
+ * glue the next record onto a damaged line. */
+function endsOnLineBoundary(path: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return true;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return true;
+    const one = Buffer.alloc(1);
+    readSync(fd, one, 0, 1, size - 1);
+    return one[0] === 0x0a;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Appends the exact bytes to the spool file, fsynced, repairing a missing trailing newline first. */
+function appendSpoolBytes(path: string, bytes: Buffer): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const fd = openSync(path, "a", 0o600);
+  try {
+    if (!endsOnLineBoundary(path)) writeSync(fd, "\n");
+    writeSync(fd, bytes);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** True when the file at `path` ends with exactly these bytes as its final line. */
+function spoolTailIs(path: string, bytes: Buffer): boolean {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size < bytes.length) return false;
+    const tail = Buffer.alloc(bytes.length);
+    readSync(fd, tail, 0, bytes.length, size - bytes.length);
+    return tail.equals(bytes);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Appends the exact record line to the session's spool, fsynced, and confirms it is the live
+ * file's last line; an append that landed in a file the importer rotated away is re-appended (the
+ * importer's line-hash dedup makes that exactly-once). False when nothing durable was written —
+ * the caller then falls back to the blocking capture wait, so a record is never dropped. */
+function spoolCaptureLine(agentDir: string, sessionId: string, line: string): boolean {
+  const path = spoolFilePath(agentDir, sessionId);
+  const bytes = Buffer.from(`${line}\n`, "utf8");
+  try {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      appendSpoolBytes(path, bytes);
+      if (spoolTailIs(path, bytes)) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 /**
  * One capture: the record, its translation intent, and the derived projection all commit atomically. A crash
  * therefore leaves the record either fully durable with its projection, or absent — never half-captured.
+ *
+ * Under a writer held by another process, capture waits only its short busy window, then parks the exact
+ * record line in the session's spool (fsynced) and returns normally — callers are void and need no new
+ * handling. The in-memory/UI projection lags on that path: the record reaches the ledger, the projection
+ * and the outbox when the reconciliation pass's files channel imports the spool exactly once. If the spool
+ * itself cannot be written, capture falls back to today's blocking wait with the original busy timeout —
+ * it never drops.
  */
 export function capture(agentDir: string, record: WorkRecord, sourcePath: string | null): void {
   const backend = backendFor(agentDir);
+  const line = JSON.stringify(record);
   const stored: StoredRecord = {
     recordHash: recordHashOf(record),
     type: record.type,
     workId: record.workId,
     sessionId: record.sessionId,
-    body: JSON.stringify(record),
+    body: line,
     sourcePath,
     sourceGeneration: 0,
     sourceOffset: null,
     importedAt: Date.now(),
   };
-  backend.tx(() => {
-    // A projection lost to a version bump or a bug is rebuilt before this record folds into it.
-    if (!backend.getHead(record.workId) && backend.recordCount(record.workId) > 0)
-      rebuildWorkInTx(backend, record.workId);
-    backend.insertRecord(stored);
-    backend.upsertMarker(stored.recordHash, record.workId, record.type);
-    foldWork(backend, record.workId, [record]);
-  });
+  const commit = () =>
+    backend.tx(() => {
+      // A projection lost to a version bump or a bug is rebuilt before this record folds into it.
+      if (!backend.getHead(record.workId) && backend.recordCount(record.workId) > 0)
+        rebuildWorkInTx(backend, record.workId);
+      backend.insertRecord(stored);
+      backend.upsertMarker(stored.recordHash, record.workId, record.type);
+      foldWork(backend, record.workId, [record]);
+    });
+  if (!backend.tryCaptureTx) {
+    commit();
+    return;
+  }
+  if (backend.tryCaptureTx(commit)) return;
+  if (spoolCaptureLine(agentDir, record.sessionId, line)) return;
+  commit();
 }
 
 /** One journal line handed to the importer; the line bytes are the dedup key (sha256 of the exact line). */
@@ -1059,15 +1165,30 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
   let ownCommits = 0;
   const rowsOf = (workId: string, log: LogName): Row[] =>
     readLog.all(workId, log).map((row) => JSON.parse(row.body) as Row);
+  const runTx = <T>(fn: () => T): T => {
+    const result = store.tx(fn);
+    ownCommits++;
+    return result;
+  };
   return {
-    tx: <T>(fn: () => T): T => {
-      const result = store.tx(fn);
-      ownCommits++;
-      return result;
-    },
+    tx: runTx,
     fence: (epoch: number) => store.fence(epoch),
     txDurations: () => txDurations(store),
     resetTxDurations: () => resetTxDurations(store),
+    tryCaptureTx: (commit: () => void): boolean => {
+      // The short wait runs on this connection only, and the original timeout is restored before
+      // the caller can fall back to the blocking wait.
+      db.exec(`PRAGMA busy_timeout=${CAPTURE_BUSY_TIMEOUT_MS}`);
+      try {
+        runTx(commit);
+        return true;
+      } catch (error) {
+        if (!isBusyError(error)) throw error;
+        return false;
+      } finally {
+        db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
+      }
+    },
     insertRecord: (row) =>
       insertRecord.run(
         row.recordHash,
