@@ -139,8 +139,9 @@ interface HelperNote {
   line?: string;
   /** When the helper read the line (ms since epoch): the true receipt time. */
   at?: number;
-  /** The helper's monotonic clock at startup (performance.now of its own thread), so the main
-   *  thread can compute the cross-thread offset both sides' heartbeat ages share. */
+  /** The helper's monotonic clock at startup (performance.now of its own thread, the same
+   *  reading that seeded the shared heartbeat slot), so the main thread can compute the
+   *  cross-thread offset both sides' heartbeat ages share. */
   clock?: number;
   eof?: boolean;
   oversized?: boolean;
@@ -177,11 +178,16 @@ let pending = "";
 // The heartbeat clock is this thread's monotonic performance.now, never the wall clock: a
 // backward wall-clock move (an NTP step) must not turn a stale heartbeat fresh. The worker
 // thread's performance.now origin differs from the main thread's, so the first action reports
-// this clock to the main thread, which derives the constant cross-thread offset from the
-// message's arrival; both sides then measure ages in the same monotonic domain. The startup
-// baseline below is the grace period the transport's construction used to seed itself with.
-Atomics.store(hb, 0, BigInt(Math.round(performance.now())));
-parentPort.postMessage({ clock: performance.now() });
+// this clock to the main thread, which derives the constant cross-thread offset from its own
+// time BEFORE it constructed this thread (see the main thread's clock-note handler: a value
+// guaranteed to precede this thread's start, so no delivery delay can shrink an age); both
+// sides then measure ages in the same monotonic domain. The startup baseline below is the
+// grace period the transport's construction used to seed itself with, and one reading both
+// seeds the shared slot and rides the startup note, so the main thread's calibration and the
+// slot's baseline are the very same instant.
+const startupClock = performance.now();
+Atomics.store(hb, 0, BigInt(Math.round(startupClock)));
+parentPort.postMessage({ clock: startupClock });
 // Test-only hook: a delay inserted between the reply checks and the
 // publication, so a test can hold a checked reply across a request's
 // timeout and the next request's start. Zero (unset) keeps it dormant.
@@ -299,9 +305,14 @@ export class StdioTransport {
   private readonly secrets = new Set<string>();
   /** The constant offset between the main thread's and the helper thread's monotonic clocks
    *  (both performance.now; their origins differ by the helper's startup). Derived once from
-   *  the helper's startup clock report — undefined until then, which reads as infinitely
-   *  stale, the safe direction. */
+   *  the main thread's time BEFORE it constructed the helper — a value guaranteed to precede
+   *  the helper's start — so the offset can only place arrivals too early and ages too old
+   *  (refuse early, the safe direction); no message-delivery latency is ever folded in.
+   *  Undefined until the startup note lands, which reads as infinitely stale, the safe
+   *  direction. */
   #monoOffsetMs: number | undefined;
+  /** The main thread's monotonic clock immediately before the helper thread was constructed. */
+  readonly #constructedAtMs: number;
 
   constructor(
     private readonly emit: (event: TransportEvent) => void,
@@ -313,6 +324,7 @@ export class StdioTransport {
     // has not had a chance to send one yet. From then on only the reader thread records
     // arrivals, so a parent that never heartbeats locks the worker out of writes after the
     // window — exactly the old-release fence decision 7 calls for.
+    this.#constructedAtMs = performance.now();
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
     this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
     this.helper.on("error", (error) => {
@@ -350,11 +362,14 @@ export class StdioTransport {
   private onHelperNote(note: HelperNote): void {
     if (note.clock !== undefined) {
       // The helper's startup clock report: derive the constant offset between the two
-      // threads' monotonic clocks. The message's arrival latency makes the offset slightly
-      // overestimate ages' freshness (by well under a millisecond), negligible against the
-      // 2 s window; the alternative — comparing raw cross-thread monotonic readings — is
-      // meaningless, since each thread's clock starts at its own startup.
-      this.#monoOffsetMs = performance.now() - note.clock;
+      // threads' monotonic clocks from the main thread's time BEFORE it constructed the
+      // helper. The helper cannot have started before that call, so this calibration can
+      // only place the helper's clock origin too early — ages can only come out older than
+      // the truth, never fresher. Message delivery latency therefore never enters the
+      // offset: a startup note queued for seconds behind a blocked main thread (Bun's worker
+      // threads share no comparable clock — even hrtime.bigint starts per thread) cannot
+      // shrink any heartbeat's age the way an arrival-calibrated offset would.
+      this.#monoOffsetMs = this.#constructedAtMs - note.clock;
       return;
     }
     if (note.line !== undefined) {

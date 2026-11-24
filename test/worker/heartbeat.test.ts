@@ -60,6 +60,40 @@ it("a backward wall-clock move cannot turn a stale heartbeat fresh", async () =>
   }
 });
 
+it("a startup clock note delivered late cannot turn a stale heartbeat fresh", async () => {
+  // The helper posts its startup clock while the main thread is blocked past the heartbeat
+  // window and no heartbeat arrives; the note sits queued until the main thread yields. The
+  // offset must be calibrated from the main thread's time BEFORE it constructed the helper
+  // — a bound no delivery delay can move — so the age after the note finally drains still
+  // covers the whole silent span. (An offset calibrated at note handling would subtract the
+  // queuing delay from every age: ~350 ms silent read as ~20 ms fresh.)
+  const transport = new StdioTransport(() => {});
+  transports.push(transport);
+  const start = Date.now();
+  const blockedUntil = start + 350;
+  while (Date.now() < blockedUntil) {
+    /* A real block: the event loop cannot drain the queued startup note. */
+  }
+  const blockedFor = Date.now() - start;
+  expect(blockedFor).toBeGreaterThanOrEqual(340);
+  // The note drains only now — after the fence window has long passed.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(transport.heartbeatAgeMs()).not.toBe(Number.POSITIVE_INFINITY);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const age = transport.heartbeatAgeMs();
+  // The age covers the whole silent span since the transport's construction, not just the
+  // time since the queued note was handled.
+  expect(age).toBeGreaterThanOrEqual(350);
+  expect(age).toBeLessThan(5_000);
+  let refused: LeaseHeartbeatLost | undefined;
+  try {
+    transport.assertHeartbeatFresh(100);
+  } catch (error) {
+    refused = error instanceof LeaseHeartbeatLost ? error : undefined;
+  }
+  expect(refused).toBeInstanceOf(LeaseHeartbeatLost);
+});
+
 it("a heartbeat's staleness tracks real elapsed time on a quiet pipe", async () => {
   const transport = await startedTransport();
   expect(transport.heartbeatAgeMs()).toBeLessThan(250);
