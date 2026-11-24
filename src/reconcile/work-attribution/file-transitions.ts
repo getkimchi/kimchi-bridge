@@ -24,10 +24,14 @@ import {
   type WorkRecord,
 } from "./summary.js";
 
-const GIT_TIMEOUT_MS = 2000;
+// A responsive git answers in milliseconds; the bound only stops a hanging command, so it
+// tolerates a loaded machine's slow spawn instead of killing a live one.
+const GIT_TIMEOUT_MS = 5000;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_COMMITS = 512;
-const RECONCILIATION_BUDGET_MS = 3000;
+// The supervisor pass supplies its own shared budget; this bounds direct callers, and stays
+// well past the per-command timeout so a loaded runner's slow commands retry, not abort.
+export const RECONCILIATION_BUDGET_MS = 10_000;
 export interface FileState {
   blob: string;
   mode: string;

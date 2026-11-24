@@ -47,6 +47,7 @@ import {
   readAttributedFileStates,
   reconcileFileTransitions,
   reconcileRepositoryTransitions,
+  RECONCILIATION_BUDGET_MS,
   reflog,
   referenceTips,
   repositoryFile,
@@ -543,7 +544,7 @@ describe("manual commit reconciliation", () => {
           ],
         }),
       ]);
-    }, 10_000);
+    }, 20_000);
   }
 
   it("retains discovery progress when reading journal headers exhausts a pass", async () => {
@@ -647,10 +648,13 @@ describe("manual commit reconciliation", () => {
     const rewritten = git("rev-list", `${upstream}..HEAD`).split("\n");
     let clock = 0;
     vi.spyOn(Date, "now").mockImplementation(() => clock);
+    // One command costs a twelfth of the budget, as before the budget grew: a bounded launch
+    // still stops after the same number of commands and later launches finish the rest.
+    const perCommand = RECONCILIATION_BUDGET_MS / 12;
     vi.spyOn(childProcess, "execFile").mockImplementation(((
       ...args: Parameters<typeof realExecFile>
     ) => {
-      clock += 250;
+      clock += perCommand;
       return realExecFile(...args);
     }) as typeof realExecFile);
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1007,10 +1011,13 @@ describe("manual commit reconciliation", () => {
       }
       let clock = 0;
       vi.spyOn(Date, "now").mockImplementation(() => clock);
+      // One command costs a twelfth of the budget, as before the budget grew: a bounded launch
+      // still stops after the same number of commands and later launches finish the rest.
+      const perCommand = RECONCILIATION_BUDGET_MS / 12;
       vi.spyOn(childProcess, "execFile").mockImplementation(((
         ...args: Parameters<typeof realExecFile>
       ) => {
-        clock += 250;
+        clock += perCommand;
         return realExecFile(...args);
       }) as typeof realExecFile);
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1038,7 +1045,7 @@ describe("manual commit reconciliation", () => {
     ) => {
       const command = args[1];
       if (Array.isArray(command) && command.includes("ls-tree") && command.includes("second.txt"))
-        clock += 4000;
+        clock += RECONCILIATION_BUDGET_MS + 1000;
       return realExecFile(...args);
     }) as typeof realExecFile);
     vi.spyOn(console, "warn").mockImplementation(() => {});

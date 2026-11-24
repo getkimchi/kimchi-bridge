@@ -465,7 +465,10 @@ function scmApi(
       // A lookup needs no checkout, and the session's folder may be gone (see gitDir).
       cwd: existsSync(root) ? root : homedir(),
       env: scmEnvironment(repo),
-      timeout: remainingTime(signal, 5000),
+      // A pass runs under its own deadline signal, which remainingTime caps this to; the
+      // signal-less cap only stops a hanging CLI outright, so it is generous enough for a
+      // loaded machine's slow spawn instead of failing the lookup.
+      timeout: remainingTime(signal, 30_000),
       maxBuffer: 4 * 1024 * 1024,
       encoding: "utf8",
       signal,

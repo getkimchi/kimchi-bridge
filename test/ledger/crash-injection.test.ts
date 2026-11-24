@@ -310,7 +310,14 @@ const { capture, closeBackends } = await import(process.argv[2]);
 const dir = process.argv[3];
 const log = process.argv[4];
 let n = 0;
+// An orphaned writer (its parent died before the test's cleanup could kill it) stops here
+// instead of capturing forever: the run itself always finishes well inside this bound.
+const stopAt = Date.now() + (Number(process.env.CAPTURE_WRITER_MAX_MS ?? 900_000) as number);
 const tick = () => {
+  if (Date.now() > stopAt) {
+    closeBackends();
+    process.exit(0);
+  }
   for (let i = 0; i < 2; i++) {
     n += 1;
     const requestId = "70000000-0000-4000-8000-" + String(n).padStart(12, "0");
@@ -738,6 +745,21 @@ test(
       expect(finalOutbox.length).toBeGreaterThan(0);
     } finally {
       for (const child of children) child.kill("SIGTERM");
+      // The writer's 25 ms capture loop must not outlive the test: its exit is awaited and
+      // forced, so no writer load leaks into later suites.
+      await Promise.all(
+        children.map(
+          (child) =>
+            new Promise<void>((resolve) => {
+              if (child.exitCode !== null) return resolve();
+              const force = setTimeout(() => child.kill("SIGKILL"), 5000);
+              child.once("exit", () => {
+                clearTimeout(force);
+                resolve();
+              });
+            }),
+        ),
+      );
       await server.stop();
       closeBackends();
       rmSync(fixture.root, { recursive: true, force: true });
