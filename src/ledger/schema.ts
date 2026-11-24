@@ -165,5 +165,7 @@ WHERE type = 'file_transition' AND json_valid(body) AND json_type(body, '$.repos
 
 /** Meta key. */
 export const META_PROJECTION_VERSION = "projectionVersion";
+/** Meta key of the reconciliation writer epoch: the fencing token a lease holder bumps per pass. */
+export const META_WRITER_EPOCH = "writer_epoch";
 /** Current derived-projection format; bump when the projection layout changes (forces rebuild). */
 export const PROJECTION_VERSION = 1;

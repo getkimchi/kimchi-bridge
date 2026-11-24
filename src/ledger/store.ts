@@ -26,6 +26,7 @@ import {
   LEDGER_SCHEMA,
   LEDGER_TRANSITION_BACKFILL,
   META_PROJECTION_VERSION,
+  META_WRITER_EPOCH,
   PROJECTION_VERSION,
   SCHEMA_VERSION,
 } from "./schema.js";
@@ -45,6 +46,22 @@ export class LedgerSchemaError extends Error {
   constructor(readonly found: number) {
     super(`PR-cost ledger schema ${found} is not schema ${SCHEMA_VERSION}; refusing to write`);
     this.name = "LedgerSchemaError";
+  }
+}
+
+/** Thrown inside a fenced store's write transaction when the writer epoch moved: this writer lost
+ * the reconciliation lease (or never held it), so its transaction rolls back without writing. */
+export class LedgerFencedError extends Error {
+  readonly code = "pr-cost-ledger/fenced";
+  /** `held` is the epoch the database now carries; `mine` is the epoch this connection was fenced with. */
+  constructor(
+    readonly held: number,
+    readonly mine: number,
+  ) {
+    super(
+      `Ledger writer epoch moved from ${mine} to ${held}; this reconciliation writer is fenced out`,
+    );
+    this.name = "LedgerFencedError";
   }
 }
 
@@ -84,7 +101,37 @@ export interface LedgerStore {
   tryAdditiveSchema(): boolean;
   /** Run fn in an immediate transaction: all-or-nothing commit for capture/import/ACK points. */
   tx<T>(fn: () => T): T;
+  /** Fences this connection's write transactions to one writer epoch: every subsequent tx first
+   * checks `meta.writer_epoch` inside the transaction and throws LedgerFencedError on a mismatch,
+   * rolling back before any statement of fn runs. Inert until called (capture connections and
+   * old releases that never write the epoch are unaffected). */
+  fence(epoch: number): void;
   close(): void;
+}
+
+/** Reads the persisted writer epoch; a missing row reads as 0 (no release ever fenced this ledger). */
+export function readWriterEpoch(db: Sqlite.Database): number {
+  const row = db
+    .query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?")
+    .get(META_WRITER_EPOCH);
+  return row ? Number(row.value) : 0;
+}
+
+/** Bumps the writer epoch and returns the new value, in one IMMEDIATE transaction: the lease
+ * holder calls this per acquisition, and passes the result to the reconciliation pass it grants.
+ * Old releases never write the epoch, so a fenced writer only ever races fences it can see. */
+export function acquireWriterEpoch(store: LedgerStore): number {
+  return store.tx(() => {
+    const held = readWriterEpoch(store.db);
+    if (!Number.isSafeInteger(held) || held < 0)
+      throw new Error("Invalid PR-cost ledger writer epoch");
+    const next = held + 1;
+    store.db.run("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", [
+      META_WRITER_EPOCH,
+      String(next),
+    ]);
+    return next;
+  });
 }
 
 /** Per-connection busy timeout. */
@@ -200,6 +247,10 @@ export function openStore(agentDir: string): LedgerStore {
       // are optional — readers probe their presence — so a held writer lock skips the pass rather than
       // stalling a reader. The store marks the skip, and readers retry the apply on this live connection
       // (a cached backend self-heals; it does not wait for the next open).
+      const epochOf = ledger.query<{ value: string }, [string]>(
+        "SELECT value FROM meta WHERE key = ?",
+      );
+      let fencedEpoch: number | undefined;
       const store: LedgerStore = {
         db: ledger,
         path,
@@ -209,7 +260,22 @@ export function openStore(agentDir: string): LedgerStore {
           store.additiveDeferred = !applyAdditiveSchema(ledger);
           return !store.additiveDeferred;
         },
-        tx: <T>(fn: () => T): T => ledger.transaction(fn).immediate(),
+        fence: (epoch: number) => {
+          fencedEpoch = epoch;
+        },
+        tx: <T>(fn: () => T): T =>
+          ledger
+            .transaction(() => {
+              // Checked after the immediate lock is held, before any statement of fn: a stale writer
+              // aborts here and the transaction rolls back having written nothing at all.
+              if (fencedEpoch !== undefined) {
+                const row = epochOf.get(META_WRITER_EPOCH);
+                const held = row ? Number(row.value) : 0;
+                if (held !== fencedEpoch) throw new LedgerFencedError(held, fencedEpoch);
+              }
+              return fn();
+            })
+            .immediate(),
         close: () => ledger.close(),
       };
       if (!applyAdditiveSchema(ledger)) store.additiveDeferred = true;

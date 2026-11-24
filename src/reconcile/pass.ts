@@ -13,6 +13,7 @@
  */
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { fenceLedgerWrites } from "../ledger/records.js";
 import type { HostPorts } from "./host.js";
 import { withHostPorts } from "./host-ports.js";
 import { reconcileWorkCosts } from "./work-attribution/cost-sync.js";
@@ -66,6 +67,9 @@ export interface PassInput {
    * caller that threads PassRun.progress into the next pass keeps the incremental history,
    * settled journals and receipt set exactly as Kimchi's live supervisor kept them on itself. */
   progress?: ContinuationProgress;
+  /** The writer epoch the lease holder granted this pass: every ledger write below runs on a
+   * connection fenced to it, so a pass whose lease was lost (the epoch moved) writes nothing. */
+  epoch?: number;
 }
 
 /**
@@ -123,6 +127,9 @@ export function runReconciliationPass(
         throw leaseFailure;
       }
     };
+    // Fencing is applied before any channel runs: the epoch this pass was granted is checked
+    // inside every write transaction it issues, so a stale pass cannot commit after a handover.
+    if (input.epoch !== undefined) fenceLedgerWrites(agentDir, input.epoch);
     const directory = join(agentDir, "work-attribution");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const deadline = Date.now() + PASS_BUDGET_MS;

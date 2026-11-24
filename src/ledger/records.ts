@@ -97,6 +97,9 @@ export interface DeliveryAccountStatus {
 export interface RecordBackend {
   /** Runs `fn` atomically; no await may happen inside. */
   tx<T>(fn: () => T): T;
+  /** Fences this backend's write transactions to one writer epoch (the SQLite store's lease
+   * fencing); absent on backends without a contended cross-process store. */
+  fence?(epoch: number): void;
   /** True when a NEW row was inserted; false when the record hash already exists (import dedup). */
   insertRecord(row: StoredRecord): boolean;
   upsertMarker(recordHash: string, workId: string, type: string): void;
@@ -204,6 +207,18 @@ let factory: ((agentDir: string) => RecordBackend) | undefined;
 /** Tests register the in-memory backend; production always resolves the SQLite one. */
 export function useBackendFactory(next: ((agentDir: string) => RecordBackend) | null): void {
   factory = next ?? undefined;
+}
+
+/** Fences this process's cached ledger connection to one writer epoch, so every write transaction
+ * the reconciliation passes issue through it aborts with LedgerFencedError once another holder
+ * bumped the epoch. Returns false when the backend has no fenceable store (the in-memory double):
+ * there is no cross-process writer to fence out. Session-side capture is never fenced — the
+ * worker process's connection is the only one a pass fences. */
+export function fenceLedgerWrites(agentDir: string, epoch: number): boolean {
+  const backend = backendFor(agentDir);
+  if (!backend.fence) return false;
+  backend.fence(epoch);
+  return true;
 }
 
 export function backendFor(agentDir: string): RecordBackend {
@@ -964,6 +979,7 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
       ownCommits++;
       return result;
     },
+    fence: (epoch: number) => store.fence(epoch),
     insertRecord: (row) =>
       insertRecord.run(
         row.recordHash,
