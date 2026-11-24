@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "bun:test";
 import { importJournalSlice } from "../../src/ledger/import.js";
+import { commitPullRequests } from "../../src/ledger/row-log.js";
 import {
   acknowledgeBatch,
   observeEvents,
@@ -735,3 +736,178 @@ it("same-work captures never drive a rebuild into a whole-work transaction", () 
   expect(backend.dirtyWorks()).toEqual([]);
   expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(250);
 }, 30_000);
+
+/** A commit record for one SHA, each observation carrying its own distinct valid PR link. */
+function commitObservation(index: number): WorkRecord {
+  const at = new Date(Date.parse("2026-10-01T00:00:00Z") + index * 1000).toISOString();
+  return {
+    version: 1,
+    type: "commit",
+    workId: WORK,
+    sessionId: "session",
+    sha: "abc123",
+    repository: "github.com/o/r",
+    worktree: "/w",
+    recordedAt: at,
+    pullRequests: [
+      {
+        provider: "github",
+        host: "github.com",
+        id: String(1000 + index),
+        url: `https://github.com/o/r/pull/${1000 + index}`,
+        checkedAt: at,
+        state: "open",
+      },
+    ],
+  } as WorkRecord;
+}
+
+it("a commit-heavy work publishes its PR summary without rescanning row versions", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  const OTHER = "00000000-0000-4000-8000-000000000002";
+  // Warm this directory's rebuild sizer down first (small request records under a slow clock),
+  // so the commit-heavy fold below runs in small slices and every transaction is measurable
+  // against the plan's ceiling — the cold start's first slice is a separate behavior.
+  for (let index = 0; index < 60; index++)
+    backend.tx(() => {
+      backend.insertRecord({
+        recordHash: `warm-${index}`,
+        type: "request",
+        workId: OTHER,
+        sessionId: "session",
+        body: JSON.stringify({ ...record(`warm-${index}`), workId: OTHER }),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: index,
+        importedAt: index,
+      });
+    });
+  slowClock(300);
+  for (let round = 0; round < 16; round++) rebuildWork(dir, OTHER);
+  useTxClock(null);
+  // 1,200 valid commit observations for one SHA, each carrying one distinct valid PR link:
+  // one final commit row (the key never moves) whose accumulated row holds every link, so a
+  // publication that rescanned every intermediate written version would merge ~720k link items
+  // inside the publication transaction (the reviewed probe measured 439 ms).
+  const observations = 1200;
+  for (let index = 0; index < observations; index++)
+    backend.tx(() => {
+      backend.insertRecord({
+        recordHash: `commit-${index}`,
+        type: "commit",
+        workId: WORK,
+        sessionId: "session",
+        body: JSON.stringify(commitObservation(index)),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: index,
+        importedAt: index,
+      });
+      backend.upsertMarker(`commit-${index}`, WORK, "commit");
+    });
+  resetLedgerTxDurations(dir);
+  rebuildWork(dir, WORK);
+  // Every transaction of the rebuild — the folds and the publication — stayed inside the plan's
+  // ceiling, and the publication (the last transaction) is a small write: the PR summary is
+  // maintained from each commit key's final row while the records fold, never rebuilt by
+  // rescanning the row's version history inside the publication transaction.
+  const histogram = ledgerTxDurations(dir);
+  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(250);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  const head = readWorkHead(dir, WORK);
+  expect(backend.readLog(WORK, "commits")).toHaveLength(1);
+  expect(head?.pullRequests).toHaveLength(observations);
+  // The merged links are exactly what the whole-work rebuild derives from the projection's
+  // stored rows (`readLog` returns each key's final version) — the reference semantics the
+  // capture fold and the single-transaction rebuild already use.
+  expect(head?.pullRequests).toEqual(commitPullRequests(backend.readLog(WORK, "commits")));
+}, 30_000);
+
+it("retry exhaustion abandons publication in bounded transactions instead of one convergence fold", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  seedUnheaded(dir, 2500);
+  // Shrink the rebuild slices first, exactly as measured slow transactions would.
+  slowClock(300);
+  for (let round = 0; round < 16; round++) rebuildWork(dir, WORK);
+  // The suite's slow transaction clock: every transaction measures 60 ms, so an unbounded
+  // outer transaction would tower over the 250 ms ceiling (the reviewed probe measured
+  // 60,060 ms for the whole-delta convergence fold).
+  slowClock(60);
+  // A same-work capture lands on the retry folds' page reads, armed only after the first
+  // publication attempt has failed (the initial fold must stay quiet, or the rebuild restarts
+  // before the publication loop is ever reached). Every publication attempt then sees a moved
+  // population and fails. The hooks never fire inside a transaction (a same-process capture
+  // cannot commit there: the write lock is held) nor re-enter themselves, so the deltas fold
+  // in bounded slices between attempts, exactly where production's page-read interleavings
+  // land.
+  const count = backend.recordCount;
+  const page = backend.readWorkRecordPage;
+  const watermark = backend.recordWatermark;
+  let injections = 0;
+  let inside = 0;
+  let injecting = false;
+  let watermarks = 0;
+  let armed = false;
+  const tx = backend.tx.bind(backend);
+  backend.tx = ((run: () => void) => {
+    inside++;
+    try {
+      return tx(run);
+    } finally {
+      inside--;
+    }
+  }) as typeof backend.tx;
+  const inject = () => {
+    if (injecting || inside || injections >= 200) return;
+    injecting = true;
+    try {
+      capture(dir, record(`req-exhaust-${injections++}`), "summary-native");
+    } finally {
+      injecting = false;
+    }
+  };
+  backend.recordCount = (workId?: Parameters<typeof count>[0]) => {
+    // Before the retries begin, one capture outside any transaction moves the population
+    // after the initial watermark was pinned, so the FIRST publication attempt fails too.
+    if (workId === WORK && !armed) inject();
+    return count(workId);
+  };
+  backend.recordWatermark = (() => {
+    // The second watermark read is the first retry's delta: from here on the population
+    // must keep moving through every later attempt.
+    if (++watermarks === 2) armed = true;
+    return watermark();
+  }) as typeof backend.recordWatermark;
+  backend.readWorkRecordPage = (...args: Parameters<typeof page>) => {
+    if (armed) inject();
+    return page(...args);
+  };
+  try {
+    resetLedgerTxDurations(dir);
+    rebuildWork(dir, WORK);
+  } finally {
+    backend.recordCount = count;
+    backend.readWorkRecordPage = page;
+    backend.recordWatermark = watermark;
+    backend.tx = tx;
+  }
+  // The retry budget ran out with the population still moving: the rebuild abandoned
+  // publication — headless with the dirty marker intact, the state every reader and the next
+  // pass repair — and never folded the arrival delta inside one outer transaction.
+  expect(backend.getHead(WORK)).toBeUndefined();
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+  expect(injections).toBeGreaterThanOrEqual(10);
+  const histogram = ledgerTxDurations(dir);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  // The abandoned state is repairable: with the captures stopped, the next rebuild folds
+  // everything that landed and publishes the complete projection.
+  useTxClock(null);
+  rebuildWork(dir, WORK);
+  expect(backend.getHead(WORK)).toBeDefined();
+  expect(backend.dirtyWorks()).toEqual([]);
+  const projection = readWorkSummary(dir, WORK);
+  expect(projection?.requests).toHaveLength(backend.recordCount(WORK));
+  expect(readRecords(dir, { workId: WORK })).toHaveLength(2500 + injections);
+}, 60_000);

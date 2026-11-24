@@ -915,9 +915,11 @@ const REBUILD_SLICE_MAX = 100_000;
  * mid-fold is detected at publish time, and this rebuild restarts instead of publishing a
  * partial, clean-looking projection over the other's clear. */
 const REBUILD_OWNERSHIP_NOTE = "__rebuild-ownership";
-/** Publication retries before the atomic convergence transaction. Each failed publication
- * folded only the delta that landed since the last fold, so the final transaction's work is
- * bounded by what arrived during the retry loop — never the whole work. */
+/** Publication retries before giving up on this rebuild attempt. Each failed publication
+ * folded only the delta that landed since the last fold, in bounded slices outside the write
+ * lock; a budget exhausted while the population still moving abandons the publication — the
+ * headless-dirty state every reader and the next pass repair — rather than folding an
+ * arbitrarily large arrival delta inside one outer transaction. */
 const REBUILD_PUBLISH_RETRY_LIMIT = 8;
 /** Whole restarts tolerated against a competing rebuild before this rebuild gives up: it
  * publishes nothing (no head, dirty marker intact — the state every reader and the next pass
@@ -973,12 +975,13 @@ function foldWorkRecordPages(
  * same-work insert since before the watermark read). A moved count no longer restarts the
  * whole rebuild: only the delta above the folded watermark is folded — in slices again — and
  * the publication retried, so a continuously capturing session cannot make the rebuild redo
- * its work or fall back to an unbounded transaction. After REBUILD_PUBLISH_RETRY_LIMIT retries,
- * one final transaction folds the (small, arrival-rate-bounded) delta and publishes under the
- * write lock, which no capture can move. A competing rebuild is detected through the ownership
- * generation instead: its clear replaced the note, so this rebuild restarts whole — and after
- * REBUILD_RESTART_LIMIT such restarts gives up without publishing, leaving the repairable
- * headless state rather than a partial projection. */
+ * its work or fall back to an unbounded transaction. After REBUILD_PUBLISH_RETRY_LIMIT retries
+ * with the population still moving, the rebuild abandons publication and returns: the work
+ * keeps its headless-dirty state, which every reader's lazy repair and the next pass rebuild
+ * in bounded slices — no transaction ever folds an unbounded arrival delta. A competing rebuild
+ * is detected through the ownership generation instead: its clear replaced the note, so this
+ * rebuild restarts whole — and after REBUILD_RESTART_LIMIT such restarts gives up without
+ * publishing, leaving the repairable headless state rather than a partial projection. */
 export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, workId: string): void {
   const sizer = rememberSizer(rebuildSizers, agentDir, () =>
     createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_MAX),
@@ -1005,12 +1008,18 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
     const generation = randomUUID();
     // `latest` and `pullRequests` are maintained incrementally while the records fold (the
     // projection-rows hook observes each written row), so the publication transaction never
-    // scans the whole work's logs to derive them.
+    // scans the whole work's logs to derive them. The commit rows are kept per row key — the
+    // hook overwrites each key's entry with its latest written version, exactly the rows the
+    // projection stores (`putRow` upserts one row per key) and the whole-work rebuild and the
+    // capture fold read back through `readLog` — instead of accumulating every intermediate
+    // version: a commit observed many times (each observation carrying its own PR links) is
+    // merged once from its final row, not rescanned version by version inside the publication
+    // transaction.
     const head = emptyHead(workId);
-    const commits: Row[] = [];
+    const commits = new Map<string, Row>();
     const rows = projectionRows(backend, head, (collection, row) => {
       observeLatest(head.latest, collection, row);
-      if (collection === "commits") commits.push(row);
+      if (collection === "commits") commits.set(ROW_KEYS.commits(row), row);
     });
     backend.tx(() => {
       // The head leaves with the dirty marker and this rebuild's ownership generation: a kill
@@ -1051,25 +1060,15 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
           foreign = true;
           return;
         }
-        if (backend.recordCount(workId) !== expected) {
-          if (attempts < REBUILD_PUBLISH_RETRY_LIMIT) return;
-          // Atomic convergence: fold whatever landed above the folded watermark inside this
-          // transaction — the write lock is held, so nothing more can land — and publish. The
-          // transaction is bounded by the delta that arrived during the retry loop, never by
-          // the whole work.
-          foldWorkRecordPages(
-            backend,
-            workId,
-            rows,
-            publishedThrough,
-            backend.recordWatermark(),
-            sizer.size(),
-          );
-        }
+        // Publication requires the work's population unchanged since it was read before the
+        // folded watermark: an unchanged count proves every record was already folded. The
+        // write lock is held for the whole transaction, so nothing can move while it runs, and
+        // the transaction itself stays one small write — it never folds records.
+        if (backend.recordCount(workId) !== expected) return;
         backend.putHead({
           ...head,
           updatedAt: new Date().toISOString(),
-          pullRequests: commitPullRequests(commits),
+          pullRequests: commitPullRequests(commits.values()),
         });
         backend.clearDirty(workId);
         backend.deleteNote(workId, REBUILD_OWNERSHIP_NOTE);
@@ -1078,6 +1077,13 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
       observe();
       if (published) return;
       if (foreign) break;
+      // The retry budget is exhausted while the population still moves: converge with bounded
+      // transactions only — the delta that arrived during the retries has just been folded in
+      // slices OUTSIDE the write lock, and the attempt above published only if the population
+      // held still. A capture that landed during that last fold leaves the headless-dirty state
+      // every reader and the next pass repair (abandon-and-repair) instead of folding an
+      // arbitrarily large arrival delta inside one outer transaction.
+      if (attempts >= REBUILD_PUBLISH_RETRY_LIMIT) return;
       // A same-work capture landed since the population was read: fold only the new delta —
       // the population is re-read BEFORE the watermark so the same invariant covers the next
       // publication attempt — and retry.
