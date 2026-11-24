@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createInterface } from "node:readline";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "bun:test";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
@@ -25,38 +27,82 @@ interface Writer {
   stop: () => Promise<void>;
 }
 
+/**
+ * Reads one phase string per line of JSON written by the driver on stdout. Parsed lines are
+ * queued by readline, so a phase is never lost when it arrives before next() or when one stdout
+ * chunk carries several phase lines; when the stream ends, a pending next() rejects instead of
+ * hanging until the test timeout.
+ */
+interface PhaseReader {
+  next: () => Promise<string>;
+  stop: () => void;
+}
+
+function startPhaseReader(input: NodeJS.ReadableStream, label = "Writer"): PhaseReader {
+  const lines = createInterface({ input });
+  const messages = lines[Symbol.asyncIterator]();
+  return {
+    next: async () => {
+      const line = await messages.next();
+      if (line.done) throw new Error(`${label} ended before its next phase`);
+      return (JSON.parse(line.value) as { phase: string }).phase;
+    },
+    stop: () => lines.close(),
+  };
+}
+
 function startWriter(dir: string, record: WorkRecord): Writer {
   const child = spawn("bun", [DRIVER, "summary-writer", dir, JSON.stringify({ record })], {
     cwd: ROOT,
     stdio: ["pipe", "pipe", "inherit"],
   });
-  let buffer = "";
-  const pending: ((phase: string) => void)[] = [];
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    buffer += chunk;
-    for (let index = buffer.indexOf("\n"); index >= 0; index = buffer.indexOf("\n")) {
-      const line = buffer.slice(0, index);
-      buffer = buffer.slice(index + 1);
-      if (!line.trim()) continue;
-      const phase = (JSON.parse(line) as { phase: string }).phase;
-      for (const resolve of pending.splice(0)) resolve(phase);
-    }
-  });
+  const phases = startPhaseReader(child.stdout!);
   const done = new Promise<number | null>((resolve, reject) => {
     child.once("exit", resolve);
     child.once("error", reject);
   });
   return {
     child,
-    next: () => new Promise((resolve) => pending.push(resolve)),
+    next: phases.next,
     done,
     stop: async () => {
       if (child.exitCode === null) child.kill("SIGKILL");
       await done.catch(() => {});
+      phases.stop();
     },
   };
 }
+
+it("delivers both phases when one stdout chunk coalesces two phase lines", async () => {
+  const stdout = new PassThrough();
+  const phases = startPhaseReader(stdout);
+  stdout.write(`${JSON.stringify({ phase: "ready" })}\n${JSON.stringify({ phase: "pending" })}\n`);
+  expect(await phases.next()).toBe("ready");
+  expect(await phases.next()).toBe("pending");
+  phases.stop();
+  stdout.end();
+}, 2_000);
+
+it("delivers every phase when one chunk coalesces three phase lines", async () => {
+  const stdout = new PassThrough();
+  const phases = startPhaseReader(stdout);
+  stdout.write(
+    `${JSON.stringify({ phase: "ready" })}\n${JSON.stringify({ phase: "pending" })}\n${JSON.stringify({ phase: "rolled-back" })}\n`,
+  );
+  expect(await phases.next()).toBe("ready");
+  expect(await phases.next()).toBe("pending");
+  expect(await phases.next()).toBe("rolled-back");
+  phases.stop();
+  stdout.end();
+}, 2_000);
+
+it("rejects a pending phase read when the child stdout ends first", async () => {
+  const stdout = new PassThrough();
+  const phases = startPhaseReader(stdout);
+  stdout.end();
+  await expect(phases.next()).rejects.toThrow("Writer ended before its next phase");
+  phases.stop();
+}, 2_000);
 
 function driver(...args: string[]): unknown {
   return JSON.parse(
