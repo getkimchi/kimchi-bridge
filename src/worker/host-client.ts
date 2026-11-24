@@ -57,7 +57,12 @@ const STATE_PARENT_GONE = 3;
 const STATE_CANCELLED = 4;
 
 /** What failed when a host request cannot be answered. */
-export type HostRequestCause = "timeout" | "parent-gone" | "invalid-reply" | "canceled";
+export type HostRequestCause =
+  | "timeout"
+  | "parent-gone"
+  | "invalid-reply"
+  | "canceled"
+  | "deadline";
 
 /** A failed host request. Fails the current channel; never falls back to a guess. */
 export class HostRequestError extends Error {
@@ -74,6 +79,8 @@ export class HostRequestError extends Error {
 /** One note from the helper thread: a forwarded line, or a stdin condition. */
 interface HelperNote {
   line?: string;
+  /** When the helper read the line (ms since epoch): the true receipt time. */
+  at?: number;
   eof?: boolean;
   oversized?: boolean;
   readError?: string;
@@ -81,7 +88,7 @@ interface HelperNote {
 
 /** What the transport hands the entry point. */
 export type TransportEvent =
-  | { kind: "message"; message: ParentMessage }
+  | { kind: "message"; message: ParentMessage; receivedAt: number }
   | { kind: "invalid-line"; reason: string }
   | { kind: "parent-gone" }
   | { kind: "transport-error"; reason: string };
@@ -104,7 +111,7 @@ const decoder = new TextDecoder();
 const MAX_LINE_BYTES = 1048576;
 const chunk = Buffer.alloc(65536);
 let pending = "";
-function forward(line) { parentPort.postMessage({ line: line }); }
+function forward(line) { parentPort.postMessage({ line: line, at: Date.now() }); }
 function reply(line, parsed) {
   if (Atomics.load(ia, 0) !== 1) return false; // nobody is waiting
   if (parsed.rid !== Atomics.load(ia, 2)) return false; // late or stale reply
@@ -170,6 +177,14 @@ export class StdioTransport {
     this.#activePassId = id;
     Atomics.store(this.slots, ACTIVE_PASS, id);
   }
+  #deadlineAt = 0;
+  /** The absolute deadline of the pass in flight (ms since epoch); 0 when none. */
+  get deadlineAt(): number {
+    return this.#deadlineAt;
+  }
+  set deadlineAt(at: number) {
+    this.#deadlineAt = at;
+  }
   private readonly shared = new SharedArrayBuffer(HEADER_BYTES + REPLY_BYTES);
   private readonly slots: Int32Array = new Int32Array(this.shared);
   private readonly helper: Worker;
@@ -195,8 +210,12 @@ export class StdioTransport {
 
   private onHelperNote(note: HelperNote): void {
     if (note.line !== undefined) {
+      // The helper's read time is the true receipt moment: the main thread
+      // may sit blocked in a host request long before it drains the event,
+      // and a pass's budget runs from receipt, not from the drain.
+      const receivedAt = note.at ?? Date.now();
       const parsed = parseParentLine(note.line);
-      if (parsed.ok) this.emit({ kind: "message", message: parsed.value });
+      if (parsed.ok) this.emit({ kind: "message", message: parsed.value, receivedAt });
       else this.emit({ kind: "invalid-line", reason: parsed.error });
       return;
     }
@@ -233,8 +252,10 @@ export class StdioTransport {
 
   /**
    * The blocking host request. Throws HostRequestError on timeout, parent
-   * death, a cancel for the pass in flight, or a malformed reply — never
-   * returns a guessed value.
+   * death, a cancel for the pass in flight, a malformed reply, or the pass
+   * deadline expiring while the request was pending — never returns a guessed
+   * value. The wait is capped at the pass deadline too, so a stalled parent
+   * cannot hold the pass past its budget behind the request timeout.
    */
   request(kind: HostRequestKind, cwd?: string): unknown {
     // A parent that already died must not be overwritten by a new wait: the
@@ -258,9 +279,26 @@ export class StdioTransport {
         ...(cwd === undefined ? {} : { cwd }),
       }),
     );
-    const waited = Atomics.wait(this.slots, STATE, STATE_WAITING, REQUEST_TIMEOUT_MS);
+    const remaining =
+      this.#deadlineAt > 0
+        ? Math.min(REQUEST_TIMEOUT_MS, this.#deadlineAt - Date.now())
+        : REQUEST_TIMEOUT_MS;
+    // Atomics.wait truncates a fractional timeout toward zero; round up so a
+    // deadline scheduled mid-millisecond still gets its full remainder.
+    const waited = Atomics.wait(
+      this.slots,
+      STATE,
+      STATE_WAITING,
+      Math.ceil(Math.max(remaining, 0)),
+    );
     if (waited === "timed-out") {
-      Atomics.store(this.slots, STATE, STATE_IDLE);
+      Atomics.compareExchange(this.slots, STATE, STATE_WAITING, STATE_IDLE);
+      if (this.#deadlineAt > 0 && Date.now() >= this.#deadlineAt)
+        throw new HostRequestError(
+          `the pass deadline expired while the ${kind} request was pending`,
+          kind,
+          "deadline",
+        );
       throw new HostRequestError(
         `the parent did not answer the ${kind} request within ${REQUEST_TIMEOUT_MS} ms`,
         kind,

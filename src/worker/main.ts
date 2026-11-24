@@ -45,6 +45,12 @@ const PARENT_GONE_EXIT_MS = 1900;
 /** Why the pass in flight was aborted. */
 type AbortCause = "cancel" | "deadline" | "parent-gone";
 
+/** A pass message with the moment the worker received it; the budget runs from receipt. */
+interface QueuedPass {
+  message: PassMessage;
+  receivedAt: number;
+}
+
 /** The state of the pass in flight; the pump and the cancel path share it. */
 interface ActivePass {
   id: number;
@@ -138,7 +144,7 @@ function main(): void {
   });
 
   let host: StdioHostClient | undefined;
-  const queued: PassMessage[] = [];
+  const queued: QueuedPass[] = [];
   let active: ActivePass | undefined;
   let parentGone = false;
   let invalidLine: string | undefined;
@@ -164,7 +170,7 @@ function main(): void {
     active.controller.abort();
   };
 
-  const handleParentMessage = (message: ParentMessage): void => {
+  const handleParentMessage = (message: ParentMessage, receivedAt: number): void => {
     switch (message.type) {
       case "hello":
         refuse("the parent sent a second hello; the worker already accepted one");
@@ -174,14 +180,27 @@ function main(): void {
           refuse("a pass with the reporting channel needs reportingCwd", message.id);
           break;
         }
-        queued.push(message);
+        queued.push({ message, receivedAt });
         break;
       }
-      case "cancel":
+      case "cancel": {
         // A cancel for a finished or unknown pass is ignored; the parent may
-        // not know which pass was in flight when it sent it.
-        if (active?.id === message.id) abortActive("cancel");
+        // not know which pass was in flight when it sent it. A cancel for a
+        // pass still waiting in the queue drops it before it ever starts: it
+        // is answered with a canceled done and never touches the host or the
+        // ledger. The pump drains parent messages before starting a queued
+        // pass, so no window exists where a canceled pass could begin.
+        if (active?.id === message.id) {
+          abortActive("cancel");
+          break;
+        }
+        const index = queued.findIndex((entry) => entry.message.id === message.id);
+        if (index !== -1) {
+          const [entry] = queued.splice(index, 1);
+          transport.send(canceledDone(entry.message));
+        }
         break;
+      }
       case "reply":
         // A late or duplicate reply: the request it belonged to already
         // timed out or was answered. Never guessed from, never answered twice.
@@ -192,7 +211,30 @@ function main(): void {
   /** The continuation repair state the supervisor used to hold in memory. */
   const continuation: ContinuationProgress = {};
 
-  const startPass = (message: PassMessage): void => {
+  /** The done message for a pass that was canceled before it ever started. */
+  const canceledDone = (message: PassMessage): DoneMessage => ({
+    type: "done",
+    id: message.id,
+    result: {
+      outcome: "canceled",
+      channels: Object.fromEntries(
+        Object.entries(message.channels)
+          .filter(([, requested]) => requested)
+          .map(([name]) => [name, { outcome: "canceled" }]),
+      ) as PassResult["channels"],
+    },
+  });
+
+  const startPass = (entry: QueuedPass): void => {
+    const { message } = entry;
+    // A pass whose budget ran out while it was queued is reported without
+    // running: no pass-started progress, no host request, no ledger write.
+    if (entry.receivedAt + message.deadlineMs - Date.now() <= 0) {
+      transport.send(expiredDone(message));
+      armIdleTimer();
+      fire();
+      return;
+    }
     stopIdleTimer();
     let finished: () => void;
     const done = new Promise<void>((resolve) => {
@@ -209,7 +251,7 @@ function main(): void {
     active = state;
     transport.activePassId = message.id;
     transport.send({ type: "progress", id: message.id, note: "pass-started" });
-    void runPass(message, state)
+    void runPass(message, state, entry.receivedAt + message.deadlineMs)
       .catch(() => {})
       .finally(() => {
         if (active === state) {
@@ -230,11 +272,21 @@ function main(): void {
     if (error instanceof HostRequestError) {
       state.hostFailures.add(error.requestKind);
       if (error.cause === "canceled") abortActive("cancel");
+      if (error.cause === "deadline") abortActive("deadline");
     }
   };
 
-  const runPass = async (message: PassMessage, state: ActivePass): Promise<void> => {
-    const deadline = setTimeout(() => abortActive("deadline"), message.deadlineMs);
+  const runPass = async (
+    message: PassMessage,
+    state: ActivePass,
+    deadlineAt: number,
+  ): Promise<void> => {
+    // The budget is measured from receipt: a pass queued behind another one
+    // starts with whatever remained. startPass already refused one that ran
+    // out in the queue; this guards the window between that check and the
+    // first host read.
+    transport.deadlineAt = deadlineAt;
+    const deadline = setTimeout(() => abortActive("deadline"), deadlineAt - Date.now());
     const base = host as StdioHostClient;
     // Every host read is observed, so a failed request reaches the done
     // message even where the pass swallows the channel error into its debug log.
@@ -312,9 +364,24 @@ function main(): void {
     } catch (error) {
       passError = error;
     }
+    transport.deadlineAt = 0;
     clearTimeout(deadline);
     transport.send(buildDoneMessage(message, state, nextRepository, passError));
   };
+
+  /** The done message for a pass whose budget ran out while it was queued. */
+  const expiredDone = (message: PassMessage): DoneMessage => ({
+    type: "done",
+    id: message.id,
+    result: {
+      outcome: "failed",
+      channels: Object.fromEntries(
+        Object.entries(message.channels)
+          .filter(([, requested]) => requested)
+          .map(([name]) => [name, { outcome: "failed", error: "the pass exceeded its deadline" }]),
+      ) as PassResult["channels"],
+    },
+  });
 
   /** Which request kinds a channel's code can ask the parent for. */
   const CHANNEL_REQUESTS: Record<string, string[]> = {
@@ -410,14 +477,20 @@ function main(): void {
         }
         const event = events.shift();
         if (event) {
-          if (event.kind === "message") handleParentMessage(event.message);
+          if (event.kind === "message") handleParentMessage(event.message, event.receivedAt);
           else if (event.kind === "invalid-line") invalidLine = event.reason;
           else if (event.kind === "parent-gone") parentGone = true;
           else refuse(`worker transport failed: ${event.reason}`);
           continue;
         }
         if (!active && queued.length > 0) {
-          startPass(queued.shift() as PassMessage);
+          // A cancel sent right behind the pass (a lease lost just after its
+          // tick) can still be queued behind this microtask; give it one
+          // macrotask to land before the pass is allowed to begin. If it
+          // lands, the drain above drops the pass instead of starting it.
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          if (events.length > 0 || parentGone || invalidLine !== undefined) continue;
+          startPass(queued.shift() as QueuedPass);
           continue;
         }
         break;

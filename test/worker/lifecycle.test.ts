@@ -168,8 +168,10 @@ async function answerRequestsUntilDone(worker: WorkerHandle, id: number): Promis
 async function drain(worker: WorkerHandle, id: number): Promise<DoneMessage> {
   for (;;) {
     const message = await worker.next();
-    const done = asDone(message, id);
-    if (done) return done;
+    if (message.type !== "done") continue;
+    // Other passes may finish first; only the requested id is awaited.
+    if (message.id !== id) continue;
+    return message;
   }
 }
 
@@ -490,3 +492,163 @@ async function answerRequestsUntilConsent(worker: WorkerHandle, consent: boolean
     throw new Error(`expected a consent request, got ${message.kind}`);
   }
 }
+
+test("a cancel for a pass queued behind a blocked one drops it before it starts", async () => {
+  const dir = agentDir();
+  seedRecord(dir);
+  const digest = ledgerDigest(dir);
+  const worker = spawnWorker(dir);
+  await handshake(worker, dir);
+  // Pass 1 blocks inside its credentials RPC (never answered) ...
+  worker.send({
+    type: "pass",
+    id: 10,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 3000,
+    epoch: 1,
+  });
+  let blocked = false;
+  for (;;) {
+    const message = await worker.next();
+    if (message.type === "request" && message.kind === "consent") {
+      worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
+      continue;
+    }
+    if (message.type === "request" && message.kind === "credentials") {
+      blocked = true;
+      break;
+    }
+  }
+  expect(blocked).toBe(true);
+  // ... pass 2 arrives while pass 1 is still blocked, and is canceled before
+  // pass 1 ever finishes: it must never start.
+  worker.send({
+    type: "pass",
+    id: 11,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 60000,
+    epoch: 1,
+  });
+  const canceled = Date.now();
+  worker.send({ type: "cancel", id: 11 });
+  // The cancel is honored as soon as the worker's main thread is free —
+  // bounded by pass 1's own deadline, not the 10 s request timeout. Pass 1
+  // reports its own done first; the pump then answers pass 2 as canceled.
+  const dones = new Map<number, DoneMessage>();
+  while (!dones.has(10) || !dones.has(11)) {
+    const message = await worker.next();
+    if (message.type === "done") dones.set(message.id, message);
+  }
+  const done = dones.get(11) as DoneMessage;
+  expect(done.result.outcome).toBe("canceled");
+  expect(done.result.channels.reporting?.outcome).toBe("canceled");
+  expect(Date.now() - canceled).toBeLessThan(5000);
+  // Nothing about pass 2 ran: no progress, no request, no ledger write.
+  const notes = worker
+    .lines()
+    .filter((line) => line.includes('"progress"') && line.includes('"id":11'));
+  expect(notes.length).toBe(0);
+  expect(ledgerDigest(dir)).toBe(digest);
+  // Pass 1 still finishes on its own terms: its deadline ended it.
+  const done1 = dones.get(10) as DoneMessage;
+  expect(done1.result.outcome).toBe("failed");
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+}, 20000);
+
+test("a pass queued behind a blocked one is reported expired when its budget ran out in the queue", async () => {
+  const dir = agentDir();
+  seedRecord(dir);
+  const worker = spawnWorker(dir);
+  await handshake(worker, dir);
+  // Pass 1 blocks inside its credentials RPC (never answered).
+  worker.send({
+    type: "pass",
+    id: 12,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 60000,
+    epoch: 1,
+  });
+  let blocked = false;
+  for (;;) {
+    const message = await worker.next();
+    if (message.type === "request" && message.kind === "consent") {
+      worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
+      continue;
+    }
+    if (message.type === "request" && message.kind === "credentials") {
+      blocked = true;
+      break;
+    }
+  }
+  expect(blocked).toBe(true);
+  // Pass 2 has a 400 ms budget, measured from this moment (its receipt).
+  worker.send({
+    type: "pass",
+    id: 13,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 400,
+    epoch: 1,
+  });
+  await Bun.sleep(1200);
+  // Unblock pass 1: it fails fast on the closed local port, and pass 2 must
+  // be dequeued only to be reported expired — never started.
+  worker.send({
+    type: "cancel",
+    id: 12,
+  });
+  const done1 = await drain(worker, 12);
+  expect(done1.result.outcome).toBe("canceled");
+  const done2 = await drain(worker, 13);
+  expect(done2.result.outcome).toBe("failed");
+  expect(done2.result.channels.reporting?.outcome).toBe("failed");
+  if (done2.result.channels.reporting?.error)
+    expect(done2.result.channels.reporting.error).toContain("deadline");
+  const notes = worker
+    .lines()
+    .filter((line) => line.includes('"progress"') && line.includes('"id":13'));
+  expect(notes.length).toBe(0);
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+}, 20000);
+
+test("the pass deadline wakes a host request the parent stalls on", async () => {
+  const dir = agentDir();
+  seedRecord(dir);
+  const worker = spawnWorker(dir);
+  await handshake(worker, dir);
+  worker.send({
+    type: "pass",
+    id: 14,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 500,
+    epoch: 1,
+  });
+  const started = Date.now();
+  let done: DoneMessage | undefined;
+  for (;;) {
+    const message = await worker.next();
+    if (message.type === "request") {
+      // The parent never replies: the deadline, not the 10 s request
+      // timeout, must end the wait and fail the channel.
+      continue;
+    }
+    if (message.type === "done") {
+      done = message;
+      break;
+    }
+  }
+  // 500 ms deadline plus slack; far below the 10 s request timeout.
+  expect(Date.now() - started).toBeLessThan(5000);
+  expect(done?.result.outcome).toBe("failed");
+  expect(done?.result.channels.reporting?.outcome).toBe("failed");
+  if (done?.result.channels.reporting?.error)
+    expect(done.result.channels.reporting.error).toContain("deadline");
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+}, 20000);
