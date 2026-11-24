@@ -2178,8 +2178,13 @@ describe("discovery starvation", () => {
       });
     let deadline = 0;
     const advance = () => {
-      const duration = Math.min(4900, deadline - Date.now());
-      setSystemTime(Date.now() + duration);
+      // A slow provider burns a large fixed slice per request. When the remaining budget
+      // cannot fit a whole slice, the clock jumps PAST the deadline before the request
+      // fails: landing exactly on the deadline would leave the pass's own (a millisecond
+      // later) budget check still open, so the pass would keep issuing lookups that all
+      // fail and poison the known links' retry back-off for a day.
+      const duration = deadline - Date.now();
+      setSystemTime(Date.now() + Math.min(4900, duration) + (duration < 4900 ? 1_000 : 0));
       if (duration < 4900) throw new Error("Simulated request timeout");
     };
     replies((url) => {
