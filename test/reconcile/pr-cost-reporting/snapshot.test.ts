@@ -21,12 +21,12 @@ import {
 } from "../../../src/reconcile/pr-cost-reporting/snapshot.js";
 
 /** Bun's it.each types reject the vitest-style tables below (plain and object rows). */
-const each = (rows: readonly unknown[]): ((name: string, fn: (...args: never[]) => void) => void) =>
+const each = (rows: readonly unknown[]): ((name: string, fn: (...args: any[]) => void) => void) =>
   (
     it.each as unknown as (
       this: unknown,
       rows: readonly unknown[],
-    ) => (name: string, fn: (...args: never[]) => void) => void
+    ) => (name: string, fn: (...args: any[]) => void) => void
   ).call(it, rows);
 
 const account = {
