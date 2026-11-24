@@ -13,7 +13,8 @@
  */
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { fenceLedgerWrites } from "../ledger/records.js";
+import { fenceLedgerWrites, ledgerTxDurations, resetLedgerTxDurations } from "../ledger/records.js";
+import type { TxDurations } from "../ledger/store.js";
 import type { HostPorts } from "./host.js";
 import { withHostPorts } from "./host-ports.js";
 import { reconcileWorkCosts } from "./work-attribution/cost-sync.js";
@@ -87,6 +88,9 @@ export interface PassResult {
   nextRepository?: string;
   /** Every channel's outcome for this pass; disabled channels are recorded as "skipped". */
   channels: Record<ReconcileChannel, ReconcileChannelOutcome>;
+  /** Write-transaction durations of this pass's ledger connection (bounded-transaction
+   * reporting); undefined on backends that do not measure. */
+  txDurations?: TxDurations;
 }
 
 /** The in-memory return of one pass: the JSON protocol result above plus the continuation
@@ -130,6 +134,8 @@ export function runReconciliationPass(
     // Fencing is applied before any channel runs: the epoch this pass was granted is checked
     // inside every write transaction it issues, so a stale pass cannot commit after a handover.
     if (input.epoch !== undefined) fenceLedgerWrites(agentDir, input.epoch);
+    // The pass's transaction-duration report is scoped to this pass.
+    resetLedgerTxDurations(agentDir);
     const directory = join(agentDir, "work-attribution");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const deadline = Date.now() + PASS_BUDGET_MS;
@@ -290,6 +296,11 @@ export function runReconciliationPass(
         channels.reporting = rejected(error, channelSignal);
       }
     }
-    return { nextRepository, channels, progress };
+    return {
+      nextRepository,
+      channels,
+      txDurations: ledgerTxDurations(agentDir),
+      progress,
+    };
   });
 }

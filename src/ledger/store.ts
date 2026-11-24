@@ -158,6 +158,78 @@ function isAdditiveBusy(error: unknown): boolean {
   return /database is (locked|busy)/.test(message);
 }
 
+/** Upper edges (ms) of the write-transaction duration histogram; the last bucket is unbounded. */
+export const TX_DURATION_EDGES = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000] as const;
+
+/** Measured write-transaction durations of one store connection, for bounded-transaction
+ * reporting: total count, wall time, slowest, the last transaction's duration (what the adaptive
+ * chunk sizers observe), and the histogram counts above. */
+export interface TxDurations {
+  count: number;
+  totalMs: number;
+  maxMs: number;
+  lastMs: number;
+  buckets: number[];
+}
+
+interface TxHistogram {
+  count: number;
+  totalMs: number;
+  maxMs: number;
+  lastMs: number;
+  buckets: number[];
+}
+
+const histograms = new WeakMap<LedgerStore, TxHistogram>();
+
+/** The store's transaction-duration histogram; zeroes when nothing was measured yet. */
+export function txDurations(store: LedgerStore): TxDurations {
+  const histogram = histograms.get(store) ?? {
+    count: 0,
+    totalMs: 0,
+    maxMs: 0,
+    lastMs: 0,
+    buckets: Array.from({ length: TX_DURATION_EDGES.length + 1 }, () => 0),
+  };
+  return { ...histogram, buckets: [...histogram.buckets] };
+}
+
+/** Zeroes the store's histogram; a pass reports its own window by resetting first. */
+export function resetTxDurations(store: LedgerStore): void {
+  const histogram = histograms.get(store);
+  if (!histogram) return;
+  histogram.count = 0;
+  histogram.totalMs = 0;
+  histogram.maxMs = 0;
+  histogram.lastMs = 0;
+  histogram.buckets.fill(0);
+}
+
+let txClock: () => number = () => performance.now();
+
+/** Replaces the clock the histogram measures with; tests inject a controllable one. */
+export function useTxClock(clock: (() => number) | null): void {
+  txClock = clock ?? (() => performance.now());
+}
+
+/** Records one measured transaction: bucketed, monotonic-clock, cheap. */
+function recordTx(store: LedgerStore, start: number): void {
+  const histogram = histograms.get(store);
+  if (!histogram) return;
+  const ms = Math.max(0, txClock() - start);
+  histogram.count++;
+  histogram.totalMs += ms;
+  histogram.maxMs = Math.max(histogram.maxMs, ms);
+  histogram.lastMs = ms;
+  histogram.buckets[txBucketOf(ms)]++;
+}
+
+function txBucketOf(ms: number): number {
+  for (let index = 0; index < TX_DURATION_EDGES.length; index++)
+    if (ms <= TX_DURATION_EDGES[index]) return index;
+  return TX_DURATION_EDGES.length;
+}
+
 /** One additive-schema attempt on a live connection: a short busy timeout orders it against other
  * writers, and a busy result is reported (not thrown) so the caller can retry later. */
 function applyAdditiveSchema(ledger: Sqlite.Database): boolean {
@@ -263,21 +335,34 @@ export function openStore(agentDir: string): LedgerStore {
         fence: (epoch: number) => {
           fencedEpoch = epoch;
         },
-        tx: <T>(fn: () => T): T =>
-          ledger
-            .transaction(() => {
-              // Checked after the immediate lock is held, before any statement of fn: a stale writer
-              // aborts here and the transaction rolls back having written nothing at all.
-              if (fencedEpoch !== undefined) {
-                const row = epochOf.get(META_WRITER_EPOCH);
-                const held = row ? Number(row.value) : 0;
-                if (held !== fencedEpoch) throw new LedgerFencedError(held, fencedEpoch);
-              }
-              return fn();
-            })
-            .immediate(),
+        tx: <T>(fn: () => T): T => {
+          const start = txClock();
+          try {
+            return ledger
+              .transaction(() => {
+                // Checked after the immediate lock is held, before any statement of fn: a stale writer
+                // aborts here and the transaction rolls back having written nothing at all.
+                if (fencedEpoch !== undefined) {
+                  const row = epochOf.get(META_WRITER_EPOCH);
+                  const held = row ? Number(row.value) : 0;
+                  if (held !== fencedEpoch) throw new LedgerFencedError(held, fencedEpoch);
+                }
+                return fn();
+              })
+              .immediate();
+          } finally {
+            recordTx(store, start);
+          }
+        },
         close: () => ledger.close(),
       };
+      histograms.set(store, {
+        count: 0,
+        totalMs: 0,
+        maxMs: 0,
+        lastMs: 0,
+        buckets: Array.from({ length: TX_DURATION_EDGES.length + 1 }, () => 0),
+      });
       if (!applyAdditiveSchema(ledger)) store.additiveDeferred = true;
       // Required objects: backend construction reads transition_repositories unconditionally, so
       // this apply is never skipped on a busy writer — the busy error propagates to the open's

@@ -17,6 +17,7 @@ import {
   type JournalCursor,
   type RecordBackend,
 } from "./records.js";
+import { createTxChunkSizer, type TxChunkSizer } from "./tx-budget.js";
 
 /** Immutable legacy import: authority, projection, coverage and cursor commit together. */
 export type JournalMode = "fresh" | "clean-append" | "mutation";
@@ -611,6 +612,8 @@ function importJournalFiles(
       cursor?.boundaryHash === reverify.boundaryHash;
     const parsed: WorkRecord[] = [];
     const entries: ImportEntry[] = [];
+    /** The absolute file offset each entry's line ends at, so a batch's cursor covers exactly its rows. */
+    const entryEnds: number[] = [];
     // A mutated prefix does not itself mark a healthy journal incomplete: every line is
     // re-imported from the start and earlier generations' records stay in the store. A journal
     // that already carried problems keeps them through a rewrite, because a rewrite can hide the
@@ -638,7 +641,7 @@ function importJournalFiles(
       if (line.text.trim()) tail = [];
       const before = parsed.length;
       parser(line.text, false);
-      if (parsed.length > before)
+      if (parsed.length > before) {
         entries.push({
           line: line.text,
           record: parsed[before],
@@ -646,6 +649,8 @@ function importJournalFiles(
           sourceGeneration: decision.generation,
           sourceOffset: decision.offset + line.start,
         });
+        entryEnds.push(decision.offset + line.end);
+      }
     }
     // Preserve a pending cut across batches; only a later nonblank line resolves it.
     parser("", true);
@@ -653,42 +658,68 @@ function importJournalFiles(
     const consumedEnd = decision.offset + consumed;
     const endReached = consumedEnd >= size;
     checkBudget?.();
-    prefix.update(data.subarray(0, consumed));
-    const hash = prefix.copy();
-    const boundaryHash = prefix.digest("hex");
     let imported = 0;
-    backend.tx(() => {
-      // A read from the start, or a continuing re-verification, that reached the end without a
-      // problem retires problems saved against older content; every other window keeps the
-      // clean marker fresh as before.
-      if (
-        !problems.length &&
-        savedProblems.length > 0 &&
-        endReached &&
-        (decision.offset === 0 || reverifying)
-      )
-        putProblems(backend, path, COVERAGE_NOTES, []);
-      else saveCoverage(backend, path, problems);
-      putProblems(backend, path, TAIL_NOTES, tail);
-      // Progress of the from-start re-verification persists across windows and passes. Damage
-      // found along the way ends it: the note then describes the current file again.
-      if (savedProblems.length > 0 && (recheck || reverifying)) {
-        if (!endReached && !problems.length) saveReverify(backend, path, consumedEnd, boundaryHash);
-        else clearReverify(backend, path);
-      } else if (reverify !== undefined && !recheck && !reverifying) clearReverify(backend, path);
-      if (entries.length) {
-        imported = importBatchInTx(backend, entries);
-      }
-      backend.putJournalCursor({
-        path,
-        dev,
-        ino,
-        generation: decision.generation,
-        offset: consumedEnd,
-        boundaryHash,
-        updatedAt: Date.now(),
+    // Adaptive batch commits (bounded transactions): the window's entries commit in batches sized
+    // from the measured transaction duration, AIMD from the historic whole-window commit. The
+    // atomic unit stays "a cursor with its rows": every batch commits exactly the entries it
+    // holds plus a cursor covering exactly those bytes, so a kill between batches resumes at the
+    // cursor and re-imports nothing (line-hash dedup) and loses nothing. The window's notes
+    // (coverage, tail) commit with the FIRST batch — they describe the whole window this pass
+    // parsed — and the last batch's cursor and boundary equal the single-transaction values.
+    const sizer = importBatchSizerFor(agentDir);
+    const windowHash = prefix.copy();
+    let folded = 0;
+    for (let first = 0; ; ) {
+      const limit = sizer.size();
+      const last = Math.min(entries.length, first + limit);
+      const batch = entries.slice(first, last);
+      const batchEnd = last === entries.length ? consumedEnd : entryEnds[last - 1];
+      windowHash.update(data.subarray(folded, batchEnd - decision.offset));
+      folded = batchEnd - decision.offset;
+      const boundary = windowHash.copy().digest("hex");
+      backend.tx(() => {
+        if (first === 0) {
+          // A read from the start, or a continuing re-verification, that reached the end without a
+          // problem retires problems saved against older content; every other window keeps the
+          // clean marker fresh as before.
+          if (
+            !problems.length &&
+            savedProblems.length > 0 &&
+            endReached &&
+            (decision.offset === 0 || reverifying)
+          )
+            putProblems(backend, path, COVERAGE_NOTES, []);
+          else saveCoverage(backend, path, problems);
+          putProblems(backend, path, TAIL_NOTES, tail);
+        }
+        // Progress of the from-start re-verification persists across windows and passes, now at
+        // each committed batch boundary. Damage found along the way ends it: the note then
+        // describes the current file again.
+        if (savedProblems.length > 0 && (recheck || reverifying)) {
+          if (!endReached && !problems.length) saveReverify(backend, path, batchEnd, boundary);
+          else clearReverify(backend, path);
+        } else if (first === 0 && reverify !== undefined && !recheck && !reverifying)
+          clearReverify(backend, path);
+        if (batch.length) {
+          imported += importBatchInTx(backend, batch);
+        }
+        backend.putJournalCursor({
+          path,
+          dev,
+          ino,
+          generation: decision.generation,
+          offset: batchEnd,
+          boundaryHash: boundary,
+          updatedAt: Date.now(),
+        });
       });
-    });
+      const measured = backend.txDurations?.().lastMs;
+      if (measured !== undefined) sizer.observe(measured);
+      if (last === entries.length) break;
+      first = last;
+    }
+    const hash = windowHash.copy();
+    const boundaryHash = windowHash.copy().digest("hex");
     // The memo survives a completed append now: the running hash, line count and stat identity
     // let the next append's preflight (and any later stat-identical window) skip the re-read.
     rememberContinued(path, {
@@ -804,6 +835,19 @@ interface ImportOptions {
 
 /** How long one import slice may hold the event loop before yielding. */
 export const IMPORT_SLICE_MS = 50;
+
+/** Import batch sizing per agent directory: AIMD on measured transaction durations, starting at
+ * the historic whole-window commit (one transaction per window) as both start and ceiling. */
+const importBatchSizers = new Map<string, TxChunkSizer>();
+const IMPORT_BATCH_START = 100_000;
+function importBatchSizerFor(agentDir: string): TxChunkSizer {
+  let sizer = importBatchSizers.get(agentDir);
+  if (!sizer) {
+    sizer = createTxChunkSizer(IMPORT_BATCH_START, 1, IMPORT_BATCH_START);
+    importBatchSizers.set(agentDir, sizer);
+  }
+  return sizer;
+}
 
 export async function importJournals(
   agentDir: string,

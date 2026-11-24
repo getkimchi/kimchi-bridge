@@ -37,6 +37,7 @@ import {
   type RecordBackend,
   type StoredRecord,
 } from "../../ledger/records.js";
+import { createTxChunkSizer, type TxChunkSizer } from "../../ledger/tx-budget.js";
 import { preludeStretch } from "./prelude.js";
 import type { Acknowledgement } from "../../ledger/protocol.js";
 import {
@@ -1080,6 +1081,19 @@ export async function reconcileReporting(
 /** At most this many requests or auxiliary records commit their events in one transaction. */
 const CHUNK_UNITS = 100;
 
+/** Translation-chunk sizing per agent directory: AIMD on the measured transaction duration, from
+ * the historic fixed chunk size. An observation is only possible on a measuring backend; the
+ * in-memory double keeps the fixed size. */
+const translationChunkSizers = new Map<string, TxChunkSizer>();
+function translationChunkSizerFor(agentDir: string): TxChunkSizer {
+  let sizer = translationChunkSizers.get(agentDir);
+  if (!sizer) {
+    sizer = createTxChunkSizer(CHUNK_UNITS);
+    translationChunkSizers.set(agentDir, sizer);
+  }
+  return sizer;
+}
+
 export { preludeStretch } from "./prelude.js";
 
 /** Time a pass keeps for committing one more chunk and delivering what it captured. */
@@ -1579,9 +1593,10 @@ async function translateGroup(
     });
   }
   const observed = new Set<string>();
+  const sizer = translationChunkSizerFor(agentDir);
   while (done < builtUnits.length) {
     if (Date.now() >= deadline - CHUNK_RESERVE_MS) return undefined;
-    const chunk = builtUnits.slice(done, done + CHUNK_UNITS);
+    const chunk = builtUnits.slice(done, done + sizer.size());
     const byAccount = new Map<string, Fact[]>();
     for (const unit of chunk)
       for (const entity of unit.entities) {
@@ -1598,6 +1613,8 @@ async function translateGroup(
       for (const [account, list] of byAccount) observeEvents(agentDir, account, list, [], check);
       backend.putNote("agent", PROGRESS_NOTE, JSON.stringify({ ...progress, units: done }));
     });
+    const measured = backend.txDurations?.().lastMs;
+    if (measured !== undefined) sizer.observe(measured);
     await setImmediate();
   }
   backend.tx(() => {

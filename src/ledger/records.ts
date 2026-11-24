@@ -14,7 +14,15 @@ import {
 } from "./row-log.js";
 import type { WorkRecord } from "./work-record.js";
 import { mergeRecordsInto, type SummaryRows } from "./merge.js";
-import { ensureProjectionVersion, type LedgerStore, openStore } from "./store.js";
+import {
+  ensureProjectionVersion,
+  type LedgerStore,
+  openStore,
+  type TxDurations,
+  resetTxDurations,
+  txDurations,
+} from "./store.js";
+import { createTxChunkSizer, type TxChunkSizer } from "./tx-budget.js";
 
 /**
  * The one storage engine behind capture, import, the derived summary projection, and tracker bookkeeping. Both
@@ -100,6 +108,11 @@ export interface RecordBackend {
   /** Fences this backend's write transactions to one writer epoch (the SQLite store's lease
    * fencing); absent on backends without a contended cross-process store. */
   fence?(epoch: number): void;
+  /** Measured write-transaction durations of this backend's connection, for the bounded-
+   * transaction budget; absent on backends that do not measure (the in-memory double). */
+  txDurations?(): TxDurations;
+  /** Zeroes the connection's duration histogram; a pass scopes its report this way. */
+  resetTxDurations?(): void;
   /** True when a NEW row was inserted; false when the record hash already exists (import dedup). */
   insertRecord(row: StoredRecord): boolean;
   upsertMarker(recordHash: string, workId: string, type: string): void;
@@ -524,20 +537,93 @@ export function listWorks(agentDir: string): { workId: string; head: WorkHead }[
     .map((head) => ({ workId: head.workId, head }));
 }
 
+/** The reconciliation connection's transaction-duration histogram (bounded-transaction
+ * reporting); undefined on backends that do not measure. */
+export function ledgerTxDurations(agentDir: string): TxDurations | undefined {
+  return backendFor(agentDir).txDurations?.();
+}
+
+/** Zeroes the agent directory's histogram, scoping the next report to one pass. */
+export function resetLedgerTxDurations(agentDir: string): void {
+  backendFor(agentDir).resetTxDurations?.();
+}
+
 /** Refolds every work marked dirty; startup recovery and projection-version bumps land here. */
 export function recoverDirty(agentDir: string): void {
   const backend = backendFor(agentDir);
   const dirty = backend.dirtyWorks();
   if (!dirty.length) return;
-  backend.tx(() => {
-    for (const workId of dirty) rebuildWorkInTx(backend, workId);
-  });
+  for (const workId of dirty) rebuildWorkSliced(backend, agentDir, workId);
 }
 
 /** Deletes the work's projection and refolds it from its records; the authority is never touched. */
 export function rebuildWork(agentDir: string, workId: string): void {
   const backend = backendFor(agentDir);
-  backend.tx(() => rebuildWorkInTx(backend, workId));
+  rebuildWorkSliced(backend, agentDir, workId);
+}
+
+/** Rebuild slice sizing per agent directory: one sizer persists across passes, AIMD on measured
+ * transaction duration, starting at the historic whole-work rebuild. */
+const rebuildSizers = new Map<string, TxChunkSizer>();
+const REBUILD_SLICE_START = 100_000;
+
+/** Sliced rebuild: while the work's records fit one slice (the starting size), the whole rebuild
+ * stays one transaction — rows, head and the dirty-marker clear commit together exactly as
+ * before. Once measured transaction durations shrank the slice size below the work's record
+ * count, the projection clears and marks dirty in its own transaction, the records fold in
+ * adaptively sized slices (the head's counters live in memory across slices, and only the final
+ * transaction publishes the head), and a kill mid-rebuild leaves a work with rows but no head —
+ * a state every reader already repairs by rebuilding lazily — never a partially published head. */
+function rebuildWorkSliced(backend: RecordBackend, agentDir: string, workId: string): void {
+  let sizer = rebuildSizers.get(agentDir);
+  if (!sizer) {
+    sizer = createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_START);
+    rebuildSizers.set(agentDir, sizer);
+  }
+  const through = backend.recordWatermark();
+  const limit = sizer.size();
+  const first = backend.readWorkRecordPage(workId, 0, through, limit);
+  const observe = () => {
+    const last = backend.txDurations?.().lastMs;
+    if (last !== undefined) sizer?.observe(last);
+  };
+  if (first.length < limit) {
+    backend.tx(() => rebuildWorkInTx(backend, workId));
+    observe();
+    return;
+  }
+  const head = emptyHead(workId);
+  const rows = projectionRows(backend, head);
+  backend.tx(() => {
+    backend.clearProjection(workId);
+    backend.markDirty(workId);
+  });
+  let page = first;
+  let readLimit = limit;
+  for (;;) {
+    const records: WorkRecord[] = [];
+    for (const row of page) {
+      try {
+        records.push(JSON.parse(row.body) as WorkRecord);
+      } catch {
+        // Skip damaged bodies; rebuild must not fail because one row is unreadable.
+      }
+    }
+    backend.tx(() => mergeRecordsInto(rows, records));
+    observe();
+    if (page.length < readLimit) break;
+    readLimit = sizer.size();
+    page = backend.readWorkRecordPage(workId, page[page.length - 1].position, through, readLimit);
+  }
+  backend.tx(() => {
+    backend.putHead({
+      ...head,
+      updatedAt: new Date().toISOString(),
+      ...summaryLatest((collection) => backend.readLog(workId, collection)),
+    });
+    backend.clearDirty(workId);
+  });
+  observe();
 }
 
 function rebuildWorkInTx(backend: RecordBackend, workId: string): void {
@@ -980,6 +1066,8 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
       return result;
     },
     fence: (epoch: number) => store.fence(epoch),
+    txDurations: () => txDurations(store),
+    resetTxDurations: () => resetTxDurations(store),
     insertRecord: (row) =>
       insertRecord.run(
         row.recordHash,
