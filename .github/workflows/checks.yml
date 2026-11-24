@@ -28,6 +28,21 @@ jobs:
       # Second full pass in a random file/test order (a fresh seed each run), so a suite that
       # only passes in the checked-in order fails here instead of slipping through silently.
       - run: bun test --randomize
+      # B3 acceptance: the worker bundle must complete hello and one pass
+      # under a released kimchi binary (BUN_BE_BUN=1 kimchi --no-env-file),
+      # not just under plain bun. The asset layout follows Kimchi's own
+      # install.sh: kimchi_<os>_<arch>.tar.gz containing bin/kimchi.
+      - name: Smoke the worker through a released kimchi binary
+        run: |
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          case "$(uname -m)" in
+            x86_64 | amd64) arch=amd64 ;;
+            *) arch=arm64 ;;
+          esac
+          temp="$(mktemp -d)"
+          curl -fsSL "https://github.com/getkimchi/kimchi/releases/latest/download/kimchi_${os}_${arch}.tar.gz" \
+            | tar -xzf - -C "$temp"
+          KIMCHI_WORKER_SMOKE_BIN="$temp/bin/kimchi" bun test test/worker/kimchi-smoke.test.ts
       # bash -n checks only its first file; the rest become arguments.
       - run: for script in install.sh scripts/*.sh; do bash -n "$script"; done
       - run: sh -n scripts/install-standalone.sh
