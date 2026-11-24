@@ -180,6 +180,8 @@ export KIMCHI_BRIDGE_ACTIVITY_URL=http://127.0.0.1:8765/imds/tool-calls:batchRec
 
 The receiver must be either `http://__imds.kimchi.internal` or plain HTTP on `127.0.0.1`, `localhost` or `[::1]`, with the exact path `/imds/tool-calls:batchRecord`. Credentials, query strings, fragments and other destinations are rejected. Sidekick supplies the remote IMDS receiver; for local replay the receiver is a separate service that you run, not the bridge.
 
+Native Kimchi sessions use the same workspace profile when the bridge CLI is available at its installed path (or under `KIMCHI_BRIDGE_BIN_DIR`). The built-in observer forwards native tool execution to `kimchi-bridge hook kimchi`; it does not contact KCP itself or alter the UI or ACP stream. Its ordered subprocess hook can add bounded latency while guaranteeing the invocation precedes its Observation, and it flushes any retained work during a bounded shutdown sync. The bridge owns capture privacy, durable pairing, retries and delivery. Without the workspace profile or an available bridge CLI, this observer is inert.
+
 After a hook, the bridge attempts delivery to that receiver. Workspace `sync` retries pending batches, and explicit `kimchi-bridge flush` drains the whole queue. Each JSON batch contains up to 100 events and targets 1 MiB. It must be accepted with one receipt per event:
 
 ```json

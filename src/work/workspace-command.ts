@@ -1,4 +1,5 @@
 import type { Native } from "./capture.ts";
+import { isHarness } from "./activity.ts";
 import { ActivityStore } from "./activity-store.ts";
 import { loadConfig } from "../settings.ts";
 import { drainActivities, flushAllActivities } from "./activity-delivery.ts";
@@ -36,8 +37,7 @@ export async function workspaceCommand(
     switch (command) {
       case "hook": {
         store.pruneIfDue();
-        if (args.length !== 2 || !["claude-code", "codex"].includes(args[1]))
-          throw new Error("missing hook source");
+        if (args.length !== 2 || !isHarness(args[1])) throw new Error("missing hook source");
         let data: Buffer;
         try {
           data = await io.readHookInput();
@@ -54,7 +54,7 @@ export async function workspaceCommand(
               : typeof parsed.hook_event_name === "string"
                 ? { stage: `classic.${parsed.hook_event_name}`, event: parsed }
                 : parsed;
-          store.observe(native, args[1] as "claude-code" | "codex", { includeSensitive });
+          store.observe(native, args[1], { includeSensitive });
         } catch {
           store.diagnostic("activity_capture_failed");
           return;
