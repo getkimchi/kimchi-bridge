@@ -306,7 +306,11 @@ function txBucketOf(ms: number): number {
  * writers, and a busy result is reported (not thrown) so the caller can retry later. Reached from
  * a fenced pass (a deferred heal on a cached connection), it carries the fence's checks inside
  * the apply transaction. */
-function applyAdditiveSchema(ledger: Sqlite.Database, agentDir: string): boolean {
+function applyAdditiveSchema(
+  ledger: Sqlite.Database,
+  agentDir: string,
+  restoreMs: number = BUSY_TIMEOUT_MS,
+): boolean {
   ledger.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS / 20}`);
   try {
     ledger
@@ -322,7 +326,7 @@ function applyAdditiveSchema(ledger: Sqlite.Database, agentDir: string): boolean
     if (!isAdditiveBusy(error) && !(error instanceof LedgerFencedError)) throw error;
     return false;
   } finally {
-    ledger.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
+    ledger.exec(`PRAGMA busy_timeout=${restoreMs}`);
   }
 }
 
@@ -358,7 +362,22 @@ export function retryOnBusy<T>(
  * shared-memory locks during a concurrent WAL upgrade of a fresh database, so two processes opening
  * the same brand-new ledger race past busy_timeout and the loser fails instantly.
  */
-export function openStore(agentDir: string): LedgerStore {
+/** Options for the capture-mode open: the cold open runs inside capture's bounded busy
+ *  window instead of the 5 s reconciliation timeout, defers the optional additive-schema apply
+ *  (the windowed read heals it lazily once contention clears), and never retries past its own
+ *  budget — so a held writer parks the record in the spool within the capture window rather
+ *  than stalling or failing the session's event loop. */
+export interface OpenStoreOptions {
+  /** The connection's initial busy timeout. */
+  busyTimeoutMs?: number;
+  /** The open-retry budget for fresh-database WAL-upgrade races. */
+  openRetryBudgetMs?: number;
+  /** Skip the eager additive-schema apply; mark it deferred for the windowed read to heal. */
+  deferAdditiveSchema?: boolean;
+}
+
+export function openStore(agentDir: string, options: OpenStoreOptions = {}): LedgerStore {
+  const busyTimeoutMs = options.busyTimeoutMs ?? BUSY_TIMEOUT_MS;
   const { Database } = bunSqlite();
   const path = ledgerDbPath(agentDir);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -369,7 +388,7 @@ export function openStore(agentDir: string): LedgerStore {
       const ledger = new Database(path, { create: true, strict: true });
       db = ledger;
       // Connection-local: even the first schema read may race another process's initialization.
-      ledger.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
+      ledger.exec(`PRAGMA busy_timeout=${busyTimeoutMs}`);
       // Read the version before any persisting pragma so a foreign database is left exactly as found.
       const version =
         ledger.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
@@ -444,7 +463,11 @@ export function openStore(agentDir: string): LedgerStore {
         lastMs: 0,
         buckets: Array.from({ length: TX_DURATION_EDGES.length + 1 }, () => 0),
       });
-      if (!applyAdditiveSchema(ledger, agentDir)) store.additiveDeferred = true;
+      // A capture-mode open defers the optional apply: attempting it under the short busy
+      // window would burn the whole window before capture even reaches its own commit, and
+      // the windowed read heals a deferred apply lazily once contention clears.
+      if (options.deferAdditiveSchema) store.additiveDeferred = true;
+      else if (!applyAdditiveSchema(ledger, agentDir, busyTimeoutMs)) store.additiveDeferred = true;
       // Required objects: backend construction reads transition_repositories unconditionally, so
       // this apply is never skipped on a busy writer — the busy error propagates to the open's
       // retry loop (which re-attempts whole) instead of handing out a backend whose schema it cannot
@@ -482,7 +505,7 @@ export function openStore(agentDir: string): LedgerStore {
       }
       throw error;
     }
-  }, OPEN_RETRY_BUDGET_MS);
+  }, options.openRetryBudgetMs ?? OPEN_RETRY_BUDGET_MS);
 }
 
 /**

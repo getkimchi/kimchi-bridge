@@ -118,6 +118,55 @@ it("capture under a 6 s writer in another process returns within 260 ms and spoo
   expect(existsSync(spoolFilePath(dir, "session"))).toBe(false);
 }, 20_000);
 
+it("a cold capture under a 6 s writer returns within 260 ms and spools the record", async () => {
+  const dir = agentDir();
+  const rec = record("req-cold");
+  // No readRecords warm-up: the first backend this agent directory ever sees in the capturing
+  // process is the capture's own — exactly a fresh session process under a held writer.
+  const holder = await holdWriter(dir, 6000);
+  let cold: { outcome: string; elapsedMs: number } | undefined;
+  try {
+    const child = spawn(
+      "bun",
+      [
+        "-e",
+        `const { capture } = await import(${JSON.stringify(`${ROOT}src/ledger/records.js`)});
+const start = Date.now();
+let outcome = "committed";
+try { capture(${JSON.stringify(dir)}, ${JSON.stringify(rec)}, "cold-test"); }
+catch (error) { outcome = "threw " + error.name + ": " + error.message; }
+console.log(JSON.stringify({ outcome, elapsedMs: Date.now() - start }));`,
+      ],
+      { cwd: ROOT, stdio: ["ignore", "pipe", "inherit"] },
+    );
+    const line = await new Promise<string>((resolve, reject) => {
+      let buffer = "";
+      child.stdout!.on("data", (chunk) => {
+        buffer += String(chunk);
+        const index = buffer.indexOf("\n");
+        if (index !== -1) resolve(buffer.slice(0, index));
+      });
+      child.once("exit", () => reject(new Error(`the cold capture child exited: ${buffer}`)));
+    });
+    cold = JSON.parse(line) as { outcome: string; elapsedMs: number };
+  } finally {
+    await holder.done;
+  }
+  // The cold open itself rode the bounded capture window: the record parked in the spool
+  // inside ~260 ms instead of stalling the open on the 5 s reconciliation timeout and
+  // throwing the record away.
+  expect(cold?.outcome).toBe("committed");
+  expect(cold?.elapsedMs ?? Infinity).toBeLessThan(260);
+  const spool = spoolFilePath(dir, "session");
+  expect(existsSync(spool)).toBe(true);
+  expect(readFileSync(spool, "utf8")).toBe(`\n${JSON.stringify(rec)}\n`);
+  // The next pass lands it exactly once, against a re-capture too.
+  expect(importSpool(dir).imported).toBe(1);
+  expect(readRecords(dir)).toHaveLength(1);
+  capture(dir, rec, "cold-test");
+  expect(readRecords(dir)).toHaveLength(1);
+}, 20_000);
+
 it("each spooled record is one self-delimiting append, so a killed writer's torn line never glues onto it", async () => {
   const dir = agentDir();
   expect(readRecords(dir)).toHaveLength(0);
