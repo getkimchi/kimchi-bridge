@@ -374,9 +374,13 @@ it("capture, lazy head reads and import rebuild a missing projection in bounded 
   slowClock(300);
   resetLedgerTxDurations(captured);
   capture(captured, record("req-new"), "summary-native");
-  expect(ledgerTxDurations(captured)?.count ?? 0).toBeGreaterThan(1);
+  // Two measurements only — the capture's outer tryCaptureTx transaction and the nested commit
+  // transaction inside it: the record and its intent committed with a dirty marker, and the
+  // missing projection was not rebuilt inside the capture transaction.
   expect(readRecords(captured)).toHaveLength(2501);
   expect(readWorkSummary(captured, WORK)?.sessions).toEqual(["session"]);
+  // The lazy read's repair ran the bounded rebuild in several slices.
+  expect(ledgerTxDurations(captured)?.count ?? 0).toBeGreaterThan(1);
 
   // A lazy head read on the same shape.
   const lazy = agentDir();
@@ -547,4 +551,135 @@ it("ack batches shrink under slow acknowledgements and every event is acknowledg
   expect(eventsOf(fixed).length).toBe(count);
   expect(eventsOf(fixed).every((event) => event.acked && !event.blocked)).toBe(true);
   useTxClock(null);
+});
+
+const ROOT = new URL("../../", import.meta.url).pathname;
+
+/** A real second process attempting BEGIN IMMEDIATE on the ledger: "acquired", or the lock
+ * error it hit while the rebuild's connection held the write lock. */
+function beginImmediateWitness(dir: string): string {
+  const code = `const { Database } = await import("bun:sqlite");
+const { ledgerDbPath } = await import(${JSON.stringify(`${ROOT}src/ledger/store.js`)});
+const db = new Database(ledgerDbPath(${JSON.stringify(dir)}));
+db.exec("PRAGMA busy_timeout=100");
+try {
+  db.exec("BEGIN IMMEDIATE");
+  db.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('witness', 'yes')");
+  db.exec("COMMIT");
+  console.log("acquired");
+} catch (error) {
+  console.log(error.name + ": " + error.message);
+} finally {
+  db.close();
+}`;
+  const child = Bun.spawnSync(["bun", "-e", code], { cwd: ROOT, timeout: 60_000 });
+  return `${child.stdout}${child.stderr}`.trim();
+}
+
+/** A work with `count` request records and no projection head. */
+function seedUnheaded(dir: string, count: number): void {
+  const backend = backendFor(dir);
+  for (let index = 0; index < count; index++)
+    backend.tx(() => {
+      backend.insertRecord({
+        recordHash: `unheaded-${index}`,
+        type: "request",
+        workId: WORK,
+        sessionId: "session",
+        body: JSON.stringify(record(`req-${index}`)),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: index,
+        importedAt: index,
+      });
+    });
+}
+
+it("capture never rebuilds a missing projection inside its own transaction", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  seedUnheaded(dir, 2500);
+  resetLedgerTxDurations(dir);
+  const page = backend.readWorkRecordPage;
+  let witness = "not called";
+  backend.readWorkRecordPage = (...args: Parameters<typeof page>) => {
+    witness = beginImmediateWitness(dir);
+    return page(...args);
+  };
+  try {
+    capture(dir, record("req-new"), "summary-native");
+  } finally {
+    backend.readWorkRecordPage = page;
+  }
+  // The capture's transaction stayed one small write (two measurements: the outer tryCaptureTx
+  // transaction and its nested commit): it never paged the authority, so a second process held
+  // the write lock the whole time it ran.
+  expect(witness).toBe("not called");
+  expect(ledgerTxDurations(dir)?.count ?? 0).toBe(2);
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+  // The lazy read repairs the projection in bounded slices, releasing the write lock between
+  // them: the same witness now acquires it during the rebuild's first page read.
+  let first = true;
+  backend.readWorkRecordPage = (...args: Parameters<typeof page>) => {
+    if (first) {
+      first = false;
+      witness = beginImmediateWitness(dir);
+    }
+    return page(...args);
+  };
+  try {
+    expect(readWorkHead(dir, WORK)).toBeDefined();
+  } finally {
+    backend.readWorkRecordPage = page;
+  }
+  expect(witness).toBe("acquired");
+  expect(backend.dirtyWorks()).toEqual([]);
+  expect(
+    readWorkSummary(dir, WORK)?.requests.find((row) => row.requestId === "req-new"),
+  ).toBeDefined();
+});
+
+it("unrelated captures do not restart a sliced rebuild or force the whole-work fallback", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  seedUnheaded(dir, 2500);
+  const OTHER = "00000000-0000-4000-8000-000000000002";
+  const unrelated = (requestId: string): WorkRecord => ({
+    ...record(requestId),
+    workId: OTHER,
+  });
+  // The unrelated work carries its own projection, so captures on it move only the global
+  // watermark — never this work's population.
+  capture(dir, unrelated("req-unrelated-0"), "summary-native");
+  // Shrink the rebuild slices, exactly as measured slow transactions would.
+  slowClock(300);
+  rebuildWork(dir, WORK);
+  useTxClock(null);
+  // Rebuild WORK in slices while every page read captures to the unrelated work.
+  const read = backend.readRecords;
+  let wholeReads = 0;
+  backend.readRecords = (opts: Parameters<typeof read>[0] = {}, checkBudget?: () => void) => {
+    if (opts?.workId === WORK) wholeReads++;
+    return read(opts, checkBudget);
+  };
+  const page = backend.readWorkRecordPage;
+  let pages = 0;
+  backend.readWorkRecordPage = (...args: Parameters<typeof page>) => {
+    if (args[0] === WORK) pages++;
+    capture(dir, unrelated(`req-unrelated-${pages}`), "summary-native");
+    return page(...args);
+  };
+  try {
+    rebuildWork(dir, WORK);
+  } finally {
+    backend.readRecords = read;
+    backend.readWorkRecordPage = page;
+  }
+  // The rebuild published from its own pages without ever falling back to one whole-authority
+  // transaction, and the unrelated captures all landed.
+  expect(wholeReads).toBe(0);
+  expect(pages).toBeGreaterThan(1);
+  expect(readRecords(dir, { workId: OTHER })).toHaveLength(pages + 1);
+  expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
+  expect(backend.dirtyWorks()).toEqual([]);
 });

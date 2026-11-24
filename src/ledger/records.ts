@@ -424,8 +424,13 @@ function spoolCaptureLine(agentDir: string, sessionId: string, line: string): bo
 }
 
 /**
- * One capture: the record, its translation intent, and the derived projection all commit atomically. A crash
- * therefore leaves the record either fully durable with its projection, or absent — never half-captured.
+ * One capture: the record, its translation intent, and — when the work already has its projection —
+ * the derived projection fold all commit atomically. A crash therefore leaves the record either
+ * fully durable with its projection, or absent — never half-captured. A work whose projection is
+ * missing (a version bump or a bug lost it, or another process's rebuild is mid-flight) commits
+ * the record and its intent with a dirty marker instead, and the next read of that work (the
+ * lazy head repair) or the reconciliation pass's recovery rebuilds the projection in bounded
+ * slices; the capture's own transaction stays one small write either way.
  *
  * Under a writer held by another process, capture waits only its short busy window, then parks the exact
  * record line in the session's spool (fsynced) and returns normally — callers are void and need no new
@@ -478,19 +483,19 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
     importedAt: Date.now(),
   };
   const commit = () => {
-    // A projection lost to a version bump or a bug is rebuilt before this record folds into it —
-    // in bounded slices outside the capture transaction, so the capture's own commit stays one
-    // small transaction. The check repeats inside the transaction below for the rare case where
-    // another process's rebuild cleared the head between the two; that fallback stays one
-    // whole-work transaction, exactly as before.
-    if (!backend.getHead(record.workId) && backend.recordCount(record.workId) > 0)
-      rebuildWorkSliced(backend, agentDir, record.workId);
+    // A projection lost to a version bump or a bug is not rebuilt here: this commit must stay
+    // one small transaction, and a rebuild that ran inside it would hold the write lock across
+    // every slice (an outer tryCaptureTx transaction cannot see the slice boundaries). The work
+    // is marked dirty instead; the next read of it (the lazy head repair) or the reconciliation
+    // pass's recovery rebuilds it in bounded slices, folding this record with the rest of the
+    // authority.
     backend.tx(() => {
-      if (!backend.getHead(record.workId) && backend.recordCount(record.workId) > 0)
-        rebuildWorkInTx(backend, record.workId);
+      const projection =
+        backend.getHead(record.workId) !== undefined || backend.recordCount(record.workId) === 0;
+      if (!projection) backend.markDirty(record.workId);
       backend.insertRecord(stored);
       backend.upsertMarker(stored.recordHash, record.workId, record.type);
-      foldWork(backend, record.workId, [record]);
+      if (projection) foldWork(backend, record.workId, [record]);
     });
   };
   if (!backend.tryCaptureTx) {
@@ -793,8 +798,9 @@ export function rebuildWork(agentDir: string, workId: string): void {
 const rebuildSizers = new Map<string, TxChunkSizer>();
 const REBUILD_SLICE_START = 1_000;
 const REBUILD_SLICE_MAX = 100_000;
-/** After this many watermark-moved restarts, one single-transaction rebuild finishes the job:
- * atomic, so a continuously capturing session cannot keep the slices restarting forever. */
+/** After this many population-moved restarts, one single-transaction rebuild finishes the
+ * job: atomic, so a continuously capturing session on this work cannot keep the slices
+ * restarting forever. */
 const REBUILD_RESTART_LIMIT = 8;
 
 /** Sliced rebuild: while the work's records fit one slice, the whole rebuild stays one
@@ -805,12 +811,15 @@ const REBUILD_RESTART_LIMIT = 8;
  * mid-rebuild leaves a work with rows but no head — a state every reader already repairs by
  * rebuilding lazily — never a partially published head.
  *
- * A capture that commits between the pinned authority watermark and the publication is not in
- * the folded pages: publishing anyway would erase its projection row and clear the dirty
- * marker. The final transaction therefore re-checks the watermark inside the write lock (no
- * writer can commit between that check and the publish) and the rebuild restarts whole from
- * the new watermark when it moved, re-clearing and re-folding everything the capture touched.
- * After REBUILD_RESTART_LIMIT restarts, one atomic whole-work transaction converges. */
+ * A capture on this work that commits between the pinned authority watermark and the
+ * publication is not in the folded pages: publishing anyway would erase its projection row and
+ * clear the dirty marker. The final transaction therefore re-checks the work's record count
+ * inside the write lock (only a write to this work moves it, and no writer can commit between
+ * that check and the publish) and the rebuild restarts whole from the new population when it
+ * moved, re-clearing and re-folding everything the capture touched. Writes to other works
+ * leave the count alone, so ordinary traffic on unrelated works cannot restart a rebuild or
+ * drive it into the atomic fallback below. After REBUILD_RESTART_LIMIT restarts, one atomic
+ * whole-work transaction converges. */
 export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, workId: string): void {
   const sizer = rememberSizer(rebuildSizers, agentDir, () =>
     createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_MAX),
@@ -821,6 +830,9 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
   };
   for (let restarts = 0; ; restarts++) {
     const through = backend.recordWatermark();
+    // The work's own population: the pinned pages cover it, and only a write to this work moves
+    // it before the publication re-check below.
+    const population = backend.recordCount(workId);
     const limit = sizer.size();
     // The single-transaction path is chosen by record count, so a fitting work never pages (and
     // never re-reads) the authority the transaction below refolds anyway.
@@ -856,7 +868,7 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
     }
     let published = false;
     backend.tx(() => {
-      if (backend.recordWatermark() !== through) return;
+      if (backend.recordCount(workId) !== population) return;
       backend.putHead({
         ...head,
         updatedAt: new Date().toISOString(),
