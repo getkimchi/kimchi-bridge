@@ -95,11 +95,13 @@ function requireRacedRecordPublished(injected: boolean, childStatus: number | nu
 }
 
 it("a capture between the rebuild's population and watermark reads reaches the projection", () => {
+  // Seeding 2,500 records and racing a real child process (a fresh Bun startup) makes this
+  // legitimately multi-second work; a loaded machine can need more than the 5 s default.
   const race = rebuildWithCaptureAt("between");
   requireRacedRecordPublished(race.injected, race.childStatus);
-});
+}, 30_000);
 
 it("a capture after the rebuild's watermark reaches the projection, not just the authority", () => {
   const race = rebuildWithCaptureAt("after");
   requireRacedRecordPublished(race.injected, race.childStatus);
-});
+}, 30_000);

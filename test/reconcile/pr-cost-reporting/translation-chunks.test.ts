@@ -176,6 +176,10 @@ it("translation chunks shrink under slow transactions and the observed units sta
       "../../../src/reconcile/pr-cost-reporting/queue.js"
     );
     await withHostPorts(host(dir), () => setReportingEnabled(dir, true));
+    // The control must run under the real clock whatever an earlier suite left installed: bun
+    // test keeps module state (the transaction clock included) across test files, and a leaked
+    // slow clock would shrink the control's chunks too, collapsing the ratio below.
+    useTxClock(null);
     backendFor(dir).putNote(
       "agent",
       "reporting-producer",

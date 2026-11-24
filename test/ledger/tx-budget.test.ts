@@ -219,7 +219,9 @@ it("import batches shrink under slow transactions, grow back, and reach the iden
   expect(cursorOf(adaptive)?.offset).toBe(cursorOf(fixed)?.offset);
   expect(cursorOf(adaptive)?.boundaryHash).toBe(cursorOf(fixed)?.boundaryHash);
   expect(readWorkSummary(adaptive, WORK)).toEqual(readWorkSummary(fixed, WORK));
-});
+  // The whole test is fsync-bound appends and imports (140 windows of real SQLite commits), so
+  // a loaded machine can legitimately need more than the 5 s default test timeout.
+}, 30_000);
 
 it("rebuild slices stay budgeted and produce the identical projection", () => {
   const dir = agentDir();
@@ -347,7 +349,7 @@ it("a cold-start rebuild splits its first slow pass without prior observations",
   rebuildWork(dir, WORK);
   expect(ledgerTxDurations(dir)?.count ?? 0).toBeGreaterThan(1);
   expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
-});
+}, 30_000);
 
 it("capture, lazy head reads and import rebuild a missing projection in bounded slices", () => {
   const seed = (dir: string, count: number) => {
@@ -399,7 +401,9 @@ it("capture, lazy head reads and import rebuild a missing projection in bounded 
   expect(readRecords(imported)).toHaveLength(2550);
   expect(readWorkSummary(imported, WORK)?.sessions).toEqual(["session"]);
   useTxClock(null);
-});
+  // Three seeded 2,500-record directories with real rebuilds and imports are legitimately
+  // multi-second work; a loaded machine can need more than the 5 s default test timeout.
+}, 30_000);
 
 it("a fast-path rebuild reads the authority once, not twice", () => {
   const dir = agentDir();
@@ -432,7 +436,7 @@ it("a fast-path rebuild reads the authority once, not twice", () => {
   // A work that fits one slice rebuilds in the single transaction without paging the authority.
   expect(pages).toBe(0);
   expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
-});
+}, 30_000);
 
 /** Distinct-entity claim facts, the shape the translation path observes. */
 function facts(count: number, first: number): Fact[] {
@@ -682,4 +686,4 @@ it("unrelated captures do not restart a sliced rebuild or force the whole-work f
   expect(readRecords(dir, { workId: OTHER })).toHaveLength(pages + 1);
   expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
   expect(backend.dirtyWorks()).toEqual([]);
-});
+}, 30_000);

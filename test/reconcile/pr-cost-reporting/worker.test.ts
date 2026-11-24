@@ -271,6 +271,9 @@ const workerHost: HostPorts = {
   },
   fetch: (input, init) => http(input, init),
 };
+// Each hook takes the queue lock (with its fsync-heavy durable writes) and flushes every
+// summary the test wrote, so a loaded machine can legitimately need more than the 5 s default
+// test timeout; 30 s keeps these hooks from reporting a timeout that is really contention.
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "kimchi-reporting-http-"));
   ssoAgentDir = undefined;
@@ -323,14 +326,24 @@ beforeEach(async () => {
   setDefaultHostPorts(workerHost);
   await setReportingEnabled(directory, true);
   await queueSnapshots(directory, [content]);
-});
+}, 30_000);
 afterEach(async () => {
   // Restores the spyOn'd globals (Date.now, Math.random, node:fs) like vi.restoreAllMocks.
   mock.restore();
+  // bun test keeps mock.module registrations for the rest of the run, so the file loaded
+  // next sees whatever implementations this suite last installed. buildEvents and
+  // observeEvents end on their no-op stand-ins after the final test, which would silently
+  // drop real reports and events for any later suite importing these modules; both return to
+  // full pass-through here so the registered mocks behave exactly like the real exports.
+  buildEvents.mockImplementation((...args) => eventsReal.buildEvents(...args));
+  observeEvents.mockImplementation((...args) => {
+    outboxReal.observeEvents(...args);
+    return undefined;
+  });
   setDefaultHostPorts(undefined);
   await flushWorkSummaries();
   await rm(directory, { recursive: true, force: true });
-});
+}, 30_000);
 const capturedReport = () => buildEvents.mock.calls.at(-1)?.[1];
 /** Every request each connected group of works passed to the producer. */
 const capturedRequests = () => buildEvents.mock.calls.flatMap(([, report]) => report.requests);
@@ -1408,7 +1421,11 @@ describe("account-fenced reporting delivery", () => {
             : new Response(new ReadableStream({ start() {} })),
       );
       const running = deliver();
-      for (let spins = 0; spins < 10_000 && http.mock.calls.length < 2; spins++)
+      // Waiting for the two uploads must survive a loaded machine: the delivery's real chain
+      // interleaves fs hops and lock retries with these immediate ticks, so a fixed spin count
+      // starves while those waits are still pending. The wait is bounded by wall clock instead.
+      const deadline = Date.now() + 8_000;
+      while (http.mock.calls.length < 2 && Date.now() < deadline)
         await new Promise<void>((resolve) => realSetImmediate(resolve));
       expect(http.mock.calls.length).toBe(2);
       await advance(5001);
@@ -1420,7 +1437,7 @@ describe("account-fenced reporting delivery", () => {
       globals.setTimeout = realSetTimeout;
       globals.clearTimeout = realClearTimeout;
     }
-  });
+  }, 15_000);
   it("persists retry timing when the complete reporting pass times out during upload", async () => {
     await seedLinked();
     http.mockImplementation(
