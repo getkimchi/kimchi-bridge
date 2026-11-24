@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -706,6 +706,50 @@ test("a mismatching build cannot forge stderr lines with control characters", as
   expect(lines.length).toBe(1);
   expect(lines[0].includes("FORGED")).toBe(false);
   expect(lines[0].includes("oops")).toBe(false);
+}, 15000);
+
+test("a parent that closes the worker's stdout read end gets a clean exit within 2 s", async () => {
+  const dir = agentDir();
+  // node:child_process, not Bun.spawn: the test must close the child's stdout
+  // read end while leaving stdin open, which Bun's stream wrapper cannot do.
+  const child = spawn(process.execPath, [WORKER], {
+    cwd: ROOT,
+    env: { ...process.env, KIMCHI_CODING_AGENT_DIR: dir },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const write = (message: unknown): void => {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  };
+  try {
+    // Handshake while the pipe is whole, then cut the parent's read end.
+    const first = await new Promise<string>((resolve, reject) => {
+      child.stdout.once("data", (chunk: Buffer) => resolve(chunk.toString("utf8")));
+      child.stdout.once("error", reject);
+      write({ type: "hello", v: PROTOCOL_VERSION, build: BUILD, agentDir: dir });
+    });
+    expect(JSON.parse(first.trim()).type).toBe("ready");
+    child.stdout.destroy();
+    const started = Date.now();
+    write({
+      type: "pass",
+      id: 40,
+      channels: { reporting: true },
+      reportingCwd: "/project",
+      deadlineMs: 60000,
+      epoch: 1,
+    });
+    // The worker's first write after the cut fails: it must treat that as
+    // parent death and leave on its own, not block or wait out a timeout.
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once("exit", (code: number | null) => resolve(code));
+      child.once("error", reject);
+      setTimeout(() => reject(new Error("the worker never exited")), 5000);
+    });
+    expect(code).toBe(0);
+    expect(Date.now() - started).toBeLessThan(2000);
+  } finally {
+    child.kill();
+  }
 }, 15000);
 
 test("a pass that fails before any channel reports the channels as failed, not ok", async () => {

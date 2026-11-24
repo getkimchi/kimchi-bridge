@@ -148,7 +148,12 @@ function onLine(line) {
 for (;;) {
   let read;
   try { read = readSync(0, chunk, 0, chunk.length, null); }
-  catch (error) { parentPort.postMessage({ readError: String(error) }); return; }
+  catch (error) {
+    // Fast wake, like EOF: a blocked request must not sit out its timeout on
+    // an already-fatal stdin error.
+    parentPort.postMessage({ readError: String(error) });
+    return gone();
+  }
   if (read === 0) return gone();
   pending += decoder.decode(chunk.subarray(0, read), { stream: true });
   for (;;) {
@@ -233,13 +238,27 @@ export class StdioTransport {
   }
 
   /** Writes one worker→parent message; blocking, so a request line is out before its wait.
-   *  A failed write means the parent is gone with its pipe; the exit path owns the rest. */
+   *  A failed write means the read end of the pipe is gone: the parent is
+   *  dead for delivery purposes, so the worker reports it and stops writing.
+   *  A parent that stays alive but stops reading can hold this write once the
+   *  pipe fills — that stalled-parent case is bounded by the parent's kill
+   *  watchdog, the same backstop the protocol's supervision relies on. */
   send(message: WorkerMessage): void {
+    if (this.#pipeGone) return;
     try {
       writeSync(1, encodeWorkerMessage(message));
     } catch {
-      // The reader thread reports the EOF; nothing more can be delivered.
+      this.pipeGone();
     }
+  }
+
+  #pipeGone = false;
+
+  /** The parent's read end is gone: nothing more can be delivered to it. */
+  private pipeGone(): void {
+    if (this.#pipeGone) return;
+    this.#pipeGone = true;
+    this.emit({ kind: "parent-gone" });
   }
 
   /** Registers a secret value (a credential token) for redaction on every error path. */
@@ -263,7 +282,7 @@ export class StdioTransport {
   request(kind: HostRequestKind, cwd?: string): unknown {
     // A parent that already died must not be overwritten by a new wait: the
     // reader thread is gone with it, so the request would never be answered.
-    if (Atomics.load(this.slots, STATE) === STATE_PARENT_GONE)
+    if (this.#pipeGone || Atomics.load(this.slots, STATE) === STATE_PARENT_GONE)
       throw new HostRequestError(
         `the parent is gone; the ${kind} request cannot be answered`,
         kind,
@@ -273,15 +292,27 @@ export class StdioTransport {
     Atomics.store(this.slots, RID, rid);
     Atomics.store(this.slots, LENGTH, 0);
     Atomics.store(this.slots, STATE, STATE_WAITING);
-    writeSync(
-      1,
-      encodeWorkerMessage({
-        type: "request",
-        rid,
+    try {
+      writeSync(
+        1,
+        encodeWorkerMessage({
+          type: "request",
+          rid,
+          kind,
+          ...(cwd === undefined ? {} : { cwd }),
+        }),
+      );
+    } catch {
+      // The parent died between the pre-check and the write: a failed request
+      // write is parent death, reported through the typed error like the rest.
+      Atomics.compareExchange(this.slots, STATE, STATE_WAITING, STATE_PARENT_GONE);
+      this.pipeGone();
+      throw new HostRequestError(
+        `the parent is gone; the ${kind} request cannot be answered`,
         kind,
-        ...(cwd === undefined ? {} : { cwd }),
-      }),
-    );
+        "parent-gone",
+      );
+    }
     const remaining =
       this.#deadlineAt > 0
         ? Math.min(REQUEST_TIMEOUT_MS, this.#deadlineAt - Date.now())
