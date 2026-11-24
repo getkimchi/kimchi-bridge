@@ -8,7 +8,12 @@ export const TOOL_ACTIVITY_LIMITS = {
   maxMetadataBytes: 4096,
 } as const;
 
-type Harness = "claude-code" | "codex";
+export const HARNESS_SOURCES = ["claude-code", "codex", "kimchi"] as const;
+export type Harness = (typeof HARNESS_SOURCES)[number];
+export function isHarness(value: unknown): value is Harness {
+  return typeof value === "string" && HARNESS_SOURCES.includes(value as Harness);
+}
+
 type Outcome = "OUTCOME_COMPLETED" | "OUTCOME_FAILED" | "OUTCOME_INTERRUPTED";
 type ToolOutcome = Outcome;
 
@@ -330,7 +335,7 @@ function hasOnlyFields(value: unknown, fields: string[]): boolean {
 
 function header(input: ActivityInput): EventHeader {
   const session = text(input.sessionId || input.event.session_id);
-  if ((input.source !== "claude-code" && input.source !== "codex") || !session)
+  if (!isHarness(input.source) || !session)
     throw new Error("activity requires a supported harness and session id");
   const cwd = input.cwd || input.event.cwd;
   if (typeof cwd !== "string" || !isAbsolute(cwd))
@@ -585,6 +590,14 @@ function optionalText(value: unknown): value is string | undefined {
   );
 }
 
+function observationBase(action: Action, startedAt: string, input: ActivityInput) {
+  return {
+    callId: actionCallId(action),
+    outcome: outcome(input),
+    ...duration(startedAt, input.occurredAt),
+  };
+}
+
 function specializedObservation(
   action: Action,
   startedAt: string,
@@ -593,12 +606,7 @@ function specializedObservation(
   if (!action.shellCommand && !action.webFetch && !action.fileOperation) return undefined;
   const response = rawResponse(input);
   const value = response.value as any;
-  const result = outcome(input);
-  const base = {
-    callId: actionCallId(action),
-    outcome: result,
-    ...duration(startedAt, input.occurredAt),
-  };
+  const base = observationBase(action, startedAt, input);
   if (action.shellCommand) {
     // ShellCommandOutput has no generic error field. Prefer a typed ToolOutput
     // that faithfully represents the provider error instead of dropping it.
@@ -696,10 +704,66 @@ function specializedObservation(
   return {
     fileOperationResult: {
       ...base,
-      success: result === "OUTCOME_COMPLETED",
+      success: base.outcome === "OUTCOME_COMPLETED",
       path,
       ...(content !== undefined ? { content } : {}),
       ...(responseError(input) ? { error: responseError(input) } : {}),
+    },
+  };
+}
+
+function asRecord(value: unknown): Record<string, any> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, any>;
+}
+
+/** Retain Kimchi's typed public result metadata without retaining native payloads. */
+function privateKimchiObservation(
+  action: Action,
+  startedAt: string,
+  input: ActivityInput,
+): Observation | undefined {
+  if (input.source !== "kimchi" || input.includeSensitive === true) return undefined;
+  const response = rawResponse(input);
+  if (!response.present) return undefined;
+  const base = observationBase(action, startedAt, input);
+  const value = asRecord(response.value);
+  const details = asRecord(value?.details);
+  if (action.shellCommand) {
+    const display = asRecord(details?.display);
+    if (
+      !details ||
+      details.handoff === true ||
+      details.exited !== true ||
+      display?.state === "running"
+    )
+      return undefined;
+    const exitCode = integerField(details, ["exitCode", "exit_code"]);
+    return {
+      shellCommandOutput: {
+        ...base,
+        ...(exitCode !== undefined ? { exitCode } : {}),
+      },
+    };
+  }
+  if (action.webFetch) {
+    const code =
+      integerField(value, ["code", "status", "status_code", "statusCode"]) ??
+      integerField(details, ["code", "status", "status_code", "statusCode"]);
+    return {
+      webFetchOutput: {
+        ...base,
+        url: action.webFetch.url,
+        ...(code !== undefined ? { code } : {}),
+      },
+    };
+  }
+  if (!action.fileOperation) return undefined;
+  return {
+    fileOperationResult: {
+      ...base,
+      success: base.outcome === "OUTCOME_COMPLETED",
+      path: action.fileOperation.path,
     },
   };
 }
@@ -773,7 +837,8 @@ export function activityObservation(
   };
   const observation: Observation = {
     invocation: before.action,
-    ...(specializedObservation(before.action, before.occurredAt, timed) ??
+    ...(privateKimchiObservation(before.action, before.occurredAt, timed) ??
+      specializedObservation(before.action, before.occurredAt, timed) ??
       genericObservation(before, timed)),
   };
   // Preserve a supplied after-hook identity; validation will reject a conflicting
