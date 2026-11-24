@@ -790,9 +790,10 @@ test("a late reply after a request's timeout never satisfies a later request", a
   expect(stalled).toBeDefined();
   const done1 = await drain(worker, 50);
   expect(done1.result.outcome).toBe("failed");
-  // Pass 2 asks again; the parent answers it, and only after seeing the new
-  // request does it deliver the stale reply belonging to pass 1's timed-out
-  // request — with a token pass 2 must never see as its answer.
+  // Pass 2 asks again with consent granted, so its credentials request
+  // really happens; only after seeing the new request does the parent
+  // deliver the stale reply belonging to pass 1's timed-out request — with
+  // a token pass 2 must never see as its answer.
   worker.send({
     type: "pass",
     id: 51,
@@ -802,6 +803,7 @@ test("a late reply after a request's timeout never satisfies a later request", a
     epoch: 1,
   });
   let done2: DoneMessage | undefined;
+  let staleSent = false;
   for (;;) {
     const message = await worker.next();
     if (message.type === "done") {
@@ -809,7 +811,14 @@ test("a late reply after a request's timeout never satisfies a later request", a
       break;
     }
     if (message.type !== "request") continue;
-    if (message.kind === "credentials" && message.rid !== stalled) {
+    if (message.kind === "consent") {
+      worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
+      continue;
+    }
+    if (message.kind === "credentials") {
+      // The later request has a rid of its own; the stale one is for the
+      // request that already timed out.
+      expect(message.rid).not.toBe(stalled);
       worker.send({
         type: "reply",
         rid: stalled as number,
@@ -818,11 +827,13 @@ test("a late reply after a request's timeout never satisfies a later request", a
           apiUrl: NO_NETWORK_API,
         },
       });
-      worker.send({ type: "reply", rid: message.rid, result: REPLIES.credentials });
-      continue;
+      staleSent = true;
     }
     worker.send({ type: "reply", rid: message.rid, result: REPLIES[message.kind] });
   }
+  // The stale reply was really delivered after the timeout, yet the fresh
+  // answer is the one that satisfied the request.
+  expect(staleSent).toBe(true);
   expect(done2.result.outcome).toBe("ok");
   for (const line of worker.lines())
     expect(line.includes("stale_token_never_an_answer_012345")).toBe(false);
