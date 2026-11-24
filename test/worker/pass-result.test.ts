@@ -238,4 +238,37 @@ describe("the pass result mapped onto the wire", () => {
     );
     expect(empty.channels.reporting?.outcome).toBe("failed");
   });
+
+  test("the pass's measured transactions land on the wire as cumulative buckets", () => {
+    const run = runOf({ files: { outcome: "ok" } });
+    // TX_DURATION_EDGES = [1, 2, 5, 10, 25, 50, 100, 250, 500, ...]: the bucket counts below
+    // place one transaction in each of the first eight buckets plus two past every edge.
+    run.txDurations = {
+      count: 10,
+      totalMs: 8000,
+      maxMs: 4000,
+      lastMs: 1,
+      buckets: [1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1],
+    };
+    const result = passResultFromRun(pass({ files: true }), { aborted: false }, run, undefined, identity);
+    expect(result.txDurations).toEqual({
+      count: 10,
+      maxMs: 4000,
+      // Cumulative: every transaction at or under each ceiling.
+      upTo25Ms: 5,
+      upTo50Ms: 6,
+      upTo100Ms: 7,
+      upTo250Ms: 8,
+      over250Ms: 2,
+    });
+    // A run that measured nothing carries no histogram at all.
+    const bare = passResultFromRun(
+      pass({ files: true }),
+      { aborted: false },
+      runOf({ files: { outcome: "ok" } }),
+      undefined,
+      identity,
+    );
+    expect(bare.txDurations).toBeUndefined();
+  });
 });

@@ -47,6 +47,8 @@ const PASS: PassMessage = {
 
 const CANCEL: ParentMessage = { type: "cancel", id: 7 };
 
+const HEARTBEAT: ParentMessage = { type: "heartbeat", at: 1795296329743 };
+
 const READY: ReadyMessage = { type: "ready", v: PROTOCOL_VERSION, build: "b3-test-build" };
 
 const DONE: DoneMessage = {
@@ -80,6 +82,7 @@ function parentMessages(): ParentMessage[] {
       result: { token: "secret-token-value", apiUrl: "https://api.example" },
     },
     { type: "hello", v: PROTOCOL_VERSION, build: "b", agentDir: "/a" },
+    HEARTBEAT,
   ];
 }
 
@@ -182,6 +185,9 @@ describe("strict line rejection", () => {
       '{"type":"pass","id":1,"channels":{"nonsense":true},"deadlineMs":10,"epoch":0}',
       '{"type":"cancel"}',
       '{"type":"cancel","id":-2}',
+      '{"type":"heartbeat"}',
+      '{"type":"heartbeat","at":"soon"}',
+      '{"type":"heartbeat","at":1795296329743,"extra":true}',
       '{"type":"reply"}',
       '{"type":"request","rid":1,"kind":"gitToken","host":5}',
       '{"type":"request","rid":1,"kind":"nonsense"}',
