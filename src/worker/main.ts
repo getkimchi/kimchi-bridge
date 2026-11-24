@@ -19,6 +19,7 @@ import type { HostPorts } from "../reconcile/host.js";
 import { runReconciliationPass, type PassRun } from "../reconcile/pass.js";
 import { setDiagnosticsRedactor } from "../reconcile/work-attribution/diagnostics.js";
 import type { ContinuationProgress } from "../reconcile/work-attribution/links.js";
+import { integrityCheckGate } from "./integrity.js";
 import { passResultFromRun, type AbortCause } from "./pass-result.js";
 import {
   HostRequestError,
@@ -222,6 +223,10 @@ function main(): void {
         }
         break;
       }
+      case "heartbeat":
+        // Tracked by the reader thread in the shared heartbeat slot at arrival; the write fence
+        // reads that slot inside every fenced transaction, so no main-thread handling is needed.
+        break;
       case "reply":
         // A late or duplicate reply: the request it belonged to already
         // timed out or was answered. Never guessed from, never answered twice.
@@ -327,37 +332,49 @@ function main(): void {
     transport.deadlineAt = deadlineAt;
     const deadline = setTimeout(() => abortActive("deadline"), deadlineAt - Date.now());
     const base = host as StdioHostClient;
+    // The once-a-day integrity gate: a failed quick_check stops every write of this pass and
+    // leaves the ledger untouched, reported as ledger_integrity_failed on every channel.
+    const integrity = integrityCheckGate(agentDir);
     let run: PassRun | undefined;
     let passError: unknown;
-    try {
-      run = await runReconciliationPass(
-        {
-          ...(message.channels.files ? { files: true } : {}),
-          ...(message.channels.pullRequests ? { pullRequests: {} } : {}),
-          ...(message.channels.costs ? { costs: true } : {}),
-          ...(message.channels.reporting
-            ? { reporting: { cwd: message.reportingCwd as string } }
-            : {}),
-          ...(message.nextRepository === undefined
-            ? {}
-            : { nextRepository: message.nextRepository }),
-          progress: continuation,
-        },
-        guardHostReads(base),
-        {
-          signal: state.controller.signal,
-          assertLease: () => {
-            if (!state.leaseValid) throw new Error("the reconciliation lease was lost");
-            state.controller.signal.throwIfAborted();
+    if (!integrity.ok) {
+      passError = new Error(`ledger_integrity_failed: ${integrity.error}`);
+    } else {
+      try {
+        run = await runReconciliationPass(
+          {
+            ...(message.channels.files ? { files: true } : {}),
+            ...(message.channels.pullRequests ? { pullRequests: {} } : {}),
+            ...(message.channels.costs ? { costs: true } : {}),
+            ...(message.channels.reporting
+              ? { reporting: { cwd: message.reportingCwd as string } }
+              : {}),
+            ...(message.nextRepository === undefined
+              ? {}
+              : { nextRepository: message.nextRepository }),
+            progress: continuation,
+            // The lease's fencing epoch, and the parent heartbeat behind the fence's writable
+            // hook: together they stop a stale worker from committing, whether the new holder
+            // bumps the epoch or is an old release that never does.
+            epoch: message.epoch,
+            assertWritable: () => base.assertHeartbeatFresh(),
           },
-        },
-      );
-      // The pass built on this progress object and mutated it in place; the
-      // returned one is what the next pass threads in, exactly as Kimchi's
-      // supervisor kept ContinuationProgress on itself between scans.
-      continuation = run.progress;
-    } catch (error) {
-      passError = error;
+          guardHostReads(base),
+          {
+            signal: state.controller.signal,
+            assertLease: () => {
+              if (!state.leaseValid) throw new Error("the reconciliation lease was lost");
+              state.controller.signal.throwIfAborted();
+            },
+          },
+        );
+        // The pass built on this progress object and mutated it in place; the
+        // returned one is what the next pass threads in, exactly as Kimchi's
+        // supervisor kept ContinuationProgress on itself between scans.
+        continuation = run.progress;
+      } catch (error) {
+        passError = error;
+      }
     }
     transport.deadlineAt = 0;
     clearTimeout(deadline);

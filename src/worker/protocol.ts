@@ -121,6 +121,16 @@ export interface CancelMessage {
   id: number;
 }
 
+/** The lease holder's heartbeat: the parent is alive and still holds the lease.
+ *  The worker's reader thread records each one's arrival, and the write fence refuses
+ *  ledger writes once none has arrived for the heartbeat window — the fence that stops a
+ *  stale worker an old release's lease handover never covers (it never bumps the epoch). */
+export interface HeartbeatMessage {
+  type: "heartbeat";
+  /** When the parent sent it, in milliseconds since the epoch. */
+  at: number;
+}
+
 /** The parent's answer to a `request`; the only message allowed to carry tokens. */
 export interface ReplyMessage {
   type: "reply";
@@ -128,7 +138,12 @@ export interface ReplyMessage {
   result: unknown;
 }
 
-export type ParentMessage = HelloMessage | PassMessage | CancelMessage | ReplyMessage;
+export type ParentMessage =
+  | HelloMessage
+  | PassMessage
+  | CancelMessage
+  | HeartbeatMessage
+  | ReplyMessage;
 
 // ---------------------------------------------------------------------------
 // Worker → parent
@@ -465,6 +480,13 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       const id = fieldInteger(object.value, "id", 1);
       if (!id.ok) return id;
       return accept({ type: "cancel", id: id.value });
+    }
+    case "heartbeat": {
+      const shape = exactKeys(object.value, ["type", "at"], []);
+      if (!shape.ok) return shape;
+      const at = fieldNumber(object.value, "at");
+      if (!at.ok) return at;
+      return accept({ type: "heartbeat", at: at.value });
     }
     case "reply": {
       const shape = exactKeys(object.value, ["type", "rid", "result"], []);

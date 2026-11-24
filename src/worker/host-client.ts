@@ -45,12 +45,15 @@ import {
 /** The parent must answer a host request within this window. */
 export const REQUEST_TIMEOUT_MS = 10_000;
 
-/** SharedArrayBuffer header (int32 slots) followed by the reply line's bytes. */
+/** SharedArrayBuffer header (int32 slots, then the aligned 64-bit heartbeat slot) followed by
+ *  the reply line's bytes. The heartbeat's arrival time is epoch milliseconds, which does not
+ *  fit an int32 slot, so it lives in its own BigInt64 slot at an 8-byte-aligned offset. */
 /** Slot 0 holds the state in its low bits and the owning request's rid above. */
 const COMBINED = 0;
 const LENGTH = 1;
 const ACTIVE_PASS = 3;
-const HEADER_BYTES = 16;
+const HEARTBEAT_OFFSET = 16;
+const HEADER_BYTES = 24;
 /** The longest reply line (a credentials or policy answer is a few hundred bytes). */
 const REPLY_BYTES = 64 * 1024;
 
@@ -74,6 +77,35 @@ export function nextRequestId(current: number): number {
 
 function combined(rid: number, state: number): number {
   return (rid << RID_SHIFT) | state;
+}
+
+/** The worker refuses ledger writes when no heartbeat arrived for this long. */
+export const HEARTBEAT_TIMEOUT_MS = 2000;
+
+/** The heartbeat window, overridable through the environment (the tests use a shorter or longer
+ *  one); the parent that spawns the worker controls its environment, like the idle exit. */
+export function heartbeatTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.KIMCHI_WORKER_HEARTBEAT_TIMEOUT_MS;
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = Number(raw.trim());
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return HEARTBEAT_TIMEOUT_MS;
+}
+
+/** The parent's lease heartbeat went silent: the worker refuses every ledger write through the
+ *  pass's write fence. Thrown by the fence's assertWritable hook, so it fails the pass's writes
+ *  the same way a lost epoch does; the channel reports it and nothing is committed. */
+export class LeaseHeartbeatLost extends Error {
+  /** How stale the freshest heartbeat was, in milliseconds. */
+  readonly ageMs: number;
+  constructor(ageMs: number) {
+    super(
+      `the parent lease heartbeat was last seen ${Math.round(ageMs)} ms ago; refusing ledger writes`,
+    );
+    this.name = "LeaseHeartbeatLost";
+    this.ageMs = ageMs;
+  }
 }
 
 /** What failed when a host request cannot be answered. */
@@ -126,6 +158,7 @@ const HELPER_SOURCE = `
 const { parentPort, workerData } = require("node:worker_threads");
 const { readSync } = require("node:fs");
 const ia = new Int32Array(workerData);
+const hb = new BigInt64Array(workerData, ${HEARTBEAT_OFFSET}, 1);
 const payload = new Uint8Array(workerData, ${HEADER_BYTES});
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -167,6 +200,13 @@ function cancel(parsed) {
   Atomics.store(ia, ${COMBINED}, ${STATE_CANCELLED});
   Atomics.notify(ia, ${COMBINED});
 }
+function heartbeat(parsed) {
+  // The reader thread records each heartbeat's arrival directly in the shared buffer, so
+  // a busy main thread still observes fresh data whenever it next checks. The parent's own
+  // clock value is not trusted for staleness; the arrival time is.
+  if (parsed.type !== "heartbeat" || typeof parsed.at !== "number") return;
+  Atomics.store(hb, 0, BigInt(Date.now()));
+}
 function gone() {
   Atomics.store(ia, ${COMBINED}, ${STATE_PARENT_GONE});
   Atomics.notify(ia, ${COMBINED});
@@ -178,6 +218,7 @@ function onLine(line) {
   if (parsed === null || typeof parsed !== "object") return forward(line);
   if (parsed.type === "reply" && typeof parsed.rid === "number" && reply(line, parsed)) return;
   if (parsed.type === "cancel" && typeof parsed.id === "number") cancel(parsed);
+  heartbeat(parsed);
   forward(line);
 }
 for (;;) {
@@ -229,6 +270,11 @@ export class StdioTransport {
   }
   private readonly shared = new SharedArrayBuffer(HEADER_BYTES + REPLY_BYTES);
   private readonly slots: Int32Array = new Int32Array(this.shared);
+  private readonly heartbeatSlot: BigInt64Array = new BigInt64Array(
+    this.shared,
+    HEARTBEAT_OFFSET,
+    1,
+  );
   private readonly helper: Worker;
   private rid = 0;
   private closed = false;
@@ -239,6 +285,11 @@ export class StdioTransport {
     options?: { ridSeed?: number },
   ) {
     this.rid = options?.ridSeed ?? 0;
+    // The heartbeat clock starts at the transport's construction: the parent has not had a
+    // chance to send one yet. From then on only the reader thread records arrivals, so a
+    // parent that never heartbeats locks the worker out of writes after the window —
+    // exactly the old-release fence decision 7 calls for.
+    Atomics.store(this.heartbeatSlot, 0, BigInt(Date.now()));
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
     this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
     this.helper.on("error", (error) => {
@@ -248,6 +299,18 @@ export class StdioTransport {
       if (!this.closed)
         this.transportError(`the stdin reader thread exited unexpectedly (${code})`);
     });
+  }
+
+  /** How long ago the reader thread last saw a parent heartbeat, in milliseconds. */
+  heartbeatAgeMs(): number {
+    return Date.now() - Number(Atomics.load(this.heartbeatSlot, 0));
+  }
+
+  /** Throws LeaseHeartbeatLost when no heartbeat arrived within the window; the write fence's
+   *  assertWritable hook calls this inside every fenced ledger transaction. */
+  assertHeartbeatFresh(timeoutMs: number = heartbeatTimeoutMs()): void {
+    const age = this.heartbeatAgeMs();
+    if (age > timeoutMs) throw new LeaseHeartbeatLost(age);
   }
 
   private transportError(reason: string): void {
@@ -543,6 +606,13 @@ export class StdioHostClient implements HostPorts {
 
   metric(metric: Parameters<HostPorts["metric"]>[0]): void {
     this.transport.send({ type: "metric", metric });
+  }
+
+  /** The write fence's heartbeat hook: throws LeaseHeartbeatLost once the parent's lease
+   *  heartbeat has been silent past the window. Delegates to the transport, whose reader
+   *  thread owns the heartbeat slot. */
+  assertHeartbeatFresh(): void {
+    this.transport.assertHeartbeatFresh();
   }
 
   /** The parent's user agent, or the worker's own identity when it sent none. */

@@ -159,11 +159,21 @@ export interface LedgerStore {
   close(): void;
 }
 
-/** Reads the persisted writer epoch; a missing row reads as 0 (no release ever fenced this ledger). */
+/** Reads the persisted writer epoch; a missing row reads as 0 (no release ever fenced this ledger).
+ *  A database whose base schema has not been created yet reads as 0 too: the create transaction
+ *  in openStore checks the fence before the schema exists, and an unfenced ledger is exactly the
+ *  state a fresh database is in. */
 export function readWriterEpoch(db: Sqlite.Database): number {
-  const row = db
-    .query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?")
-    .get(META_WRITER_EPOCH);
+  let row: { value: string } | null | undefined;
+  try {
+    row = db
+      .query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?")
+      .get(META_WRITER_EPOCH);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("no such table") && message.includes("meta")) return 0;
+    throw error;
+  }
   return row ? Number(row.value) : 0;
 }
 
