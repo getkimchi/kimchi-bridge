@@ -1,9 +1,10 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "bun:test";
+import { afterEach, expect, it, vi } from "bun:test";
 import { importJournalSlice } from "../../src/ledger/import.js";
 import { commitPullRequests } from "../../src/ledger/row-log.js";
+import * as rowLog from "../../src/ledger/row-log.js";
 import {
   acknowledgeBatch,
   observeEvents,
@@ -823,6 +824,124 @@ it("a commit-heavy work publishes its PR summary without rescanning row versions
   // capture fold and the single-transaction rebuild already use.
   expect(head?.pullRequests).toEqual(commitPullRequests(backend.readLog(WORK, "commits")));
 }, 30_000);
+
+it("a many-distinct-commit work publishes its merged PR summary outside the write lock", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  const OTHER = "00000000-0000-4000-8000-000000000002";
+  // Warm this directory's rebuild sizer down first (small request records under a slow clock),
+  // so the commit-heavy fold below runs in small slices and every transaction is measurable
+  // against the plan's ceiling — the cold start's first slice is a separate behavior.
+  for (let index = 0; index < 60; index++)
+    backend.tx(() => {
+      backend.insertRecord({
+        recordHash: `warm-${index}`,
+        type: "request",
+        workId: OTHER,
+        sessionId: "session",
+        body: JSON.stringify({ ...record(`warm-${index}`), workId: OTHER }),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: index,
+        importedAt: index,
+      });
+    });
+  slowClock(300);
+  for (let round = 0; round < 16; round++) rebuildWork(dir, OTHER);
+  useTxClock(null);
+  // 40,000 DISTINCT commit keys, each carrying its own five valid PR links — 200k links
+  // across 40k rows, the shape the one-SHA regression above cannot reach: the publication
+  // cannot lean on key deduplication, and its merged summary is O(distinct rows + links).
+  const commits = 40_000;
+  const linksPerCommit = 5;
+  const at = new Date().toISOString();
+  let seeded = 0;
+  for (let round = 0; seeded < commits; round++) {
+    const from = seeded;
+    backend.tx(() => {
+      for (let index = from; index < from + 2000 && index < commits; index++) {
+        const links = Array.from({ length: linksPerCommit }, (_, k) => ({
+          provider: "github",
+          host: "github.com",
+          id: String(100_000 + index * linksPerCommit + k),
+          url: `https://github.com/o/r/pull/${100_000 + index * linksPerCommit + k}`,
+          checkedAt: at,
+          state: "open",
+        }));
+        backend.insertRecord({
+          recordHash: `commit-${index}`,
+          type: "commit",
+          workId: WORK,
+          sessionId: "session",
+          body: JSON.stringify({
+            version: 1,
+            type: "commit",
+            workId: WORK,
+            sessionId: "session",
+            sha: `sha${index.toString(16).padStart(6, "0")}`,
+            repository: "github.com/o/r",
+            worktree: "/w",
+            recordedAt: at,
+            pullRequests: links,
+          }),
+          sourcePath: "/journal",
+          sourceGeneration: 0,
+          sourceOffset: index,
+          importedAt: index,
+        });
+        backend.upsertMarker(`commit-${index}`, WORK, "commit");
+        seeded = index + 1;
+      }
+    });
+  }
+  expect(backend.recordCount(WORK)).toBe(commits);
+  // The merged summary's placement is structural, not a timing coincidence: the spy counts
+  // the one merge the sliced rebuild performs and the transaction wrapper whether it ran
+  // inside any write transaction — the publication's merge must sit outside the lock.
+  let inTx = 0;
+  let merges = 0;
+  let mergesInTx = 0;
+  const realTx = backend.tx;
+  backend.tx = ((fn: () => void) => {
+    inTx++;
+    try {
+      return realTx(fn);
+    } finally {
+      inTx--;
+    }
+  }) as typeof realTx;
+  const realMerge = rowLog.commitPullRequests;
+  const merge = vi.spyOn(rowLog, "commitPullRequests").mockImplementation(((
+    ...args: Parameters<typeof realMerge>
+  ) => {
+    merges++;
+    if (inTx > 0) mergesInTx++;
+    return realMerge(...args);
+  }) as typeof realMerge);
+  resetLedgerTxDurations(dir);
+  try {
+    rebuildWork(dir, WORK);
+  } finally {
+    merge.mockRestore();
+    backend.tx = realTx;
+  }
+  // The sliced rebuild merged the summary exactly once, and outside every transaction: the
+  // publication is one small write, never an O(distinct commits + links) merge under the
+  // write lock (the reviewed probe measured 323 ms inside the publication transaction for
+  // 200k distinct rows; this shape's pre-fix probe measured 551 ms).
+  expect(merges).toBe(1);
+  expect(mergesInTx).toBe(0);
+  const histogram = ledgerTxDurations(dir);
+  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(250);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  const head = readWorkHead(dir, WORK);
+  expect(backend.readLog(WORK, "commits")).toHaveLength(commits);
+  expect(head?.pullRequests).toHaveLength(commits * linksPerCommit);
+  // The merged links are exactly what the whole-work rebuild derives from the projection's
+  // stored rows — the reference semantics the capture fold and the single-transaction
+  // rebuild already use.
+  expect(head?.pullRequests).toEqual(commitPullRequests(backend.readLog(WORK, "commits")));
+}, 60_000);
 
 it("retry exhaustion abandons publication in bounded transactions instead of one convergence fold", () => {
   const dir = agentDir();

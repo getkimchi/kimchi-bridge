@@ -1124,6 +1124,13 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
     for (let attempts = 0; ; attempts++) {
       let published = false;
       let foreign = false;
+      // The merged PR summary is a pure function of the commit rows folded so far, and it is
+      // O(distinct commit rows + links): it is computed OUTSIDE the write lock, just before
+      // each publication attempt, so the transaction below stays one small write — a work of
+      // many distinct commits otherwise pays its whole summary merge inside the publication
+      // transaction (the reviewed probe measured 323 ms for 200k distinct commit rows). A
+      // failed attempt re-folds the delta first, so the next attempt's merge sees every row.
+      const pullRequests = commitPullRequests(commits.values());
       backend.tx(() => {
         if (backend.getNote(workId, REBUILD_OWNERSHIP_NOTE) !== generation) {
           foreign = true;
@@ -1137,7 +1144,7 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
         backend.putHead({
           ...head,
           updatedAt: new Date().toISOString(),
-          pullRequests: commitPullRequests(commits.values()),
+          pullRequests,
         });
         backend.clearDirty(workId);
         backend.deleteNote(workId, REBUILD_OWNERSHIP_NOTE);
