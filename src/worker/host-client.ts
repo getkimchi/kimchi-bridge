@@ -46,9 +46,9 @@ import {
 export const REQUEST_TIMEOUT_MS = 10_000;
 
 /** SharedArrayBuffer header (int32 slots) followed by the reply line's bytes. */
-const STATE = 0;
+/** Slot 0 holds the state in its low bits and the owning request's rid above. */
+const COMBINED = 0;
 const LENGTH = 1;
-const RID = 2;
 const ACTIVE_PASS = 3;
 const HEADER_BYTES = 16;
 /** The longest reply line (a credentials or policy answer is a few hundred bytes). */
@@ -59,6 +59,17 @@ const STATE_WAITING = 1;
 const STATE_READY = 2;
 const STATE_PARENT_GONE = 3;
 const STATE_CANCELLED = 4;
+/** The state bits of the combined word; the rid occupies the bits above. */
+const STATE_MASK = 0b111;
+/** How far the rid sits above the state bits in the combined word. */
+const RID_SHIFT = 3;
+/** The rid's bits of the combined word; the mask keeps the word a positive int32. */
+const RID_MASK = 0x0fffffff;
+
+/** Packs a slot owner into one word: state in the low bits, rid above. */
+function combined(rid: number, state: number): number {
+  return (rid << RID_SHIFT) | state;
+}
 
 /** What failed when a host request cannot be answered. */
 export type HostRequestCause =
@@ -116,28 +127,44 @@ const decoder = new TextDecoder();
 const MAX_LINE_BYTES = 1048576;
 const chunk = Buffer.alloc(65536);
 let pending = "";
+// Test-only hook: a delay inserted between the reply checks and the
+// publication, so a test can hold a checked reply across a request's
+// timeout and the next request's start. Zero (unset) keeps it dormant.
+const TEST_REPLY_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_REPLY_DELAY_MS || 0);
+const TEST_SLEEP = new Int32Array(new SharedArrayBuffer(4));
 function forward(line) { parentPort.postMessage({ line: line, at: Date.now() }); }
 function reply(line, parsed) {
-  if (Atomics.load(ia, ${STATE}) !== ${STATE_WAITING}) return false; // nobody is waiting
-  if (parsed.rid !== Atomics.load(ia, ${RID})) return false; // late or stale reply
+  const word = Atomics.load(ia, ${COMBINED});
+  if ((word & ${STATE_MASK}) !== ${STATE_WAITING}) return false; // nobody is waiting
+  if (parsed.rid !== (word >>> ${RID_SHIFT})) return false; // late or stale reply
+  // The slot may only be written while it is WAITING: then the request's
+  // thread is blocked and cannot be reading the payload.
+  if (TEST_REPLY_DELAY_MS > 0) Atomics.wait(TEST_SLEEP, 0, 0, TEST_REPLY_DELAY_MS);
+  const expected = (parsed.rid << ${RID_SHIFT}) | ${STATE_WAITING};
   const bytes = encoder.encode(line);
   if (bytes.length <= payload.length) { payload.set(bytes); Atomics.store(ia, ${LENGTH}, bytes.length); }
   else Atomics.store(ia, ${LENGTH}, -1);
-  Atomics.store(ia, ${STATE}, ${STATE_READY});
-  Atomics.notify(ia, ${STATE});
+  // Publication must win a compare-exchange on the combined rid/state word:
+  // the slot accepts the reply only if it still belongs to this rid in
+  // WAITING. A reply that passed the checks above can no longer publish
+  // after its request timed out and a newer request took the slot — the
+  // exchange fails and the reply is declined, never delivered to the next
+  // request as a poisoned READY.
+  if (Atomics.compareExchange(ia, ${COMBINED}, expected, (parsed.rid << ${RID_SHIFT}) | ${STATE_READY}) !== expected) return false;
+  Atomics.notify(ia, ${COMBINED});
   return true;
 }
 function cancel(parsed) {
   // Fast wake: a cancel for the pass in flight must not sit behind a pending
   // request's timeout. The line is still forwarded for the main thread to own.
   if (parsed.id !== Atomics.load(ia, ${ACTIVE_PASS})) return;
-  if (Atomics.load(ia, ${STATE}) !== ${STATE_WAITING}) return;
-  Atomics.store(ia, ${STATE}, ${STATE_CANCELLED});
-  Atomics.notify(ia, ${STATE});
+  if ((Atomics.load(ia, ${COMBINED}) & ${STATE_MASK}) !== ${STATE_WAITING}) return;
+  Atomics.store(ia, ${COMBINED}, ${STATE_CANCELLED});
+  Atomics.notify(ia, ${COMBINED});
 }
 function gone() {
-  Atomics.store(ia, ${STATE}, ${STATE_PARENT_GONE});
-  Atomics.notify(ia, ${STATE});
+  Atomics.store(ia, ${COMBINED}, ${STATE_PARENT_GONE});
+  Atomics.notify(ia, ${COMBINED});
   parentPort.postMessage({ eof: true });
 }
 function onLine(line) {
@@ -287,16 +314,18 @@ export class StdioTransport {
   request(kind: HostRequestKind, params?: { cwd?: string; host?: string }): unknown {
     // A parent that already died must not be overwritten by a new wait: the
     // reader thread is gone with it, so the request would never be answered.
-    if (this.#pipeGone || Atomics.load(this.slots, STATE) === STATE_PARENT_GONE)
+    if (this.#pipeGone || (Atomics.load(this.slots, COMBINED) & STATE_MASK) === STATE_PARENT_GONE)
       throw new HostRequestError(
         `the parent is gone; the ${kind} request cannot be answered`,
         kind,
         "parent-gone",
       );
-    const rid = ++this.rid;
-    Atomics.store(this.slots, RID, rid);
+    const rid = ++this.rid & RID_MASK;
+    // One store claims the slot for this rid in WAITING, so the helper's
+    // publication compare-exchange — not a separate rid check — decides
+    // whether the slot still belongs to this request when a reply lands.
     Atomics.store(this.slots, LENGTH, 0);
-    Atomics.store(this.slots, STATE, STATE_WAITING);
+    Atomics.store(this.slots, COMBINED, combined(rid, STATE_WAITING));
     try {
       writeSync(
         1,
@@ -309,9 +338,15 @@ export class StdioTransport {
         }),
       );
     } catch {
-      // The parent died between the pre-check and the write: a failed request
-      // write is parent death, reported through the typed error like the rest.
-      Atomics.compareExchange(this.slots, STATE, STATE_WAITING, STATE_PARENT_GONE);
+      // The parent died between the pre-check and the write: a failed
+      // request write is parent death. The compare-exchange converts only
+      // this request's own WAITING slot, never a state another writer stored.
+      Atomics.compareExchange(
+        this.slots,
+        COMBINED,
+        combined(rid, STATE_WAITING),
+        STATE_PARENT_GONE,
+      );
       this.pipeGone();
       throw new HostRequestError(
         `the parent is gone; the ${kind} request cannot be answered`,
@@ -327,19 +362,24 @@ export class StdioTransport {
     // deadline scheduled mid-millisecond still gets its full remainder.
     const waited = Atomics.wait(
       this.slots,
-      STATE,
-      STATE_WAITING,
+      COMBINED,
+      combined(rid, STATE_WAITING),
       Math.ceil(Math.max(remaining, 0)),
     );
     if (waited === "timed-out") {
       // The compare-exchange is the race's referee: this thread is the only
-      // writer that may move WAITING to IDLE, so a value other than WAITING
-      // back means the reader thread stored a terminal state (a reply, a
-      // cancel, or parent death) after the wait expired but before this
-      // exchange. That state wins over the timeout and is handled below —
-      // never misreported as one.
-      const observed = Atomics.compareExchange(this.slots, STATE, STATE_WAITING, STATE_IDLE);
-      if (observed === STATE_WAITING) {
+      // writer that may end its own WAITING, so a value other than its own
+      // combined WAITING word back means the reader thread stored a terminal
+      // state (a reply, a cancel, or parent death) after the wait expired but
+      // before this exchange. That state wins over the timeout and is handled
+      // below — never misreported as one.
+      const observed = Atomics.compareExchange(
+        this.slots,
+        COMBINED,
+        combined(rid, STATE_WAITING),
+        STATE_IDLE,
+      );
+      if (observed === combined(rid, STATE_WAITING)) {
         if (this.#deadlineAt > 0 && Date.now() >= this.#deadlineAt)
           throw new HostRequestError(
             `the pass deadline expired while the ${kind} request was pending`,
@@ -353,7 +393,7 @@ export class StdioTransport {
         );
       }
     }
-    const state = Atomics.load(this.slots, STATE);
+    const state = Atomics.load(this.slots, COMBINED) & STATE_MASK;
     if (state === STATE_PARENT_GONE)
       throw new HostRequestError(
         `the parent is gone; the ${kind} request cannot be answered`,
@@ -361,7 +401,7 @@ export class StdioTransport {
         "parent-gone",
       );
     if (state === STATE_CANCELLED) {
-      Atomics.store(this.slots, STATE, STATE_IDLE);
+      Atomics.store(this.slots, COMBINED, STATE_IDLE);
       throw new HostRequestError(
         `the pass was canceled while the ${kind} request was pending`,
         kind,
@@ -369,7 +409,7 @@ export class StdioTransport {
       );
     }
     const length = Atomics.load(this.slots, LENGTH);
-    Atomics.store(this.slots, STATE, STATE_IDLE);
+    Atomics.store(this.slots, COMBINED, STATE_IDLE);
     if (length < 0)
       throw new HostRequestError(
         `the parent's ${kind} reply exceeded the ${REPLY_BYTES} byte pipe buffer`,

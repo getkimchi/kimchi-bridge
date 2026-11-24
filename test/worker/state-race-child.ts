@@ -18,8 +18,9 @@
 import { Worker } from "node:worker_threads";
 import { HostRequestError, StdioTransport } from "../../src/worker/host-client.js";
 
-/** The transport's shared slot layout: the state index and two state values. */
-const STATE = 0;
+/** The transport's shared slot layout: slot 0 is the combined rid/state word. */
+const COMBINED = 0;
+const STATE_MASK = 0b111;
 const STATE_WAITING = 1;
 const STATE_CANCELLED = 4;
 
@@ -33,7 +34,8 @@ const ITERATIONS = 20_000;
 const MAX_DELAY_NS = 150_000;
 
 // The handshake between the two threads: [0] go (0 idle, 1 go, 2 stop),
-// [1] the racer's compare-exchange return value, [2] the racer has reported.
+// [1] the racer's compare-exchange return value, [2] the racer has reported,
+// [3] the combined WAITING word the racer raced for.
 const gate = new Int32Array(new SharedArrayBuffer(16));
 
 const RACER_SOURCE = `
@@ -51,10 +53,18 @@ for (;;) {
   // when the window was missed entirely: the request has already ended, and
   // the compare-exchange below still reports that as a lost race.
   let spins = 0;
-  while (Atomics.load(slots, ${STATE}) !== ${STATE_WAITING} && spins++ < 2_000_000) {}
+  let waiting = -1; // a value no combined word can hold: the window was missed
+  while (spins++ < 2_000_000) {
+    const word = Atomics.load(slots, ${COMBINED});
+    if ((word & ${STATE_MASK}) === ${STATE_WAITING}) { waiting = word; break; }
+  }
   const until = process.hrtime.bigint() + BigInt(Math.round(Math.random() * ${MAX_DELAY_NS}));
   while (process.hrtime.bigint() < until) {}
-  const was = Atomics.compareExchange(slots, ${STATE}, ${STATE_WAITING}, ${STATE_CANCELLED});
+  // The racer races the request's own ending exchange for the whole combined
+  // word it observed: the state bits say WAITING and the rid bits name the
+  // request whose WAITING it is.
+  Atomics.store(gate, 3, waiting);
+  const was = Atomics.compareExchange(slots, ${COMBINED}, waiting, ${STATE_CANCELLED});
   Atomics.store(gate, 1, was);
   Atomics.store(gate, 2, 1);
   Atomics.notify(gate, 2);
@@ -88,13 +98,14 @@ for (let iteration = 0; iteration < ITERATIONS; iteration++) {
   }
   while (Atomics.load(gate, 2) !== 1) Atomics.wait(gate, 2, 0, 1000);
   const observed = Atomics.load(gate, 1);
-  if (observed === STATE_WAITING) won++;
+  const waiting = Atomics.load(gate, 3);
+  if (observed === waiting) won++;
   else lost++;
   // The invariant: a terminal state the racer stored before the request's
   // own compare-exchange is honored, never reported as an expiry.
-  if (observed === STATE_WAITING && outcome !== "canceled")
+  if (observed === waiting && outcome !== "canceled")
     violations.push({ iteration, outcome, observed });
-  if (observed !== STATE_WAITING && outcome !== "deadline")
+  if (observed !== waiting && outcome !== "deadline")
     violations.push({ iteration, outcome, observed });
 }
 Atomics.store(gate, 0, 2);

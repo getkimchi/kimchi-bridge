@@ -850,6 +850,70 @@ test("a late reply after a request's timeout never satisfies a later request", a
   expect(await worker.exited()).toBe(0);
 }, 40000);
 
+test("a delayed reply publication never fails the next host request", async () => {
+  const dir = agentDir();
+  seedRecord(dir);
+  // The reader thread's test-only delay holds every checked reply between
+  // its state/rid checks and its publication — the preemption window the
+  // reviewer probed. A reply for a request that has since timed out must
+  // then be declined, never published into the next request's slot as a
+  // poisoned READY that fails that request as invalid-reply.
+  const worker = spawnWorker(dir, { KIMCHI_WORKER_TEST_REPLY_DELAY_MS: "300" });
+  await handshake(worker, dir);
+  // Pass 1's 100 ms deadline expires while the reader thread still holds its
+  // consent reply, so the pass ends on its own deadline, not its own answer.
+  worker.send({
+    type: "pass",
+    id: 80,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 100,
+    epoch: 1,
+  });
+  // Pass 2 is queued while pass 1 is still in flight: its consent request
+  // must already be waiting when the reader thread wakes to publish pass 1's
+  // held reply, so the stale publication meets a slot owned by a live
+  // request — the exact ordering a preemption between the checks and the
+  // publication produces. (Sending it after pass 1's done would not do: the
+  // pass line itself waits behind the sleeping reader on stdin.)
+  worker.send({
+    type: "pass",
+    id: 81,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 60000,
+    epoch: 1,
+  });
+  let answeredForPass1 = false;
+  let done80: DoneMessage | undefined;
+  let done81: DoneMessage | undefined;
+  for (;;) {
+    const message = await worker.next();
+    if (message.type === "request") {
+      if (done80 === undefined) answeredForPass1 = true; // pass 1's held reply exists
+      worker.send({ type: "reply", rid: message.rid, result: REPLIES[message.kind] });
+      continue;
+    }
+    if (message.type !== "done") continue;
+    if (message.id === 80) done80 = message;
+    if (message.id === 81) {
+      done81 = message;
+      break;
+    }
+  }
+  if (done80 === undefined || done81 === undefined) throw new Error("a pass never finished");
+  // Pass 1's held reply was really answered before its deadline ended it.
+  expect(answeredForPass1).toBe(true);
+  expect(done80.result.outcome).toBe("failed");
+  expect(done80.result.channels.reporting?.error).toContain("deadline");
+  // Pass 2 completed on its own answers, each delivered after the held
+  // publication of pass 1's reply was declined.
+  expect(done81.result.outcome).toBe("ok");
+  expect(done81.result.channels.reporting?.outcome).toBe("ok");
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+}, 20000);
+
 test("several messages in one chunk and a line split across chunks both parse", async () => {
   const dir = agentDir();
   seedRecord(dir);
