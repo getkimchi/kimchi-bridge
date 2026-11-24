@@ -19,10 +19,11 @@
  *   rows           print the saved projection view for work <arg>
  *   listfiles      print every file path under <agentDir> (zero-write evidence)
  *
- * Kimchi-only commands (native-usage*, read-work-records, read-history*, pr-checks,
- * note, remove-note) stay in Kimchi's tests/e2e/tui/support/ledger-driver.ts: they exercise
- * code that has not moved to the bridge (pull-request-status lookups against provider
- * accounts, work-attribution hydration such as readWorkRecordsAsync and flushWorkSummaries).
+ * Kimchi-only commands (native-usage*, pr-checks, note, remove-note) stay in Kimchi's
+ * tests/e2e/tui/support/ledger-driver.ts: they exercise code that has not moved to the
+ * bridge (pull-request-status lookups against provider accounts). The read-work-records,
+ * read-history and read-history-async lanes moved here with B2, which moved summary.ts
+ * (readWorkRecords/readWorkRecordsAsync) into the bridge.
  * The producer and legacy-freeze lanes moved here with B2: the queue, machine and snapshot
  * code they drive is bridge code now, and each scenario runs bound to driverHost. The
  * removed scenarios whose core operations are moved ledger code run in the bridge's own
@@ -1995,6 +1996,47 @@ const commands: Record<string, (agent: string, arg?: string) => void | Promise<v
     out({ imported: result.imported, modes: result.files.map((file) => file.mode) });
   },
   listfiles: (agent) => listFiles(agent),
+  "read-work-records": async (agent) => {
+    setDefaultHostPorts(driverHost(agent));
+    const { readWorkRecords } = await import("../../src/reconcile/work-attribution/summary.js");
+    out(readWorkRecords(agent));
+  },
+  "read-history": async (agent) => {
+    setDefaultHostPorts(driverHost(agent));
+    const { readWorkRecords } = await import("../../src/reconcile/work-attribution/summary.js");
+    const problems: unknown[] = [];
+    const records = readWorkRecords(agent, undefined, undefined, (problem) =>
+      problems.push(problem),
+    );
+    out({ records, problems });
+  },
+  "read-history-async": async (agent) => {
+    setDefaultHostPorts(driverHost(agent));
+    const { readWorkRecordsAsync } = await import(
+      "../../src/reconcile/work-attribution/summary.js"
+    );
+    const problems: unknown[] = [];
+    let turns = 0;
+    let reading = true;
+    const spin = () => {
+      turns++;
+      if (reading) setImmediate(spin);
+    };
+    setImmediate(spin);
+    try {
+      const records = await readWorkRecordsAsync(agent, new AbortController().signal, (problem) =>
+        problems.push(problem),
+      );
+      out({
+        records: records.length,
+        requestIds: records.filter((row) => row.type === "request").map((row) => row.requestId),
+        problems,
+        turns,
+      });
+    } finally {
+      reading = false;
+    }
+  },
   "summary-state": (agent, workId) => summaryState(agent, workId ?? ""),
   "summary-writer": (agent, json) => summaryWriter(agent, json ?? "{}"),
   "known-record-regressions": (agent, json) => knownRecordRegressions(agent, json ?? "{}"),
