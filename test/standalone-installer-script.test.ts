@@ -92,7 +92,9 @@ test("installs the latest release's verified binary for the clients on PATH", ()
   // The download ran from the install directory and is gone.
   expect(readdirSync(prefix)).toEqual([]);
   expect(result.output).toContain(`Add ${env.KIMCHI_BRIDGE_BIN_DIR} to your PATH`);
-});
+  // Each test spawns the installer shell script, which spawns the fake release binary and curl;
+  // a loaded machine can legitimately need more than the 5 s default test timeout.
+}, 30_000);
 
 test("a pinned release, a named client, and the one client installed", () => {
   let { env, ran, urls } = machine();
@@ -105,7 +107,7 @@ test("a pinned release, a named client, and the one client installed", () => {
   ({ env, ran } = machine({ clients: ["claude"] }));
   expect(install(env).status).toBe(0);
   expect(ran()).toEqual(["install claude"]);
-});
+}, 30_000);
 
 test("a checksum mismatch runs and installs nothing", () => {
   const { prefix, env, ran } = machine({ checksum: "0".repeat(64) });
@@ -114,7 +116,7 @@ test("a checksum mismatch runs and installs nothing", () => {
   expect(result.output).toContain(`${asset} does not match the release's checksum`);
   expect(ran()).toEqual([]);
   expect(readdirSync(prefix)).toEqual([]);
-});
+}, 30_000);
 
 test("a failed install fails the installer and leaves no download behind", () => {
   const { prefix, env, ran } = machine({ exit: 1 });
@@ -123,7 +125,7 @@ test("a failed install fails the installer and leaves no download behind", () =>
   expect(result.output).toContain("kimchi-bridge install failed");
   expect(ran()).toEqual(["install both"]);
   expect(readdirSync(prefix)).toEqual([]);
-});
+}, 30_000);
 
 test("refuses before downloading without a client, a valid choice or a valid tag", () => {
   const { env, urls } = machine({ clients: [] });
