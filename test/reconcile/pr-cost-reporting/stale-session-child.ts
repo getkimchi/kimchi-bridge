@@ -32,6 +32,7 @@ setDefaultHostPorts({
   e2eSeam: () => undefined,
   now: () => Date.now(),
   credentials: () => ({ token: "key", apiUrl: "https://account.example" }),
+  gitToken: () => undefined,
   endpoints: () => ({
     llmEndpoint: "https://llm.example",
     openAiBaseUrl: "https://openai.example",
