@@ -1,13 +1,16 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { backendFor } from "../../src/ledger/records.js";
 import type { HostMetric, HostPorts } from "../../src/reconcile/host.js";
 import { hostPorts, setDefaultHostPorts, withHostPorts } from "../../src/reconcile/host-ports.js";
 import { reconcileWorkCosts } from "../../src/reconcile/work-attribution/cost-sync.js";
 import { deliverEvents } from "../../src/reconcile/pr-cost-reporting/worker.js";
+import { reportingStatePath } from "../../src/reconcile/pr-cost-reporting/queue.js";
+import golden from "../ledger/protocol-golden.json";
 import { ReconcileLeaseLostError, runReconciliationPass } from "../../src/reconcile/pass.js";
 
 /**
@@ -146,6 +149,14 @@ test("a full pass reaches every port: reconciliation metric, consent, policy, se
   expect(stat.mode & 0o700).toBe(0o700);
   // An empty ledger leaves the repository rotation unset.
   expect(result.nextRepository).toBeUndefined();
+  // Every enabled channel completed; the disabled ones are recorded as skipped.
+  expect(result.channels).toEqual({
+    files: { outcome: "ok" },
+    "pull-requests": { outcome: "ok" },
+    costs: { outcome: "ok" },
+    continuations: { outcome: "ok" },
+    reporting: { outcome: "ok" },
+  });
 });
 
 test("event delivery resolves credentials through the host and re-checks them mid-pass", async () => {
@@ -285,40 +296,13 @@ test("the resource gate consults the org policy port", async () => {
   expect(writes).toHaveLength(0);
 });
 
-test("a lease assertion failure mid-pass aborts the pass with a typed error and writes nothing after the loss", async () => {
-  const dir = agentDir();
+/** A request and its dispatch, so the costs channel runs a billing lookup for it. */
+function seedBillingRequest(dir: string): void {
   const workId = "22222222-2222-4222-8222-222222222222";
   const requestId = "11111111-1111-4111-8111-111111111111";
   const startedAt = "2026-10-24T08:00:00.000Z";
   const dispatchedAt = "2026-10-24T08:00:01.000Z";
-  const backend = backendFor(dir);
-  // The own-commit counter plus the row watermark sees every ledger write this process makes.
-  const ledgerState = () =>
-    [
-      backend.dataVersion(),
-      backend.recordWatermark(),
-      backend.dirtyWorks().length,
-      backend.outboxDeliveryStatus().length,
-    ].join(":");
-  let lost = false;
-  let stateAtLoss: string | undefined;
-  let verifies = 0;
-  const fake = fakeHost(dir, async (input) => {
-    const url = String(input);
-    if (url.endsWith("/api-keys:verify")) {
-      verifies += 1;
-      // The lease is lost while the costs channel's account verification is in flight.
-      lost = true;
-      stateAtLoss = ledgerState();
-      return Response.json({ organizationId: ORG, userId: USER });
-    }
-    if (lost) throw new Error("no network work may run after the lease was lost");
-    return Response.json({
-      items: [{ id: workId, totalPrice: "0.123456789", castaiApiKeyOwnerId: USER }],
-      totalCount: 1,
-    });
-  });
-  backend.insertRecord({
+  backendFor(dir).insertRecord({
     recordHash: "a".repeat(64),
     type: "request",
     workId,
@@ -338,7 +322,7 @@ test("a lease assertion failure mid-pass aborts the pass with a typed error and 
     sourceOffset: 0,
     importedAt: Date.now(),
   });
-  backend.insertRecord({
+  backendFor(dir).insertRecord({
     recordHash: "b".repeat(64),
     type: "request_dispatch",
     workId,
@@ -371,6 +355,39 @@ test("a lease assertion failure mid-pass aborts the pass with a typed error and 
     sourceOffset: 0,
     importedAt: Date.now(),
   });
+}
+
+test("a lease assertion failure mid-pass aborts the pass with a typed error and writes nothing after the loss", async () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  // The own-commit counter plus the row watermark sees every ledger write this process makes.
+  const ledgerState = () =>
+    [
+      backend.dataVersion(),
+      backend.recordWatermark(),
+      backend.dirtyWorks().length,
+      backend.outboxDeliveryStatus().length,
+    ].join(":");
+  const workId = "22222222-2222-4222-8222-222222222222";
+  let lost = false;
+  let stateAtLoss: string | undefined;
+  let verifies = 0;
+  const fake = fakeHost(dir, async (input) => {
+    const url = String(input);
+    if (url.endsWith("/api-keys:verify")) {
+      verifies += 1;
+      // The lease is lost while the costs channel's account verification is in flight.
+      lost = true;
+      stateAtLoss = ledgerState();
+      return Response.json({ organizationId: ORG, userId: USER });
+    }
+    if (lost) throw new Error("no network work may run after the lease was lost");
+    return Response.json({
+      items: [{ id: workId, totalPrice: "0.123456789", castaiApiKeyOwnerId: USER }],
+      totalCount: 1,
+    });
+  });
+  seedBillingRequest(dir);
   const failure = await runReconciliationPass(
     { costs: true, reporting: { cwd: "/project" } },
     fake.host,
@@ -394,4 +411,109 @@ test("a lease assertion failure mid-pass aborts the pass with a typed error and 
   // Nothing was committed after the loss: the ledger is exactly as it was at that moment.
   if (stateAtLoss === undefined) throw new Error("the loss moment must be recorded");
   expect(ledgerState()).toBe(stateAtLoss);
+});
+
+/** A due outbox event for the reporting account, so the reporting channel delivers it. */
+function seedOutboxEvent(dir: string): void {
+  // A complete wire event (adapted from the protocol golden fixture): delivery validates the
+  // full identity, revision chain and typed payload, so a hand-rolled shape cannot pass.
+  const seeded = {
+    ...(golden.events[0].input as Record<string, unknown>),
+    id: "88888888-8888-4888-8888-888888888888",
+    entityId: "99999999-9999-4999-8999-999999999999",
+    deviceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  };
+  const body = Buffer.from(JSON.stringify(seeded));
+  backendFor(dir).insertOutboxEvent({
+    id: seeded.id as string,
+    accountKey: JSON.stringify([ENDPOINT, ORG, USER]),
+    entityId: seeded.entityId as string,
+    kind: "work",
+    body,
+    hash: createHash("sha256").update(body).digest("hex"),
+    createdAt: 0,
+    ackedAt: null,
+    blocked: "",
+  });
+}
+
+test("a failed channel records its outcome while the pass continues", async () => {
+  const dir = agentDir();
+  // A reporting state file that fails validation: the reporting channel rejects before
+  // its delivery, and the pass still resolves with the outcome recorded.
+  const statePath = reportingStatePath(dir);
+  mkdirSync(dirname(statePath), { recursive: true });
+  writeFileSync(statePath, "{");
+  const fake = fakeHost(dir);
+  const result = await runReconciliationPass(
+    { costs: true, reporting: { cwd: "/project" } },
+    fake.host,
+    { signal: new AbortController().signal, assertLease: () => {} },
+  );
+  expect(result.nextRepository).toBeUndefined();
+  expect(result.channels).toEqual({
+    files: { outcome: "skipped" },
+    "pull-requests": { outcome: "skipped" },
+    costs: { outcome: "ok" },
+    continuations: { outcome: "skipped" },
+    reporting: { outcome: "failed", error: expect.any(String) },
+  });
+  // No reporting network work ran.
+  expect(fake.fetches).toHaveLength(0);
+});
+
+test("a channel's own signal cancels only that channel", async () => {
+  const dir = agentDir();
+  seedBillingRequest(dir);
+  seedOutboxEvent(dir);
+  const costs = new AbortController();
+  let verifies = 0;
+  const fake = fakeHost(dir, async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/api-keys:verify")) {
+      verifies += 1;
+      // The costs channel's verification is in flight when its own signal aborts; the
+      // reporting channel's work afterwards must still run to completion.
+      if (verifies === 1) costs.abort();
+      return Response.json({ organizationId: ORG, userId: USER });
+    }
+    if (url.includes("/llm-requests")) {
+      return Response.json({
+        items: [
+          {
+            id: "22222222-2222-4222-8222-222222222222",
+            totalPrice: "0.123456789",
+            castaiApiKeyOwnerId: USER,
+          },
+        ],
+        totalCount: 1,
+      });
+    }
+    // The event batch upload: answer with the acknowledgement the sent batch describes.
+    const wire = JSON.parse(String(init?.body ?? "{}")) as {
+      batch?: { id: string; events: Array<{ id: string; revision: string }> };
+    };
+    const batch = wire.batch ?? { id: "", events: [] };
+    return Response.json({
+      batchId: batch.id,
+      receipts: batch.events.map((event) => ({
+        id: event.id,
+        revision: event.revision,
+        status: "accepted",
+      })),
+    });
+  });
+  const result = await runReconciliationPass(
+    { costs: { signal: costs.signal }, reporting: { cwd: "/project" } },
+    fake.host,
+    { signal: new AbortController().signal, assertLease: () => {} },
+  );
+  expect(result.channels.costs).toEqual({ outcome: "canceled" });
+  // The reporting channel delivered despite the costs cancellation; the pass signal was
+  // never aborted, so the channels stayed independent.
+  expect(result.channels.reporting).toEqual({ outcome: "ok" });
+  expect(result.channels.files).toEqual({ outcome: "skipped" });
+  expect(fake.fetches.some((url) => url.includes("pr-cost-events:batchIngest"))).toBe(true);
+  // The delivered event was acknowledged, not deferred.
+  expect(backendFor(dir).outboxDeliveryStatus()[0]?.sendable).toBe(false);
 });

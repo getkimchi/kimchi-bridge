@@ -31,6 +31,18 @@ import {
 
 const PASS_BUDGET_MS = 3000;
 
+/** The channels of a pass, in run order. */
+export type ReconcileChannel = "files" | "pull-requests" | "costs" | "continuations" | "reporting";
+
+/** One channel's outcome in a pass. */
+export interface ReconcileChannelOutcome {
+  /** "ok" ran to completion; "failed" rejected and the error was logged or reported;
+   *  "canceled" the channel's signal aborted; "skipped" the channel was not enabled. */
+  outcome: "ok" | "failed" | "canceled" | "skipped";
+  /** The channel's rejection message; present only when the outcome is "failed". */
+  error?: string;
+}
+
 export interface PassInput {
   /** The files channel: transition reconciliation, followed by continuation repair. */
   files?: boolean;
@@ -39,11 +51,13 @@ export interface PassInput {
     onUpdate?: (update: WorkPullRequestUpdate) => void;
     /** Replaces the supervisor's subscriber onError hooks; defaults to the debug log. */
     onError?: (error: unknown) => void;
+    /** Stops only this channel, as the supervisor's per-channel controller did. */
+    signal?: AbortSignal;
   };
-  /** The billing cost channel. */
-  costs?: boolean;
+  /** The billing cost channel: enabled, or enabled with its own cancellation signal. */
+  costs?: boolean | { signal?: AbortSignal };
   /** PR-cost translation and delivery, with the reporting session's cwd. */
-  reporting?: { cwd: string };
+  reporting?: { cwd: string; signal?: AbortSignal };
   /** Where the files channel left off last pass; the new position is returned. */
   nextRepository?: string;
   /** Continuation repair progress, carried across passes (the supervisor's ContinuationProgress). */
@@ -63,6 +77,8 @@ export class ReconcileLeaseLostError extends Error {
 export interface PassResult {
   /** The repository the next files channel starts from. */
   nextRepository?: string;
+  /** Every channel's outcome for this pass; disabled channels are recorded as "skipped". */
+  channels: Record<ReconcileChannel, ReconcileChannelOutcome>;
 }
 
 /**
@@ -99,28 +115,44 @@ export function runReconciliationPass(
     const deadline = Date.now() + PASS_BUDGET_MS;
     host.metric({ kind: "reconciliation" });
     const exhausted = new Error("Work attribution reconciliation time limit exceeded");
+    const channels: Record<ReconcileChannel, ReconcileChannelOutcome> = {
+      files: { outcome: "skipped" },
+      "pull-requests": { outcome: "skipped" },
+      costs: { outcome: "skipped" },
+      continuations: { outcome: "skipped" },
+      reporting: { outcome: "skipped" },
+    };
+    const describeError = (error: unknown): string =>
+      error instanceof Error ? error.message : String(error);
     const checkBudget = () => {
       assertLease();
       if (Date.now() > deadline) throw exhausted;
     };
-    /** A channel's guard: the pass's lease and cancellation, as runChannel composed them. */
-    const assertChannel = () => {
+    /** A channel's guard: the pass's lease and that channel's cancellation, as runChannel composed them. */
+    const assertChannelWith = (channelSignal: AbortSignal) => () => {
       assertLease();
-      signal.throwIfAborted();
+      channelSignal.throwIfAborted();
     };
     /** A channel error reaches its handlers; without one it reaches the debug log. */
     const channelError = (
       error: unknown,
+      channelSignal: AbortSignal,
       handlers: ((error: unknown) => void)[] | undefined,
       label: string,
     ) => {
       if (leaseFailure) throw leaseFailure;
-      if (signal.aborted) return;
+      if (channelSignal.aborted) return;
       if (handlers?.length) for (const handler of handlers) handler(error);
       else debug(label, error);
     };
+    /** A rejected channel's outcome: cancellation when its signal aborted, failure otherwise. */
+    const rejected = (error: unknown, channelSignal: AbortSignal): ReconcileChannelOutcome =>
+      channelSignal.aborted
+        ? { outcome: "canceled" }
+        : { outcome: "failed", error: describeError(error) };
     let nextRepository = input.nextRepository;
     if (input.files) {
+      channels.files = { outcome: "ok" };
       try {
         // One whole-type read serves every repository of the pass, not one full table scan each.
         const shared: SharedTypeReads = {};
@@ -147,8 +179,9 @@ export function runReconciliationPass(
         }
       } catch (error) {
         if (leaseFailure) throw leaseFailure;
-        if (error !== exhausted && !signal.aborted)
-          debug("Could not discover repositories: %o", error);
+        if (error === exhausted || signal.aborted) throw error;
+        channels.files = { outcome: "failed", error: describeError(error) };
+        debug("Could not discover repositories: %o", error);
       }
     }
     // Network lookup has its own deadline. A slow local repository must not starve it,
@@ -156,44 +189,76 @@ export function runReconciliationPass(
     if (input.pullRequests) {
       if (leaseFailure) throw leaseFailure;
       const channel = input.pullRequests;
+      const channelSignal = AbortSignal.any([signal, ...(channel.signal ? [channel.signal] : [])]);
+      channels["pull-requests"] = { outcome: "ok" };
       try {
-        await reconcileWorkPullRequests(agentDir, signal, assertChannel, (update) =>
-          channel.onUpdate?.(update),
+        await reconcileWorkPullRequests(
+          agentDir,
+          channelSignal,
+          assertChannelWith(channelSignal),
+          (update) => channel.onUpdate?.(update),
         );
       } catch (error) {
         channelError(
           error,
+          channelSignal,
           channel.onError ? [channel.onError] : undefined,
           "Reconciliation unavailable:",
         );
+        channels["pull-requests"] = rejected(error, channelSignal);
       }
     }
+    const costsChannel = input.costs && typeof input.costs === "object" ? input.costs : undefined;
     if (input.costs) {
       if (leaseFailure) throw leaseFailure;
+      const channelSignal = AbortSignal.any([
+        signal,
+        ...(costsChannel?.signal ? [costsChannel.signal] : []),
+      ]);
+      channels.costs = { outcome: "ok" };
       try {
-        await reconcileWorkCosts(agentDir, signal, assertChannel);
+        await reconcileWorkCosts(agentDir, channelSignal, assertChannelWith(channelSignal));
       } catch (error) {
-        channelError(error, undefined, "Could not reconcile costs: %o");
+        channelError(error, channelSignal, undefined, "Could not reconcile costs: %o");
+        channels.costs = rejected(error, channelSignal);
       }
     }
     // Historical repair is local and has its own budget; PR and billing work run first.
     if (input.files) {
       if (leaseFailure) throw leaseFailure;
+      channels.continuations = { outcome: "ok" };
       try {
         await reconcileWorkContinuations(agentDir, signal, assertLease, input.progress);
       } catch (error) {
         if (leaseFailure) throw leaseFailure;
-        if (!signal.aborted) debug("Could not reconcile work continuations: %o", error);
+        if (!signal.aborted) {
+          channels.continuations = {
+            outcome: "failed",
+            error: describeError(error),
+          };
+          debug("Could not reconcile work continuations: %o", error);
+        } else channels.continuations = { outcome: "canceled" };
       }
     }
     if (input.reporting) {
       if (leaseFailure) throw leaseFailure;
+      const channelSignal = AbortSignal.any([
+        signal,
+        ...(input.reporting.signal ? [input.reporting.signal] : []),
+      ]);
+      channels.reporting = { outcome: "ok" };
       try {
-        await reconcileReporting(agentDir, input.reporting.cwd, signal, assertChannel);
+        await reconcileReporting(
+          agentDir,
+          input.reporting.cwd,
+          channelSignal,
+          assertChannelWith(channelSignal),
+        );
       } catch (error) {
-        channelError(error, undefined, "Could not report PR costs: %o");
+        channelError(error, channelSignal, undefined, "Could not report PR costs: %o");
+        channels.reporting = rejected(error, channelSignal);
       }
     }
-    return { nextRepository };
+    return { nextRepository, channels };
   });
 }
