@@ -1221,9 +1221,30 @@ describe("producer identity across machines", () => {
     expect(backendFor(directory).recordCount()).toBe(0);
   });
 
-  // "keeps legacy and frozen delta bytes across real SQLite ..." stays in Kimchi: it drives
-  // the e2e ledger-driver's producer scenario against the full Kimchi stack; K1 repoints that
-  // driver at the bridge build, like B1's deferred scenarios.
+  it("keeps legacy and frozen delta bytes across real SQLite producer initialization and process reopen", async () => {
+    const saved = await savedOn(original);
+    const path = join(directory, "pr-cost-reporting/state.json");
+    const bytes = await readFile(path);
+    const driver = fileURLToPath(new URL("../../../test/ledger/ledger-driver.ts", import.meta.url));
+    const run = async () =>
+      JSON.parse(
+        (await promisify(execFile)("bun", [driver, "producer", directory], { timeout: 30_000 }))
+          .stdout,
+      );
+    const [first, concurrent] = await Promise.all([run(), run()]);
+    expect(concurrent.producerId).toBe(first.producerId);
+    for (const result of [first, concurrent, await run()]) {
+      expect(result).toMatchObject({
+        producerId: first.producerId,
+        legacyRetained: true,
+        batchRetained: true,
+        frozenProducer: saved.producerId,
+        note: { version: 1, producerId: first.producerId },
+      });
+      expect(result.producerId !== saved.producerId).toBe(result.machineKnown);
+    }
+    expect(await readFile(path)).toEqual(bytes);
+  }, 30_000);
 
   it("seeds the same-machine legacy producer once and ignores later old-writer state", async () => {
     const saved = await savedOn(original);
@@ -1315,8 +1336,29 @@ describe("producer identity across machines", () => {
   });
 });
 
-// "retains legacy bytes, ACK ownership and bounded scan progress in real SQLite" stays in
-// Kimchi for the same reason: it drives the ledger-driver's legacy-freeze scenario end to end.
+it("retains legacy bytes, ACK ownership and bounded scan progress in real SQLite", async () => {
+  await setReportingEnabled(directory, true);
+  await queueSnapshots(directory, [snapshot([requestId])]);
+  const driver = fileURLToPath(new URL("../../../test/ledger/ledger-driver.ts", import.meta.url));
+  const result = JSON.parse(
+    (await promisify(execFile)("bun", [driver, "legacy-freeze", directory], { timeout: 60_000 }))
+      .stdout,
+  );
+  expect(result).toEqual({
+    initialBytes: true,
+    ackRollback: true,
+    receiptCorruptionRejected: true,
+    cleanupReplay: true,
+    partialScanProgress: true,
+    retainedReceipts: 20,
+    archivedOriginalBytes: true,
+    pendingAfterArchive: 1,
+    latestRetained: true,
+    receiptScan: false,
+    resumeScans: 0,
+    reopened: true,
+  });
+}, 60_000);
 
 describe("unusable provider metadata for one PR", () => {
   const at = (minutes: number) => new Date(Date.UTC(2026, 9, 2, 10, minutes)).toISOString();

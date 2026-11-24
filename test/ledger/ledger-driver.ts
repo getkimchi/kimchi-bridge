@@ -19,15 +19,17 @@
  *   rows           print the saved projection view for work <arg>
  *   listfiles      print every file path under <agentDir> (zero-write evidence)
  *
- * Kimchi-only commands (native-usage*, producer, legacy-freeze, read-work-records,
- * read-history*, pr-checks, note, remove-note) stay in Kimchi's
- * tests/e2e/tui/support/ledger-driver.ts: they exercise code that has not moved to the
- * bridge (pull-request-status, queue.js, worker.js, work-attribution hydration such as
- * readWorkRecordsAsync and flushWorkSummaries). The removed scenarios whose core operations
- * are moved ledger code run in the bridge's own suites instead: the capture-stage rollback
- * (capture-atomic.test.ts), the async stored reader (stored-read-regressions.test.ts), and the
- * gated competing writer below (summary-writer.test.ts). summary-writer keeps the gated
- * putHead dance but drops the flushWorkSummaries tail, which is Kimchi-only hydration.
+ * Kimchi-only commands (native-usage*, read-work-records, read-history*, pr-checks,
+ * note, remove-note) stay in Kimchi's tests/e2e/tui/support/ledger-driver.ts: they exercise
+ * code that has not moved to the bridge (pull-request-status lookups against provider
+ * accounts, work-attribution hydration such as readWorkRecordsAsync and flushWorkSummaries).
+ * The producer and legacy-freeze lanes moved here with B2: the queue, machine and snapshot
+ * code they drive is bridge code now, and each scenario runs bound to driverHost. The
+ * removed scenarios whose core operations are moved ledger code run in the bridge's own
+ * suites instead: the capture-stage rollback (capture-atomic.test.ts), the async stored
+ * reader (stored-read-regressions.test.ts), and the gated competing writer below
+ * (summary-writer.test.ts). summary-writer keeps the gated putHead dance but drops the
+ * flushWorkSummaries tail, which is Kimchi-only hydration.
  */
 
 import { Database } from "bun:sqlite";
@@ -1251,6 +1253,196 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return Buffer.from(left).equals(Buffer.from(right));
 }
 
+/** Kimchi's producer scenario: the new producer freezes alongside legacy pending bytes in real SQLite. */
+async function producerScenario(agent: string): Promise<void> {
+  setDefaultHostPorts(driverHost(agent));
+  const { readReportingState, reportingProducer } = await import(
+    "../../src/reconcile/pr-cost-reporting/queue.js"
+  );
+  const { backendFor, closeBackends } = await import("../../src/ledger/records.js");
+  const { observeEvents, pendingBatch } = await import("../../src/ledger/outbox.js");
+  const { machineFingerprint } = await import("../../src/reconcile/pr-cost-reporting/machine.js");
+  const { accountKey } = await import("../../src/reconcile/pr-cost-reporting/snapshot.js");
+  const state = await readReportingState(agent);
+  const entry = Object.values(state.entries)[0];
+  if (!entry?.pending) throw new Error("Missing legacy pending producer fixture");
+  const account = accountKey(entry.account);
+  const current = () => {};
+  observeEvents(
+    agent,
+    account,
+    [
+      {
+        entityId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        source: "kimchi",
+        sourceVersion: "test",
+        deviceId: state.producerId,
+        observeTime: "2026-10-24T00:00:00Z",
+        coverage: { code: "observed", count: "1" },
+      },
+    ],
+    [],
+    current,
+  );
+  const frozen = pendingBatch(agent, account, current);
+  if (!frozen) throw new Error("Missing frozen producer fixture");
+  const producerId = await reportingProducer(agent, current);
+  const pending = pendingBatch(agent, account, current);
+  out({
+    producerId,
+    machineKnown: !!(await machineFingerprint()),
+    note: JSON.parse(backendFor(agent).getNote("agent", "reporting-producer") ?? "null"),
+    legacyRetained: JSON.stringify(await readReportingState(agent)) === JSON.stringify(state),
+    batchRetained: pending?.id === frozen.id && sameBytes(pending.body, frozen.body),
+    frozenProducer: JSON.parse(Buffer.from(frozen.body).toString("utf8")).batch.events[0].deviceId,
+  });
+  closeBackends();
+}
+
+/** Kimchi's legacy-freeze scenario: frozen ACK rollback, receipts, bounded scans in real SQLite. */
+async function legacyFreezeScenario(agent: string): Promise<void> {
+  setDefaultHostPorts(driverHost(agent));
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const {
+    acknowledgeFrozenSnapshot,
+    freezeSnapshots,
+    pendingFrozenSnapshots,
+    queueSnapshots,
+    readReportingState,
+    reportingStatePath,
+    setReportingEnabled,
+  } = await import("../../src/reconcile/pr-cost-reporting/queue.js");
+  const { backendFor, closeBackends } = await import("../../src/ledger/records.js");
+  const check = () => {};
+  const path = reportingStatePath(agent);
+  const originalState = readFileSync(path);
+  const initial = Object.values((await readReportingState(agent)).entries)[0];
+  if (!initial.pending) throw new Error("Missing original legacy fixture");
+  const originalBody = JSON.stringify(initial.pending);
+  const all = () => pendingFrozenSnapshots(agent, check, Date.now() + 30_000);
+  await freezeSnapshots(agent, check);
+  const [first] = await all();
+  if (!first || first.body !== originalBody) throw new Error("Legacy bytes changed during freeze");
+  const backend = backendFor(agent);
+  const remove = backend.deleteNote.bind(backend);
+  let removed = false;
+  backend.deleteNote = (workId: string, name: string) => {
+    remove(workId, name);
+    removed = true;
+    throw new Error("after actual pending deletion");
+  };
+  let rejected = false;
+  try {
+    await acknowledgeFrozenSnapshot(
+      agent,
+      first,
+      { status: "accepted", revision: "1", receivedAt: new Date().toISOString() },
+      check,
+    );
+  } catch (error) {
+    rejected = error instanceof Error && error.message === "after actual pending deletion";
+  } finally {
+    backend.deleteNote = remove;
+  }
+  const ackRollback =
+    removed &&
+    rejected &&
+    (await all())[0]?.body === originalBody &&
+    backend.readNotePage("legacy-pr-cost-snapshot-receipts", "", 64).length === 0;
+  if (!ackRollback) throw new Error("Frozen ACK did not roll back");
+  await acknowledgeFrozenSnapshot(
+    agent,
+    first,
+    { status: "accepted", revision: "1", receivedAt: new Date().toISOString() },
+    check,
+  );
+  const receipt = backend.getNote("legacy-pr-cost-snapshot-receipts", first.id);
+  if (receipt === undefined) throw new Error("Missing completed legacy receipt");
+  const { ack: _ack, ...invalidReceipt } = JSON.parse(receipt);
+  backend.putNote("legacy-pr-cost-snapshot-receipts", first.id, JSON.stringify(invalidReceipt));
+  writeFileSync(path, originalState);
+  let receiptCorruptionRejected = false;
+  try {
+    await freezeSnapshots(agent, check);
+  } catch {
+    receiptCorruptionRejected = readFileSync(path).equals(originalState);
+  }
+  backend.putNote("legacy-pr-cost-snapshot-receipts", first.id, receipt);
+  await freezeSnapshots(agent, check);
+  const cleanupReplay =
+    (await all()).length === 0 &&
+    !Object.values((await readReportingState(agent)).entries)[0].pending;
+  for (let index = 0; index < 20; index++) {
+    await queueSnapshots(agent, [
+      {
+        account: initial.account,
+        content: {
+          repository: initial.pending.repository,
+          pullRequests: initial.pending.pullRequests,
+          coverage: initial.pending.coverage,
+          requests: initial.pending.requests.map((request) => ({
+            ...request,
+            allocation: { ...request.allocation, kind: index % 2 ? "unlinked" : "unknown" },
+          })),
+        },
+      },
+    ]);
+    await freezeSnapshots(agent, check);
+  }
+  const [partial] = await pendingFrozenSnapshots(agent, check, Date.now() - 1);
+  closeBackends();
+  const [next] = await pendingFrozenSnapshots(agent, check, Date.now() - 1);
+  const partialScanProgress = !!partial && !!next && partial.id !== next.id;
+  const pending = await all();
+  if (pending.length !== 20)
+    throw new Error(`Expected twenty frozen versions, got ${pending.length}`);
+  const latest = pending.reduce((a, b) =>
+    BigInt(a.entry.revision) > BigInt(b.entry.revision) ? a : b,
+  );
+  for (const frozen of pending) {
+    if (frozen.id === latest.id) continue;
+    await acknowledgeFrozenSnapshot(
+      agent,
+      frozen,
+      {
+        status: "accepted",
+        revision: frozen.entry.revision,
+        receivedAt: new Date().toISOString(),
+      },
+      check,
+    );
+  }
+  const reopened = backendFor(agent);
+  const page = reopened.readNotePage.bind(reopened);
+  const namespaces: string[] = [];
+  reopened.readNotePage = (workId: string, after: string, limit: number) => {
+    namespaces.push(workId);
+    return page(workId, after, limit);
+  };
+  await setReportingEnabled(agent, true);
+  const resumeScans = namespaces.length;
+  const remaining = await all();
+  const receiptScan = namespaces.some((name) => name === "legacy-pr-cost-snapshot-receipts");
+  reopened.readNotePage = page;
+  const receipts = page("legacy-pr-cost-snapshot-receipts", "", 64);
+  const archived = receipts.map((row) => JSON.parse(row.body));
+  out({
+    initialBytes: first.body === originalBody,
+    ackRollback,
+    receiptCorruptionRejected,
+    cleanupReplay,
+    partialScanProgress,
+    retainedReceipts: receipts.length,
+    archivedOriginalBytes: archived.some((row) => row.body === originalBody),
+    pendingAfterArchive: remaining.length,
+    latestRetained: remaining[0]?.body === latest.body,
+    receiptScan,
+    resumeScans,
+    reopened: true,
+  });
+  closeBackends();
+}
+
 function summaryState(agent: string, workId: string): void {
   const store = openStore(agent);
   try {
@@ -1791,6 +1983,8 @@ const commands: Record<string, (agent: string, arg?: string) => void | Promise<v
     out(repositories);
   },
   "import-journals": (agent) => importJournalsCommand(agent),
+  producer: (agent) => producerScenario(agent),
+  "legacy-freeze": (agent) => legacyFreezeScenario(agent),
   outbox: (agent, mode) => outboxScenario(agent, mode ?? "sqlite"),
   "delivery-status": (agent, mode) => deliveryStatusScenario(agent, mode ?? "sqlite"),
   "outbox-transport": (agent) => outboxTransport(agent),
