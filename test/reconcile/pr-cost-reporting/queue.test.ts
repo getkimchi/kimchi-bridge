@@ -33,6 +33,7 @@ const queueHost: HostPorts = {
   e2eSeam: () => undefined,
   now: () => Date.now(),
   credentials: () => ({ token: "", apiUrl: "https://account.example" }),
+  gitToken: () => undefined,
   endpoints: () => ({
     llmEndpoint: "https://llm.example",
     openAiBaseUrl: "https://llm.example/openai/v1",

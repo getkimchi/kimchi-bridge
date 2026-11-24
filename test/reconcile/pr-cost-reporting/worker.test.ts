@@ -254,6 +254,7 @@ const workerHost: HostPorts = {
     }
     return credential;
   },
+  gitToken: () => undefined,
   endpoints(_cwd) {
     return {
       llmEndpoint: "https://llm.example",

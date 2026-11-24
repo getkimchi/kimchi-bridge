@@ -66,6 +66,12 @@ export interface HostPorts {
    * including mid-pass re-checks and per-record lookups.
    */
   readonly credentials: (cwd: string) => HostCredentials;
+  /**
+   * The saved Git host token (gitTokens.<host> in the embedding process's global config),
+   * or undefined when none is saved. PR discovery reads it at its original call sites;
+   * only the function behind them changes, so there is no second credential resolver here.
+   */
+  readonly gitToken: (host: string) => string | undefined;
   /** The gateway and platform endpoints configured for a working directory. */
   readonly endpoints: (cwd: string) => HostEndpoints;
   /** The session's effective org policy, fetched once per process by the embedding host. */

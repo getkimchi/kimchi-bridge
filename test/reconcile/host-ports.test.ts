@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -10,6 +11,10 @@ import { hostPorts, setDefaultHostPorts, withHostPorts } from "../../src/reconci
 import { reconcileWorkCosts } from "../../src/reconcile/work-attribution/cost-sync.js";
 import { deliverEvents } from "../../src/reconcile/pr-cost-reporting/worker.js";
 import { reportingStatePath } from "../../src/reconcile/pr-cost-reporting/queue.js";
+import {
+  credential,
+  repositoryIdentity,
+} from "../../src/reconcile/pull-request-status/provider-api.js";
 import golden from "../ledger/protocol-golden.json";
 import { ReconcileLeaseLostError, runReconciliationPass } from "../../src/reconcile/pass.js";
 
@@ -28,6 +33,8 @@ interface FakeHost {
   host: HostPorts;
   counts: Record<string, number>;
   cwds: string[];
+  /** Saved git host tokens the host answers PR discovery with. */
+  gitTokens: Record<string, string | undefined>;
   metrics: HostMetric[];
   endpointCwds: string[];
   fetches: string[];
@@ -40,6 +47,7 @@ function fakeHost(agentDir: string, fetchImpl?: HostPorts["fetch"]): FakeHost {
   const endpointCwds: string[] = [];
   const metrics: HostMetric[] = [];
   const fetches: string[] = [];
+  const gitTokens: Record<string, string | undefined> = {};
   let credential: { token: string; organizationId?: string; apiUrl: string } = {
     token: "api-key",
     organizationId: undefined,
@@ -56,6 +64,10 @@ function fakeHost(agentDir: string, fetchImpl?: HostPorts["fetch"]): FakeHost {
       counts.credentials = (counts.credentials ?? 0) + 1;
       cwds.push(cwd);
       return credential;
+    },
+    gitToken(host) {
+      counts.gitToken = (counts.gitToken ?? 0) + 1;
+      return gitTokens[host];
     },
     endpoints(cwd) {
       counts.endpoints = (counts.endpoints ?? 0) + 1;
@@ -91,6 +103,7 @@ function fakeHost(agentDir: string, fetchImpl?: HostPorts["fetch"]): FakeHost {
     host,
     counts,
     cwds,
+    gitTokens,
     metrics,
     endpointCwds,
     fetches,
@@ -516,4 +529,52 @@ test("a channel's own signal cancels only that channel", async () => {
   expect(fake.fetches.some((url) => url.includes("pr-cost-events:batchIngest"))).toBe(true);
   // The delivered event was acknowledged, not deferred.
   expect(backendFor(dir).outboxDeliveryStatus()[0]?.sendable).toBe(false);
+});
+
+test("git provider tokens resolve through the host port at both discovery call sites", async () => {
+  const dir = agentDir();
+  const fake = fakeHost(dir);
+  fake.gitTokens["git.example"] = "glpat-saved";
+  fake.gitTokens["github.com"] = "ghp-saved";
+  setDefaultHostPorts(fake.host);
+  const repository = { provider: "gitlab" as const, host: "git.example" };
+  // The credential() call site: no environment token, the gh/gitlab command helpers fail, and
+  // the saved token from the host port is the answer.
+  const tokens = new Map<string, Promise<string | undefined>>();
+  const token = await credential(
+    repository,
+    new AbortController().signal,
+    Date.now() + 1000,
+    tokens,
+  );
+  expect(token).toBe("glpat-saved");
+  expect(fake.counts.gitToken).toBeGreaterThanOrEqual(1);
+  // The repositoryIdentity() call site: an unrecognized host's remote reads the saved token
+  // instead of resolving credentials again.
+  const work = mkdtempSync(join(tmpdir(), "kimchi-git-identity-"));
+  dirs.push(work);
+  execFileSync("git", ["init", "-q"], { cwd: work });
+  execFileSync("git", ["remote", "add", "origin", "https://git.example/team/repo.git"], {
+    cwd: work,
+  });
+  const resolved = await withHostPorts(
+    {
+      ...fake.host,
+      fetch: async (input) =>
+        Response.json({
+          id: 42,
+          path_with_namespace: "team/repo",
+          web_url: "https://git.example/team/repo",
+        }),
+    },
+    () =>
+      repositoryIdentity(
+        join(work, ".git"),
+        new AbortController().signal,
+        Date.now() + 1000,
+        new Map(),
+      ),
+  );
+  expect(resolved.token).toBe("glpat-saved");
+  expect(resolved.host).toBe("git.example");
 });

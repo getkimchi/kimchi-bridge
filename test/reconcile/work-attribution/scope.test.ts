@@ -75,6 +75,7 @@ const host: HostPorts = {
     }
     return { token: "", apiUrl: ENDPOINT };
   },
+  gitToken: () => undefined,
   endpoints: () => ({
     llmEndpoint: "https://llm.example",
     openAiBaseUrl: "https://llm.example/openai/v1",

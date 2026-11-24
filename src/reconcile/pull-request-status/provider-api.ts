@@ -4,7 +4,6 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { readGitToken } from "../shared/git-token.js";
 import { hostPorts } from "../host-ports.js";
 import { object } from "../work-attribution/summary.js";
 import {
@@ -232,7 +231,7 @@ export async function credential(
   if (!token) {
     token = (async () =>
       environmentToken(repository) ||
-      readGitToken(repository.host) ||
+      hostPorts().gitToken(repository.host) ||
       (await (repository.provider === "github"
         ? command(
             "gh",
@@ -628,7 +627,7 @@ export async function repositoryIdentity(
 
   const provider = providerFor(remote.host);
   const candidates: Repository["provider"][] = provider ? [provider] : ["github", "gitlab"];
-  const saved = provider ? undefined : readGitToken(remote.host);
+  const saved = provider ? undefined : hostPorts().gitToken(remote.host);
   for (const candidate of candidates) {
     if (!repositoryPath(remote.name, candidate)) continue;
     const repository: Repository = { ...remote, provider: candidate };

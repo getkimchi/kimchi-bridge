@@ -71,6 +71,7 @@ function driverHost(agent: string): HostPorts {
     e2eSeam: () => undefined,
     now: () => Date.now(),
     credentials: () => ({ token: "", apiUrl: "https://api.example" }),
+    gitToken: () => undefined,
     endpoints: () => ({
       llmEndpoint: "https://llm.example",
       openAiBaseUrl: "https://llm.example/openai/v1",

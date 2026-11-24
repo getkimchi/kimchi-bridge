@@ -105,7 +105,6 @@ test("the bridge-native reconcile files are never on the moved allowlist", () =>
     "src/reconcile/shared/verify-api-key.ts",
     "src/reconcile/shared/platform-url.ts",
     "src/reconcile/shared/durable-write.ts",
-    "src/reconcile/shared/git-token.ts",
   ];
   for (const file of native) expect(MOVED).not.toContain(file);
 });

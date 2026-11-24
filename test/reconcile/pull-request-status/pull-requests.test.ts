@@ -28,7 +28,6 @@ import {
   reconcileWorkPullRequests,
   type WorkPullRequestUpdate,
 } from "../../../src/reconcile/pull-request-status/pull-requests.js";
-import * as gitToken from "../../../src/reconcile/shared/git-token.js";
 
 /**
  * Ported from Kimchi's src/extensions/pull-request-status/pull-requests.test.ts. The
@@ -42,7 +41,7 @@ import * as gitToken from "../../../src/reconcile/shared/git-token.js";
  * Only the tests that also assert the work-lookup half are ported here.
  *
  * Vitest's vi.mock("node:child_process") / config readGitToken / global fetch stubs map
- * to bun:test spies: vi.spyOn(childProcess, "execFile"), vi.spyOn(gitToken, "readGitToken")
+ * to bun:test spies: vi.spyOn(childProcess, "execFile"), the fake HostPorts gitToken port
  * and the fake HostPorts fetch. vi.stubEnv/vi.setSystemTime/vi.waitFor/vi.resetModules have
  * no bun equivalents and are replaced by the local helpers below.
  */
@@ -307,6 +306,7 @@ const host: HostPorts = {
   e2eSeam: () => undefined,
   now: () => Date.now(),
   credentials: () => ({ token: "", apiUrl: "https://account.example" }),
+  gitToken: (host: string) => cli.token(host),
   endpoints: () => ({
     llmEndpoint: "https://llm.example",
     openAiBaseUrl: "https://llm.example/openai/v1",
@@ -338,7 +338,6 @@ beforeEach(() => {
   ])
     stubEnv(name, undefined);
   vi.spyOn(childProcess, "execFile").mockImplementation(execFileRoute);
-  vi.spyOn(gitToken, "readGitToken").mockImplementation((host: string) => cli.token(host));
   setDefaultHostPorts(host);
   closeBackends();
   useBackendFactory(() => createMemoryRecords());
