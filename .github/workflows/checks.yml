@@ -64,7 +64,10 @@ jobs:
         with:
           bun-version: 1.4.0
       - run: pnpm install --frozen-lockfile
-      - run: bun test test/worker/bundle.test.ts
+      # bun test cannot run on Windows: bunfig's preload imports bridge-native
+      # activity code that refuses to load outside macOS and Linux. bun run
+      # skips the preload, so the smoke script drives the bundle directly.
+      - run: bun run scripts/worker-windows-smoke.ts
   package:
     runs-on: ubuntu-latest
     steps:
