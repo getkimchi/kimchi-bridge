@@ -203,6 +203,8 @@ const host: HostPorts = {
   e2eSeam: (name) => process.env[name],
   now: () => Date.now(),
   credentials: () => ({ token: currentKey, apiUrl: API }),
+  // PR discovery never runs in this suite; no saved token exists to return.
+  gitToken: () => undefined,
   endpoints: () => ({
     llmEndpoint: "https://gateway.example/openai/v1",
     openAiBaseUrl: "https://gateway.example/openai/v1",

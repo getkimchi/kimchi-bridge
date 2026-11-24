@@ -71,8 +71,10 @@ const MOVED_TESTS: readonly string[] = [
   "test/reconcile/pr-cost-reporting/queue.test.ts",
   "test/reconcile/pr-cost-reporting/worker.test.ts",
   "test/reconcile/pull-request-status/pull-requests.test.ts",
+  "test/reconcile/work-attribution/cost-sync.test.ts",
   "test/reconcile/work-attribution/file-transitions.test.ts",
   "test/reconcile/work-attribution/links.test.ts",
+  "test/reconcile/work-attribution/summary.test.ts",
 ];
 
 test("runtime, build scripts and tests use native APIs and parsers without local regexes", () => {
