@@ -25,6 +25,7 @@
 import { writeSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import type { HostPorts } from "../reconcile/host.js";
+import { DEFAULT_WORKER_USER_AGENT, makeWorkerFetch } from "./fetch.js";
 import {
   encodeWorkerMessage,
   parseHostCredentials,
@@ -350,16 +351,24 @@ export class StdioTransport {
 /**
  * HostPorts over the pipe: credentials, endpoints, policy and consent are
  * blocking requests; metrics are replayed as `metric` messages; fetch is the
- * worker's own global fetch; the seam answers come from `hello.seams`; the
- * agent directory and clock are local.
+ * user-agent and idle-timeout wrapper over the worker's own fetch (see
+ * fetch.ts); the seam answers come from `hello.seams`; the agent directory and
+ * clock are local.
  */
 export class StdioHostClient implements HostPorts {
   private readonly seams: Record<string, string>;
   constructor(
     private readonly transport: StdioTransport,
-    private readonly hello: { agentDir: string; seams?: Record<string, string> },
+    private readonly hello: {
+      agentDir: string;
+      seams?: Record<string, string>;
+      userAgent?: string;
+    },
   ) {
     this.seams = hello.seams ?? {};
+    // The parent sends its own wrapper's user agent; without one the worker
+    // still identifies itself, never the bare runtime default.
+    this.fetch = makeWorkerFetch(hello.userAgent ?? DEFAULT_WORKER_USER_AGENT);
   }
 
   get agentDir(): string {
@@ -428,5 +437,6 @@ export class StdioHostClient implements HostPorts {
     this.transport.send({ type: "metric", metric });
   }
 
-  readonly fetch: HostPorts["fetch"] = (input, init) => fetch(input, init);
+  /** The parent's user agent, or the worker's own identity when it sent none. */
+  readonly fetch: HostPorts["fetch"];
 }

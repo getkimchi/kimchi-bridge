@@ -90,6 +90,8 @@ export interface HelloMessage {
   agentDir: string;
   /** The e2e seams the worker's host answers with, by seam name. */
   seams?: Record<string, string>;
+  /** The user-agent the parent's own fetch wrapper sends; the worker's fetch defaults to it. */
+  userAgent?: string;
 }
 
 /** One reconciliation pass for the worker to run. */
@@ -388,7 +390,11 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
   if (!object.ok) return object;
   switch (object.value.type) {
     case "hello": {
-      const shape = exactKeys(object.value, ["type", "v", "build", "agentDir"], ["seams"]);
+      const shape = exactKeys(
+        object.value,
+        ["type", "v", "build", "agentDir"],
+        ["seams", "userAgent"],
+      );
       if (!shape.ok) return shape;
       const v = fieldInteger(object.value, "v", 1);
       if (!v.ok) return v;
@@ -402,12 +408,15 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
         if (!parsed.ok) return parsed;
         seams = parsed.value;
       }
+      const userAgent = optionalFieldString(object.value, "userAgent");
+      if (!userAgent.ok) return userAgent;
       return accept({
         type: "hello",
         v: v.value,
         build: build.value,
         agentDir: agentDir.value,
         ...(seams === undefined ? {} : { seams }),
+        ...(userAgent.value === undefined ? {} : { userAgent: userAgent.value }),
       });
     }
     case "pass": {
