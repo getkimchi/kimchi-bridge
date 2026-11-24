@@ -27,10 +27,10 @@
  * The producer and legacy-freeze lanes moved here with B2: the queue, machine and snapshot
  * code they drive is bridge code now, and each scenario runs bound to driverHost. The
  * removed scenarios whose core operations are moved ledger code run in the bridge's own
- * suites instead: the capture-stage rollback (capture-atomic.test.ts), the async stored
- * reader (stored-read-regressions.test.ts), and the gated competing writer below
- * (summary-writer.test.ts). summary-writer keeps the gated putHead dance but drops the
- * flushWorkSummaries tail, which is Kimchi-only hydration.
+ * suites instead: the capture-stage rollback (capture-atomic.test.ts) and the async stored
+ * reader (stored-read-regressions.test.ts). summary-writer keeps the gated putHead dance,
+ * the multi-record loop and the flushWorkSummaries tail (moved summary.ts), and the
+ * summary-reader command answers gated reads with a fresh store per snapshot.
  */
 
 import { Database } from "bun:sqlite";
@@ -1445,15 +1445,27 @@ async function legacyFreezeScenario(agent: string): Promise<void> {
   closeBackends();
 }
 
-function summaryState(agent: string, workId: string): void {
+function summaryState(
+  agent: string,
+  workId: string,
+): {
+  authority: Record<string, unknown>[];
+  markers: Record<string, unknown>[];
+  head: string | null;
+  rows: Record<string, unknown>[];
+} {
   const store = openStore(agent);
   try {
-    out({
+    return {
       authority: store.db
-        .query("SELECT * FROM work_records WHERE work_id = ? ORDER BY rowid")
+        .query<Record<string, unknown>, [string]>(
+          "SELECT * FROM work_records WHERE work_id = ? ORDER BY rowid",
+        )
         .all(workId),
       markers: store.db
-        .query("SELECT * FROM pending_translation WHERE work_id = ? ORDER BY record_hash")
+        .query<Record<string, unknown>, [string]>(
+          "SELECT * FROM pending_translation WHERE work_id = ? ORDER BY record_hash",
+        )
         .all(workId),
       head:
         store.db
@@ -1462,9 +1474,11 @@ function summaryState(agent: string, workId: string): void {
           )
           .get(workId)?.body ?? null,
       rows: store.db
-        .query("SELECT * FROM work_projection_rows WHERE work_id = ? ORDER BY log, pos")
+        .query<Record<string, unknown>, [string]>(
+          "SELECT * FROM work_projection_rows WHERE work_id = ? ORDER BY log, pos",
+        )
         .all(workId),
-    });
+    };
   } finally {
     store.close();
   }
@@ -1472,10 +1486,21 @@ function summaryState(agent: string, workId: string): void {
 
 /** A synchronous pipe gate holds a real transaction after its head write, never across await.
  * Writing 'r' cancels the writer after its head publish (the capture rolls back); 'c' lets it
- * commit. The rolled-back writer stays alive across a competing writer's commit, then closes. */
+ * commit. The rolled-back writer stays alive across a competing writer's commit, then closes.
+ * `count` captures several records one gated publish at a time, and `beforeFlush` gates once
+ * more before the shutdown flush. */
 async function summaryWriter(agent: string, json: string): Promise<void> {
   const { backendFor, closeBackends } = await import("../../src/ledger/records.js");
-  const { record } = JSON.parse(json) as { record: WorkRecord };
+  const { flushWorkSummaries } = await import("../../src/reconcile/work-attribution/summary.js");
+  const {
+    record,
+    count = 1,
+    beforeFlush = false,
+  } = JSON.parse(json) as {
+    record: WorkRecord;
+    count?: number;
+    beforeFlush?: boolean;
+  };
   const backend = backendFor(agent);
   const publish = backend.putHead;
   const cancelled = new Error("writer ownership cancelled before commit");
@@ -1492,16 +1517,25 @@ async function summaryWriter(agent: string, json: string): Promise<void> {
   };
   try {
     signal("ready");
-    try {
-      capture(agent, record, "summary-native");
-    } catch (error) {
-      if (error !== cancelled) throw error;
-      signal("rolled-back");
-      // Stay alive while the competing writer commits: the cancelled head must never reappear.
-      gate();
-      return;
+    for (let index = 0; index < count; index++) {
+      try {
+        capture(
+          agent,
+          count === 1 ? record : { ...record, requestId: `${record.sessionId}-${index}` },
+          "summary-native",
+        );
+      } catch (error) {
+        if (error !== cancelled) throw error;
+        signal("rolled-back");
+        // Stay alive while the competing writer commits: the cancelled head must never reappear.
+        gate();
+        return;
+      }
+      signal("committed");
     }
-    signal("committed");
+    if (beforeFlush && !gate()) throw new Error("Missing flush release");
+    await flushWorkSummaries();
+    signal("flushed");
   } finally {
     backend.putHead = publish;
     closeBackends();
@@ -2038,7 +2072,19 @@ const commands: Record<string, (agent: string, arg?: string) => void | Promise<v
       reading = false;
     }
   },
-  "summary-state": (agent, workId) => summaryState(agent, workId ?? ""),
+  "summary-state": (agent, workId) => out(summaryState(agent, workId ?? "")),
+  "summary-reader": async (agent, workId) => {
+    // Process startup must finish before the test holds any writer transaction.
+    summaryState(agent, workId ?? "");
+    const input = createInterface({ input: process.stdin });
+    out({ phase: "ready" });
+    try {
+      for await (const _ of input)
+        out({ phase: "snapshot", state: summaryState(agent, workId ?? "") });
+    } finally {
+      input.close();
+    }
+  },
   "summary-writer": (agent, json) => summaryWriter(agent, json ?? "{}"),
   "known-record-regressions": (agent, json) => knownRecordRegressions(agent, json ?? "{}"),
   "known-schema-race": (agent) => knownSchemaRace(agent),

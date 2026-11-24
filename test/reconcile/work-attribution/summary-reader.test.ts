@@ -6,7 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, expect, it, mock, spyOn } from "bun:test";
-import { backendFor, capture, closeBackends } from "../../../src/ledger/records.js";
+import {
+  backendFor,
+  capture,
+  closeBackends,
+  recordHashOf,
+  rebuildWork,
+} from "../../../src/ledger/records.js";
 import {
   pinWorkContinuation,
   readContinuationHistory,
@@ -32,10 +38,11 @@ import type {
  * intercept; bun's spyOn on the builtin namespaces does the same without a module mock.
  * vi.restoreAllMocks maps to bun's mock.restore() in the shared afterEach.
  *
- * Not ported (covered in the bridge already, see the report): the it.each over the
- * "known-async-read-regressions" / "known-async-stored-read-regressions" driver lanes —
- * test/ledger/stored-read-regressions.test.ts (B1) asserts the same cancellation, snapshot and
- * reopen contract against the real SQLite backend.
+ * Not ported (covered in the bridge already, see the report): the "known-async-stored-read-regressions"
+ * driver lane — test/ledger/stored-read-regressions.test.ts (B1) asserts the same cancellation,
+ * snapshot and reopen contract against readStoredRecordsAsync and the real SQLite backend. The
+ * non-stored "known-async-read-regressions" lane (readWorkRecordsAsync, the moved wrapper that
+ * imports journals before paging the store) is ported below against the same backend.
  */
 
 const WORK = "11111111-1111-4111-8111-111111111111";
@@ -441,3 +448,123 @@ it("interrupts preparation of an unchanged large prefix without advancing its cu
   chunk.mockRestore();
   expect(readWorkRecords(agentDir)).toHaveLength(1);
 });
+
+it("cancels inside native SQLite reading and preserves same-connection and reopened history", async () => {
+  // Kimchi's "known-async-read-regressions" driver lane: the same cancellation, snapshot and
+  // reopen contract as stored-read-regressions.test.ts, but through readWorkRecordsAsync — the
+  // moved wrapper that imports journals (none here: the store holds native captures only)
+  // before paging the store and parsing each committed body.
+  const agentDir = mkdtempSync(join(tmpdir(), "kimchi-native-async-reader-"));
+  directories.push(agentDir);
+  const base: WorkRecord = { ...work, sessionId: "native-reader" };
+  const native: WorkRecord[] = [
+    base,
+    ...Array.from(
+      { length: 1024 },
+      (_, index): WorkRecord => ({
+        ...base,
+        type: "request",
+        requestId: `native-${index}`,
+        scope: null,
+        padding: "x".repeat(1024),
+      }),
+    ),
+  ];
+  const sourcePath = join(
+    agentDir,
+    "work-attribution",
+    `${encodeURIComponent(base.sessionId)}.jsonl`,
+  );
+  const backend = backendFor(agentDir);
+  backend.tx(() => {
+    for (const record of native) {
+      const recordHash = recordHashOf(record);
+      backend.insertRecord({
+        recordHash,
+        type: record.type,
+        workId: record.workId,
+        sessionId: record.sessionId,
+        body: JSON.stringify(record),
+        sourcePath,
+        sourceGeneration: 0,
+        sourceOffset: null,
+        importedAt: Date.now(),
+      });
+      backend.upsertMarker(recordHash, record.workId, record.type);
+    }
+  });
+  rebuildWork(agentDir, base.workId);
+  const read = backend.readRecords.bind(backend);
+  const page = backend.readRecordPage.bind(backend);
+  const before = read({});
+  const readAsync = (signal: AbortSignal) => readWorkRecordsAsync(agentDir, signal);
+
+  const controller = new AbortController();
+  const sentinel = new Error("native reader closed");
+  let visited = 0;
+  let callbackRan = false;
+  let rowsAtAbort = 0;
+  backend.readRecordPage = (after, through, limit, checkBudget) =>
+    page(after, through, limit, () => {
+      if (++visited === 2)
+        setImmediate(() => {
+          callbackRan = true;
+          rowsAtAbort = visited;
+          controller.abort(sentinel);
+        });
+      checkBudget?.();
+    });
+  let cancelled = false;
+  try {
+    await readAsync(controller.signal);
+  } catch (error) {
+    if (error !== sentinel) throw error;
+    cancelled = true;
+  } finally {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    backend.readRecordPage = page;
+  }
+  const sameConnectionComplete = JSON.stringify(read({})) === JSON.stringify(before);
+
+  const added: WorkRecord = {
+    ...base,
+    type: "request",
+    requestId: "native-after-abort",
+    scope: null,
+  };
+  capture(agentDir, added, sourcePath);
+  const committed = read({});
+  let insertedDuringRead = false;
+  backend.readRecordPage = (after, through, limit, checkBudget) => {
+    const rows = page(after, through, limit, checkBudget);
+    if (!insertedDuringRead) {
+      insertedDuringRead = true;
+      setImmediate(() =>
+        capture(agentDir, { ...added, requestId: "native-during-page" }, sourcePath),
+      );
+    }
+    return rows;
+  };
+  const snapshot = await readAsync(new AbortController().signal);
+  backend.readRecordPage = page;
+  const next = await readAsync(new AbortController().signal);
+  const afterCapture = read({});
+  closeBackends();
+  const reopened = backendFor(agentDir).readRecords({});
+
+  expect(visited).toBeGreaterThan(0);
+  expect(callbackRan).toBe(true);
+  expect(cancelled).toBe(true);
+  expect(before).toHaveLength(1025);
+  expect(rowsAtAbort).toBeGreaterThan(0);
+  expect(rowsAtAbort).toBeLessThan(before.length);
+  expect(sameConnectionComplete).toBe(true);
+  expect(committed).toHaveLength(before.length + 1);
+  expect(JSON.stringify(snapshot)).toBe(
+    JSON.stringify(committed.map((row) => JSON.parse(row.body))),
+  );
+  expect(next).toHaveLength(snapshot.length + 1);
+  expect(next.at(-1)?.requestId).toBe("native-during-page");
+  expect(JSON.stringify(reopened)).toBe(JSON.stringify(afterCapture));
+  expect(fs.readdirSync(agentDir).includes("work-attribution")).toBe(false);
+}, 30_000);

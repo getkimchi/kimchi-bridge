@@ -40,8 +40,8 @@ import {
  *  - "commits a pending native capture before shutdown flush completes", "rolls back a
  *    cancelled native publisher...", "recovers a killed native owner...", "keeps a responding
  *    reader beyond its cumulative watchdog deadline", "serializes three native writers..." —
- *    native-process races whose summary-writer/summary-reader driver halves B1 already ported
- *    (test/ledger/summary-writer.test.ts, stored-read-regressions.test.ts).
+ *    native-process races ported with the driver's summary-writer/summary-reader commands in
+ *    test/ledger/summary-writer.test.ts.
  *  - The it.each blocks over damaged legacy state and restart modes share the same
  *    recoverWorkSummaries/getWorkId machinery.
  */
