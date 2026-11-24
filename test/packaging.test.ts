@@ -85,3 +85,54 @@ test("wiring names follow the wiring: the same inputs, the same name; any change
     rmSync(copy, { recursive: true, force: true });
   }
 });
+
+test("the release tarball ships the reconciliation worker next to the bridge bundle", async () => {
+  const out = mkdtempSync(join(tmpdir(), "kimchi-bridge-tarball-"));
+  try {
+    // The packager builds from this checkout; the worker's build id is its commit.
+    const commit = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
+      cwd: root,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    expect(commit.exitCode).toBe(0);
+    await Bun.spawn(["bun", join(root, "scripts/package.ts"), "v0.1.0-rc.1", out], {
+      cwd: root,
+      stdout: "ignore",
+      stderr: "inherit",
+    }).exited;
+    const listing = Bun.spawnSync(["tar", "-tzf", join(out, "kimchi-bridge.tar.gz")], {
+      stdout: "pipe",
+    });
+    expect(listing.exitCode).toBe(0);
+    // tar -C stage . prefixes every entry with ./.
+    const names = listing.stdout
+      .toString()
+      .trim()
+      .split("\n")
+      .map((name) => (name.startsWith("./") ? name.slice(2) : name));
+    expect(names).toContain("lib/kimchi-bridge.mjs");
+    expect(names).toContain("lib/worker.mjs");
+    // The documented launch path matches the tarball layout: the archive's
+    // top folder becomes share/kimchi/bridge when Kimchi unpacks it, so the
+    // entry Kimchi spawns is share/kimchi/bridge/lib/worker.mjs.
+    expect(names).toContain("lib/worker.build");
+    // The worker bundle embeds the checkout commit Kimchi will pin (K1/K2).
+    const extract = Bun.spawnSync(
+      ["tar", "-xOzf", join(out, "kimchi-bridge.tar.gz"), "./lib/worker.mjs"],
+      { stdout: "pipe" },
+    );
+    expect(extract.exitCode).toBe(0);
+    expect(extract.stdout.toString()).toContain(commit.stdout.toString().trim());
+    // The build file ships the same commit the bundle embedded: it is the
+    // supported source for the parent's hello.build.
+    const buildFile = Bun.spawnSync(
+      ["tar", "-xOzf", join(out, "kimchi-bridge.tar.gz"), "./lib/worker.build"],
+      { stdout: "pipe" },
+    );
+    expect(buildFile.exitCode).toBe(0);
+    expect(buildFile.stdout.toString()).toBe(`${commit.stdout.toString().trim()}\n`);
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+}, 120000);

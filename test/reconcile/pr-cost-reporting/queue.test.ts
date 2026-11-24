@@ -53,6 +53,13 @@ const queueHost: HostPorts = {
   },
   fetch: () => Promise.reject(new Error("the queue suite never reaches the network")),
 };
+// Captured before the mock installs: a later import of the same specifier would resolve to the
+// mock itself, and the pass-through below would recurse into it.
+const machineReal = {
+  ...((await import(
+    "../../../src/reconcile/pr-cost-reporting/machine.js"
+  )) as typeof import("../../../src/reconcile/pr-cost-reporting/machine.js")),
+};
 mock.module("../../../src/reconcile/pr-cost-reporting/machine.js", () => ({ machineFingerprint }));
 // The vitest suite spied on node:fs/promises' open to fail one fsync; the same seam is a
 // wrapper installed through bun's mock.module before the queue module loads.
@@ -146,6 +153,11 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   setDefaultHostPorts(undefined);
+  // bun test keeps mock.module registrations for the rest of the run, so the file loaded next
+  // sees whatever machineFingerprint last answered; after the final test it would keep
+  // resolving undefined and stamp every later suite's queue state with no machine id. The
+  // mock ends on a pass-through to the real fingerprint instead.
+  machineFingerprint.mockImplementation(() => machineReal.machineFingerprint());
   if (savedTelemetryEnv === undefined) delete process.env.KIMCHI_TELEMETRY_ENABLED;
   else process.env.KIMCHI_TELEMETRY_ENABLED = savedTelemetryEnv;
   await rm(directory, { recursive: true, force: true });

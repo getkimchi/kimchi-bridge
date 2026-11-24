@@ -3,6 +3,18 @@ import { join } from "node:path";
 import { format } from "node:util";
 import { hostPorts } from "../host-ports.js";
 
+/** Redacts a diagnostics line before it is persisted; set by the worker process. */
+let redactLine: ((text: string) => string) | undefined;
+
+/**
+ * Registers the redactor for diagnostics lines. The worker process sets this
+ * so its live secret registry scrubs credentials from every logged error;
+ * unset, lines are persisted as formatted.
+ */
+export function setDiagnosticsRedactor(redactor: ((text: string) => string) | undefined): void {
+  redactLine = redactor;
+}
+
 /** Opt-in diagnostics must never write through the live TUI or ACP transport. */
 export function debugWorkAttribution(message: string, ...details: unknown[]): void {
   // Bun's debuglog lacks Node's enabled getter. Match NODE_DEBUG without calling its stderr logger.
@@ -14,9 +26,10 @@ export function debugWorkAttribution(message: string, ...details: unknown[]): vo
   try {
     const directory = join(hostPorts().agentDir, "logs");
     mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const line = format(message, ...details);
     appendFileSync(
       join(directory, "work-attribution.log"),
-      `${new Date().toISOString()} ${process.pid} ${format(message, ...details)}\n`,
+      `${new Date().toISOString()} ${process.pid} ${redactLine === undefined ? line : redactLine(line)}\n`,
       { mode: 0o600 },
     );
   } catch {

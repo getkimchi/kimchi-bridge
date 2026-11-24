@@ -11,11 +11,21 @@ import { describe, expect, it } from "bun:test";
  * This suite enforces the import boundary statically: every import in those files must be a
  * relative path to another bridge file, a `node:` builtin, or `bun:sqlite`; and the module graph
  * reachable from the public barrel must never reach platform.ts or escape src/ledger|src/reconcile.
+ * The worker (src/worker) runs wherever Kimchi runs too, so it obeys the same rules; it may reach
+ * into the two libraries it drives, but never out to the rest of the bridge.
  */
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const BOUNDARY_DIRS = [join(ROOT, "src/ledger"), join(ROOT, "src/reconcile")];
-const BOUNDARY_FILES = [...files(join(ROOT, "src/ledger")), ...files(join(ROOT, "src/reconcile"))];
+const BOUNDARY_DIRS = [
+  join(ROOT, "src/ledger"),
+  join(ROOT, "src/reconcile"),
+  join(ROOT, "src/worker"),
+];
+const BOUNDARY_FILES = [
+  ...files(join(ROOT, "src/ledger")),
+  ...files(join(ROOT, "src/reconcile")),
+  ...files(join(ROOT, "src/worker")),
+];
 const PLATFORM = join(ROOT, "src/platform.ts");
 /**
  * The reconcile passes moved byte-identically from Kimchi and carry three library dependencies
@@ -214,6 +224,34 @@ describe("ledger import boundary", () => {
     expect(seen.has(join(ROOT, "src/reconcile/pr-cost-reporting/worker.ts"))).toBe(true);
     expect(seen.has(join(ROOT, "src/reconcile/work-attribution/file-transitions.ts"))).toBe(true);
     expect(seen.has(join(ROOT, "src/reconcile/pull-request-status/pull-requests.ts"))).toBe(true);
+  });
+
+  it("the worker entry's graph reaches the libraries but never platform.ts or the rest of the bridge", () => {
+    const seen = new Set<string>();
+    const queue = [join(ROOT, "src/worker/main.ts")];
+    while (queue.length) {
+      const file = queue.shift()!;
+      if (seen.has(file)) continue;
+      seen.add(file);
+      expect(file === PLATFORM, `${relative(ROOT, file)} reaches src/platform.ts`).toBe(false);
+      const insideBoundary = BOUNDARY_DIRS.some((dir) => file === dir || inside(file, dir));
+      expect(
+        insideBoundary,
+        `${relative(ROOT, file)} escapes src/ledger|src/reconcile|src/worker`,
+      ).toBe(true);
+      for (const { specifier } of importsOf(file)) {
+        if (specifier.startsWith("./") || specifier.startsWith("../")) {
+          const target = resolveRelative(file, specifier);
+          expect(target, `broken relative import ${specifier}`).toBeDefined();
+          if (target) queue.push(target);
+        }
+      }
+    }
+    // Sanity: the walk really drove the pass and the host client.
+    expect(seen.has(join(ROOT, "src/worker/host-client.ts"))).toBe(true);
+    expect(seen.has(join(ROOT, "src/worker/protocol.ts"))).toBe(true);
+    expect(seen.has(join(ROOT, "src/reconcile/pass.ts"))).toBe(true);
+    expect(seen.has(join(ROOT, "src/ledger/store.ts"))).toBe(true);
   });
 
   it("no ledger or reconcile file imports Kimchi paths or the @earendil-works SDK", () => {

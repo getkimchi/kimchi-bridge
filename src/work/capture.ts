@@ -95,14 +95,18 @@ function sshHost(alias: string): string {
   if (knownHost(alias) || alias.startsWith("-")) return alias;
   let host = sshHosts.get(alias);
   if (host === undefined) {
-    const config = spawnSync("ssh", ["-G", alias], {
+    const result = spawnSync("ssh", ["-G", alias], {
       encoding: "utf8",
-      timeout: 2000,
+      // A responsive `ssh -G` prints its parsed config in milliseconds; the bound only stops a
+      // hanging ssh from stalling capture, so it tolerates a loaded machine's slow spawn.
+      timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
-    }).stdout;
-    const line = (config ?? "").split("\n").find((l) => l.startsWith("hostname "));
+    });
+    const line = (result.stdout ?? "").split("\n").find((l) => l.startsWith("hostname "));
     host = line ? line.slice("hostname ".length).trim() : alias;
-    sshHosts.set(alias, host);
+    // A failed or timed-out resolution is not cached: the alias stands in for this call, and
+    // the next capture retries the config instead of keeping the unresolved alias forever.
+    if (!result.error) sshHosts.set(alias, host);
   }
   return knownHost(host) ? host : alias;
 }

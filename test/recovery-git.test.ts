@@ -955,6 +955,8 @@ test("collector Git reconciliation preserves the originating source, version and
   }
 });
 
+// Each pass looks the repository and its PRs up through the real SCM CLI on PATH; a loaded
+// machine can stretch those spawns past the default test timeout.
 test("PR refresh revises lifecycle while retaining one exact commit membership link", () => {
   const { root, store, r, scope } = fixture();
   const bin = join(root, "bin");
@@ -1021,8 +1023,10 @@ test("PR refresh revises lifecycle while retaining one exact commit membership l
   expect(
     (store.db.query("SELECT count(*) AS n FROM events WHERE kind='link'").get() as any).n,
   ).toBe(1);
-});
+}, 30_000);
 
+// The pass resolves the commit's PR through the real SCM CLI on PATH; a loaded machine can
+// stretch that spawn past the default test timeout.
 // Claude Desktop runs a session in a worktree under <repo>/.claude/worktrees and removes it when the session is
 // archived, often before the session's PR is opened.
 test("a commit still finds its PR after its session's worktree is removed", () => {
@@ -1079,7 +1083,7 @@ test("a commit still finds its PR after its session's worktree is removed", () =
     fromId: sha,
     reason: "provider_commit_membership",
   });
-});
+}, 30_000);
 
 test("native edits in a removed worktree still match the commit made from them", () => {
   const { base, store, r } = fixture("claude-code");
@@ -1265,6 +1269,8 @@ test("an HTTPS remote keeps its port; an SSH remote's port is not the web host's
   expect(host("git@github.com:team/repo.git")).toBe("github.com");
 });
 
+// Resolving the alias spawns the real ssh binary; a loaded machine can stretch that spawn
+// past the default test timeout.
 test("an SSH host alias names its provider through ssh's own config, as Kimchi resolves it", () => {
   const { base, root } = fixture();
   git(root, "init", "--initial-branch=main");
@@ -1287,7 +1293,7 @@ test("an SSH host alias names its provider through ssh's own config, as Kimchi r
     host: "github.com",
     name: "testOrg/widgets",
   });
-});
+}, 30_000);
 
 function withBridgeHome<T>(base: string, run: () => T): T {
   const previous = process.env.KIMCHI_BRIDGE_HOME;
