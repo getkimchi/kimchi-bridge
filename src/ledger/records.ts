@@ -294,11 +294,40 @@ export function spoolDirectory(agentDir: string): string {
   return join(agentDir, "work-attribution", "spool");
 }
 
+/** Total session-id encoding for the spool filename: `encodeURIComponent` for every
+ * well-formed id, and an explicit `%uXXXX` escape for each unpaired UTF-16 surrogate it
+ * rejects (a lone high or low half). ANY string session id therefore has a safe, collision-free
+ * filename, so a contended capture can always park its record in the spool instead of throwing
+ * it away — well-formed ids keep byte-for-byte the names earlier releases wrote. */
+function encodeSpoolSessionId(sessionId: string): string {
+  try {
+    return encodeURIComponent(sessionId);
+  } catch {
+    let encoded = "";
+    for (let index = 0; index < sessionId.length; index++) {
+      const code = sessionId.charCodeAt(index);
+      const next = index + 1 < sessionId.length ? sessionId.charCodeAt(index + 1) : 0;
+      const pairedHigh = code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff;
+      const unpaired =
+        (code >= 0xd800 && code <= 0xdbff && !pairedHigh) || (code >= 0xdc00 && code <= 0xdfff);
+      if (unpaired) {
+        encoded += `%u${code.toString(16).padStart(4, "0")}`;
+        continue;
+      }
+      // A surrogate pair encodes as its combined code point, exactly like the fast path.
+      const unit = pairedHigh ? sessionId.slice(index, index + 2) : sessionId[index];
+      if (pairedHigh) index++;
+      encoded += encodeURIComponent(unit);
+    }
+    return encoded;
+  }
+}
+
 /** The session's spool file. The fixed `s-` prefix and the `.jsonl` suffix always surround the
  * encoded id, so Windows-reserved basenames (CON, NUL, COM1, …) and trailing dots or spaces can
  * never form the name on their own, and path separators never split it. */
 export function spoolFilePath(agentDir: string, sessionId: string): string {
-  return join(spoolDirectory(agentDir), `s-${encodeURIComponent(sessionId)}.jsonl`);
+  return join(spoolDirectory(agentDir), `s-${encodeSpoolSessionId(sessionId)}.jsonl`);
 }
 
 /** Directory-entry fsync: persists a newly created spool directory or file, and the spool's
@@ -345,6 +374,17 @@ function ensureDirectoryChain(directory: string): string[] {
   return created.map((path) => dirname(path));
 }
 
+/** Best-effort diagnostic line to stderr. It is observability only: a closed or failed
+ * stream (an EPIPE on a closed stderr) must never break the capture path it reports for,
+ * so any throw — or write failure — is swallowed and the caller continues. */
+function writeDiagnosticNote(text: string): void {
+  try {
+    process.stderr.write(text);
+  } catch {
+    // The diagnostic is best-effort by contract; the record's own path is unaffected.
+  }
+}
+
 /** Appends the record's self-delimiting bytes to the spool file in ONE write: a leading newline
  * (which completes any torn earlier append as its own, separately quarantined line), the exact
  * line, and a trailing newline. The write loops until every byte is written, so a short write
@@ -356,14 +396,30 @@ function appendSpoolRecord(path: string, line: string): boolean {
   const bytes = Buffer.from(`\n${line}\n`, "utf8");
   const fsyncDirectories = ensureDirectoryChain(directory);
   let fd: number;
+  // Creation is decided by an exclusive-create attempt, never inferred from a pre-open
+  // existsSync: a retirement or replacement between a check and the open would hide a fresh
+  // directory entry. Only an append whose own open created the entry needs the directory's
+  // fsync; an append to an existing file leaves the directory unchanged and syncs only the
+  // file, so sustained contention does not pay a blocking directory flush per capture.
+  let created = false;
   try {
     fd = openSync(
       path,
-      constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | O_NOFOLLOW,
+      constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW,
       0o600,
     );
-  } catch {
-    return false;
+    created = true;
+  } catch (error) {
+    if (!object(error) || error.code !== "EEXIST") return false;
+    try {
+      fd = openSync(
+        path,
+        constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | O_NOFOLLOW,
+        0o600,
+      );
+    } catch {
+      return false;
+    }
   }
   try {
     const stat = fstatSync(fd);
@@ -376,13 +432,14 @@ function appendSpoolRecord(path: string, line: string): boolean {
       written += count;
     }
     fsyncSync(fd);
-    // The append is durable; the directory entries the O_CREAT open may have created need the
-    // directories' fsync too, or a kernel crash can lose the path the next import scans. Creation
-    // is never inferred from a pre-open existsSync — a retirement or replacement between the
-    // check and the open would hide a fresh directory entry — so every append fsyncs the spool
-    // directory, and a created chain fsyncs every level it added plus the first existing
-    // ancestor. Windows cannot open a directory for fsync; the file's own fsync still holds.
-    fsyncDirectoryDurable(directory);
+    // The append is durable. The directory entries a created file (or directory chain) added
+    // need their directories' fsync too, or a kernel crash can lose the path the next import
+    // scans — an append to an existing entry syncs nothing but the file itself. Creation is
+    // decided by the exclusive-create attempt above, never inferred from a pre-open
+    // existsSync (a retirement or replacement between the check and the open would hide a
+    // fresh directory entry). Windows cannot open a directory for fsync; the file's own
+    // fsync still holds.
+    if (created) fsyncDirectoryDurable(directory);
     for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
     // Verify through this descriptor that the record is the file's last line, and then that
     // the live pathname is still this user's private single-link regular file at the same
@@ -410,7 +467,7 @@ function appendSpoolRecord(path: string, line: string): boolean {
       // swapped in for it, an added hardlink, or a foreign owner): the append is not
       // acknowledged, the caller re-appends or falls back to the blocking SQLite wait, and the
       // unsafe path is reported so it can be repaired.
-      process.stderr.write(
+      writeDiagnosticNote(
         "kimchi: the capture spool path is unsafe; the record is being re-appended\n",
       );
       return false;
@@ -426,8 +483,11 @@ function appendSpoolRecord(path: string, line: string): boolean {
  * importer's line-hash dedup makes that exactly-once). False when nothing durable was written —
  * the caller then falls back to the blocking capture wait, so a record is never dropped. */
 function spoolCaptureLine(agentDir: string, sessionId: string, line: string): boolean {
-  const path = spoolFilePath(agentDir, sessionId);
   try {
+    // The path itself is inside the try: ANY failure to derive a spool path for this session id
+    // — however malformed — returns false, so the caller always continues to the blocking
+    // no-drop capture instead of throwing the record away.
+    const path = spoolFilePath(agentDir, sessionId);
     for (let attempt = 0; attempt < 5; attempt++) if (appendSpoolRecord(path, line)) return true;
   } catch {
     return false;
@@ -475,7 +535,9 @@ function blockingCaptureCommit(commit: () => void): void {
       const now = Date.now();
       if (now - noted >= BLOCKED_NOTE_MS) {
         noted = now;
-        process.stderr.write(
+        // Best-effort: a throwing or failed stderr write (a closed stream) must never abort
+        // the unlimited retry — the diagnostic is observability, not part of capture's path.
+        writeDiagnosticNote(
           "kimchi: the work ledger's writer is busy; capture is blocking until it can commit\n",
         );
       }

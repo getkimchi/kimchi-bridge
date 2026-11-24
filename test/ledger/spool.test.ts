@@ -172,6 +172,41 @@ it("session ids encode into safe spool filenames, Windows reserved names include
   expect(readRecords(dir)).toHaveLength(1);
 }, 20_000);
 
+it("a contended capture with a lone-surrogate session id still lands the record exactly once", async () => {
+  // Any string sessionId — including the unpaired UTF-16 surrogates encodeURIComponent rejects —
+  // must have a spoolable filename: the record parks in the spool under contention and is
+  // imported exactly once, never thrown back to the caller (capture never drops).
+  const ids = ["\uD83D", "surrogate-\uDC44-tail", "emoji-🦀-session", "plain-ascii"];
+  for (const sessionId of ids) {
+    const dir = agentDir();
+    const rec = record(`req-${ids.indexOf(sessionId)}`, sessionId);
+    expect(readRecords(dir)).toHaveLength(0);
+    const holder = await holdWriter(dir, 2500);
+    try {
+      const start = Date.now();
+      capture(dir, rec, "summary-native");
+      expect(Date.now() - start).toBeLessThan(260);
+    } finally {
+      await holder.done;
+    }
+    const spool = spoolFilePath(dir, sessionId);
+    expect(existsSync(spool)).toBe(true);
+    expect(readFileSync(spool, "utf8")).toBe(`\n${JSON.stringify(rec)}\n`);
+    expect(importSpool(dir).imported).toBe(1);
+    expect(importSpool(dir).imported).toBe(0);
+    const rows = readRecords(dir);
+    expect(rows).toHaveLength(1);
+    // The record's body round-trips: the JSON line escapes the lone surrogate losslessly.
+    expect(rows[0]).toEqual(rec);
+    expect(existsSync(spool)).toBe(false);
+    closeBackends();
+  }
+  // Uncontended, the same malformed id commits straight through the SQLite capture path.
+  const direct = agentDir();
+  capture(direct, record("req-direct", "\uD83D"), "summary-native");
+  expect(readRecords(direct)).toHaveLength(1);
+}, 30_000);
+
 it("a spool path that is a symlink is refused, so capture blocks instead of writing elsewhere", async () => {
   const dir = agentDir();
   expect(readRecords(dir)).toHaveLength(0);
@@ -252,6 +287,34 @@ it("an unwritable spool under a writer longer than the busy timeout still lands 
     // The spool cannot take the record, so capture blocks on the writer until it commits: the
     // 5 s busy timeout must not turn into a lost record when the holder outlasts it.
     capture(dir, record("req-long"), "summary-native");
+    expect(Date.now() - start).toBeGreaterThanOrEqual(4000);
+    expect(notes).toBeGreaterThanOrEqual(1);
+  } finally {
+    process.stderr.write = stderr;
+    await holder.done;
+  }
+  expect(readRecords(dir)).toHaveLength(1);
+  expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
+}, 20_000);
+
+it("a throwing diagnostic cannot abort the blocking capture", async () => {
+  const dir = agentDir();
+  expect(readRecords(dir)).toHaveLength(0);
+  // The spool path is unusable (a directory where the file would go), so the spool write fails.
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(spool, { recursive: true });
+  const holder = await holdWriter(dir, 6000);
+  // The diagnostic stream itself fails (an EPIPE from a closed stderr): the note is best-effort,
+  // so the blocking retry continues and the record still commits once the holder releases.
+  const stderr = process.stderr.write;
+  let notes = 0;
+  process.stderr.write = (() => {
+    notes++;
+    throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+  }) as typeof process.stderr.write;
+  try {
+    const start = Date.now();
+    capture(dir, record("req-diagnostic-epipe"), "summary-native");
     expect(Date.now() - start).toBeGreaterThanOrEqual(4000);
     expect(notes).toBeGreaterThanOrEqual(1);
   } finally {

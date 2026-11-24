@@ -153,6 +153,40 @@ it("an O_CREAT-created replacement spool entry gets its directory fsynced", asyn
   expect(importer.spoolFiles(dir)).toHaveLength(0);
 }, 20_000);
 
+it("an append to an existing spool file syncs the file only, not the directory", async () => {
+  const dir = agentDir();
+  expect(records.readRecords(dir)).toHaveLength(0);
+  spoolPath = records.spoolFilePath(dir, "session");
+  const spool = spoolPath;
+  // First contended capture: the O_EXCL open creates the file, so the append fsyncs the file
+  // and the spool directory that took its new entry.
+  let holder = await holdWriter(dir, 1500);
+  try {
+    records.capture(dir, record("first"), "summary-native");
+  } finally {
+    await holder.done;
+  }
+  const dirFsyncsAfterFirst = fsynced.get(dirname(spool)) ?? 0;
+  expect(dirFsyncsAfterFirst).toBeGreaterThanOrEqual(1);
+  expect(fsynced.get(spool) ?? 0).toBeGreaterThanOrEqual(1);
+  // Steady state under sustained contention: the file's entry is unchanged, so every later
+  // append syncs only the file — no avoidable blocking directory flush on the capture path.
+  for (let index = 0; index < 3; index++) {
+    holder = await holdWriter(dir, 800);
+    try {
+      records.capture(dir, record(`again-${index}`), "summary-native");
+    } finally {
+      await holder.done;
+    }
+  }
+  expect(fsynced.get(dirname(spool)) ?? 0).toBe(dirFsyncsAfterFirst);
+  expect(fsynced.get(spool) ?? 0).toBeGreaterThanOrEqual(4);
+  // Every record survives the round trip exactly once.
+  expect(importer.importSpool(dir).imported).toBe(4);
+  expect(records.readRecords(dir)).toHaveLength(4);
+  expect(importer.spoolFiles(dir)).toHaveLength(0);
+}, 20_000);
+
 it("a created spool directory chain fsyncs every level it added plus the first ancestor", async () => {
   const dir = agentDir();
   // Open the backend before contention, as the session process long since did.
