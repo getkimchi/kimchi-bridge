@@ -299,7 +299,7 @@ test("version, build and agent directory mismatches are refused before ready", a
     worker.send({ type: "hello", v: PROTOCOL_VERSION, build: BUILD, agentDir: dir, ...overrides });
     const first = await worker.next();
     expect(first.type).toBe("error");
-    if (first.type === "error") expect(first.message).toMatch(/mismatch/);
+    if (first.type === "error") expect(first.message.includes("mismatch")).toBe(true);
     worker.end();
     expect(await worker.exited()).not.toBe(0);
   }
@@ -330,7 +330,7 @@ test("an invalid protocol line is rejected with an error and a non-zero exit", a
   worker.send({ type: "nonsense" });
   const first = await worker.next();
   expect(first.type).toBe("error");
-  if (first.type === "error") expect(first.message).toMatch(/invalid protocol line/);
+  if (first.type === "error") expect(first.message.includes("invalid protocol line")).toBe(true);
   expect(await worker.exited()).not.toBe(0);
 }, 15000);
 

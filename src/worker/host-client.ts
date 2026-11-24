@@ -99,11 +99,12 @@ export type TransportEvent =
  * The helper thread's whole program, eval'd so it needs no second file in the
  * bundle (the worker ships as one lib/worker.mjs). It reads fd 0 in a blocking
  * loop — a worker thread's `process.stdin` is not wired to the real stdin — and
- * never touches stdout, which only the main thread writes.
+ * never touches stdout, which only the main thread writes. The shared buffer's
+ * slot indexes and state values are interpolated from the constants above, so
+ * the two threads cannot drift apart on the layout.
  */
 const HELPER_SOURCE = `
 "use strict";
-// SharedArrayBuffer slots: [0] state, [1] length, [2] expected rid, [3] active pass id.
 const { parentPort, workerData } = require("node:worker_threads");
 const { readSync } = require("node:fs");
 const ia = new Int32Array(workerData);
@@ -115,26 +116,26 @@ const chunk = Buffer.alloc(65536);
 let pending = "";
 function forward(line) { parentPort.postMessage({ line: line, at: Date.now() }); }
 function reply(line, parsed) {
-  if (Atomics.load(ia, 0) !== 1) return false; // nobody is waiting
-  if (parsed.rid !== Atomics.load(ia, 2)) return false; // late or stale reply
+  if (Atomics.load(ia, ${STATE}) !== ${STATE_WAITING}) return false; // nobody is waiting
+  if (parsed.rid !== Atomics.load(ia, ${RID})) return false; // late or stale reply
   const bytes = encoder.encode(line);
-  if (bytes.length <= payload.length) { payload.set(bytes); Atomics.store(ia, 1, bytes.length); }
-  else Atomics.store(ia, 1, -1);
-  Atomics.store(ia, 0, 2);
-  Atomics.notify(ia, 0);
+  if (bytes.length <= payload.length) { payload.set(bytes); Atomics.store(ia, ${LENGTH}, bytes.length); }
+  else Atomics.store(ia, ${LENGTH}, -1);
+  Atomics.store(ia, ${STATE}, ${STATE_READY});
+  Atomics.notify(ia, ${STATE});
   return true;
 }
 function cancel(parsed) {
   // Fast wake: a cancel for the pass in flight must not sit behind a pending
   // request's timeout. The line is still forwarded for the main thread to own.
-  if (parsed.id !== Atomics.load(ia, 3)) return;
-  if (Atomics.load(ia, 0) !== 1) return;
-  Atomics.store(ia, 0, 4);
-  Atomics.notify(ia, 0);
+  if (parsed.id !== Atomics.load(ia, ${ACTIVE_PASS})) return;
+  if (Atomics.load(ia, ${STATE}) !== ${STATE_WAITING}) return;
+  Atomics.store(ia, ${STATE}, ${STATE_CANCELLED});
+  Atomics.notify(ia, ${STATE});
 }
 function gone() {
-  Atomics.store(ia, 0, 3);
-  Atomics.notify(ia, 0);
+  Atomics.store(ia, ${STATE}, ${STATE_PARENT_GONE});
+  Atomics.notify(ia, ${STATE});
   parentPort.postMessage({ eof: true });
 }
 function onLine(line) {
