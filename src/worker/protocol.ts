@@ -11,6 +11,13 @@
  * "./worker-protocol": only types are shared with "./reconcile", so the wire
  * contract never pulls the reconcile library's runtime graph into Kimchi's
  * inline-mode imports.
+ *
+ * The build id for `hello.build` comes from lib/worker.build, the file the
+ * bridge release ships next to lib/worker.mjs: the packager writes the commit
+ * it embedded in the worker bundle, and the parent — which unpacked the
+ * tarball to share/kimchi/bridge — pins that value when it was built and
+ * sends it back. A mismatch is fatal on both sides, so no two builds of the
+ * bridge ever touch one ledger.
  */
 import type { HostCredentials, HostEndpoints, HostMetric } from "../reconcile/host.js";
 

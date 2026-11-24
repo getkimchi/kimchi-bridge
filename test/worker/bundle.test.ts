@@ -8,7 +8,8 @@ import { PROTOCOL_VERSION } from "../../src/worker/protocol.js";
 /**
  * The worker bundle smoke test (reconcile-out-of-process plan, chunk B3): the
  * release tarball ships lib/worker.mjs next to kimchi-bridge.mjs, and Kimchi
- * starts it as `BUN_BE_BUN=1 kimchi share/kimchi/bridge/worker.mjs`. CI has no
+ * starts it as `BUN_BE_BUN=1 kimchi share/kimchi/bridge/lib/worker.mjs` — the
+ * archive's top folder becomes share/kimchi/bridge when Kimchi unpacks it. CI has no
  * kimchi binary, so this runs the bundle under bun — the same runtime. It is
  * the only worker test the Windows runner executes: it proves the bundle
  * imports, speaks the protocol and refuses a mismatched parent, everywhere.

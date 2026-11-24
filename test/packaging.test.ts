@@ -113,6 +113,10 @@ test("the release tarball ships the reconciliation worker next to the bridge bun
       .map((name) => name.replace(/^\.\//, ""));
     expect(names).toContain("lib/kimchi-bridge.mjs");
     expect(names).toContain("lib/worker.mjs");
+    // The documented launch path matches the tarball layout: the archive's
+    // top folder becomes share/kimchi/bridge when Kimchi unpacks it, so the
+    // entry Kimchi spawns is share/kimchi/bridge/lib/worker.mjs.
+    expect(names).toContain("lib/worker.build");
     // The worker bundle embeds the checkout commit Kimchi will pin (K1/K2).
     const extract = Bun.spawnSync(
       ["tar", "-xOzf", join(out, "kimchi-bridge.tar.gz"), "lib/worker.mjs"],
@@ -120,6 +124,14 @@ test("the release tarball ships the reconciliation worker next to the bridge bun
     );
     expect(extract.exitCode).toBe(0);
     expect(extract.stdout.toString()).toContain(commit.stdout.toString().trim());
+    // The build file ships the same commit the bundle embedded: it is the
+    // supported source for the parent's hello.build.
+    const buildFile = Bun.spawnSync(
+      ["tar", "-xOzf", join(out, "kimchi-bridge.tar.gz"), "lib/worker.build"],
+      { stdout: "pipe" },
+    );
+    expect(buildFile.exitCode).toBe(0);
+    expect(buildFile.stdout.toString()).toBe(`${commit.stdout.toString().trim()}\n`);
   } finally {
     rmSync(out, { recursive: true, force: true });
   }

@@ -16,8 +16,9 @@ import {
 /**
  * The worker's lifecycle (reconcile-out-of-process plan, chunk B3), against a
  * REAL child process: `bun src/worker/main.ts` — the same runtime the release
- * bundle runs under (Kimchi starts it as `BUN_BE_BUN=1 kimchi worker.mjs`, and
- * CI has no kimchi binary). The parent side is a fake: it answers host
+ * bundle runs under (Kimchi starts it as `BUN_BE_BUN=1 kimchi
+ * share/kimchi/bridge/lib/worker.mjs`, and CI has no kimchi binary). The
+ * parent side is a fake: it answers host
  * requests with fake credentials, policy and consent and never needs the
  * network (endpoints point at a closed local port).
  */
