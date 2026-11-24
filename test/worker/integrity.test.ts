@@ -1,4 +1,3 @@
-
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -10,7 +9,7 @@ import {
   integrityMarkerPath,
 } from "../../src/worker/integrity.js";
 import { Database } from "bun:sqlite";
-import { openStore } from "../../src/ledger/store.js";
+import { openStore, SQLITE_OPEN_READWRITE } from "../../src/ledger/store.js";
 import { capture, closeBackends } from "../../src/ledger/records.js";
 
 /**
@@ -60,7 +59,10 @@ function seedLedger(dir: string): void {
   }
   // Fold the WAL into the main file, so the corruption below lands on the bytes a
   // later open actually reads instead of being masked by a live WAL page.
-  const checkpoint = new Database(join(dir, "pr-cost-reporting", "ledger.db"), { create: false });
+  const checkpoint = new Database(
+    join(dir, "pr-cost-reporting", "ledger.db"),
+    SQLITE_OPEN_READWRITE,
+  );
   try {
     checkpoint.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   } finally {
@@ -272,4 +274,3 @@ async function nextOf(lines: string[]): Promise<WorkerLine> {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
-

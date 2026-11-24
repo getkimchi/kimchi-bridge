@@ -250,7 +250,13 @@ describe("the pass result mapped onto the wire", () => {
       lastMs: 1,
       buckets: [1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1],
     };
-    const result = passResultFromRun(pass({ files: true }), { aborted: false }, run, undefined, identity);
+    const result = passResultFromRun(
+      pass({ files: true }),
+      { aborted: false },
+      run,
+      undefined,
+      identity,
+    );
     expect(result.txDurations).toEqual({
       count: 10,
       maxMs: 4000,

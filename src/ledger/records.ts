@@ -462,7 +462,10 @@ const BLOCKED_NOTE_MS = 5000;
  * goes to stderr each time another 5 s elapses (the ledger itself may be the busy resource, so
  * the note cannot go there). Any non-busy error keeps today's behavior and propagates. */
 function blockingCaptureCommit(commit: () => void): void {
-  let noted = Date.now();
+  // The first expiry notes unconditionally: a busy error means SQLite already waited its full
+  // timeout inside the statement, and a clock that lands a few milliseconds short of the note
+  // interval must not silence the diagnostic for a whole extra timeout.
+  let noted = Date.now() - BLOCKED_NOTE_MS;
   for (;;) {
     try {
       commit();

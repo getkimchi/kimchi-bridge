@@ -24,7 +24,12 @@ import {
   readWorkSummary,
   setNote,
 } from "../../src/ledger/records.js";
-import { acquireWriterEpoch, ledgerDbPath, openStore } from "../../src/ledger/store.js";
+import {
+  acquireWriterEpoch,
+  ledgerDbPath,
+  openStore,
+  SQLITE_OPEN_READWRITE,
+} from "../../src/ledger/store.js";
 import { setDefaultHostPorts } from "../../src/reconcile/host-ports.js";
 import type { HostPorts } from "../../src/reconcile/host.js";
 import {
@@ -195,9 +200,7 @@ async function trackedEdit(
   void readDigest;
   const repoFile = await repositoryFile(path);
   const before =
-    repoFile === undefined
-      ? undefined
-      : await diskState(path, undefined, repoFile.repository);
+    repoFile === undefined ? undefined : await diskState(path, undefined, repoFile.repository);
   if (before === undefined || repoFile === undefined)
     throw new Error("fixture edit left the repository");
   await asyncFs.writeFile(path, content.replace(from, to), "utf8");
@@ -402,9 +405,9 @@ function spawnWorker(dir: string): WorkerHandle {
           result: replies[String(message.kind)],
         });
       }
-      return parsed().find(
-        (message) => message.type === "done" && message.id === id,
-      ) as unknown as DoneResult | undefined;
+      return parsed().find((message) => message.type === "done" && message.id === id) as unknown as
+        | DoneResult
+        | undefined;
     },
     killNow() {
       proc.kill("SIGKILL");
@@ -477,7 +480,7 @@ interface OutboxRow {
 }
 
 function outboxRows(dir: string): OutboxRow[] {
-  const db = new Database(ledgerDbPath(dir), { create: false });
+  const db = new Database(ledgerDbPath(dir), SQLITE_OPEN_READWRITE);
   try {
     return db
       .query<OutboxRow, []>("SELECT id, hash, acked_at FROM outbox_events ORDER BY id")
@@ -525,7 +528,7 @@ function spooledCaptureIds(dir: string): string[] {
 
 function assertInvariants(dir: string, before: OutboxRow[], server: ServerState): void {
   // The database is intact.
-  const db = new Database(ledgerDbPath(dir), { create: false });
+  const db = new Database(ledgerDbPath(dir), SQLITE_OPEN_READWRITE);
   try {
     const check = db.query<{ integrity_check: string }, []>("PRAGMA integrity_check").all();
     expect(check.map((row) => row.integrity_check)).toEqual(["ok"]);
@@ -543,9 +546,7 @@ function assertInvariants(dir: string, before: OutboxRow[], server: ServerState)
   // No event is ACKed without the server having received it, and no event twice.
   for (const row of after) {
     if (row.acked_at === null) continue;
-    expect(server.receipts.flat(), `acked event ${row.id} has no server receipt`).toContain(
-      row.id,
-    );
+    expect(server.receipts.flat(), `acked event ${row.id} has no server receipt`).toContain(row.id);
   }
   expect(server.conflicts).toEqual([]);
   // Every projection equals a rebuild from authority. The capture writer's own work keeps
@@ -555,9 +556,9 @@ function assertInvariants(dir: string, before: OutboxRow[], server: ServerState)
   const store = openStore(dir);
   let works: { workId: string }[];
   try {
-    works = store.db.query<{ workId: string }, []>(
-      "SELECT DISTINCT work_id AS workId FROM work_records",
-    ).all();
+    works = store.db
+      .query<{ workId: string }, []>("SELECT DISTINCT work_id AS workId FROM work_records")
+      .all();
   } finally {
     store.close();
   }
@@ -572,9 +573,7 @@ function assertInvariants(dir: string, before: OutboxRow[], server: ServerState)
         .filter((row) => row.workId === workId)
         .map((row) => (row as { requestId?: string }).requestId);
       expect(requests.length).toBeLessThanOrEqual(expected.length);
-      expect(requests.map((row) => row.requestId)).toEqual(
-        expected.slice(0, requests.length),
-      );
+      expect(requests.map((row) => row.requestId)).toEqual(expected.slice(0, requests.length));
       continue;
     }
     const rebuilt = readWorkSummary(dir, workId);
@@ -586,155 +585,163 @@ function assertInvariants(dir: string, before: OutboxRow[], server: ServerState)
 
 // --- The run ------------------------------------------------------------------------------------
 
-test("randomized SIGKILLs of the worker during passes keep the ledger safe", async () => {
-  const server = startServer();
-  const fixture = seedFixture(server.url);
-  const serverState = server.state;
-  const captureLog = join(fixture.root, "capture-writer.log");
-  const children: ReturnType<typeof spawn>[] = [];
-  try {
-    setDefaultHostPorts(seedHost(fixture));
-    const gitDir = realpathSync(join(fixture.repo, ".git"));
-    // The writer session's request, dispatched through the gateway the billing source captured.
-    appendWorkRecord(
-      { cwd: fixture.repo, sessionManager: { getSessionId: () => "writer" } },
-      {
-        type: "request",
-        requestId: REQUEST1,
-        startedAt: DISPATCHED_AT,
-        scope: {
-          account: { apiUrl: server.url, organizationId: ORG, userId: USER },
-          repository: gitDir,
+test(
+  "randomized SIGKILLs of the worker during passes keep the ledger safe",
+  async () => {
+    const server = startServer();
+    const fixture = seedFixture(server.url);
+    const serverState = server.state;
+    const captureLog = join(fixture.root, "capture-writer.log");
+    const children: ReturnType<typeof spawn>[] = [];
+    try {
+      setDefaultHostPorts(seedHost(fixture));
+      const gitDir = realpathSync(join(fixture.repo, ".git"));
+      // The writer session's request, dispatched through the gateway the billing source captured.
+      appendWorkRecord(
+        { cwd: fixture.repo, sessionManager: { getSessionId: () => "writer" } },
+        {
+          type: "request",
+          requestId: REQUEST1,
+          startedAt: DISPATCHED_AT,
+          scope: {
+            account: { apiUrl: server.url, organizationId: ORG, userId: USER },
+            repository: gitDir,
+          },
         },
-      },
-      WRITER,
-    );
-    const origin = apiOrigin(server.url);
-    const source = captureBillingSource(
-      new Headers({ Authorization: "Bearer crash-test-token" }),
-      `${origin}/gateway/openai/v1/chat/completions`,
-      fixture.repo,
-    );
-    if (!source) throw new Error("fixture billing source capture failed");
-    const selector = requestTagSelector(REQUEST1, DISPATCHED_AT);
-    if (!selector) throw new Error("fixture billing selector build failed");
-    appendWorkRecord(
-      { cwd: fixture.repo, sessionManager: { getSessionId: () => "writer" } },
-      {
-        type: "request_dispatch",
-        requestId: REQUEST1,
-        dispatchedAt: DISPATCHED_AT,
-        billingSource: source,
-        billingSelector: selector,
-      },
-      WRITER,
-    );
-    await trackedEdit(fixture.repo, "writer", WRITER, "one", "first");
-    git(fixture.repo, fixture.root, "add", ".");
-    git(fixture.repo, fixture.root, "commit", "-qm", "feature");
-    // The parallel capture writer: a real process capturing through the worker's writes.
-    const writerScript = join(fixture.root, "capture-writer.ts");
-    writeFileSync(writerScript, CAPTURE_WRITER, "utf8");
-    const writerChild = spawn(
-      process.execPath,
-      [writerScript, join(ROOT, "src/ledger/records.ts"), fixture.agentDir, captureLog],
-      { cwd: ROOT, stdio: ["ignore", "ignore", "inherit"] },
-    );
-    children.push(writerChild);
-    await new Promise((resolve) => setTimeout(resolve, 300));
+        WRITER,
+      );
+      const origin = apiOrigin(server.url);
+      const source = captureBillingSource(
+        new Headers({ Authorization: "Bearer crash-test-token" }),
+        `${origin}/gateway/openai/v1/chat/completions`,
+        fixture.repo,
+      );
+      if (!source) throw new Error("fixture billing source capture failed");
+      const selector = requestTagSelector(REQUEST1, DISPATCHED_AT);
+      if (!selector) throw new Error("fixture billing selector build failed");
+      appendWorkRecord(
+        { cwd: fixture.repo, sessionManager: { getSessionId: () => "writer" } },
+        {
+          type: "request_dispatch",
+          requestId: REQUEST1,
+          dispatchedAt: DISPATCHED_AT,
+          billingSource: source,
+          billingSelector: selector,
+        },
+        WRITER,
+      );
+      await trackedEdit(fixture.repo, "writer", WRITER, "one", "first");
+      git(fixture.repo, fixture.root, "add", ".");
+      git(fixture.repo, fixture.root, "commit", "-qm", "feature");
+      // The parallel capture writer: a real process capturing through the worker's writes.
+      const writerScript = join(fixture.root, "capture-writer.ts");
+      writeFileSync(writerScript, CAPTURE_WRITER, "utf8");
+      const writerChild = spawn(
+        process.execPath,
+        [writerScript, join(ROOT, "src/ledger/records.ts"), fixture.agentDir, captureLog],
+        { cwd: ROOT, stdio: ["ignore", "ignore", "inherit"] },
+      );
+      children.push(writerChild);
+      await new Promise((resolve) => setTimeout(resolve, 300));
 
-    let passId = 0;
-    const summary = { kills: 0, passes: 0, records: 0, events: 0, spooled: 0 };
-    for (let run = 0; run < RUNS; run++) {
+      let passId = 0;
+      const summary = { kills: 0, passes: 0, records: 0, events: 0, spooled: 0 };
+      for (let run = 0; run < RUNS; run++) {
+        const worker = spawnWorker(fixture.agentDir);
+        try {
+          worker.send({
+            type: "hello",
+            v: 1,
+            build: BUILD,
+            agentDir: fixture.agentDir,
+          });
+          const before = outboxRows(fixture.agentDir);
+          const killAfter = 150 + Math.floor(random() * 2350);
+          const startedAt = Date.now();
+          for (;;) {
+            const left = killAfter - (Date.now() - startedAt);
+            if (left <= 0) {
+              worker.killNow();
+              summary.kills += 1;
+              break;
+            }
+            passId += 1;
+            const finished = await runPass(worker, fixture, passId, Math.min(left + 40, 4000));
+            if (finished) summary.passes += 1;
+          }
+          // The kill's invariants: intact, no loss, no rewrite, no unreceipted ACK.
+          const logged = existsSync(captureLog)
+            ? readFileSync(captureLog, "utf8")
+                .split("\n")
+                .filter((line) => line !== "")
+            : [];
+          summary.records = Math.max(summary.records, logged.length);
+          const stored = storedCaptureIds(fixture.agentDir);
+          const spooled = spooledCaptureIds(fixture.agentDir);
+          for (const requestId of logged) {
+            const inDb = stored.filter((id) => id === requestId).length;
+            expect(inDb, `captured record ${requestId} duplicated in the database`).toBeLessThan(2);
+            expect(
+              inDb + spooled.filter((id) => id === requestId).length,
+              `captured record ${requestId} was lost by the kill`,
+            ).toBeGreaterThan(0);
+          }
+          assertInvariants(fixture.agentDir, before, serverState);
+          summary.events = outboxRows(fixture.agentDir).length;
+        } finally {
+          await worker.stop();
+        }
+      }
+
+      // The final drain: fresh worker, passes until the spool is empty and two passes in a row
+      // change nothing, then the run's closing assertions.
       const worker = spawnWorker(fixture.agentDir);
       try {
-        worker.send({
-          type: "hello",
-          v: 1,
-          build: BUILD,
-          agentDir: fixture.agentDir,
-        });
-        const before = outboxRows(fixture.agentDir);
-        const killAfter = 150 + Math.floor(random() * 2350);
-        const startedAt = Date.now();
-        for (;;) {
-          const left = killAfter - (Date.now() - startedAt);
-          if (left <= 0) {
-            worker.killNow();
-            summary.kills += 1;
-            break;
-          }
+        worker.send({ type: "hello", v: 1, build: BUILD, agentDir: fixture.agentDir });
+        let lastSignature = "";
+        for (let attempt = 0; attempt < 12; attempt++) {
           passId += 1;
-          const finished = await runPass(worker, fixture, passId, Math.min(left + 40, 4000));
-          if (finished) summary.passes += 1;
+          const finished = await runPass(worker, fixture, passId, 10_000);
+          if (!finished) continue;
+          summary.passes += 1;
+          const signature = JSON.stringify([
+            outboxRows(fixture.agentDir).map((row) => [row.id, row.hash, row.acked_at]),
+            storedCaptureIds(fixture.agentDir).length,
+            spooledCaptureIds(fixture.agentDir).length,
+          ]);
+          if (signature === lastSignature) break;
+          lastSignature = signature;
         }
-        // The kill's invariants: intact, no loss, no rewrite, no unreceipted ACK.
-        const logged = existsSync(captureLog)
-          ? readFileSync(captureLog, "utf8").split("\n").filter((line) => line !== "")
-          : [];
-        summary.records = Math.max(summary.records, logged.length);
-        const stored = storedCaptureIds(fixture.agentDir);
-        const spooled = spooledCaptureIds(fixture.agentDir);
-        for (const requestId of logged) {
-          const inDb = stored.filter((id) => id === requestId).length;
-          expect(inDb, `captured record ${requestId} duplicated in the database`).toBeLessThan(2);
-          expect(
-            inDb + spooled.filter((id) => id === requestId).length,
-            `captured record ${requestId} was lost by the kill`,
-          ).toBeGreaterThan(0);
-        }
-        assertInvariants(fixture.agentDir, before, serverState);
-        summary.events = outboxRows(fixture.agentDir).length;
       } finally {
         await worker.stop();
       }
-    }
-
-    // The final drain: fresh worker, passes until the spool is empty and two passes in a row
-    // change nothing, then the run's closing assertions.
-    const worker = spawnWorker(fixture.agentDir);
-    try {
-      worker.send({ type: "hello", v: 1, build: BUILD, agentDir: fixture.agentDir });
-      let lastSignature = "";
-      for (let attempt = 0; attempt < 12; attempt++) {
-        passId += 1;
-        const finished = await runPass(worker, fixture, passId, 10_000);
-        if (!finished) continue;
-        summary.passes += 1;
-        const signature = JSON.stringify([
-          outboxRows(fixture.agentDir).map((row) => [row.id, row.hash, row.acked_at]),
-          storedCaptureIds(fixture.agentDir).length,
-          spooledCaptureIds(fixture.agentDir).length,
-        ]);
-        if (signature === lastSignature) break;
-        lastSignature = signature;
-      }
+      const logged = readFileSync(captureLog, "utf8")
+        .split("\n")
+        .filter((line) => line !== "");
+      const stored = storedCaptureIds(fixture.agentDir);
+      for (const requestId of logged)
+        expect(stored.filter((id) => id === requestId)).toHaveLength(1);
+      expect(spooledCaptureIds(fixture.agentDir)).toEqual([]);
+      const finalOutbox = outboxRows(fixture.agentDir);
+      for (const row of finalOutbox)
+        expect(
+          serverState.receipts.flat(),
+          `acked event ${row.id} has no server receipt`,
+        ).toContain(row.id);
+      expect(serverState.conflicts).toEqual([]);
+      summary.events = finalOutbox.length;
+      summary.records = logged.length;
+      console.log(
+        `crash-injection summary: seed=${SEED} runs=${RUNS} kills=${summary.kills} passes=${summary.passes} captureRecords=${summary.records} outboxEvents=${summary.events} spooledLeft=${summary.spooled} conflicts=${serverState.conflicts.length}`,
+      );
+      expect(summary.kills).toBe(RUNS);
+      expect(finalOutbox.length).toBeGreaterThan(0);
     } finally {
-      await worker.stop();
+      for (const child of children) child.kill("SIGTERM");
+      await server.stop();
+      closeBackends();
+      rmSync(fixture.root, { recursive: true, force: true });
     }
-    const logged = readFileSync(captureLog, "utf8").split("\n").filter((line) => line !== "");
-    const stored = storedCaptureIds(fixture.agentDir);
-    for (const requestId of logged)
-      expect(stored.filter((id) => id === requestId)).toHaveLength(1);
-    expect(spooledCaptureIds(fixture.agentDir)).toEqual([]);
-    const finalOutbox = outboxRows(fixture.agentDir);
-    for (const row of finalOutbox)
-      expect(
-        serverState.receipts.flat(),
-        `acked event ${row.id} has no server receipt`,
-      ).toContain(row.id);
-    expect(serverState.conflicts).toEqual([]);
-    summary.events = finalOutbox.length;
-    summary.records = logged.length;
-    console.log(
-      `crash-injection summary: seed=${SEED} runs=${RUNS} kills=${summary.kills} passes=${summary.passes} captureRecords=${summary.records} outboxEvents=${summary.events} spooledLeft=${summary.spooled} conflicts=${serverState.conflicts.length}`,
-    );
-    expect(summary.kills).toBe(RUNS);
-    expect(finalOutbox.length).toBeGreaterThan(0);
-  } finally {
-    for (const child of children) child.kill("SIGTERM");
-    await server.stop();
-    closeBackends();
-    rmSync(fixture.root, { recursive: true, force: true });
-  }
-}, 1000 * (Number(process.env.CRASH_TIMEOUT_S ?? 240)));
+  },
+  1000 * Number(process.env.CRASH_TIMEOUT_S ?? 240),
+);

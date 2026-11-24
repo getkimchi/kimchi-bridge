@@ -17,7 +17,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
-import { ledgerDbPath } from "../ledger/store.js";
+import { ledgerDbPath, SQLITE_OPEN_READWRITE } from "../ledger/store.js";
 
 /** The marker's validity window: one check per agent directory per day. */
 export const INTEGRITY_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -29,9 +29,7 @@ interface IntegrityMarker {
 }
 
 /** The gate's outcome: ok, or the failure the worker must report instead of writing. */
-export type IntegrityCheck =
-  | { ok: true }
-  | { ok: false; error: string };
+export type IntegrityCheck = { ok: true } | { ok: false; error: string };
 
 /** The marker file's path under the agent directory. */
 export function integrityMarkerPath(agentDir: string): string {
@@ -63,9 +61,13 @@ function writeMarker(path: string, checkedAt: number): void {
   try {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const temp = join(dirname(path), `.integrity-check.${process.pid}.tmp`);
-    writeFileSync(temp, `${JSON.stringify({ version: 1, checkedAt } satisfies IntegrityMarker)}\n`, {
-      mode: 0o600,
-    });
+    writeFileSync(
+      temp,
+      `${JSON.stringify({ version: 1, checkedAt } satisfies IntegrityMarker)}\n`,
+      {
+        mode: 0o600,
+      },
+    );
     renameSync(temp, path);
   } catch {
     // The marker is an optimization; the check it caches is what matters.
@@ -76,7 +78,7 @@ function writeMarker(path: string, checkedAt: number): void {
  *  The open is read-write so SQLite can recover a journal a crash left behind, but the check
  *  itself only reads. */
 function quickCheckRows(agentDir: string): string[] {
-  const database = new Database(ledgerDbPath(agentDir), { create: false });
+  const database = new Database(ledgerDbPath(agentDir), SQLITE_OPEN_READWRITE);
   try {
     return (
       database.query<{ quick_check: string }, []>("PRAGMA quick_check").all() as {
@@ -94,10 +96,7 @@ function quickCheckRows(agentDir: string): string[] {
  * a failed check leaves the marker absent and every later pass re-checks until
  * someone repairs the ledger.
  */
-export function integrityCheckGate(
-  agentDir: string,
-  now: () => number = Date.now,
-): IntegrityCheck {
+export function integrityCheckGate(agentDir: string, now: () => number = Date.now): IntegrityCheck {
   const marker = integrityMarkerPath(agentDir);
   const age = markerAgeMs(marker, now());
   if (age !== undefined && age >= 0 && age < INTEGRITY_CHECK_INTERVAL_MS) return { ok: true };

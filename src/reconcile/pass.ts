@@ -237,7 +237,10 @@ export function runReconciliationPass(
       if (input.pullRequests) {
         if (leaseFailure) throw leaseFailure;
         const channel = input.pullRequests;
-        const channelSignal = AbortSignal.any([signal, ...(channel.signal ? [channel.signal] : [])]);
+        const channelSignal = AbortSignal.any([
+          signal,
+          ...(channel.signal ? [channel.signal] : []),
+        ]);
         channels["pull-requests"] = { outcome: "ok" };
         try {
           await reconcileWorkPullRequests(

@@ -10,7 +10,12 @@ import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "bun:test";
 import { importSpool } from "../../src/ledger/import.js";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
-import { closeBackends, readRecords, readWorkSummary, spoolDirectory } from "../../src/ledger/records.js";
+import {
+  closeBackends,
+  readRecords,
+  readWorkSummary,
+  spoolDirectory,
+} from "../../src/ledger/records.js";
 import type { WorkHead } from "../../src/ledger/row-log.js";
 
 /**

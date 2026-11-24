@@ -528,9 +528,7 @@ it("a worker paused across an epoch handover cannot commit after resuming", asyn
     worker.send({
       type: "hello",
       v: 1,
-      build: Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: ROOT })
-        .stdout.toString()
-        .trim(),
+      build: Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: ROOT }).stdout.toString().trim(),
       agentDir: dir,
     });
     const ready = await worker.next();
@@ -587,9 +585,7 @@ it("a worker whose parent heartbeat went silent cannot commit after resuming", a
     worker.send({
       type: "hello",
       v: 1,
-      build: Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: ROOT })
-        .stdout.toString()
-        .trim(),
+      build: Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: ROOT }).stdout.toString().trim(),
       agentDir: dir,
     });
     const ready = await worker.next();

@@ -48,7 +48,8 @@ export function wireTxDurations(measured: LedgerTxDurations): TxDurations {
   const buckets = measured.buckets;
   const upTo = (edgeIndex: number): number => {
     let total = 0;
-    for (let index = 0; index <= edgeIndex && index < buckets.length; index++) total += buckets[index];
+    for (let index = 0; index <= edgeIndex && index < buckets.length; index++)
+      total += buckets[index];
     return total;
   };
   const upTo25Ms = upTo(4);

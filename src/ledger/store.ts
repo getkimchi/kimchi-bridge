@@ -32,6 +32,10 @@ import {
   SCHEMA_VERSION,
 } from "./schema.js";
 
+/** SQLite's own read-write open flag, passed as the raw `bun:sqlite` flags number when an
+ *  existing database must be opened read-write without creating it. */
+export const SQLITE_OPEN_READWRITE = 2;
+
 /** Thrown when the database cannot be opened in this runtime (no bun:sqlite). */
 export class LedgerUnavailableError extends Error {
   readonly code = "pr-cost-ledger/unavailable";
