@@ -953,6 +953,43 @@ describe("capture prefix verification (memory backend)", () => {
     expect(readRecords(dir).map((row) => row.requestId)).toEqual(["req-1", "req-X", "req-2"]);
   });
 
+  it("rejects a rewrite landing between the final prefix read and the post-read fstat", async () => {
+    const dir = agentDir();
+    dirs.push(dir);
+    const backend = createMemoryRecords();
+    useBackendFactory(() => backend);
+    const file = join(journal(dir), "parent.jsonl");
+    const original = line(request("req-1"));
+    writeFileSync(file, original);
+    expect((await importJournals(dir, { verifyCapturePrefix: true })).imported).toBe(1);
+    const generation = backend.getJournalCursor(file)?.generation ?? 0;
+    appendFileSync(file, line(request("req-2")));
+    // The preflight's post-read fstatSync is this import's second fstat call (the first is its
+    // own pre-read stat), so firing on the second call lands a same-length rewrite of the
+    // consumed req-1 plus a small append exactly between the final prefix readSync and the
+    // fstatSync whose growth the memo then accepts: the memo's hash still describes req-1
+    // while its stat describes the rewritten, grown file.
+    const realFstat: typeof fs.fstatSync = fs.fstatSync;
+    let stats = 0;
+    const fstat = vi.spyOn(fs, "fstatSync").mockImplementation(((...args: unknown[]) => {
+      if (++stats === 2) {
+        writeFileSync(file, readFileSync(file, "utf8").replace("req-1", "req-X"));
+        appendFileSync(file, " \n");
+      }
+      return realFstat(...(args as Parameters<typeof fs.fstatSync>));
+    }) as typeof fs.fstatSync);
+    let result: Awaited<ReturnType<typeof importJournals>>;
+    try {
+      result = await importJournals(dir, { verifyCapturePrefix: true });
+    } finally {
+      fstat.mockRestore();
+    }
+    expect(result.anomalies).toEqual([{ path: file, code: "journal-mutation" }]);
+    while (result.pending) result = await importJournals(dir, { verifyCapturePrefix: true });
+    expect(backend.getJournalCursor(file)?.generation).toBe(generation + 1);
+    expect(readRecords(dir).map((row) => row.requestId)).toEqual(["req-1", "req-X", "req-2"]);
+  });
+
   it("verifies capture-only appends with serial SHA-256 and rejects same-inode prefix rewrites", async () => {
     const dir = agentDir();
     dirs.push(dir);

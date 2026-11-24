@@ -236,6 +236,13 @@ const continued = new Map<
     boundaryHash: string;
     hash: Hash;
     lines: number;
+    /** Set when the preflight took this memo while the file grew mid-verification: the hash
+     *  covers bytes read BEFORE the growth was observed, and a same-length rewrite landing in
+     *  that window (between the final prefix readSync and the post-read fstatSync) would leave
+     *  it describing bytes the file no longer holds. No consumer may then trust the memo's
+     *  hash — the synchronous importer re-hashes the current prefix itself; the memo's identity,
+     *  stat and line count stay usable (the line count only ever rides a hash that verifies). */
+    grew?: boolean;
   }
 >();
 /** The journal each agent directory's last timed slice stopped at; the next slice starts there instead of rewalking. */
@@ -255,6 +262,7 @@ function rememberContinued(
     boundaryHash: string;
     hash: Hash;
     lines: number;
+    grew?: boolean;
   },
 ): void {
   continued.delete(path);
@@ -282,8 +290,9 @@ const rechecked = new Set<string>();
 /** Capture-only preflight: verify every old byte before the synchronous importer can reuse its running hash.
  * The whole-prefix re-read this function performs is the one an append always owes — but cooperatively,
  * yielding between pages, so it never holds the event loop. Memoized with the post-read stat, so an
- * unchanged file skips even this. Growth during the read is safe: it cannot change the consumed prefix,
- * whose hash the importer still checks; any other change invalidates the memo and re-runs. */
+ * unchanged file skips even this. Growth during the read cannot change the consumed prefix without
+ * leaving the memo growth-marked — the importer then re-hashes the prefix itself instead of trusting
+ * the memo's hash — and any other change invalidates the memo and re-runs. */
 async function verifyCapturePrefix(
   path: string,
   cursor: JournalCursor,
@@ -360,6 +369,11 @@ async function verifyCapturePrefix(
       boundaryHash: cursor.boundaryHash,
       hash: prefix,
       lines,
+      // Growth is the one acceptance that cannot prove the prefix bytes this hash covers are
+      // still the file's: the memo keeps its cooperative re-read skip (an unchanged stat still
+      // means nothing else wrote) but is marked so the synchronous importer re-hashes the
+      // current prefix instead of trusting this hash against the cursor's boundaryHash.
+      grew,
     });
   } finally {
     closeSync(fd);
@@ -409,10 +423,14 @@ function prepareJournal(
     let lineOffset = samePrefix ? known.lines : 0;
     // A settled file's memo is trustworthy for every caller (its times predate the cursor that
     // committed it); a fresh file's exact-stat memo only for capture, whose preflight read the
-    // bytes behind it. Strict readers keep their inline verification on fresh files — the
-    // budget-checked cancellation their preparation contract requires.
+    // bytes behind it. A growth-marked memo is trusted by neither: its hash covers bytes read
+    // before the growth was observed, so the importer re-hashes the current prefix itself —
+    // the check a rewrite between the final prefix readSync and the post-read fstatSync needs.
+    // Strict readers keep their inline verification on fresh files — the budget-checked
+    // cancellation their preparation contract requires.
     if (
       samePrefix &&
+      !known.grew &&
       (untouched(stat) ||
         (verifiedPrefix &&
           known.size === size &&
@@ -422,8 +440,11 @@ function prepareJournal(
       prefix = known.hash.copy();
     } else if (cursor && cursor.dev === dev && cursor.ino === ino && size >= cursor.offset) {
       // Only the capture path defers: it runs the cooperative preflight first, and its slice never
-      // pays the synchronous prefix re-read. Strict readers verify here, as they always did.
-      if (verifiedPrefix && cursor.offset > 0) return "pending" as const;
+      // pays the synchronous prefix re-read. A growth-marked memo is the exception — the preflight
+      // could not prove the prefix bytes it hashed are still the file's, so this slice re-hashes
+      // the consumed prefix synchronously (budget-checked) and only a later settled import skips.
+      if (verifiedPrefix && cursor.offset > 0 && !(samePrefix && known.grew))
+        return "pending" as const;
       let position = 0;
       while (position < cursor.offset) {
         checkBudget?.();
