@@ -42,6 +42,36 @@ export async function buildBundle(version: string, outfile: string) {
   await Bun.write(outfile, result.outputs[0]!);
 }
 
+/**
+ * The reconciliation worker's bundle (lib/worker.mjs), embedded with the bridge
+ * commit as its build id: the worker refuses a parent built from any other
+ * commit, so mixed versions can never write one ledger. Tests pass an explicit
+ * build; the packager embeds the commit being released.
+ */
+export async function buildWorkerBundle(build: string, outfile: string) {
+  const result = await Bun.build({
+    entrypoints: [join(import.meta.dir, "../src/worker/main.ts")],
+    target: "bun",
+    minify: true,
+    define: { BRIDGE_BUILD: JSON.stringify(build) },
+  });
+  if (!result.success) throw new AggregateError(result.logs, "Worker bundle build failed");
+  await Bun.write(outfile, result.outputs[0]!);
+}
+
+/** The commit being packaged; the release and its worker bundle must agree on it. */
+function checkoutCommit(root: string): string {
+  const commit = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  const value = commit.stdout.toString().trim();
+  if (commit.exitCode !== 0 || value === "")
+    throw new Error("Could not resolve the checkout commit");
+  return value;
+}
+
 async function main() {
   const [version, output] = process.argv.slice(2);
   if (!version || !output) throw new Error("Usage: scripts/package.sh vVERSION OUTPUT_DIRECTORY");
@@ -56,6 +86,7 @@ async function main() {
     for (const path of ["bin", "lib", "markets", ".claude-plugin", ".agents/plugins"])
       mkdirSync(join(stage, path), { recursive: true });
     await buildBundle(version, join(stage, "lib/kimchi-bridge.mjs"));
+    await buildWorkerBundle(checkoutCommit(root), join(stage, "lib/worker.mjs"));
     cpSync(join(root, "plugins"), join(stage, "plugins"), { recursive: true });
     for (const bin of ["bin", `plugins/${plugin}/claude/bin`, `plugins/${plugin}/codex/bin`]) {
       mkdirSync(join(stage, bin), { recursive: true });

@@ -33,6 +33,23 @@ jobs:
       - run: sh -n scripts/install-standalone.sh
       - run: python3 -c "import plistlib; plistlib.load(open('build/entitlements.mac.plist', 'rb'))"
       - run: git diff --check
+  # The worker path must run on Windows (no platform.ts, no FFI, no shell wrappers):
+  # build the bundle and smoke-test that it imports, speaks the protocol and
+  # refuses a mismatched parent. Full suites stay on the POSIX runners.
+  worker-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: pnpm install --frozen-lockfile
+      - run: bun test test/worker/bundle.test.ts
   package:
     runs-on: ubuntu-latest
     steps:
