@@ -25,7 +25,7 @@ import type { HostCredentials, HostEndpoints, HostMetric } from "../reconcile/ho
 export const PROTOCOL_VERSION = 1;
 
 /** The host services the worker cannot resolve itself and must ask the parent for. */
-export type HostRequestKind = "credentials" | "endpoints" | "policy" | "consent";
+export type HostRequestKind = "credentials" | "endpoints" | "policy" | "consent" | "gitToken";
 
 /** The channels one pass runs; the supervisor's channel set, on the wire. */
 export interface PassChannels {
@@ -148,6 +148,8 @@ export interface RequestMessage {
   kind: HostRequestKind;
   /** The working directory the answer is resolved for, when the kind takes one. */
   cwd?: string;
+  /** The git host the saved token is read for, when the kind takes one. */
+  host?: string;
 }
 
 /** A PR-cost metric replayed into the parent's telemetry context. */
@@ -495,22 +497,31 @@ function parseWorkerValue(value: unknown): Parsed<WorkerMessage> {
       return accept({ type: "ready", v: v.value, build: build.value });
     }
     case "request": {
-      const shape = exactKeys(object.value, ["type", "rid", "kind"], ["cwd"]);
+      const shape = exactKeys(object.value, ["type", "rid", "kind"], ["cwd", "host"]);
       if (!shape.ok) return shape;
       const rid = fieldInteger(object.value, "rid", 1);
       if (!rid.ok) return rid;
       const kind =
         typeof object.value.kind === "string"
-          ? oneOf(object.value.kind, ["credentials", "endpoints", "policy", "consent"] as const)
+          ? oneOf(object.value.kind, [
+              "credentials",
+              "endpoints",
+              "policy",
+              "consent",
+              "gitToken",
+            ] as const)
           : undefined;
       if (!kind) return reject('field "kind" is not a known request kind');
       const cwd = optionalFieldString(object.value, "cwd");
       if (!cwd.ok) return cwd;
+      const host = optionalFieldString(object.value, "host");
+      if (!host.ok) return host;
       return accept({
         type: "request",
         rid: rid.value,
         kind,
         ...(cwd.value === undefined ? {} : { cwd: cwd.value }),
+        ...(host.value === undefined ? {} : { host: host.value }),
       });
     }
     case "metric": {
@@ -702,6 +713,21 @@ export function parseConsentReply(value: unknown): Parsed<ConsentReply> {
   const consent = fieldBoolean(object.value, "consent");
   if (!consent.ok) return consent;
   return accept({ consent: consent.value });
+}
+
+/** The gitToken reply: the saved Git host token, or no token at all when none is saved. */
+export interface GitTokenReply {
+  token?: string;
+}
+
+export function parseGitTokenReply(value: unknown): Parsed<GitTokenReply> {
+  const object = asObject(value, "gitToken reply");
+  if (!object.ok) return object;
+  const shape = exactKeys(object.value, [], ["token"]);
+  if (!shape.ok) return shape;
+  const token = optionalFieldString(object.value, "token");
+  if (!token.ok) return token;
+  return accept(token.value === undefined ? {} : { token: token.value });
 }
 
 // ---------------------------------------------------------------------------

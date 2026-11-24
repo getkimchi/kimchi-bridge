@@ -1,10 +1,11 @@
 /**
  * The worker process's HostPorts (reconcile-out-of-process plan, chunk B3).
  *
- * HostPorts' credential, endpoint, policy and consent reads are synchronous and
- * are called at many synchronous sites inside the moved passes, whose timing
- * must not change now that they run in the worker. So the worker answers them
- * with a blocking RPC over its private stdin/stdout pipe:
+ * HostPorts' credential, git-token, endpoint, policy and consent reads are
+ * synchronous and are called at many synchronous sites inside the moved
+ * passes, whose timing must not change now that they run in the worker. So
+ * the worker answers them with a blocking RPC over its private stdin/stdout
+ * pipe:
  *
  *   - the main thread writes a `request` line to stdout with fs.writeSync and
  *     blocks in Atomics.wait on a SharedArrayBuffer (10 s timeout);
@@ -28,11 +29,12 @@ import type { HostPorts } from "../reconcile/host.js";
 import { DEFAULT_WORKER_USER_AGENT, makeWorkerFetch } from "./fetch.js";
 import {
   encodeWorkerMessage,
+  parseConsentReply,
+  parseGitTokenReply,
   parseHostCredentials,
   parseHostEndpoints,
   parseParentLine,
   parsePolicyReply,
-  parseConsentReply,
   redactTokens,
   resourceEnabledFromPolicy,
   type HostRequestKind,
@@ -282,7 +284,7 @@ export class StdioTransport {
    * value. The wait is capped at the pass deadline too, so a stalled parent
    * cannot hold the pass past its budget behind the request timeout.
    */
-  request(kind: HostRequestKind, cwd?: string): unknown {
+  request(kind: HostRequestKind, params?: { cwd?: string; host?: string }): unknown {
     // A parent that already died must not be overwritten by a new wait: the
     // reader thread is gone with it, so the request would never be answered.
     if (this.#pipeGone || Atomics.load(this.slots, STATE) === STATE_PARENT_GONE)
@@ -302,7 +304,8 @@ export class StdioTransport {
           type: "request",
           rid,
           kind,
-          ...(cwd === undefined ? {} : { cwd }),
+          ...(params?.cwd === undefined ? {} : { cwd: params.cwd }),
+          ...(params?.host === undefined ? {} : { host: params.host }),
         }),
       );
     } catch {
@@ -427,7 +430,7 @@ export class StdioHostClient implements HostPorts {
   }
 
   credentials(cwd: string) {
-    const parsed = parseHostCredentials(this.transport.request("credentials", cwd));
+    const parsed = parseHostCredentials(this.transport.request("credentials", { cwd }));
     if (!parsed.ok)
       throw new HostRequestError(
         `the parent's credentials reply was invalid: ${parsed.error}`,
@@ -439,8 +442,21 @@ export class StdioHostClient implements HostPorts {
     return parsed.value;
   }
 
+  gitToken(host: string): string | undefined {
+    const parsed = parseGitTokenReply(this.transport.request("gitToken", { host }));
+    if (!parsed.ok)
+      throw new HostRequestError(
+        `the parent's gitToken reply was invalid: ${parsed.error}`,
+        "gitToken",
+        "invalid-reply",
+      );
+    // A saved token is now known to this process: every reported error scrubs it.
+    if (parsed.value.token !== undefined) this.transport.addSecret(parsed.value.token);
+    return parsed.value.token;
+  }
+
   endpoints(cwd: string) {
-    const parsed = parseHostEndpoints(this.transport.request("endpoints", cwd));
+    const parsed = parseHostEndpoints(this.transport.request("endpoints", { cwd }));
     if (!parsed.ok)
       throw new HostRequestError(
         `the parent's endpoints reply was invalid: ${parsed.error}`,

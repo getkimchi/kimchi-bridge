@@ -3,6 +3,7 @@ import {
   encodeParentMessage,
   encodeWorkerMessage,
   parseConsentReply,
+  parseGitTokenReply,
   parseHostCredentials,
   parseHostEndpoints,
   parseParentLine,
@@ -89,6 +90,7 @@ function workerMessages(): WorkerMessage[] {
     { type: "request", rid: 2, kind: "policy" },
     { type: "request", rid: 3, kind: "consent" },
     { type: "request", rid: 4, kind: "endpoints", cwd: "/project" },
+    { type: "request", rid: 5, kind: "gitToken", host: "github.com" },
     { type: "metric", metric: { kind: "reconciliation" } },
     { type: "metric", metric: { kind: "delivery", outcome: "success" } },
     { type: "metric", metric: { kind: "unpriced", value: 4 } },
@@ -180,6 +182,8 @@ describe("strict line rejection", () => {
       '{"type":"cancel"}',
       '{"type":"cancel","id":-2}',
       '{"type":"reply"}',
+      '{"type":"request","rid":1,"kind":"gitToken","host":5}',
+      '{"type":"request","rid":1,"kind":"nonsense"}',
       '{"type":"metric","metric":{"kind":"delivery","outcome":"maybe"}}',
       '{"type":"done","id":1,"result":{"outcome":"finished","channels":{}}}',
       '{"type":"done","id":1,"result":{"outcome":"ok","channels":{"files":{"outcome":"ok","extra":1}}}}',
@@ -224,7 +228,7 @@ describe("strict line rejection", () => {
 });
 
 describe("reply payload validation", () => {
-  test("credentials, endpoints, policy and consent replies validate", () => {
+  test("credentials, endpoints, policy, consent and gitToken replies validate", () => {
     expect(parseHostCredentials({ token: "t", apiUrl: "https://a" })).toEqual({
       ok: true,
       value: { token: "t", apiUrl: "https://a" },
@@ -257,6 +261,15 @@ describe("reply payload validation", () => {
     expect(parseConsentReply({ consent: false }).ok).toBe(true);
     expect(parseConsentReply({ consent: "no" }).ok).toBe(false);
     expect(parseConsentReply({}).ok).toBe(false);
+    // The saved git host token, or no token at all when none is saved.
+    expect(parseGitTokenReply({ token: "ghp_saved" })).toEqual({
+      ok: true,
+      value: { token: "ghp_saved" },
+    });
+    expect(parseGitTokenReply({})).toEqual({ ok: true, value: {} });
+    expect(parseGitTokenReply({ token: "ghp_saved", extra: 1 }).ok).toBe(false);
+    expect(parseGitTokenReply({ token: 1 }).ok).toBe(false);
+    expect(parseGitTokenReply("ghp_saved").ok).toBe(false);
   });
 
   // Kimchi's isResourceEnabled semantics: the reply carries effective answers

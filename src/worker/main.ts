@@ -333,6 +333,14 @@ function main(): void {
           throw error;
         }
       },
+      gitToken(host) {
+        try {
+          return base.gitToken(host);
+        } catch (error) {
+          noteHostFailure(state, error);
+          throw error;
+        }
+      },
       endpoints(cwd) {
         try {
           return base.endpoints(cwd);

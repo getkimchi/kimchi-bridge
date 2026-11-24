@@ -50,6 +50,7 @@ function agentDir(): string {
 /** The fake parent's standard answers; a test may override or withhold one. */
 const REPLIES: Record<HostRequestKind, unknown> = {
   credentials: { token: FAKE_TOKEN, apiUrl: NO_NETWORK_API },
+  gitToken: {},
   endpoints: {
     llmEndpoint: "http://127.0.0.1:1",
     openAiBaseUrl: "http://127.0.0.1:1/openai/v1",
@@ -949,6 +950,84 @@ test("an idle worker exits after its idle lifetime, and a pass rearms it", async
   expect(Date.now() - passedAt).toBeGreaterThanOrEqual(900);
   expect(Date.now() - handed).toBeLessThan(15000);
 }, 20000);
+
+test("the saved git host token is answered over the pipe and never reported", async () => {
+  const dir = agentDir();
+  // A real git repository whose remote names no known provider: PR discovery
+  // asks the parent for that host's saved token before any lookup. The remote
+  // points at a closed local port, so the lookup itself needs no network.
+  const repo = mkdtempSync(join(tmpdir(), "kimchi-worker-life-git-"));
+  dirs.push(repo);
+  execFileSync("git", ["-C", repo, "init", "-q"]);
+  execFileSync("git", [
+    "-C",
+    repo,
+    "remote",
+    "add",
+    "origin",
+    "https://127.0.0.1:9/owner/repo.git",
+  ]);
+  const workId = "44444444-4444-4444-8444-444444444444";
+  backendFor(dir).insertRecord({
+    recordHash: "c".repeat(64),
+    type: "commit",
+    workId,
+    sessionId: "session",
+    body: JSON.stringify({
+      version: 1,
+      type: "commit",
+      workId,
+      sessionId: "session",
+      sha: "1234567890abcdef1234567890abcdef12345678",
+      repository: repo,
+      worktree: repo,
+      cwd: repo,
+    }),
+    sourcePath: join(dir, "work-attribution", "session.jsonl"),
+    sourceGeneration: 0,
+    sourceOffset: 0,
+    importedAt: Date.now(),
+  });
+  closeBackends();
+  const worker = spawnWorker(dir);
+  await handshake(worker, dir);
+  worker.send({
+    type: "pass",
+    id: 16,
+    channels: { pullRequests: true },
+    deadlineMs: 30000,
+    epoch: 1,
+  });
+  const SAVED = "ghp_lifecycle_saved_git_token_0123456";
+  const hosts: string[] = [];
+  let done: DoneMessage | undefined;
+  for (;;) {
+    const message = await worker.next();
+    if (message.type === "request") {
+      if (message.kind === "gitToken") {
+        hosts.push(message.host ?? "");
+        worker.send({ type: "reply", rid: message.rid, result: { token: SAVED } });
+        continue;
+      }
+      worker.send({ type: "reply", rid: message.rid, result: REPLIES[message.kind] });
+      continue;
+    }
+    if (message.type === "done") {
+      done = message;
+      break;
+    }
+  }
+  // The token request carried the remote's host, and the reply's token is a
+  // live secret from the moment it is answered.
+  expect(hosts.length).toBeGreaterThan(0);
+  for (const host of hosts) expect(host.includes("127.0.0.1")).toBe(true);
+  expect(done?.result.channels.pullRequests).toBeDefined();
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+  // The saved token never reaches any output, even though the lookup fails.
+  for (const line of worker.lines()) expect(line.includes(SAVED)).toBe(false);
+  expect(worker.stderrText().includes(SAVED)).toBe(false);
+}, 40000);
 
 test("a pass that fails before any channel reports the channels as failed, not ok", async () => {
   const dir = agentDir();
