@@ -139,9 +139,10 @@ interface HelperNote {
   line?: string;
   /** When the helper read the line (ms since epoch): the true receipt time. */
   at?: number;
-  /** The helper's monotonic clock at startup (performance.now of its own thread, the same
-   *  reading that seeded the shared heartbeat slot), so the main thread can compute the
-   *  cross-thread offset both sides' heartbeat ages share. */
+  /** The helper's monotonic clock (performance.now of its own thread): at startup, on the
+   *  note with no line (the same reading that seeded the shared heartbeat slot), and on every
+   *  heartbeat note, where it is the send time of that very heartbeat — the reading the main
+   *  thread's running-minimum offset calibration below is estimated from. */
   clock?: number;
   eof?: boolean;
   oversized?: boolean;
@@ -178,13 +179,16 @@ let pending = "";
 // The heartbeat clock is this thread's monotonic performance.now, never the wall clock: a
 // backward wall-clock move (an NTP step) must not turn a stale heartbeat fresh. The worker
 // thread's performance.now origin differs from the main thread's, so the first action reports
-// this clock to the main thread, which derives the constant cross-thread offset from its own
-// time BEFORE it constructed this thread (see the main thread's clock-note handler: a value
-// guaranteed to precede this thread's start, so no delivery delay can shrink an age); both
-// sides then measure ages in the same monotonic domain. The startup baseline below is the
-// grace period the transport's construction used to seed itself with, and one reading both
-// seeds the shared slot and rides the startup note, so the main thread's calibration and the
-// slot's baseline are the very same instant.
+// this clock to the main thread, which derives a conservative fallback offset from its own
+// time BEFORE it constructed this thread (a value guaranteed to precede this thread's start,
+// so no delivery delay can shrink an age); both sides then measure ages in the same monotonic
+// domain. Every heartbeat's send time rides its forwarded note as well, so the main thread
+// re-estimates the offset per heartbeat and keeps the running minimum — each estimate is the
+// true offset plus that note's delivery latency, so the minimum converges toward the truth
+// without ever dropping below it. The startup baseline below is the grace period the
+// transport's construction used to seed itself with, and one reading both seeds the shared
+// slot and rides the startup note, so the main thread's fallback calibration and the slot's
+// baseline are the very same instant.
 const startupClock = performance.now();
 Atomics.store(hb, 0, BigInt(Math.round(startupClock)));
 parentPort.postMessage({ clock: startupClock });
@@ -193,7 +197,13 @@ parentPort.postMessage({ clock: startupClock });
 // timeout and the next request's start. Zero (unset) keeps it dormant.
 const TEST_REPLY_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_REPLY_DELAY_MS || 0);
 const TEST_SLEEP = new Int32Array(new SharedArrayBuffer(4));
-function forward(line) { parentPort.postMessage({ line: line, at: Date.now() }); }
+function forward(line, clock) {
+  parentPort.postMessage(
+    clock === undefined
+      ? { line: line, at: Date.now() }
+      : { line: line, at: Date.now(), clock: clock },
+  );
+}
 function reply(line, parsed) {
   const word = Atomics.load(ia, ${COMBINED});
   if ((word & ${STATE_MASK}) !== ${STATE_WAITING}) return false; // nobody is waiting
@@ -227,9 +237,16 @@ function heartbeat(parsed) {
   // The reader thread records each heartbeat's arrival directly in the shared buffer, so
   // a busy main thread still observes fresh data whenever it next checks. The arrival is
   // stamped on this thread's monotonic clock, not the parent's own clock value and not
-  // the wall clock: staleness must not depend on either moving backwards.
+  // the wall clock: staleness must not depend on either moving backwards. The stamped
+  // reading rides the forwarded note too, so the main thread can estimate the constant
+  // cross-thread offset from this very heartbeat's send time (see the main thread's
+  // heartbeat-note handler): every estimate is the true offset plus the note's delivery
+  // latency, an upper bound, so the minimum of them can only converge toward the truth
+  // from the safe side.
   if (parsed.type !== "heartbeat" || typeof parsed.at !== "number") return;
-  Atomics.store(hb, 0, BigInt(Math.round(performance.now())));
+  const at = Math.round(performance.now());
+  Atomics.store(hb, 0, BigInt(at));
+  return at;
 }
 function gone() {
   Atomics.store(ia, ${COMBINED}, ${STATE_PARENT_GONE});
@@ -242,8 +259,8 @@ function onLine(line) {
   if (parsed === null || typeof parsed !== "object") return forward(line);
   if (parsed.type === "reply" && typeof parsed.rid === "number" && reply(line, parsed)) return;
   if (parsed.type === "cancel" && typeof parsed.id === "number") cancel(parsed);
-  heartbeat(parsed);
-  forward(line);
+  const heartbeatClock = heartbeat(parsed);
+  forward(line, heartbeatClock);
 }
 for (;;) {
   let read;
@@ -303,14 +320,23 @@ export class StdioTransport {
   private rid = 0;
   private closed = false;
   private readonly secrets = new Set<string>();
-  /** The constant offset between the main thread's and the helper thread's monotonic clocks
-   *  (both performance.now; their origins differ by the helper's startup). Derived once from
-   *  the main thread's time BEFORE it constructed the helper — a value guaranteed to precede
-   *  the helper's start — so the offset can only place arrivals too early and ages too old
-   *  (refuse early, the safe direction); no message-delivery latency is ever folded in.
-   *  Undefined until the startup note lands, which reads as infinitely stale, the safe
-   *  direction. */
+  /** The conservative fallback offset between the main thread's and the helper thread's monotonic
+   *  clocks (both performance.now; their origins differ by the helper's startup): derived once from
+   *  the main thread's time BEFORE it constructed the helper — a value guaranteed to precede the
+   *  helper's start — so it understates the true offset by the whole construction-to-startup
+   *  latency and therefore only ever overstates a heartbeat's age (refuse early, the safe
+   *  direction). Superseded by the first heartbeat's own calibration below; undefined until
+   *  the startup note lands, which reads as infinitely stale, the safe direction. */
   #monoOffsetMs: number | undefined;
+  /** The running MINIMUM of the per-heartbeat offset estimates: each estimate is the helper's
+   *  send-time clock subtracted from the main thread's time when it handled that heartbeat's
+   *  note, so each equals the true offset plus that note's delivery latency — an upper bound.
+   *  The minimum can therefore only shrink toward the true offset, never below it: a
+   *  late-delivered heartbeat (whose own estimate bakes its queuing delay) can never loosen an
+   *  already-calibrated offset, and a prompt heartbeat converges it to the truth, dropping the
+   *  construction-time staleness of the fallback above. Undefined until the first heartbeat's
+   *  note is handled, which keeps the conservative fallback in force. */
+  #heartbeatOffsetMs: number | undefined;
   /** The main thread's monotonic clock immediately before the helper thread was constructed. */
   readonly #constructedAtMs: number;
 
@@ -325,6 +351,17 @@ export class StdioTransport {
     // arrivals, so a parent that never heartbeats locks the worker out of writes after the
     // window — exactly the old-release fence decision 7 calls for.
     this.#constructedAtMs = performance.now();
+    // Test-only hook: a delay inserted between the construction-time sampling above and the
+    // helper thread's start, so a test can reproduce a Worker construction stretched past the
+    // fence window (scheduler pressure, a paused process) without perturbing the clock
+    // readings themselves. Zero (unset) keeps it dormant.
+    const TEST_CONSTRUCT_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS || 0);
+    if (TEST_CONSTRUCT_DELAY_MS > 0) {
+      const until = this.#constructedAtMs + TEST_CONSTRUCT_DELAY_MS;
+      while (performance.now() < until) {
+        /* A real block: the helper thread cannot start until it ends. */
+      }
+    }
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
     this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
     this.helper.on("error", (error) => {
@@ -340,12 +377,18 @@ export class StdioTransport {
    *  the monotonic clocks both threads share (never the wall clock, whose backward moves
    *  would turn a stale heartbeat fresh). */
   heartbeatAgeMs(): number {
-    if (this.#monoOffsetMs === undefined) return Number.POSITIVE_INFINITY;
+    // The heartbeat-calibrated offset wins once any heartbeat has landed: it is an upper
+    // bound that converges toward the true offset, while the construction-derived fallback
+    // can only overstate ages (a slow helper construction would otherwise refuse every live
+    // heartbeat for the transport's lifetime). Either way the arrival is the helper's
+    // monotonic read time, never the wall clock.
+    const offset = this.#heartbeatOffsetMs ?? this.#monoOffsetMs;
+    if (offset === undefined) return Number.POSITIVE_INFINITY;
     const arrival = Number(Atomics.load(this.heartbeatSlot, 0));
     // A slot that never landed (the helper died before its first store) reads as ancient, not
     // as fresh: refusing writes is the safe direction.
     if (arrival === 0) return Number.POSITIVE_INFINITY;
-    return Math.max(0, performance.now() - (arrival + this.#monoOffsetMs));
+    return Math.max(0, performance.now() - (arrival + offset));
   }
 
   /** Throws LeaseHeartbeatLost when no heartbeat arrived within the window; the write fence's
@@ -360,19 +403,32 @@ export class StdioTransport {
   }
 
   private onHelperNote(note: HelperNote): void {
-    if (note.clock !== undefined) {
-      // The helper's startup clock report: derive the constant offset between the two
-      // threads' monotonic clocks from the main thread's time BEFORE it constructed the
-      // helper. The helper cannot have started before that call, so this calibration can
-      // only place the helper's clock origin too early — ages can only come out older than
-      // the truth, never fresher. Message delivery latency therefore never enters the
-      // offset: a startup note queued for seconds behind a blocked main thread (Bun's worker
-      // threads share no comparable clock — even hrtime.bigint starts per thread) cannot
-      // shrink any heartbeat's age the way an arrival-calibrated offset would.
+    if (note.clock !== undefined && note.line === undefined) {
+      // The helper's startup clock report: derive the conservative fallback offset between
+      // the two threads' monotonic clocks from the main thread's time BEFORE it constructed
+      // the helper. The helper cannot have started before that call, so this calibration
+      // can only place the helper's clock origin too early — ages can only come out older
+      // than the truth, never fresher. Message delivery latency therefore never enters it:
+      // a startup note queued for seconds behind a blocked main thread cannot shrink any
+      // heartbeat's age the way an arrival-calibrated offset would. Its construction-time
+      // understatement is dropped by the first heartbeat's own estimate below.
       this.#monoOffsetMs = this.#constructedAtMs - note.clock;
       return;
     }
     if (note.line !== undefined) {
+      if (note.clock !== undefined) {
+        // A heartbeat note carrying its send time: estimate the cross-thread offset from
+        // this very heartbeat. The estimate is the main thread's handling time minus the
+        // helper's send time, which is the true offset plus the note's delivery latency
+        // (postMessage queuing plus any main-thread block) — an UPPER bound: a heartbeat
+        // whose note sat queued can only overstate the offset, never understate it. Keeping
+        // the running minimum therefore cannot move the offset below the truth, while a
+        // promptly delivered heartbeat converges it — availability restored after a slow
+        // helper construction, whose stale fallback sample the minimum drops.
+        const estimate = performance.now() - note.clock;
+        if (this.#heartbeatOffsetMs === undefined || estimate < this.#heartbeatOffsetMs)
+          this.#heartbeatOffsetMs = estimate;
+      }
       // The helper's read time is the true receipt moment: the main thread
       // may sit blocked in a host request long before it drains the event,
       // and a pass's budget runs from receipt, not from the drain.
