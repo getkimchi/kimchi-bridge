@@ -2,6 +2,7 @@ import { createHash, randomUUID, type Hash } from "node:crypto";
 import {
   closeSync,
   fstatSync,
+  mkdirSync,
   openSync,
   readdirSync,
   readSync,
@@ -19,8 +20,10 @@ import {
   workJournals,
 } from "./work-record.js";
 import {
+  assertLedgerWritable,
   backendFor,
   diagnostic,
+  fsyncDirectoryDurable,
   type ImportEntry,
   importBatchInTx,
   type JournalCursor,
@@ -932,31 +935,57 @@ export function spoolFiles(agentDir: string): string[] {
   return paths;
 }
 
-/** Deletes a spool file whose committed cursor reached its end — rename first, so a capture
- * appending at that instant still lands its line somewhere the next import scans: the renamed
- * file stays a .jsonl in the spool when it grew, and a capture whose append went into it
- * re-verifies its line against the live path and re-appends. The line-hash dedup keeps every
- * re-import exactly-once, so a rotation never loses or duplicates a record. */
+/** Where spool files with lines this reader could not parse (corrupt bytes, or a record type a
+ * newer release wrote) are moved instead of deleted: the bytes stay on disk, recoverable by a
+ * newer release or a manual repair, and the diagnostics table counts each quarantine. */
+export function spoolQuarantineDirectory(agentDir: string): string {
+  return join(spoolDirectory(agentDir), "quarantine");
+}
+
+/** Deletes a spool file whose committed cursor reached its end — but only after claiming it by
+ * an atomic rename to a unique name and verifying the claimed file's identity (dev and inode)
+ * against the stat the cursor validation used. Two importers can validate the same old file; the
+ * first renames it away, and a capture can create a same-length replacement at the original
+ * path before the second renames. The second importer's rename then claims the replacement, and
+ * the identity check fails: the claim is left in the spool directory (still scanned and imported
+ * as its own file), never deleted. A file whose cursor covers the whole file but whose saved
+ * problems are non-empty (a corrupt or unknown-type line, never a pending incomplete tail) moves
+ * to quarantine instead of being unlinked. */
 function retireImportedSpool(agentDir: string, files: string[], checkBudget?: () => void): void {
   const backend = backendFor(agentDir);
   for (const path of files) {
     checkBudget?.();
     try {
       const cursor = backend.getJournalCursor(path);
+      if (!cursor) continue;
       const stat = statSync(path);
-      if (
-        !cursor ||
-        cursor.offset !== stat.size ||
-        cursor.dev !== stat.dev ||
-        cursor.ino !== stat.ino
-      )
+      if (cursor.offset !== stat.size || cursor.dev !== stat.dev || cursor.ino !== stat.ino)
         continue;
-      // The rows and the cursor are committed and the cursor covers the whole file: rotate the
-      // name away from capture, forget its cursor, then delete the bytes.
-      const rotated = join(dirname(path), `retired-${randomUUID()}-${basename(path)}`);
-      renameSync(path, rotated);
+      // The epoch/writable fence covers this destructive file step, like every pass write.
+      assertLedgerWritable(agentDir);
+      const claim = join(dirname(path), `claim-${randomUUID()}-${basename(path)}`);
+      renameSync(path, claim);
+      const claimed = statSync(claim);
+      if (claimed.dev !== stat.dev || claimed.ino !== stat.ino) {
+        // A replacement a capture created after this validation: leave the claim in the spool
+        // directory; the next pass imports it as its own file (line-hash dedup keeps it
+        // exactly-once) and retires it when its own cursor reaches its end.
+        continue;
+      }
+      const problems =
+        coverageProblems(backend, path).length + coverageProblems(backend, path, TAIL_NOTES).length;
       backend.tx(() => backend.deleteJournalCursor(path));
-      if (statSync(rotated).size === cursor.offset) unlinkSync(rotated);
+      if (problems === 0) {
+        unlinkSync(claim);
+      } else {
+        const quarantine = spoolQuarantineDirectory(agentDir);
+        mkdirSync(quarantine, { recursive: true, mode: 0o700 });
+        const kept = join(quarantine, `${randomUUID()}-${basename(path)}`);
+        renameSync(claim, kept);
+        fsyncDirectoryDurable(quarantine);
+        diagnostic(agentDir, "spool-quarantined");
+      }
+      fsyncDirectoryDurable(dirname(path));
     } catch {
       // A failed rename or unlink (an open handle, permissions) retries next pass; a re-import
       // is deduped, so nothing is lost or duplicated either way.
@@ -966,7 +995,8 @@ function retireImportedSpool(agentDir: string, files: string[], checkBudget?: ()
 
 /** The reconciliation files channel's spool step: imports every spool file through the cursor
  * importer (line-hash dedup makes each record exactly-once, against native capture too), then
- * deletes the files whose cursor reached their end. */
+ * retires the files whose every line was committed — deleted only when clean, quarantined when
+ * any line this reader could not parse, and left in place while an incomplete tail remains. */
 export function importSpool(agentDir: string, checkBudget?: () => void): ImportResult {
   checkBudget?.();
   const files = spoolFiles(agentDir);

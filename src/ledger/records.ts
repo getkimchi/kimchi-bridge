@@ -298,10 +298,10 @@ export function spoolFilePath(agentDir: string, sessionId: string): string {
   return join(spoolDirectory(agentDir), `s-${encodeURIComponent(sessionId)}.jsonl`);
 }
 
-/** Directory-entry fsync: persists a newly created spool directory or file (and the rotation
- * renames below) so a kernel crash cannot lose the path the next import scans. Windows cannot
+/** Directory-entry fsync: persists a newly created spool directory or file, and the spool's
+ * rotation renames, so a kernel crash cannot lose the path the next import scans. Windows cannot
  * open a directory for fsync, so the sync is skipped there — the file's own fsync still holds. */
-function fsyncDirectorySync(path: string): void {
+export function fsyncDirectoryDurable(path: string): void {
   if (process.platform === "win32") return;
   const fd = openSync(path, "r");
   try {
@@ -352,7 +352,7 @@ function appendSpoolRecord(path: string, line: string): boolean {
     fsyncSync(fd);
     // The append is durable; a newly created directory or file entry needs the directory's
     // fsync too, or a kernel crash can lose the path the next import scans.
-    if (directoryCreated || !fileExisted) fsyncDirectorySync(directory);
+    if (directoryCreated || !fileExisted) fsyncDirectoryDurable(directory);
     // Verify through this descriptor that the record is the live file's last line: an append
     // that raced a rotation (a different inode at the path now) is retried on a fresh open.
     const size = fstatSync(fd).size;

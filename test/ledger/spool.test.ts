@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
 import {
+  appendFileSync,
   existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -15,15 +17,17 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { afterEach, expect, it } from "bun:test";
-import { importSpool } from "../../src/ledger/import.js";
+import { importSpool, spoolFiles } from "../../src/ledger/import.js";
 import {
   backendFor,
   capture,
   closeBackends,
   readRecords,
   readWorkSummary,
+  spoolDirectory,
   spoolFilePath,
 } from "../../src/ledger/records.js";
+import { openStore } from "../../src/ledger/store.js";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
 
 /**
@@ -257,6 +261,126 @@ it("an unwritable spool under a writer longer than the busy timeout still lands 
   expect(readRecords(dir)).toHaveLength(1);
   expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
 }, 20_000);
+
+it("an unparsable spool line is quarantined, never deleted", () => {
+  const dir = agentDir();
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  // A corrupt complete line: parsed, reported, and covered by the cursor.
+  const content = `\n${JSON.stringify(record("req-a"))}\nnot-a-record\n`;
+  writeFileSync(spool, content, { mode: 0o600 });
+  const result = importSpool(dir);
+  // The intact record imported; the damaged one did not.
+  expect(result.imported).toBe(1);
+  expect(result.problems.map((problem) => problem.kind)).toEqual(["invalid"]);
+  expect(readRecords(dir)).toHaveLength(1);
+  // The file's bytes are preserved under quarantine, not deleted, and the diagnostic is counted.
+  const quarantine = join(spoolDirectory(dir), "quarantine");
+  const kept = readdirSync(quarantine);
+  expect(kept).toHaveLength(1);
+  expect(readFileSync(join(quarantine, kept[0]), "utf8")).toBe(content);
+  expect(existsSync(spool)).toBe(false);
+  const probe = openStore(dir);
+  try {
+    expect(
+      probe.db
+        .query("SELECT COUNT(*) AS n FROM diagnostics WHERE code = 'spool-quarantined'")
+        .get(),
+    ).toEqual({ n: 1 });
+  } finally {
+    probe.close();
+  }
+});
+
+it("an unknown-type spool line is quarantined, never deleted", () => {
+  const dir = agentDir();
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  const future = JSON.stringify({
+    version: 1,
+    type: "a_type_this_reader_does_not_know",
+    workId: WORK,
+    sessionId: "session",
+  });
+  const content = `\n${future}\n`;
+  writeFileSync(spool, content, { mode: 0o600 });
+  const result = importSpool(dir);
+  expect(result.imported).toBe(0);
+  expect(result.problems.map((problem) => problem.kind)).toEqual(["unknown-type"]);
+  expect(readRecords(dir)).toHaveLength(0);
+  const quarantine = join(spoolDirectory(dir), "quarantine");
+  const kept = readdirSync(quarantine);
+  expect(kept).toHaveLength(1);
+  expect(readFileSync(join(quarantine, kept[0]), "utf8")).toBe(content);
+  expect(existsSync(spool)).toBe(false);
+});
+
+it("a spool file with an incomplete trailing line stays for a later pass", () => {
+  const dir = agentDir();
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  // The second record's line has no trailing newline: it is not consumed yet.
+  const complete = JSON.stringify(record("req-tail-a"));
+  const partial = JSON.stringify(record("req-tail-b")).slice(0, 20);
+  const content = `\n${complete}\n${partial}`;
+  writeFileSync(spool, content, { mode: 0o600 });
+  const result = importSpool(dir);
+  expect(result.imported).toBe(1);
+  expect(readRecords(dir)).toHaveLength(1);
+  // The file is neither deleted nor quarantined: the partial line is not consumed.
+  expect(readFileSync(spool, "utf8")).toBe(content);
+  expect(existsSync(join(spoolDirectory(dir), "quarantine"))).toBe(false);
+  // Once a later append completes the line, the record lands and the file retires.
+  appendFileSync(spool, `${JSON.stringify(record("req-tail-b")).slice(20)}\n`);
+  expect(importSpool(dir).imported).toBe(1);
+  expect(readRecords(dir)).toHaveLength(2);
+  expect(existsSync(spool)).toBe(false);
+});
+
+it("two concurrent importers with concurrent captures lose no record", async () => {
+  const dir = agentDir();
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  const seeded = 10;
+  writeFileSync(
+    spool,
+    Array.from(
+      { length: seeded },
+      (_, index) => `\n${JSON.stringify(record(`req-race-${index}`))}\n`,
+    ).join(""),
+    { mode: 0o600 },
+  );
+  const importer = () => {
+    const child = spawn(
+      "bun",
+      [
+        "-e",
+        `const { importSpool } = await import(${JSON.stringify(`${ROOT}src/ledger/import.js`)});
+for (let round = 0; round < 12; round++) { importSpool(${JSON.stringify(dir)}); await new Promise(r => setTimeout(r, 25)); }
+console.log(JSON.stringify({ done: true }));`,
+      ],
+      { cwd: ROOT, stdio: ["ignore", "pipe", "inherit"] },
+    );
+    return new Promise<void>((resolve, reject) =>
+      child.once("exit", (code) =>
+        code === 0 ? resolve() : reject(new Error(`importer exited ${code}`)),
+      ),
+    );
+  };
+  const captures = 20;
+  const both = Promise.all([importer(), importer()]);
+  for (let index = 0; index < captures; index++) {
+    capture(dir, record(`req-live-${index}`), "summary-native");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  await both;
+  // Drain: every spool file (a claim left behind, a replacement) imports and retires.
+  for (let round = 0; round < 10 && spoolFiles(dir).length; round++) importSpool(dir);
+  const ids = readRecords(dir).map((row) => row.requestId);
+  expect(ids).toHaveLength(seeded + captures);
+  expect(new Set(ids).size).toBe(seeded + captures);
+  expect(spoolFiles(dir)).toHaveLength(0);
+}, 30_000);
 
 /** A child that keeps the writer busy with short transactions and WAL checkpoints, the load the
  * plan's risk section calls out: checkpoints in the worker must not stall or drop capture. */
