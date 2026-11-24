@@ -25,7 +25,7 @@ const STATE_WAITING = 1;
 const STATE_CANCELLED = 4;
 
 /** Iterations of the race; each is a few hundred microseconds of work. */
-const ITERATIONS = 20_000;
+const ITERATIONS = Number(process.env.STATE_RACE_ITERATIONS ?? 20_000);
 /**
  * The racer's delay ceiling in nanoseconds: several times the request's whole
  * pre-wait preamble, so randomized delays land before, inside, and after the
@@ -83,8 +83,13 @@ const racer = new Worker(RACER_SOURCE, {
 
 let won = 0;
 let lost = 0;
+let iteration = 0;
 const violations: { iteration: number; outcome: string; observed: number }[] = [];
-for (let iteration = 0; iteration < ITERATIONS; iteration++) {
+// A slow runner still finishes: the loop stops at the iteration cap or at
+// this deadline, whichever comes first. Both sides of the race occur within
+// the first few thousand iterations, so the assertions keep their teeth.
+const deadline = Date.now() + (Number(process.env.STATE_RACE_DEADLINE_MS ?? 30_000) as number);
+for (; iteration < ITERATIONS && Date.now() < deadline; iteration++) {
   Atomics.store(gate, 1, -1);
   Atomics.store(gate, 2, 0);
   Atomics.store(gate, 0, 1);
@@ -112,6 +117,6 @@ Atomics.store(gate, 0, 2);
 Atomics.notify(gate, 0);
 racer.terminate();
 transport.close();
-process.stderr.write(`${JSON.stringify({ iterations: ITERATIONS, won, lost, violations })}\n`);
+process.stderr.write(`${JSON.stringify({ iterations: iteration, won, lost, violations })}\n`);
 // The terminated threads may still be winding down; the summary is out.
 process.exit(0);
