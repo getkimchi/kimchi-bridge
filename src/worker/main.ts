@@ -330,6 +330,7 @@ function main(): void {
       },
     };
     let nextRepository: string | undefined;
+    let observedChannels: Record<string, ObservedChannel> | undefined;
     let passError: unknown;
     try {
       const result = await runReconciliationPass(
@@ -361,12 +362,13 @@ function main(): void {
         },
       );
       nextRepository = result.nextRepository;
+      observedChannels = channelObservations(result);
     } catch (error) {
       passError = error;
     }
     transport.deadlineAt = 0;
     clearTimeout(deadline);
-    transport.send(buildDoneMessage(message, state, nextRepository, passError));
+    transport.send(buildDoneMessage(message, state, nextRepository, passError, observedChannels));
   };
 
   /** The done message for a pass whose budget ran out while it was queued. */
@@ -391,49 +393,101 @@ function main(): void {
     reporting: ["credentials", "endpoints", "consent"],
   };
 
+  /** A channel outcome the pass itself reported for its own result. */
+  interface ObservedChannel {
+    outcome: "ok" | "failed" | "canceled" | "skipped";
+    error?: unknown;
+  }
+
+  /** The pass result's per-channel outcomes, when the result carries them. */
+  function channelObservations(result: {
+    nextRepository?: string;
+  }): Record<string, ObservedChannel> | undefined {
+    const channels = (result as { channels?: unknown }).channels;
+    if (typeof channels !== "object" || channels === null) return undefined;
+    return channels as Record<string, ObservedChannel>;
+  }
+
+  /** Translates a channel outcome the pass reported into the wire shape. */
+  const channelResultFrom = (
+    observed: ObservedChannel,
+    errorText: (error: unknown) => string,
+  ): ChannelResult =>
+    observed.outcome === "ok"
+      ? { outcome: "ok" }
+      : observed.outcome === "skipped"
+        ? { outcome: "canceled" }
+        : observed.outcome === "canceled"
+          ? { outcome: "canceled" }
+          : {
+              outcome: "failed",
+              ...(observed.error === undefined ? {} : { error: errorText(observed.error) }),
+            };
+
   const buildDoneMessage = (
     message: PassMessage,
     state: ActivePass,
     nextRepository: string | undefined,
     passError: unknown,
+    observed?: Record<string, ObservedChannel>,
   ): DoneMessage => {
     const aborted = state.controller.signal.aborted;
     const canceled = aborted && state.reason !== "deadline";
-    const outcome = aborted
-      ? canceled
-        ? "canceled"
-        : "failed"
-      : passError !== undefined || state.hostFailures.size > 0 || state.pullRequestErrors.length > 0
-        ? "failed"
-        : "ok";
     const errorText = (error: unknown): string => transport.redact(describe(error));
     const channels: PassResult["channels"] = {};
-    for (const [name, requested] of Object.entries(message.channels) as [string, boolean][])
+    for (const [name, requested] of Object.entries(message.channels) as [string, boolean][]) {
       if (!requested) continue;
-      else if (canceled) channels[name as keyof PassResult["channels"]] = { outcome: "canceled" };
-      else if (aborted)
+      if (canceled) {
+        channels[name as keyof PassResult["channels"]] = { outcome: "canceled" };
+        continue;
+      }
+      if (aborted) {
         channels[name as keyof PassResult["channels"]] = {
           outcome: "failed",
           error: "the pass exceeded its deadline",
         };
-      else {
-        const kinds = CHANNEL_REQUESTS[name] ?? [];
-        if (state.hostFailures.size > 0 && kinds.some((kind) => state.hostFailures.has(kind))) {
-          channels[name as keyof PassResult["channels"]] = {
-            outcome: "failed",
-            error: "a host request failed",
-          };
-          continue;
-        }
-        if (name === "pullRequests" && state.pullRequestErrors.length > 0) {
-          channels[name as keyof PassResult["channels"]] = {
-            outcome: "failed",
-            error: errorText(state.pullRequestErrors[0]),
-          };
-          continue;
-        }
-        channels[name as keyof PassResult["channels"]] = { outcome: "ok" };
+        continue;
       }
+      // A channel outcome the pass itself reported wins over inference.
+      const reported = observed?.[name];
+      if (reported !== undefined) {
+        channels[name as keyof PassResult["channels"]] = channelResultFrom(reported, errorText);
+        continue;
+      }
+      // A failure that escaped the pass fails every requested channel: the
+      // pass never reached the point where a channel could report for itself.
+      if (passError !== undefined) {
+        channels[name as keyof PassResult["channels"]] = {
+          outcome: "failed",
+          error: errorText(passError),
+        };
+        continue;
+      }
+      const kinds = CHANNEL_REQUESTS[name] ?? [];
+      if (state.hostFailures.size > 0 && kinds.some((kind) => state.hostFailures.has(kind))) {
+        channels[name as keyof PassResult["channels"]] = {
+          outcome: "failed",
+          error: "a host request failed",
+        };
+        continue;
+      }
+      if (name === "pullRequests" && state.pullRequestErrors.length > 0) {
+        channels[name as keyof PassResult["channels"]] = {
+          outcome: "failed",
+          error: errorText(state.pullRequestErrors[0]),
+        };
+        continue;
+      }
+      channels[name as keyof PassResult["channels"]] = { outcome: "ok" };
+    }
+    const channelFailed = Object.values(channels).some((channel) => channel?.outcome === "failed");
+    const outcome = aborted
+      ? canceled
+        ? "canceled"
+        : "failed"
+      : passError !== undefined || channelFailed
+        ? "failed"
+        : "ok";
     return {
       type: "done",
       id: message.id,

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -615,6 +615,23 @@ test("a pass queued behind a blocked one is reported expired when its budget ran
   worker.end();
   expect(await worker.exited()).toBe(0);
 }, 20000);
+
+test("a pass that fails before any channel reports the channels as failed, not ok", async () => {
+  const dir = agentDir();
+  // A regular file where the work-attribution directory belongs: the pass
+  // fails at startup, before any channel runs.
+  writeFileSync(join(dir, "work-attribution"), "not a directory");
+  const worker = spawnWorker(dir);
+  await handshake(worker, dir);
+  worker.send({ type: "pass", id: 15, channels: { files: true }, deadlineMs: 30000, epoch: 1 });
+  const done = await answerRequestsUntilDone(worker, 15);
+  expect(done.result.outcome).toBe("failed");
+  expect(done.result.channels.files?.outcome).toBe("failed");
+  if (done.result.channels.files?.error)
+    expect(done.result.channels.files.error.length).toBeGreaterThan(0);
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+}, 15000);
 
 test("the pass deadline wakes a host request the parent stalls on", async () => {
   const dir = agentDir();
