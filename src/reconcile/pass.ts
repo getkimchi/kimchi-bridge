@@ -60,7 +60,11 @@ export interface PassInput {
   reporting?: { cwd: string; signal?: AbortSignal };
   /** Where the files channel left off last pass; the new position is returned. */
   nextRepository?: string;
-  /** Continuation repair progress, carried across passes (the supervisor's ContinuationProgress). */
+  /** Continuation repair progress, carried across passes (the supervisor's ContinuationProgress).
+   *
+   * The object is mutated in place, and a fresh one is created (and returned) when omitted, so a
+   * caller that threads PassResult.progress into the next pass keeps the incremental history,
+   * settled journals and receipt set exactly as Kimchi's live supervisor kept them on itself. */
   progress?: ContinuationProgress;
 }
 
@@ -77,6 +81,8 @@ export class ReconcileLeaseLostError extends Error {
 export interface PassResult {
   /** The repository the next files channel starts from. */
   nextRepository?: string;
+  /** The continuation progress the pass built on and mutated; thread it into the next pass's input. */
+  progress: ContinuationProgress;
   /** Every channel's outcome for this pass; disabled channels are recorded as "skipped". */
   channels: Record<ReconcileChannel, ReconcileChannelOutcome>;
 }
@@ -151,6 +157,9 @@ export function runReconciliationPass(
         ? { outcome: "canceled" }
         : { outcome: "failed", error: describeError(error) };
     let nextRepository = input.nextRepository;
+    // Materialized once per pass: mutated in place by the continuations channel, and returned so a
+    // caller that only keeps the result still carries the incremental history across passes.
+    const progress: ContinuationProgress = input.progress ?? {};
     if (input.files) {
       channels.files = { outcome: "ok" };
       try {
@@ -179,9 +188,14 @@ export function runReconciliationPass(
         }
       } catch (error) {
         if (leaseFailure) throw leaseFailure;
-        if (error === exhausted || signal.aborted) throw error;
-        channels.files = { outcome: "failed", error: describeError(error) };
-        debug("Could not discover repositories: %o", error);
+        // Kimchi's supervisor swallowed the pass budget and cancellation here and still ran the
+        // later channels (reconcile-supervisor.ts:151-153): an exhausted files channel ends only
+        // the files work, never the pull-request, cost, continuation or reporting work after it.
+        if (error === exhausted || signal.aborted) channels.files = { outcome: "canceled" };
+        else {
+          channels.files = { outcome: "failed", error: describeError(error) };
+          debug("Could not discover repositories: %o", error);
+        }
       }
     }
     // Network lookup has its own deadline. A slow local repository must not starve it,
@@ -228,7 +242,7 @@ export function runReconciliationPass(
       if (leaseFailure) throw leaseFailure;
       channels.continuations = { outcome: "ok" };
       try {
-        await reconcileWorkContinuations(agentDir, signal, assertLease, input.progress);
+        await reconcileWorkContinuations(agentDir, signal, assertLease, progress);
       } catch (error) {
         if (leaseFailure) throw leaseFailure;
         if (!signal.aborted) {
@@ -259,6 +273,6 @@ export function runReconciliationPass(
         channels.reporting = rejected(error, channelSignal);
       }
     }
-    return { nextRepository, channels };
+    return { nextRepository, channels, progress };
   });
 }
