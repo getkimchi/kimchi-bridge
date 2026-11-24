@@ -651,6 +651,25 @@ export function parsePolicyReply(value: unknown): Parsed<PolicyReply> {
   return accept({ resources });
 }
 
+/**
+ * The ungoverned default for a resource id the policy reply does not carry —
+ * Kimchi's isResourceEnabled fallback: a resource its definition table knows
+ * gets that definition's defaultEnabled, and an id nothing governs is
+ * enabled. The parent answers effective policy for the ids it is asked about,
+ * so the default only decides ids the reply omitted. The bridge's reconcile
+ * code queries "extensions.cost-per-pr", whose Kimchi definition defaults on.
+ */
+const RESOURCE_DEFAULTS: Record<string, boolean> = {
+  "extensions.cost-per-pr": true,
+};
+
+/** Whether a resource is enabled under the parent's policy reply. */
+export function resourceEnabledFromPolicy(reply: PolicyReply, resourceId: string): boolean {
+  const entry = reply.resources[resourceId];
+  if (entry !== undefined) return entry;
+  return RESOURCE_DEFAULTS[resourceId] ?? true;
+}
+
 export interface ConsentReply {
   consent: boolean;
 }

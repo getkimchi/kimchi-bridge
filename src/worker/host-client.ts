@@ -33,6 +33,7 @@ import {
   parsePolicyReply,
   parseConsentReply,
   redactTokens,
+  resourceEnabledFromPolicy,
   type HostRequestKind,
   type ParentMessage,
   type WorkerMessage,
@@ -405,9 +406,11 @@ export class StdioHostClient implements HostPorts {
         "policy",
         "invalid-reply",
       );
-    const resources = parsed.value.resources;
-    // Unknown resource ids fail closed: the parent answers for the ids it knows.
-    return { resourceEnabled: (resourceId: string) => resources[resourceId] === true };
+    // Unknown or unanswered ids fall back to Kimchi's ungoverned default:
+    // the parent answers effective policy for the ids it is asked about.
+    return {
+      resourceEnabled: (resourceId: string) => resourceEnabledFromPolicy(parsed.value, resourceId),
+    };
   }
 
   telemetryConsent(): boolean {

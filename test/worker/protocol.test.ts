@@ -10,6 +10,7 @@ import {
   parseWorkerLine,
   PROTOCOL_VERSION,
   redactTokens,
+  resourceEnabledFromPolicy,
   type DoneMessage,
   type HelloMessage,
   type PassMessage,
@@ -237,6 +238,35 @@ describe("reply payload validation", () => {
     expect(parseConsentReply({ consent: false }).ok).toBe(true);
     expect(parseConsentReply({ consent: "no" }).ok).toBe(false);
     expect(parseConsentReply({}).ok).toBe(false);
+  });
+
+  // Kimchi's isResourceEnabled semantics: the reply carries effective answers
+  // for the ids it governs; an id nothing governs defaults to enabled.
+  test("resource enablement matches Kimchi's isResourceEnabled fallback", () => {
+    // A known resource id the reply answers.
+    expect(
+      resourceEnabledFromPolicy(
+        { resources: { "extensions.cost-per-pr": false } },
+        "extensions.cost-per-pr",
+      ),
+    ).toBe(false);
+    expect(
+      resourceEnabledFromPolicy(
+        { resources: { "extensions.cost-per-pr": true } },
+        "extensions.cost-per-pr",
+      ),
+    ).toBe(true);
+    // An id the reply omits falls back to the definition default (on).
+    expect(resourceEnabledFromPolicy({ resources: {} }, "extensions.cost-per-pr")).toBe(true);
+    // An unknown id with no governing entry is enabled, as in Kimchi.
+    expect(resourceEnabledFromPolicy({ resources: {} }, "extensions.something-new")).toBe(true);
+    // An org-controlled entry for an unknown id still applies.
+    expect(
+      resourceEnabledFromPolicy(
+        { resources: { "extensions.something-new": false } },
+        "extensions.something-new",
+      ),
+    ).toBe(false);
   });
 });
 
