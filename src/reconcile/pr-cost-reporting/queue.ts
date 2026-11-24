@@ -519,7 +519,9 @@ async function update(
   // loss (a SIGSTOP, a stalled process) then refuses to rename its stale state over its
   // successor's instead of publishing it. No atomic fence exists for a file rename, so a
   // suspension between this check and the rename syscall itself remains a residual window.
-  const epoch = backendFor(agentDir).writerEpoch?.();
+  // The first epoch read happens inside the try: a backend that fails to open (a corrupted
+  // ledger.db) must still reach the finally below and release the queue lock it holds.
+  let epoch: number | undefined;
   const check = () => {
     if (compromised) throw compromised;
     assertCurrent();
@@ -531,10 +533,11 @@ async function update(
     // installed.
     assertLedgerWritable(agentDir);
     const backend = backendFor(agentDir);
-    if (backend.writerEpoch && backend.writerEpoch() !== epoch)
+    if (epoch !== undefined && backend.writerEpoch && backend.writerEpoch() !== epoch)
       throw new Error("PR reporting queue state was fenced by a newer lease holder");
   };
   try {
+    epoch = backendFor(agentDir).writerEpoch?.();
     const { state, text } = await loadReportingState(agentDir);
     const before = JSON.stringify(state);
     check();

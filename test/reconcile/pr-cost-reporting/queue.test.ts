@@ -1928,3 +1928,15 @@ describe("server limits", () => {
     expect(state.entries[key].heldAt).toBeUndefined();
   });
 });
+
+describe("queue lock lifecycle", () => {
+  it("releases the queue lock when the ledger backend fails to open", async () => {
+    // A ledger.db that cannot be opened (a directory in its place) fails the epoch read after
+    // the queue lock is taken; the release in the finally must still run, or the lock file
+    // outlives the failed update and blocks every later one.
+    await files.mkdir(join(directory, "pr-cost-reporting"), { recursive: true, mode: 0o700 });
+    await files.mkdir(join(directory, "pr-cost-reporting", "ledger.db"));
+    await expect(setReportingEnabled(directory, true)).rejects.toThrow();
+    expect(existsSync(join(directory, "pr-cost-reporting.lock"))).toBe(false);
+  });
+});
