@@ -16,9 +16,10 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { HostPorts } from "../reconcile/host.js";
-import { runReconciliationPass } from "../reconcile/pass.js";
+import { runReconciliationPass, type PassRun } from "../reconcile/pass.js";
 import { setDiagnosticsRedactor } from "../reconcile/work-attribution/diagnostics.js";
 import type { ContinuationProgress } from "../reconcile/work-attribution/links.js";
+import { passResultFromRun, type AbortCause } from "./pass-result.js";
 import {
   HostRequestError,
   StdioHostClient,
@@ -27,7 +28,6 @@ import {
 } from "./host-client.js";
 import {
   PROTOCOL_VERSION,
-  type ChannelResult,
   type DoneMessage,
   type HelloMessage,
   type ParentMessage,
@@ -56,9 +56,6 @@ function workerIdleExitMs(env: NodeJS.ProcessEnv = process.env): number {
 /** Parent death must end the worker well within 2 s of stdin EOF. */
 const PARENT_GONE_EXIT_MS = 1900;
 
-/** Why the pass in flight was aborted. */
-type AbortCause = "cancel" | "deadline" | "parent-gone";
-
 /** A pass message with the moment the worker received it; the budget runs from receipt. */
 interface QueuedPass {
   message: PassMessage;
@@ -72,9 +69,6 @@ interface ActivePass {
   /** The parent controls lease validity: cancel invalidates it for the pass. */
   leaseValid: boolean;
   reason?: AbortCause;
-  /** The request kinds whose RPCs failed during this pass. */
-  hostFailures: Set<string>;
-  pullRequestErrors: unknown[];
   /** Resolves when the pass has reported done. */
   done: Promise<void>;
 }
@@ -236,7 +230,7 @@ function main(): void {
   };
 
   /** The continuation repair state the supervisor used to hold in memory. */
-  const continuation: ContinuationProgress = {};
+  let continuation: ContinuationProgress = {};
 
   /** The done message for a pass that was canceled before it ever started. */
   const canceledDone = (message: PassMessage): DoneMessage => ({
@@ -271,8 +265,6 @@ function main(): void {
       id: message.id,
       controller: new AbortController(),
       leaseValid: true,
-      hostFailures: new Set<string>(),
-      pullRequestErrors: [],
       done,
     };
     active = state;
@@ -292,15 +284,35 @@ function main(): void {
   };
 
   /**
-   * Records a failed host request against the pass and cancels it when the
-   * failure was a cancel that arrived while the request was blocked.
+   * Wraps the host client's blocking reads so a request that died from the
+   * pass's own cancellation or deadline marks the pass state before the
+   * error is swallowed by a channel handler. No channel outcome is inferred
+   * here: the pass result alone decides what the wire reports.
    */
-  const noteHostFailure = (state: ActivePass, error: unknown): void => {
-    if (error instanceof HostRequestError) {
-      state.hostFailures.add(error.requestKind);
-      if (error.cause === "canceled") abortActive("cancel");
-      if (error.cause === "deadline") abortActive("deadline");
-    }
+  const guardHostReads = (base: StdioHostClient): HostPorts => {
+    const guarded = <T>(read: () => T): T => {
+      try {
+        return read();
+      } catch (error) {
+        if (error instanceof HostRequestError) {
+          if (error.cause === "canceled") abortActive("cancel");
+          if (error.cause === "deadline") abortActive("deadline");
+        }
+        throw error;
+      }
+    };
+    return {
+      agentDir: base.agentDir,
+      e2eSeam: (name: string) => base.e2eSeam(name),
+      now: () => base.now(),
+      metric: base.metric.bind(base),
+      fetch: base.fetch,
+      credentials: (cwd: string) => guarded(() => base.credentials(cwd)),
+      gitToken: (host: string) => guarded(() => base.gitToken(host)),
+      endpoints: (cwd: string) => guarded(() => base.endpoints(cwd)),
+      orgPolicy: () => guarded(() => base.orgPolicy()),
+      telemetryConsent: () => guarded(() => base.telemetryConsent()),
+    };
   };
 
   const runPass = async (
@@ -315,71 +327,13 @@ function main(): void {
     transport.deadlineAt = deadlineAt;
     const deadline = setTimeout(() => abortActive("deadline"), deadlineAt - Date.now());
     const base = host as StdioHostClient;
-    // Every host read is observed, so a failed request reaches the done
-    // message even where the pass swallows the channel error into its debug log.
-    const observingHost: HostPorts = {
-      agentDir: base.agentDir,
-      // Bound like metric below: an unbound method reads the decorator's
-      // fields, not the client's seams.
-      e2eSeam: (name: string) => base.e2eSeam(name),
-      now: base.now,
-      metric: base.metric.bind(base),
-      fetch: base.fetch,
-      credentials(cwd) {
-        try {
-          return base.credentials(cwd);
-        } catch (error) {
-          noteHostFailure(state, error);
-          throw error;
-        }
-      },
-      gitToken(host) {
-        try {
-          return base.gitToken(host);
-        } catch (error) {
-          noteHostFailure(state, error);
-          throw error;
-        }
-      },
-      endpoints(cwd) {
-        try {
-          return base.endpoints(cwd);
-        } catch (error) {
-          noteHostFailure(state, error);
-          throw error;
-        }
-      },
-      orgPolicy() {
-        try {
-          return base.orgPolicy();
-        } catch (error) {
-          noteHostFailure(state, error);
-          throw error;
-        }
-      },
-      telemetryConsent() {
-        try {
-          return base.telemetryConsent();
-        } catch (error) {
-          noteHostFailure(state, error);
-          throw error;
-        }
-      },
-    };
-    let nextRepository: string | undefined;
-    let observedChannels: Record<string, ObservedChannel> | undefined;
+    let run: PassRun | undefined;
     let passError: unknown;
     try {
-      const result = await runReconciliationPass(
+      run = await runReconciliationPass(
         {
           ...(message.channels.files ? { files: true } : {}),
-          ...(message.channels.pullRequests
-            ? {
-                pullRequests: {
-                  onError: (error) => state.pullRequestErrors.push(error),
-                },
-              }
-            : {}),
+          ...(message.channels.pullRequests ? { pullRequests: {} } : {}),
           ...(message.channels.costs ? { costs: true } : {}),
           ...(message.channels.reporting
             ? { reporting: { cwd: message.reportingCwd as string } }
@@ -389,7 +343,7 @@ function main(): void {
             : { nextRepository: message.nextRepository }),
           progress: continuation,
         },
-        observingHost,
+        guardHostReads(base),
         {
           signal: state.controller.signal,
           assertLease: () => {
@@ -398,14 +352,18 @@ function main(): void {
           },
         },
       );
-      nextRepository = result.nextRepository;
-      observedChannels = channelObservations(result);
+      // The pass built on this progress object and mutated it in place; the
+      // returned one is what the next pass threads in, exactly as Kimchi's
+      // supervisor kept ContinuationProgress on itself between scans.
+      continuation = run.progress;
     } catch (error) {
       passError = error;
     }
     transport.deadlineAt = 0;
     clearTimeout(deadline);
-    transport.send(buildDoneMessage(message, state, nextRepository, passError, observedChannels));
+    transport.send(
+      buildDoneMessage(message, state, run, passError, (text) => transport.redact(text)),
+    );
   };
 
   /** The done message for a pass whose budget ran out while it was queued. */
@@ -422,120 +380,23 @@ function main(): void {
     },
   });
 
-  /** Which request kinds a channel's code can ask the parent for. */
-  const CHANNEL_REQUESTS: Record<string, string[]> = {
-    files: [],
-    pullRequests: [],
-    costs: ["credentials", "endpoints"],
-    reporting: ["credentials", "endpoints", "consent"],
-  };
-
-  /** A channel outcome the pass itself reported for its own result. */
-  interface ObservedChannel {
-    outcome: "ok" | "failed" | "canceled" | "skipped";
-    error?: unknown;
-  }
-
-  /** The pass result's per-channel outcomes, when the result carries them. */
-  function channelObservations(result: {
-    nextRepository?: string;
-  }): Record<string, ObservedChannel> | undefined {
-    const channels = (result as { channels?: unknown }).channels;
-    if (typeof channels !== "object" || channels === null) return undefined;
-    return channels as Record<string, ObservedChannel>;
-  }
-
-  /** Translates a channel outcome the pass reported into the wire shape. */
-  const channelResultFrom = (
-    observed: ObservedChannel,
-    errorText: (error: unknown) => string,
-  ): ChannelResult =>
-    observed.outcome === "ok"
-      ? { outcome: "ok" }
-      : observed.outcome === "skipped"
-        ? { outcome: "canceled" }
-        : observed.outcome === "canceled"
-          ? { outcome: "canceled" }
-          : {
-              outcome: "failed",
-              ...(observed.error === undefined ? {} : { error: errorText(observed.error) }),
-            };
-
   const buildDoneMessage = (
     message: PassMessage,
     state: ActivePass,
-    nextRepository: string | undefined,
+    run: PassRun | undefined,
     passError: unknown,
-    observed?: Record<string, ObservedChannel>,
-  ): DoneMessage => {
-    const aborted = state.controller.signal.aborted;
-    const canceled = aborted && state.reason !== "deadline";
-    const errorText = (error: unknown): string => transport.redact(describe(error));
-    const channels: PassResult["channels"] = {};
-    for (const [name, requested] of Object.entries(message.channels) as [string, boolean][]) {
-      if (!requested) continue;
-      if (canceled) {
-        channels[name as keyof PassResult["channels"]] = { outcome: "canceled" };
-        continue;
-      }
-      if (aborted) {
-        channels[name as keyof PassResult["channels"]] = {
-          outcome: "failed",
-          error: "the pass exceeded its deadline",
-        };
-        continue;
-      }
-      // A channel outcome the pass itself reported wins over inference.
-      const reported = observed?.[name];
-      if (reported !== undefined) {
-        channels[name as keyof PassResult["channels"]] = channelResultFrom(reported, errorText);
-        continue;
-      }
-      // A failure that escaped the pass fails every requested channel: the
-      // pass never reached the point where a channel could report for itself.
-      if (passError !== undefined) {
-        channels[name as keyof PassResult["channels"]] = {
-          outcome: "failed",
-          error: errorText(passError),
-        };
-        continue;
-      }
-      const kinds = CHANNEL_REQUESTS[name] ?? [];
-      if (state.hostFailures.size > 0 && kinds.some((kind) => state.hostFailures.has(kind))) {
-        channels[name as keyof PassResult["channels"]] = {
-          outcome: "failed",
-          error: "a host request failed",
-        };
-        continue;
-      }
-      if (name === "pullRequests" && state.pullRequestErrors.length > 0) {
-        channels[name as keyof PassResult["channels"]] = {
-          outcome: "failed",
-          error: errorText(state.pullRequestErrors[0]),
-        };
-        continue;
-      }
-      channels[name as keyof PassResult["channels"]] = { outcome: "ok" };
-    }
-    const channelFailed = Object.values(channels).some((channel) => channel?.outcome === "failed");
-    const outcome = aborted
-      ? canceled
-        ? "canceled"
-        : "failed"
-      : passError !== undefined || channelFailed
-        ? "failed"
-        : "ok";
-    return {
-      type: "done",
-      id: message.id,
-      result: {
-        outcome,
-        channels,
-        ...(nextRepository === undefined ? {} : { nextRepository }),
-        // txDurations is filled by chunk B4's transaction budget.
-      },
-    };
-  };
+    redact: (text: string) => string,
+  ): DoneMessage => ({
+    type: "done",
+    id: message.id,
+    result: passResultFromRun(
+      message,
+      { aborted: state.controller.signal.aborted, reason: state.reason },
+      run,
+      passError,
+      redact,
+    ),
+  });
 
   const describe = (error: unknown): string =>
     error instanceof Error ? error.message : String(error);

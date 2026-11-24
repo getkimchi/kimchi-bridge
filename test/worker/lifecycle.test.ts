@@ -1,6 +1,14 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -1028,6 +1036,56 @@ test("the saved git host token is answered over the pipe and never reported", as
   for (const line of worker.lines()) expect(line.includes(SAVED)).toBe(false);
   expect(worker.stderrText().includes(SAVED)).toBe(false);
 }, 40000);
+
+test("the worker carries the pass's continuation progress into the next pass", async () => {
+  const dir = agentDir();
+  // A session journal with one valid request record: the first pass imports
+  // it, finds no receipts to repair and nothing to write, and settles the
+  // journals (the quiet fast path's progress).
+  mkdirSync(join(dir, "work-attribution"), { recursive: true });
+  const journal = join(dir, "work-attribution", "session.jsonl");
+  writeFileSync(
+    journal,
+    `${JSON.stringify({
+      version: 1,
+      type: "request",
+      workId: "55555555-5555-4555-8555-555555555555",
+      sessionId: "session",
+      requestId: "66666666-6666-4666-8666-666666666666",
+    })}\n`,
+  );
+  const worker = spawnWorker(dir);
+  await handshake(worker, dir);
+  worker.send({ type: "pass", id: 17, channels: { files: true }, deadlineMs: 30000, epoch: 1 });
+  const done1 = await drain(worker, 17);
+  expect(done1.result.outcome).toBe("ok");
+  expect(done1.result.channels.files?.outcome).toBe("ok");
+  // Real damage lands after the cursor: an unparsable line, not an
+  // in-progress append. A pass that rebuilds its history from scratch must
+  // refuse to treat the journal as complete; the quiet fast path — which only
+  // the progress carried from pass 1 can take — absorbs it.
+  appendFileSync(journal, "this line is not json\n");
+  worker.send({ type: "pass", id: 18, channels: { files: true }, deadlineMs: 30000, epoch: 1 });
+  const done2 = await drain(worker, 18);
+  expect(done2.result.outcome).toBe("ok");
+  expect(done2.result.channels.files?.outcome).toBe("ok");
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+  // The counterfactual, on the same on-disk state: a fresh worker with no
+  // carried progress does the full rebuild, and the strict history read
+  // reports the damage. Pass 2's ok above proves the progress was carried —
+  // the supervisor's ContinuationProgress, kept on the worker between passes.
+  const fresh = spawnWorker(dir);
+  await handshake(fresh, dir);
+  fresh.send({ type: "pass", id: 19, channels: { files: true }, deadlineMs: 30000, epoch: 1 });
+  const done3 = await drain(fresh, 19);
+  expect(done3.result.outcome).toBe("failed");
+  expect(done3.result.channels.files?.outcome).toBe("failed");
+  if (done3.result.channels.files?.error)
+    expect(done3.result.channels.files.error).toContain("invalid records");
+  fresh.end();
+  expect(await fresh.exited()).toBe(0);
+}, 20000);
 
 test("a pass that fails before any channel reports the channels as failed, not ok", async () => {
   const dir = agentDir();
