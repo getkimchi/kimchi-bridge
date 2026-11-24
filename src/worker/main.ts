@@ -40,6 +40,19 @@ declare const BRIDGE_BUILD: string | undefined;
 
 /** Idle exit: a worker nobody needs for 10 minutes shuts itself down. */
 export const IDLE_EXIT_MS = 10 * 60 * 1000;
+
+/**
+ * The idle lifetime, overridable through the environment (the tests use a
+ * short one); the parent that spawns the worker controls its environment.
+ */
+function workerIdleExitMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.KIMCHI_WORKER_IDLE_EXIT_MS;
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = Number(raw.trim());
+    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  }
+  return IDLE_EXIT_MS;
+}
 /** Parent death must end the worker well within 2 s of stdin EOF. */
 const PARENT_GONE_EXIT_MS = 1900;
 
@@ -174,7 +187,7 @@ function main(): void {
       // Ten minutes without a pass: nobody needs this worker any more.
       if (active) active.controller.abort();
       exit(0);
-    }, IDLE_EXIT_MS);
+    }, workerIdleExitMs());
   };
 
   const abortActive = (reason: AbortCause): void => {

@@ -62,6 +62,8 @@ const REPLIES: Record<HostRequestKind, unknown> = {
 
 interface WorkerHandle {
   send(message: unknown): void;
+  /** Writes raw bytes to the worker's stdin, framing tests included. */
+  sendRaw(text: string): void;
   next(): Promise<WorkerMessage>;
   end(): void;
   exited(): Promise<number>;
@@ -110,6 +112,10 @@ function spawnWorker(dir: string, extraEnv: Record<string, string> = {}): Worker
   const handle: WorkerHandle = {
     send(message) {
       proc.stdin.write(`${JSON.stringify(message)}\n`);
+      proc.stdin.flush();
+    },
+    sendRaw(text) {
+      proc.stdin.write(text);
       proc.stdin.flush();
     },
     async next() {
@@ -751,6 +757,179 @@ test("a parent that closes the worker's stdout read end gets a clean exit within
     child.kill();
   }
 }, 15000);
+
+test("a late reply after a request's timeout never satisfies a later request", async () => {
+  const dir = agentDir();
+  seedRecord(dir);
+  const worker = spawnWorker(dir);
+  await handshake(worker, dir);
+  // Pass 1: consent is granted, then the credentials request is never
+  // answered; the 10 s request timeout ends the pass.
+  worker.send({
+    type: "pass",
+    id: 50,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 60000,
+    epoch: 1,
+  });
+  let stalled: number | undefined;
+  for (;;) {
+    const message = await worker.next();
+    if (message.type !== "request") continue;
+    if (message.kind === "consent") {
+      worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
+      continue;
+    }
+    stalled = message.rid;
+    break;
+  }
+  expect(stalled).toBeDefined();
+  const done1 = await drain(worker, 50);
+  expect(done1.result.outcome).toBe("failed");
+  // Pass 2 asks again; the parent answers it, and only after seeing the new
+  // request does it deliver the stale reply belonging to pass 1's timed-out
+  // request — with a token pass 2 must never see as its answer.
+  worker.send({
+    type: "pass",
+    id: 51,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 60000,
+    epoch: 1,
+  });
+  let done2: DoneMessage | undefined;
+  for (;;) {
+    const message = await worker.next();
+    if (message.type === "done") {
+      done2 = message;
+      break;
+    }
+    if (message.type !== "request") continue;
+    if (message.kind === "credentials" && message.rid !== stalled) {
+      worker.send({
+        type: "reply",
+        rid: stalled as number,
+        result: {
+          token: "stale_token_never_an_answer_012345",
+          apiUrl: NO_NETWORK_API,
+        },
+      });
+      worker.send({ type: "reply", rid: message.rid, result: REPLIES.credentials });
+      continue;
+    }
+    worker.send({ type: "reply", rid: message.rid, result: REPLIES[message.kind] });
+  }
+  expect(done2.result.outcome).toBe("ok");
+  for (const line of worker.lines())
+    expect(line.includes("stale_token_never_an_answer_012345")).toBe(false);
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+}, 40000);
+
+test("several messages in one chunk and a line split across chunks both parse", async () => {
+  const dir = agentDir();
+  seedRecord(dir);
+  const worker = spawnWorker(dir);
+  // The whole handshake and the pass message arrive as one write; the second
+  // pass message is split mid-JSON across two writes.
+  const hello = JSON.stringify({ type: "hello", v: PROTOCOL_VERSION, build: BUILD, agentDir: dir });
+  const pass = JSON.stringify({
+    type: "pass",
+    id: 60,
+    channels: { files: true },
+    deadlineMs: 30000,
+    epoch: 1,
+  });
+  worker.sendRaw(`${hello}\n${pass}\n`);
+  const first = await worker.next();
+  expect(first.type).toBe("ready");
+  const split = JSON.stringify({
+    type: "pass",
+    id: 61,
+    channels: { files: true },
+    deadlineMs: 30000,
+    epoch: 1,
+  });
+  worker.sendRaw(split.slice(0, Math.floor(split.length / 2)));
+  await Bun.sleep(150);
+  worker.sendRaw(`${split.slice(Math.floor(split.length / 2))}\n`);
+  const done60 = await drain(worker, 60);
+  expect(done60.result.outcome).toBe("ok");
+  const done61 = await drain(worker, 61);
+  expect(done61.result.outcome).toBe("ok");
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+}, 15000);
+
+test("a reply larger than the pipe buffer fails the channel instead of truncating", async () => {
+  const dir = agentDir();
+  seedRecord(dir);
+  const worker = spawnWorker(dir);
+  await handshake(worker, dir);
+  worker.send({
+    type: "pass",
+    id: 70,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 60000,
+    epoch: 1,
+  });
+  // A well-formed credentials answer whose token alone dwarfs the 64 KiB
+  // shared reply slot: the worker must fail the channel, never use a cut.
+  // Consent is granted so the credentials request actually happens.
+  const huge = "x".repeat(70_000);
+  let done: DoneMessage | undefined;
+  for (;;) {
+    const message = await worker.next();
+    if (message.type === "request") {
+      const result =
+        message.kind === "credentials"
+          ? { token: huge, apiUrl: NO_NETWORK_API }
+          : message.kind === "consent"
+            ? { consent: true }
+            : REPLIES[message.kind];
+      worker.send({ type: "reply", rid: message.rid, result });
+      continue;
+    }
+    if (message.type === "done") {
+      done = message;
+      break;
+    }
+  }
+  expect(done.result.outcome).toBe("failed");
+  expect(done.result.channels.reporting?.outcome).toBe("failed");
+  // The oversized payload never leaked into the failure report either.
+  for (const line of worker.lines()) expect(line.includes("xxxxx")).toBe(false);
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+}, 20000);
+
+test("an idle worker exits after its idle lifetime, and a pass rearms it", async () => {
+  const dir = agentDir();
+  const worker = spawnWorker(dir, { KIMCHI_WORKER_IDLE_EXIT_MS: "1000" });
+  await handshake(worker, dir);
+  const handed = Date.now();
+  // One quick files-only pass: the idle window must restart from its end,
+  // not from the handshake.
+  worker.send({
+    type: "pass",
+    id: 80,
+    channels: { files: true },
+    deadlineMs: 30000,
+    epoch: 1,
+  });
+  const done = await answerRequestsUntilDone(worker, 80);
+  expect(done.result.outcome).toBe("ok");
+  const passedAt = Date.now();
+  // Half the idle window after the pass: still alive.
+  await Bun.sleep(500);
+  // The worker exits on its own once the rearmed window closes.
+  const code = await worker.exited();
+  expect(code).toBe(0);
+  expect(Date.now() - passedAt).toBeGreaterThanOrEqual(900);
+  expect(Date.now() - handed).toBeLessThan(15000);
+}, 20000);
 
 test("a pass that fails before any channel reports the channels as failed, not ok", async () => {
   const dir = agentDir();
