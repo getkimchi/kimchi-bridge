@@ -21,6 +21,7 @@ import {
   readRecords,
   spoolFilePath,
 } from "../../src/ledger/records.js";
+import { acquireWriterEpoch, openStore } from "../../src/ledger/store.js";
 import {
   PROTOCOL_VERSION,
   type DoneMessage,
@@ -873,6 +874,17 @@ test("a late reply after a request's timeout never satisfies a later request", a
 test("a delayed reply publication never fails the next host request", async () => {
   const dir = agentDir();
   seedRecord(dir);
+  // The fake parent grants the pass's fencing epoch like a real lease holder:
+  // it bumps meta.writer_epoch first (B4), so the worker's writes pass the
+  // fence while the delayed publications are probed. A granted epoch the
+  // ledger never received would fence every write instead.
+  const leaseStore = openStore(dir);
+  let epoch: number;
+  try {
+    epoch = acquireWriterEpoch(leaseStore);
+  } finally {
+    leaseStore.close();
+  }
   // The reader thread's test-only delay holds every checked reply between
   // its state/rid checks and its publication — the preemption window the
   // reviewer probed. A reply for a request that has since timed out must
@@ -888,7 +900,7 @@ test("a delayed reply publication never fails the next host request", async () =
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 100,
-    epoch: 1,
+    epoch,
   });
   // Pass 2 is queued while pass 1 is still in flight: its consent request
   // must already be waiting when the reader thread wakes to publish pass 1's
@@ -902,7 +914,7 @@ test("a delayed reply publication never fails the next host request", async () =
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch,
   });
   let answeredForPass1 = false;
   let done80: DoneMessage | undefined;
