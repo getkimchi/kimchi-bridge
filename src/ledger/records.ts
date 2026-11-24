@@ -19,11 +19,14 @@ import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
   BUSY_TIMEOUT_MS,
   CAPTURE_BUSY_TIMEOUT_MS,
+  currentLedgerWriteFence,
   ensureProjectionVersion,
   isBusyError,
+  LedgerFencedError,
   type LedgerStore,
   openStore,
   type TxDurations,
+  readWriterEpoch,
   resetTxDurations,
   txDurations,
 } from "./store.js";
@@ -110,9 +113,9 @@ export interface DeliveryAccountStatus {
 export interface RecordBackend {
   /** Runs `fn` atomically; no await may happen inside. */
   tx<T>(fn: () => T): T;
-  /** Fences this backend's write transactions to one writer epoch (the SQLite store's lease
-   * fencing); absent on backends without a contended cross-process store. */
-  fence?(epoch: number): void;
+  /** The persisted writer epoch of this backend's store, for the file-write fence check; absent
+   * on backends without a cross-process store (the in-memory double). */
+  writerEpoch?(): number;
   /** Measured write-transaction durations of this backend's connection, for the bounded-
    * transaction budget; absent on backends that do not measure (the in-memory double). */
   txDurations?(): TxDurations;
@@ -231,16 +234,21 @@ export function useBackendFactory(next: ((agentDir: string) => RecordBackend) | 
   factory = next ?? undefined;
 }
 
-/** Fences this process's cached ledger connection to one writer epoch, so every write transaction
- * the reconciliation passes issue through it aborts with LedgerFencedError once another holder
- * bumped the epoch. Returns false when the backend has no fenceable store (the in-memory double):
- * there is no cross-process writer to fence out. Session-side capture is never fenced — the
- * worker process's connection is the only one a pass fences. */
-export function fenceLedgerWrites(agentDir: string, epoch: number): boolean {
+/** The file-write guard of a fenced pass: outside a transaction, re-reads the persisted writer
+ * epoch and runs the fence's writable hook before a durable file step (a queue state rename, a
+ * spool retirement). Backends without a cross-process store (the in-memory double) have no
+ * epoch to read, so the check is inert there. The window between this check and the file write
+ * is not covered by the SQLite fence: a holder that bumps the epoch inside it can still see
+ * that one write land. */
+export function assertLedgerWritable(agentDir: string): void {
+  const fence = currentLedgerWriteFence();
+  if (!fence || fence.agentDir !== agentDir) return;
   const backend = backendFor(agentDir);
-  if (!backend.fence) return false;
-  backend.fence(epoch);
-  return true;
+  if (backend.writerEpoch) {
+    const held = backend.writerEpoch();
+    if (held !== fence.epoch) throw new LedgerFencedError(held, fence.epoch);
+  }
+  fence.assertWritable();
 }
 
 export function backendFor(agentDir: string): RecordBackend {
@@ -673,14 +681,16 @@ export function listWorks(agentDir: string): { workId: string; head: WorkHead }[
 }
 
 /** The reconciliation connection's transaction-duration histogram (bounded-transaction
- * reporting); undefined on backends that do not measure. */
+ * reporting); undefined on backends that do not measure, or before any backend opened. */
 export function ledgerTxDurations(agentDir: string): TxDurations | undefined {
-  return backendFor(agentDir).txDurations?.();
+  return backends.get(agentDir)?.txDurations?.();
 }
 
-/** Zeroes the agent directory's histogram, scoping the next report to one pass. */
+/** Zeroes the agent directory's histogram, scoping the next report to one pass; a directory
+ * with no open backend yet has nothing to reset — opening one is a write path the pass's fence
+ * must gate, so this never forces it. */
 export function resetLedgerTxDurations(agentDir: string): void {
-  backendFor(agentDir).resetTxDurations?.();
+  backends.get(agentDir)?.resetTxDurations?.();
 }
 
 /** Refolds every work marked dirty; startup recovery and projection-version bumps land here. */
@@ -976,9 +986,15 @@ export function outboxClaimsSql(entityPlaceholders: readonly string[], paged: bo
 function sqliteBackendFor(store: LedgerStore): RecordBackend {
   const db = store.db;
   if (ensureProjectionVersion(store)) {
-    db.query(
-      "INSERT OR IGNORE INTO work_dirty (work_id) SELECT DISTINCT work_id FROM work_records",
-    ).run();
+    // Backend construction is reached from inside a fenced pass's context in the worker, so
+    // this maintenance write rides the store's (fence-checked) transaction like every other.
+    store.tx(() =>
+      db
+        .query(
+          "INSERT OR IGNORE INTO work_dirty (work_id) SELECT DISTINCT work_id FROM work_records",
+        )
+        .run(),
+    );
   }
   const insertRecord = db.query(
     // Targeted duplicate-hash no-op: any other integrity error surfaces and rolls the capture transaction back.
@@ -1199,9 +1215,17 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
     ownCommits++;
     return result;
   };
+  /** Autocommit mutators a pass can reach (notes, diagnostics, cursors) run inside the store's
+   * transaction when none is open, so the write fence and the duration budget cover them too;
+   * inside an already-open transaction they run bare — that transaction was fenced at its
+   * start, and nested transactions are not possible. */
+  const runMutation = (run: () => unknown): void => {
+    if (db.inTransaction) run();
+    else store.tx(run);
+  };
   return {
     tx: runTx,
-    fence: (epoch: number) => store.fence(epoch),
+    writerEpoch: () => readWriterEpoch(db),
     txDurations: () => txDurations(store),
     resetTxDurations: () => resetTxDurations(store),
     tryCaptureTx: (commit: () => void): boolean => {
@@ -1365,25 +1389,27 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
     hasNote: (workId, name) => hasNote.get(workId, name) != null,
     getNote: (workId, name) => getNote.get(workId, name)?.body,
     readNotePage: (workId, after, limit) => notePage.all(workId, after, limit),
-    putNote: (workId, name, body) => putNote.run(workId, name, body, Date.now()),
+    putNote: (workId, name, body) => runMutation(() => putNote.run(workId, name, body, Date.now())),
     deleteNote: (workId, name) => {
-      deleteNote.run(workId, name);
+      runMutation(() => deleteNote.run(workId, name));
     },
-    diagnostic: (code) => bumpDiagnostic.run(code, Date.now()),
+    diagnostic: (code) => runMutation(() => bumpDiagnostic.run(code, Date.now())),
     dataVersion: () => (dataVersionStmt.get()?.data_version ?? 0) + ownCommits,
     getJournalCursor: (path) => getCursor.get(path) ?? undefined,
     putJournalCursor: (cursor) =>
-      putCursor.run(
-        cursor.path,
-        cursor.dev,
-        cursor.ino,
-        cursor.generation,
-        cursor.offset,
-        cursor.boundaryHash,
-        cursor.updatedAt,
+      runMutation(() =>
+        putCursor.run(
+          cursor.path,
+          cursor.dev,
+          cursor.ino,
+          cursor.generation,
+          cursor.offset,
+          cursor.boundaryHash,
+          cursor.updatedAt,
+        ),
       ),
     deleteJournalCursor: (path) => {
-      deleteCursor.run(path);
+      runMutation(() => deleteCursor.run(path));
     },
     listJournalCursors: () => allCursors.all(),
     close: () => store.close(),

@@ -10,7 +10,7 @@ import { isWorkId } from "../../ledger/work-id.js";
 import { hostPorts } from "../host-ports.js";
 import { isWorkAccount, type WorkAccount } from "../work-attribution/scope.js";
 import { object, SHA256_HEX } from "../work-attribution/summary.js";
-import { backendFor, diagnostic } from "../../ledger/records.js";
+import { assertLedgerWritable, backendFor, diagnostic } from "../../ledger/records.js";
 import { machineFingerprint } from "./machine.js";
 import {
   accountKey,
@@ -516,6 +516,12 @@ async function update(
   const check = () => {
     if (compromised) throw compromised;
     assertCurrent();
+    // The ledger's write fence covers this queue's file commits too, including the paths that
+    // arrive without their own assertion (an error note after a failed capture). The check runs
+    // while the queue lock is held, immediately before each durable rename. Residual window: a
+    // lease holder that bumps the ledger epoch after this check and before the rename completes
+    // is not covered by it — the lease assert and the worker's kill narrow it to milliseconds.
+    assertLedgerWritable(agentDir);
   };
   try {
     const { state, text } = await loadReportingState(agentDir);

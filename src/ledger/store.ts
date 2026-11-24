@@ -17,6 +17,7 @@
  * concurrent WAL upgrade of a fresh database.
  */
 import type * as Sqlite from "bun:sqlite";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { closeSync, mkdirSync, openSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -75,6 +76,55 @@ function bunSqlite(): typeof Sqlite {
     }
   }
   return sqlite;
+}
+
+/** A reconciliation pass's write fence. `epoch` is the writer epoch the lease holder granted
+ * the pass; every fenced write re-reads the persisted epoch inside its transaction and aborts
+ * whole on a mismatch. `assertWritable` is the injectable liveness hook the fence calls inside
+ * every fenced write transaction, right after the epoch check, and again on the pass's durable
+ * file-write paths (the reporting queue's state renames, spool retirement) where no SQLite
+ * transaction surrounds the write. Contract: it must be cheap, synchronous and side-effect
+ * free, and it throws to abort the fenced write. The epoch check alone cannot stop a stale
+ * writer whose lease was taken by an old release that never bumps `meta.writer_epoch`, so the
+ * worker (chunk B4b) wires this hook to its parent-heartbeat check: a worker whose parent died
+ * stops writing even when the epoch row cannot move. A no-op hook keeps epoch-only fencing. */
+export interface LedgerWriteFence {
+  /** The agent directory whose ledger this fence scopes. */
+  readonly agentDir: string;
+  /** The writer epoch this pass was granted by the lease holder. */
+  readonly epoch: number;
+  /** Throws to abort a fenced write; see the interface contract above. */
+  assertWritable(): void;
+}
+
+const writeFences = new AsyncLocalStorage<LedgerWriteFence>();
+
+/** Runs body with this agent directory's write fence installed for the current async context:
+ * every ledger write the body issues, directly or through anything it awaits, first re-checks
+ * the persisted writer epoch inside its transaction and calls the fence's writable hook. The
+ * fence is context-scoped, never connection-global: the same process's session capture runs
+ * outside the pass context and is never fenced. The lease holder must call this before the
+ * pass body runs; `acquireWriterEpoch` itself must run outside a fenced context of the same
+ * agent directory, or it would fence its own bump. */
+export function withLedgerWriteFence<T>(fence: LedgerWriteFence, body: () => T): T {
+  return writeFences.run(fence, body);
+}
+
+/** The write fence of the current async context, if any. */
+export function currentLedgerWriteFence(): LedgerWriteFence | undefined {
+  return writeFences.getStore();
+}
+
+/** Inside an open write transaction on this agent directory's database: re-reads the persisted
+ * epoch (only a new lease holder can have moved it, inside its own immediate transaction) and
+ * runs the writable hook. Inert without a fence, or when the fence scopes another agent
+ * directory's ledger. */
+function assertFencedWritable(db: Sqlite.Database, agentDir: string): void {
+  const fence = writeFences.getStore();
+  if (!fence || fence.agentDir !== agentDir) return;
+  const held = readWriterEpoch(db);
+  if (held !== fence.epoch) throw new LedgerFencedError(held, fence.epoch);
+  fence.assertWritable();
 }
 
 /** The ledger lives beside the legacy state.json queue, inheriting its directory's lock discipline. */
@@ -239,18 +289,23 @@ function txBucketOf(ms: number): number {
 }
 
 /** One additive-schema attempt on a live connection: a short busy timeout orders it against other
- * writers, and a busy result is reported (not thrown) so the caller can retry later. */
-function applyAdditiveSchema(ledger: Sqlite.Database): boolean {
+ * writers, and a busy result is reported (not thrown) so the caller can retry later. Reached from
+ * a fenced pass (a deferred heal on a cached connection), it carries the fence's checks inside
+ * the apply transaction. */
+function applyAdditiveSchema(ledger: Sqlite.Database, agentDir: string): boolean {
   ledger.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS / 20}`);
   try {
     ledger
       .transaction(() => {
+        assertFencedWritable(ledger, agentDir);
         ledger.exec(LEDGER_ADDITIVE_SCHEMA);
       })
       .immediate();
     return true;
   } catch (error) {
-    if (!isAdditiveBusy(error)) throw error;
+    // A fenced-out writer defers the optional apply exactly like a busy one: reads still work
+    // (the windowed read probes and drops the index hint) and a later context retries it.
+    if (!isAdditiveBusy(error) && !(error instanceof LedgerFencedError)) throw error;
     return false;
   } finally {
     ledger.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
@@ -312,6 +367,7 @@ export function openStore(agentDir: string): LedgerStore {
           .transaction(() => {
             // Re-read inside the immediate lock: a concurrent process may have finished creating (or written a
             // foreign version) between the outer read and this transaction.
+            assertFencedWritable(ledger, agentDir);
             const again =
               ledger.query<{ user_version: number }, []>("PRAGMA user_version").get()
                 ?.user_version ?? 0;
@@ -337,7 +393,7 @@ export function openStore(agentDir: string): LedgerStore {
         additiveDeferred: false,
         tryAdditiveSchema: () => {
           if (!store.additiveDeferred) return true;
-          store.additiveDeferred = !applyAdditiveSchema(ledger);
+          store.additiveDeferred = !applyAdditiveSchema(ledger, agentDir);
           return !store.additiveDeferred;
         },
         fence: (epoch: number) => {
@@ -355,6 +411,9 @@ export function openStore(agentDir: string): LedgerStore {
                   const held = row ? Number(row.value) : 0;
                   if (held !== fencedEpoch) throw new LedgerFencedError(held, fencedEpoch);
                 }
+                // The context-scoped pass fence carries the same check plus the writable hook,
+                // so a pass-scoped connection is fenced without touching the session's capture.
+                assertFencedWritable(ledger, agentDir);
                 return fn();
               })
               .immediate();
@@ -371,7 +430,7 @@ export function openStore(agentDir: string): LedgerStore {
         lastMs: 0,
         buckets: Array.from({ length: TX_DURATION_EDGES.length + 1 }, () => 0),
       });
-      if (!applyAdditiveSchema(ledger)) store.additiveDeferred = true;
+      if (!applyAdditiveSchema(ledger, agentDir)) store.additiveDeferred = true;
       // Required objects: backend construction reads transition_repositories unconditionally, so
       // this apply is never skipped on a busy writer — the busy error propagates to the open's
       // retry loop (which re-attempts whole) instead of handing out a backend whose schema it cannot
@@ -390,6 +449,7 @@ export function openStore(agentDir: string): LedgerStore {
           .transaction(() => {
             // Re-read inside the write lock: another process may have finished the
             // migration between the outer lock-free probe and this transaction.
+            assertFencedWritable(ledger, agentDir);
             const again = ledger
               .query<{ count: number }, []>(
                 "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'transition_repositories'",

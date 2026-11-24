@@ -1,17 +1,30 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "bun:test";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
-import { backendFor, capture, closeBackends, readRecords } from "../../src/ledger/records.js";
+import {
+  backendFor,
+  capture,
+  closeBackends,
+  diagnostic,
+  readRecords,
+  setNote,
+} from "../../src/ledger/records.js";
 import {
   acquireWriterEpoch,
   LedgerFencedError,
   openStore,
   readWriterEpoch,
+  withLedgerWriteFence,
 } from "../../src/ledger/store.js";
 import { runReconciliationPass } from "../../src/reconcile/pass.js";
+import { withHostPorts } from "../../src/reconcile/host-ports.js";
+import {
+  recordReportingError,
+  setReportingEnabled,
+} from "../../src/reconcile/pr-cost-reporting/queue.js";
 import type { HostPorts } from "../../src/reconcile/host.js";
 
 /**
@@ -228,5 +241,161 @@ it("a pass granted the live epoch imports; a stale epoch writes nothing", async 
     expect(readWriterEpoch(writer.db)).toBe(epoch + 1);
   } finally {
     writer.close();
+  }
+}, 30_000);
+
+it("an inline pass fenced out by a later handover does not fence the session's capture", async () => {
+  const dir = agentDir();
+  seedJournal(dir);
+  const writer = openStore(dir);
+  try {
+    const epoch = acquireWriterEpoch(writer);
+    const other = openStore(dir);
+    try {
+      acquireWriterEpoch(other);
+    } finally {
+      other.close();
+    }
+    await runReconciliationPass({ files: true, epoch }, passHost(dir), {
+      signal: new AbortController().signal,
+      assertLease: () => {},
+    });
+    // The stale pass wrote nothing...
+    expect(readRecords(dir)).toHaveLength(0);
+    // ...and the same process's session capture still commits after the handover: the pass's
+    // fence is scoped to the pass, never to the process's cached capture connection.
+    capture(dir, record("00000000-0000-4000-8000-000000000002", "req-2"), "summary-native");
+    expect(readRecords(dir)).toHaveLength(1);
+  } finally {
+    writer.close();
+  }
+}, 30_000);
+
+it("a fence whose writable hook throws writes nothing even when the epoch never moved", async () => {
+  const dir = agentDir();
+  seedJournal(dir);
+  const holder = openStore(dir);
+  try {
+    // An old release acquires the lease next without ever bumping the epoch, so the epoch check
+    // alone cannot stop this stale pass: only the fence's writable hook can (the parent-heartbeat
+    // check the worker wires to it).
+    const epoch = acquireWriterEpoch(holder);
+    // The hook aborts every fenced write: the pass fails its channel (loudly, so the worker can
+    // report and exit) or completes having written nothing — either way the ledger is untouched.
+    await runReconciliationPass(
+      {
+        files: true,
+        epoch,
+        assertWritable: () => {
+          throw new Error("parent heartbeat lost");
+        },
+      },
+      passHost(dir),
+      { signal: new AbortController().signal, assertLease: () => {} },
+    ).catch(() => {});
+    expect(readRecords(dir)).toHaveLength(0);
+  } finally {
+    holder.close();
+  }
+}, 30_000);
+
+it("a stale pass's notes, diagnostics and cursor bookkeeping write nothing", () => {
+  const dir = agentDir();
+  // Open the backend outside the fence, as the session process long since did.
+  expect(backendFor(dir).getNote("w", "note")).toBeUndefined();
+  const holder = openStore(dir);
+  try {
+    const epoch = acquireWriterEpoch(holder);
+    const other = openStore(dir);
+    try {
+      acquireWriterEpoch(other);
+    } finally {
+      other.close();
+    }
+    withLedgerWriteFence({ agentDir: dir, epoch, assertWritable: () => {} }, () => {
+      expect(() => setNote(dir, "w", "note", "body")).toThrow(LedgerFencedError);
+      expect(() => diagnostic(dir, "fence-probe")).toThrow(LedgerFencedError);
+    });
+    expect(backendFor(dir).getNote("w", "note")).toBeUndefined();
+    const probe = openStore(dir);
+    try {
+      expect(
+        probe.db.query("SELECT COUNT(*) AS n FROM diagnostics WHERE code = 'fence-probe'").get(),
+      ).toEqual({ n: 0 });
+    } finally {
+      probe.close();
+    }
+  } finally {
+    holder.close();
+  }
+});
+
+it("backend-open projection maintenance reached from a stale fenced pass writes nothing", () => {
+  const dir = agentDir();
+  const seeder = openStore(dir);
+  try {
+    // A stale projection version forces the next backend construction to clear and restamp it.
+    seeder.db.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('projectionVersion', '0')");
+    seeder.db.run(
+      "INSERT INTO work_projection_rows (work_id, log, key, pos, body) VALUES ('w', 'sessions', 'k', 1, '{}')",
+    );
+    seeder.close();
+  } catch (error) {
+    seeder.close();
+    throw error;
+  }
+  const holder = openStore(dir);
+  try {
+    const epoch = acquireWriterEpoch(holder);
+    const other = openStore(dir);
+    try {
+      acquireWriterEpoch(other);
+    } finally {
+      other.close();
+    }
+    withLedgerWriteFence({ agentDir: dir, epoch, assertWritable: () => {} }, () => {
+      expect(() => backendFor(dir)).toThrow(LedgerFencedError);
+    });
+    closeBackends();
+    const check = openStore(dir);
+    try {
+      expect(
+        check.db.query("SELECT value FROM meta WHERE key = 'projectionVersion'").get(),
+      ).toEqual({ value: "0" });
+      expect(check.db.query("SELECT COUNT(*) AS n FROM work_projection_rows").get()).toEqual({
+        n: 1,
+      });
+    } finally {
+      check.close();
+    }
+  } finally {
+    holder.close();
+  }
+});
+
+it("a stale pass's reporting-queue error note writes no queue state", async () => {
+  const dir = agentDir();
+  await withHostPorts(passHost(dir), () => setReportingEnabled(dir, true));
+  const statePath = join(dir, "pr-cost-reporting", "state.json");
+  const before = readFileSync(statePath, "utf8");
+  const holder = openStore(dir);
+  try {
+    const epoch = acquireWriterEpoch(holder);
+    const other = openStore(dir);
+    try {
+      acquireWriterEpoch(other);
+    } finally {
+      other.close();
+    }
+    await withHostPorts(passHost(dir), () =>
+      withLedgerWriteFence({ agentDir: dir, epoch, assertWritable: () => {} }, async () => {
+        await expect(recordReportingError(dir, "capture failed")).rejects.toThrow(
+          LedgerFencedError,
+        );
+      }),
+    );
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+  } finally {
+    holder.close();
   }
 }, 30_000);
