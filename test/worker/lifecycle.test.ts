@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
@@ -13,7 +14,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { backendFor, closeBackends } from "../../src/ledger/records.js";
+import {
+  backendFor,
+  capture,
+  closeBackends,
+  readRecords,
+  spoolFilePath,
+} from "../../src/ledger/records.js";
 import {
   PROTOCOL_VERSION,
   type DoneMessage,
@@ -33,6 +40,7 @@ import {
 
 const ROOT = join(import.meta.dir, "../..");
 const WORKER = join(ROOT, "src/worker/main.ts");
+const LEDGER_DRIVER = join(ROOT, "test/ledger/ledger-driver.ts");
 /** The dev build falls back to the checkout's commit; the bundle embeds its own. */
 const BUILD = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT }).toString().trim();
 const FAKE_TOKEN = "kchi_lifecycle_fake_token_0123456789";
@@ -1216,3 +1224,61 @@ test("the pass deadline wakes a host request the parent stalls on", async () => 
   worker.end();
   expect(await worker.exited()).toBe(0);
 }, 20000);
+
+test("capture under a 6 s writer spools, and the next worker pass imports it exactly once", async () => {
+  const dir = agentDir();
+  const workId = "22222222-2222-4222-8222-222222222222";
+  const rec = {
+    version: 1,
+    type: "request",
+    workId,
+    sessionId: "session",
+    requestId: "33333333-3333-4333-8333-333333333333",
+    scope: null,
+    recordedAt: "2026-10-01T00:00:00.000Z",
+  };
+  // The session process (this test) opened its backend before the contention began.
+  expect(readRecords(dir)).toHaveLength(0);
+  // A 6 s writer held in another process: capture must park the record in the spool and
+  // return, never block the session out past the busy window.
+  const holder = spawn(process.execPath, [LEDGER_DRIVER, "hold-writer", dir, "6000"], {
+    cwd: ROOT,
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  try {
+    const held = await (async () => {
+      const lines = createInterface({ input: holder.stdout! });
+      const messages = lines[Symbol.asyncIterator]();
+      const first = await messages.next();
+      return !first.done && (JSON.parse(first.value) as { held?: boolean }).held === true;
+    })();
+    expect(held).toBe(true);
+    const start = Date.now();
+    capture(dir, rec as never, "summary-native");
+    expect(Date.now() - start).toBeLessThan(260);
+    expect(existsSync(spoolFilePath(dir, "session"))).toBe(true);
+    expect(readRecords(dir)).toHaveLength(0);
+  } finally {
+    await new Promise((resolve) => holder.once("exit", resolve));
+  }
+
+  // The next pass through the real worker imports the spooled record exactly once, and the
+  // spool retires; a second pass and a re-capture of the same line change nothing.
+  const worker = spawnWorker(dir);
+  try {
+    await handshake(worker, dir);
+    worker.send({ type: "pass", id: 41, channels: { files: true }, deadlineMs: 30000, epoch: 0 });
+    const done = await answerRequestsUntilDone(worker, 41);
+    expect(done.result.outcome).toBe("ok");
+    expect(done.result.channels.files?.outcome).toBe("ok");
+    expect(readRecords(dir)).toHaveLength(1);
+    expect(existsSync(spoolFilePath(dir, "session"))).toBe(false);
+    worker.send({ type: "pass", id: 42, channels: { files: true }, deadlineMs: 30000, epoch: 0 });
+    expect((await answerRequestsUntilDone(worker, 42)).result.outcome).toBe("ok");
+    capture(dir, rec as never, "summary-native");
+    expect(readRecords(dir)).toHaveLength(1);
+  } finally {
+    worker.kill();
+    await worker.exited();
+  }
+}, 30000);
