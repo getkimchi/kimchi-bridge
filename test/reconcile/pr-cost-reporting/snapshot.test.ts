@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import type { WorkPullRequest } from "../pull-request-status/pull-requests.js"
-import { calculatePullRequestCosts } from "../work-attribution/costs.js"
-import type { WorkRecord } from "../work-attribution/summary.js"
+import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { fakeClock } from "../clock.js"
+import type { WorkPullRequest } from "../../../src/reconcile/pull-request-status/pull-requests.js"
+import { calculatePullRequestCosts } from "../../../src/reconcile/work-attribution/costs.js"
+import type { WorkRecord } from "../../../src/reconcile/work-attribution/summary.js"
 import {
 	accountKey,
 	allocationFor,
@@ -16,7 +17,7 @@ import {
 	validateSnapshot,
 	type WireSnapshot,
 	wireBytes,
-} from "./snapshot.js"
+} from "../../../src/reconcile/pr-cost-reporting/snapshot.js"
 
 const account = {
 	apiUrl: "https://api.example",
@@ -26,11 +27,16 @@ const account = {
 const requestId = "33333333-3333-4333-8333-333333333333"
 const billingId = "44444444-4444-4444-8444-444444444444"
 const at = "2026-10-04T12:00:00.000Z"
+let restoreClock = fakeClock("2026-10-07T12:00:00Z")
 beforeEach(() => {
-	vi.useFakeTimers({ toFake: ["Date"] })
-	vi.setSystemTime(new Date("2026-10-07T12:00:00Z"))
+	restoreClock()
+	restoreClock = fakeClock("2026-10-07T12:00:00Z")
 })
-afterEach(() => vi.useRealTimers())
+afterEach(() => restoreClock())
+function setSystemTime(at: string): void {
+	restoreClock()
+	restoreClock = fakeClock(at)
+}
 const pull = (number = 1, repository = "example/repo", repositoryId = "42"): WorkPullRequest => ({
 	provider: "github",
 	id: String(100 + number),
@@ -261,7 +267,7 @@ describe("allowlisted repository snapshots", () => {
 		"closed",
 	] as const)("keeps a %s PR when the client clock is three hours ahead of its 32-day cutoff", (state) => {
 		const finished = "2026-09-05T12:00:00Z"
-		vi.setSystemTime(new Date("2026-10-07T15:00:00Z"))
+		setSystemTime("2026-10-07T15:00:00Z")
 		const pr = {
 			...pull(),
 			state,
@@ -733,7 +739,7 @@ describe("local and reported confidence", () => {
 				...result.snapshots[0].content,
 			}),
 		).not.toThrow()
-		vi.setSystemTime(new Date("2026-11-26T12:00:00.000Z"))
+		setSystemTime("2026-11-26T12:00:00.000Z")
 		expect(build(rows).snapshots[0].content.requests).toEqual([])
 	})
 	it.each([
