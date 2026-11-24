@@ -2,6 +2,9 @@ import { expect, test } from "bun:test";
 import * as reconcile from "../../src/reconcile/index.js";
 import type {
   BillingSource,
+  PassInput,
+  PassResult,
+  PassRun,
   FileState,
   FileTransition,
   LimitNotices,
@@ -34,6 +37,9 @@ const types:
       FileState,
       FileTransition,
       LimitNotices,
+      PassInput,
+      PassResult,
+      PassRun,
       PendingRepository,
       Repository,
       ReportingRepository,

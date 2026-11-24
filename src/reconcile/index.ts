@@ -18,6 +18,7 @@ export {
   runReconciliationPass,
   type PassInput,
   type PassResult,
+  type PassRun,
   type ReconcileChannel,
   type ReconcileChannelOutcome,
 } from "./pass.js";

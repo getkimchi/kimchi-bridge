@@ -63,7 +63,7 @@ export interface PassInput {
   /** Continuation repair progress, carried across passes (the supervisor's ContinuationProgress).
    *
    * The object is mutated in place, and a fresh one is created (and returned) when omitted, so a
-   * caller that threads PassResult.progress into the next pass keeps the incremental history,
+   * caller that threads PassRun.progress into the next pass keeps the incremental history,
    * settled journals and receipt set exactly as Kimchi's live supervisor kept them on itself. */
   progress?: ContinuationProgress;
 }
@@ -81,10 +81,17 @@ export class ReconcileLeaseLostError extends Error {
 export interface PassResult {
   /** The repository the next files channel starts from. */
   nextRepository?: string;
-  /** The continuation progress the pass built on and mutated; thread it into the next pass's input. */
-  progress: ContinuationProgress;
   /** Every channel's outcome for this pass; disabled channels are recorded as "skipped". */
   channels: Record<ReconcileChannel, ReconcileChannelOutcome>;
+}
+
+/** The in-memory return of one pass: the JSON protocol result above plus the continuation
+ * progress the caller threads into the next pass's input. The progress object carries Sets and
+ * Maps that JSON.stringify empties, so it stays in the calling process and never crosses the
+ * B3 wire; a worker sends only the PassResult half of this object. */
+export interface PassRun extends PassResult {
+  /** The continuation progress the pass built on and mutated; thread it into the next pass's input. */
+  progress: ContinuationProgress;
 }
 
 /**
@@ -96,7 +103,7 @@ export function runReconciliationPass(
   input: PassInput,
   host: HostPorts,
   io: { signal: AbortSignal; assertLease: () => void },
-): Promise<PassResult> {
+): Promise<PassRun> {
   return withHostPorts(host, async () => {
     const agentDir = host.agentDir;
     let leaseFailure: ReconcileLeaseLostError | undefined;
@@ -191,7 +198,10 @@ export function runReconciliationPass(
         // Kimchi's supervisor swallowed the pass budget and cancellation here and still ran the
         // later channels (reconcile-supervisor.ts:151-153): an exhausted files channel ends only
         // the files work, never the pull-request, cost, continuation or reporting work after it.
-        if (error === exhausted || signal.aborted) channels.files = { outcome: "canceled" };
+        // Cancellation stays reserved for an aborted signal; an unaborted budget stop is a
+        // failure carrying the exhaustion message, so the outcome tells a requested stop from a
+        // starving channel apart.
+        if (signal.aborted) channels.files = { outcome: "canceled" };
         else {
           channels.files = { outcome: "failed", error: describeError(error) };
           debug("Could not discover repositories: %o", error);

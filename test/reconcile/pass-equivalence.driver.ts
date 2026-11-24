@@ -21,7 +21,7 @@ import { ledgerDbPath } from "../../src/ledger/store.js";
 import { closeBackends, setNote } from "../../src/ledger/records.js";
 import type { HostMetric, HostPorts } from "../../src/reconcile/host.js";
 import { hostPorts, setDefaultHostPorts, withHostPorts } from "../../src/reconcile/host-ports.js";
-import { runReconciliationPass, type PassResult } from "../../src/reconcile/pass.js";
+import { runReconciliationPass, type PassRun } from "../../src/reconcile/pass.js";
 import { debugWorkAttribution as debug } from "../../src/reconcile/work-attribution/diagnostics.js";
 import {
   digest,
@@ -834,13 +834,13 @@ function oracleOwner(lane: Lane): Supervisor {
 
 // --- The pass lane: the B3 worker harness around runReconciliationPass ----------------------
 
-/** What the worker keeps between passes; exactly what PassResult hands back. */
+/** What the worker keeps between passes; exactly what the pass run hands back. */
 interface WorkerState {
   nextRepository?: string;
   progress?: ContinuationProgress;
 }
 
-async function workerPass(lane: Lane, state: WorkerState): Promise<PassResult> {
+async function workerPass(lane: Lane, state: WorkerState): Promise<PassRun> {
   const controller = new AbortController();
   const leaseLost = new AbortController();
   let compromised: Error | undefined;
@@ -1078,8 +1078,8 @@ async function main(): Promise<void> {
   let nextRepository: string | undefined;
   let progressRetained = false;
   let settledJournals = false;
-  let workerFirst: PassResult | undefined;
-  let workerSecond: PassResult | undefined;
+  let workerFirst: PassRun | undefined;
+  let workerSecond: PassRun | undefined;
   if (mode === "oracle") {
     const owner = oracleOwner(lane);
     await withHostPorts(lane.host, () =>

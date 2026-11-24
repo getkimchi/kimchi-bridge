@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { backendFor } from "../../src/ledger/records.js";
 import type { HostMetric, HostPorts } from "../../src/reconcile/host.js";
 import { hostPorts, setDefaultHostPorts, withHostPorts } from "../../src/reconcile/host-ports.js";
@@ -16,7 +16,12 @@ import {
   repositoryIdentity,
 } from "../../src/reconcile/pull-request-status/provider-api.js";
 import golden from "../ledger/protocol-golden.json";
-import { ReconcileLeaseLostError, runReconciliationPass } from "../../src/reconcile/pass.js";
+import {
+  ReconcileLeaseLostError,
+  runReconciliationPass,
+  type PassResult,
+  type PassRun,
+} from "../../src/reconcile/pass.js";
 
 /**
  * Contract test for the HostPorts seam: a fake host counts every call, and the
@@ -577,4 +582,82 @@ test("git provider tokens resolve through the host port at both discovery call s
   );
   expect(resolved.token).toBe("glpat-saved");
   expect(resolved.host).toBe("git.example");
+});
+
+test("an expired files budget reports failed, an aborted signal reports canceled", async () => {
+  const dir = agentDir();
+  // One transition journal makes the files channel discover a repository, so its budget
+  // check runs; the repository directory exists but is not a Git worktree.
+  const repository = join(dir, "repo");
+  mkdirSync(repository);
+  mkdirSync(join(dir, "work-attribution", "transitions"), { recursive: true });
+  writeFileSync(
+    join(dir, "work-attribution", "transitions", "seed.jsonl"),
+    `${JSON.stringify({
+      version: 1,
+      type: "file_transition",
+      workId: "11111111-1111-4111-8111-111111111111",
+      transitionId: "22222222-2222-4222-8222-222222222222",
+      toolCallId: "write-file",
+      sessionId: "session",
+      cwd: "/project",
+      repository,
+      worktree: repository,
+      path: "file.txt",
+      baseline: null,
+      before: null,
+      after: { blob: "b".repeat(40), mode: "100644" },
+      baselineFile: null,
+      cursor: { bytes: 1, digest: "d".repeat(64) },
+    })}\n`,
+  );
+  // The pass sets its deadline from the first clock read; every later read is past the 3 s
+  // budget, and the pass signal is never aborted, so the stop is a failure carrying the
+  // exhaustion message — while the channels after the files channel still run.
+  let reads = 0;
+  const clock = spyOn(Date, "now").mockImplementation(() => (reads++ === 0 ? 0 : 3001));
+  try {
+    const fake = fakeHost(dir);
+    const result = await runReconciliationPass(
+      { files: true, costs: true, reporting: { cwd: "/project" } },
+      fake.host,
+      { signal: new AbortController().signal, assertLease: () => {} },
+    );
+    expect(result.channels.files).toEqual({
+      outcome: "failed",
+      error: "Work attribution reconciliation time limit exceeded",
+    });
+    expect(result.channels.costs).toEqual({ outcome: "ok" });
+    expect(result.channels.reporting).toEqual({ outcome: "ok" });
+  } finally {
+    clock.mockRestore();
+  }
+  // A pass whose signal was aborted is what cancellation means: the same stop reports canceled.
+  const aborted = new AbortController();
+  aborted.abort();
+  const fake = fakeHost(dir);
+  const cancelled = await runReconciliationPass(
+    { files: true, costs: true, reporting: { cwd: "/project" } },
+    fake.host,
+    { signal: aborted.signal, assertLease: () => {} },
+  );
+  expect(cancelled.channels.files).toEqual({ outcome: "canceled" });
+});
+
+test("the pass return splits into a JSON protocol result and in-worker progress", async () => {
+  const dir = agentDir();
+  const fake = fakeHost(dir);
+  const run: PassRun = await runReconciliationPass({ costs: true }, fake.host, {
+    signal: new AbortController().signal,
+    assertLease: () => {},
+  });
+  // A worker sends only the protocol half of the run over the B3 wire (done.result).
+  const { progress, ...result } = run;
+  const wire: PassResult = result;
+  expect(JSON.parse(JSON.stringify(wire))).toEqual(wire);
+  // The progress half stays in worker state: its Sets and Maps do not survive JSON.
+  progress.done = new Set(["receipt"]);
+  progress.historyReceipts = new Set(["record"]);
+  expect(JSON.parse(JSON.stringify(progress)).done).toEqual({});
+  expect(JSON.parse(JSON.stringify(progress)).historyReceipts).toEqual({});
 });

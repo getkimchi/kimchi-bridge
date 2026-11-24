@@ -51,8 +51,8 @@ interface DriverResult {
     receipts: { method: string; url: string; body: string | null }[];
   };
   worker?: {
-    first?: { channels?: Record<string, { outcome: string }> };
-    second?: { channels?: Record<string, { outcome: string }> };
+    first?: { channels?: Record<string, { outcome: string; error?: string }> };
+    second?: { channels?: Record<string, { outcome: string; error?: string }> };
   };
   state: {
     nextRepository?: string;
@@ -164,8 +164,8 @@ describe("runReconciliationPass matches the supervisor's scan()", () => {
 
       // The pass lane's channels all completed, except the first pass's files channel: its
       // 3 s budget expired mid-rotation (the driver steps the clock past it), which the pass
-      // records as "canceled" — the supervisor silently swallowed the same exhaustion — and
-      // still runs the later channels.
+      // records as a failed files channel with the exhaustion message — the supervisor
+      // silently swallowed the same exhaustion — and still runs the later channels.
       const ok = {
         files: { outcome: "ok" },
         "pull-requests": { outcome: "ok" },
@@ -173,7 +173,10 @@ describe("runReconciliationPass matches the supervisor's scan()", () => {
         continuations: { outcome: "ok" },
         reporting: { outcome: "ok" },
       };
-      expect(pass.worker?.first?.channels).toEqual({ ...ok, files: { outcome: "canceled" } });
+      expect(pass.worker?.first?.channels).toEqual({
+        ...ok,
+        files: { outcome: "failed", error: "Work attribution reconciliation time limit exceeded" },
+      });
       expect(pass.worker?.second?.channels).toEqual(ok);
 
       // Cross-pass state agrees: the rotation and the retained continuation progress.
