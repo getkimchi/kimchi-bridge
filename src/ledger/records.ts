@@ -424,6 +424,10 @@ function appendSpoolRecord(path: string, line: string): boolean {
   // fsync; an append to an existing file leaves the directory unchanged and syncs only the
   // file, so sustained contention does not pay a blocking directory flush per capture.
   let created = false;
+  /** The directory entry the exclusive attempt's EEXIST saw, if any: its inode decides
+   *  whether the fallback open below appends to that same entry or lands on a fresh one. */
+  let existedIno: number | undefined;
+  let sawEntry = false;
   try {
     fd = openSync(
       path,
@@ -433,14 +437,38 @@ function appendSpoolRecord(path: string, line: string): boolean {
     created = true;
   } catch (error) {
     if (!object(error) || error.code !== "EEXIST") return false;
+    // The entry the EEXIST observed: an importer can retire it (rename to a claim, then
+    // unlink) before the opens below, or another creator can replace it, so the inode is
+    // remembered rather than the mere fact that the name existed — whatever the fallback
+    // lands on is compared against it. A missing entry here (already retired) leaves the
+    // fallback's creation undeniably fresh.
+    try {
+      sawEntry = true;
+      existedIno = lstatSync(path).ino;
+    } catch {
+      // Retired between the EEXIST and here: the exclusive retry below creates fresh.
+    }
+    // Retry the exclusive create: a retirement since the first EEXIST makes it succeed, so a
+    // replacement entry this append itself creates is detected by the same contract as the
+    // primary path instead of being opened as if it pre-existed.
     try {
       fd = openSync(
         path,
-        constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | O_NOFOLLOW,
+        constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW,
         0o600,
       );
-    } catch {
-      return false;
+      created = true;
+    } catch (again) {
+      if (!object(again) || again.code !== "EEXIST") return false;
+      try {
+        fd = openSync(
+          path,
+          constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | O_NOFOLLOW,
+          0o600,
+        );
+      } catch {
+        return false;
+      }
     }
   }
   try {
@@ -457,11 +485,13 @@ function appendSpoolRecord(path: string, line: string): boolean {
     // The append is durable. The directory entries a created file (or directory chain) added
     // need their directories' fsync too, or a kernel crash can lose the path the next import
     // scans — an append to an existing entry syncs nothing but the file itself. Creation is
-    // decided by the exclusive-create attempt above, never inferred from a pre-open
-    // existsSync (a retirement or replacement between the check and the open would hide a
-    // fresh directory entry). Windows cannot open a directory for fsync; the file's own
-    // fsync still holds.
-    if (created) fsyncDirectoryDurable(directory);
+    // decided by the exclusive-create attempts above and, on their fallback path, by
+    // comparing the opened entry's inode against the one the first EEXIST saw: an importer
+    // that retired the old name, or another creator that replaced it with a fresh entry,
+    // otherwise leaves the fallback's acknowledged append without a directory fsync — a
+    // crash could lose the pathname the next import scans. Windows cannot open a directory
+    // for fsync; the file's own fsync still holds.
+    if (created || (sawEntry && existedIno !== stat.ino)) fsyncDirectoryDurable(directory);
     for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
     // Verify through this descriptor that the record is the file's last line, and then that
     // the live pathname is still this user's private single-link regular file at the same

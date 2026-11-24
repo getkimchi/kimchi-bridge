@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, renameSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,12 +32,15 @@ const fsynced = new Map<string, number>();
 mock.module("node:fs", () => ({
   ...realFs,
   openSync: ((path: string, flags: number, mode?: number) => {
-    // The real importer retires the checked file before this open creates its replacement.
+    // The real importer retires the checked file between the exclusive attempt's EEXIST and
+    // this fallback open, so the fallback's O_CREAT creates a replacement entry the old
+    // code never directory-fsynced.
     if (
       !injected &&
       retireBeforeCreate &&
       String(path) === spoolPath &&
-      (flags & realFs.constants.O_CREAT) !== 0
+      (flags & realFs.constants.O_CREAT) !== 0 &&
+      (flags & realFs.constants.O_EXCL) === 0
     ) {
       injected = true;
       retireBeforeCreate();
@@ -76,6 +79,8 @@ function agentDir(): string {
 }
 afterEach(() => {
   retireBeforeCreate = undefined;
+  injected = false;
+  createdViaOpen = false;
   records.closeBackends();
   while (dirs.length) rmSync(dirs.pop() as string, { recursive: true, force: true });
 });
@@ -150,6 +155,41 @@ it("an O_CREAT-created replacement spool entry gets its directory fsynced", asyn
       .map((row) => row.requestId)
       .sort(),
   ).toEqual(["old", "replacement"]);
+  expect(importer.spoolFiles(dir)).toHaveLength(0);
+}, 20_000);
+
+it("a fallback append onto another creator's fresh replacement entry fsyncs the directory", async () => {
+  const dir = agentDir();
+  expect(records.readRecords(dir)).toHaveLength(0);
+  spoolPath = records.spoolFilePath(dir, "session");
+  const spool = spoolPath;
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  writeFileSync(spool, `\n${JSON.stringify(record("old"))}\n`, { mode: 0o600 });
+  // A concurrent creator replaces the entry between the exclusive attempt's EEXIST and the
+  // fallback open: the fallback appends to an entry it did not create through the exclusive
+  // path and whose inode differs from the one the EEXIST saw, so the append itself must
+  // persist that fresh directory record — the other creator's own durability obligations
+  // cannot be assumed to still be alive.
+  const other = join(dir, "other-creator-entry");
+  writeFileSync(other, "", { mode: 0o600 });
+  retireBeforeCreate = () => {
+    // Rename the prepared entry over the spool path: the replacement's inode is the other
+    // creator's own, guaranteed distinct from the one the EEXIST observed.
+    renameSync(other, spool);
+    fsynced.clear();
+  };
+  const holder = await holdWriter(dir, 1500);
+  try {
+    records.capture(dir, record("appended"), "summary-native");
+  } finally {
+    await holder.done;
+  }
+  expect(injected).toBe(true);
+  expect(createdViaOpen).toBe(true);
+  expect(fsynced.get(dirname(spool)) ?? 0).toBeGreaterThanOrEqual(1);
+  // The appended record lands exactly once on the replacement entry the creator left.
+  expect(importer.importSpool(dir).imported).toBe(1);
+  expect(records.readRecords(dir).map((row) => row.requestId)).toEqual(["appended"]);
   expect(importer.spoolFiles(dir)).toHaveLength(0);
 }, 20_000);
 
