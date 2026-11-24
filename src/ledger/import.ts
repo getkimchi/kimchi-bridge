@@ -28,6 +28,7 @@ import {
   importBatchInTx,
   type JournalCursor,
   type RecordBackend,
+  rebuildWorkSliced,
   spoolDirectory,
 } from "./records.js";
 import { createTxChunkSizer, type TxChunkSizer } from "./tx-budget.js";
@@ -690,6 +691,14 @@ function importJournalFiles(
       windowHash.update(data.subarray(folded, batchEnd - decision.offset));
       folded = batchEnd - decision.offset;
       const boundary = windowHash.copy().digest("hex");
+      // A batch whose work lost its head (a version bump, a crash mid-rebuild) is rebuilt in
+      // bounded slices BEFORE the batch transaction, so the batch itself stays small; the
+      // in-transaction check below remains as the fallback for the rare case where another
+      // process's rebuild cleared the head between this and the commit.
+      for (const workId of new Set(batch.map((entry) => entry.record.workId))) {
+        if (!backend.getHead(workId) && backend.recordCount(workId) > 0)
+          rebuildWorkSliced(backend, agentDir, workId);
+      }
       backend.tx(() => {
         if (first === 0) {
           // A read from the start, or a continuing re-verification, that reached the end without a
@@ -850,13 +859,15 @@ interface ImportOptions {
 export const IMPORT_SLICE_MS = 50;
 
 /** Import batch sizing per agent directory: AIMD on measured transaction durations, starting at
- * the historic whole-window commit (one transaction per window) as both start and ceiling. */
+ * a bounded cold-start size (the first window after a process restart is already split) and
+ * growing toward the historic whole-window commit as its ceiling. */
 const importBatchSizers = new Map<string, TxChunkSizer>();
-const IMPORT_BATCH_START = 100_000;
+const IMPORT_BATCH_START = 512;
+const IMPORT_BATCH_MAX = 100_000;
 function importBatchSizerFor(agentDir: string): TxChunkSizer {
   let sizer = importBatchSizers.get(agentDir);
   if (!sizer) {
-    sizer = createTxChunkSizer(IMPORT_BATCH_START, 1, IMPORT_BATCH_START);
+    sizer = createTxChunkSizer(IMPORT_BATCH_START, 1, IMPORT_BATCH_MAX);
     importBatchSizers.set(agentDir, sizer);
   }
   return sizer;

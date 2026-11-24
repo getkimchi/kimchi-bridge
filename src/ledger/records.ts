@@ -433,15 +433,22 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
     sourceOffset: null,
     importedAt: Date.now(),
   };
-  const commit = () =>
+  const commit = () => {
+    // A projection lost to a version bump or a bug is rebuilt before this record folds into it —
+    // in bounded slices outside the capture transaction, so the capture's own commit stays one
+    // small transaction. The check repeats inside the transaction below for the rare case where
+    // another process's rebuild cleared the head between the two; that fallback stays one
+    // whole-work transaction, exactly as before.
+    if (!backend.getHead(record.workId) && backend.recordCount(record.workId) > 0)
+      rebuildWorkSliced(backend, agentDir, record.workId);
     backend.tx(() => {
-      // A projection lost to a version bump or a bug is rebuilt before this record folds into it.
       if (!backend.getHead(record.workId) && backend.recordCount(record.workId) > 0)
         rebuildWorkInTx(backend, record.workId);
       backend.insertRecord(stored);
       backend.upsertMarker(stored.recordHash, record.workId, record.type);
       foldWork(backend, record.workId, [record]);
     });
+  };
   if (!backend.tryCaptureTx) {
     commit();
     return;
@@ -670,13 +677,14 @@ export function fingerprint(agentDir: string): string {
   return String(backendFor(agentDir).recordCount());
 }
 
-/** The work's manifest, rebuilt from its records when the projection is missing. */
+/** The work's manifest, rebuilt from its records when the projection is missing — in bounded
+ * slices, so a large work's lazy repair never runs as one unbounded transaction. */
 export function readWorkHead(agentDir: string, workId: string): WorkHead | undefined {
   const backend = backendFor(agentDir);
   const head = backend.getHead(workId);
   if (head) return head;
   if (backend.recordCount(workId) === 0) return undefined;
-  backend.tx(() => rebuildWorkInTx(backend, workId));
+  rebuildWorkSliced(backend, agentDir, workId);
   return backend.getHead(workId);
 }
 
@@ -736,67 +744,88 @@ export function rebuildWork(agentDir: string, workId: string): void {
 }
 
 /** Rebuild slice sizing per agent directory: one sizer persists across passes, AIMD on measured
- * transaction duration, starting at the historic whole-work rebuild. */
+ * transaction duration. The start is a bounded cold-start size (the first transaction after a
+ * process restart is already split); growth climbs back toward the historic whole-work rebuild. */
 const rebuildSizers = new Map<string, TxChunkSizer>();
-const REBUILD_SLICE_START = 100_000;
+const REBUILD_SLICE_START = 1_000;
+const REBUILD_SLICE_MAX = 100_000;
+/** After this many watermark-moved restarts, one single-transaction rebuild finishes the job:
+ * atomic, so a continuously capturing session cannot keep the slices restarting forever. */
+const REBUILD_RESTART_LIMIT = 8;
 
-/** Sliced rebuild: while the work's records fit one slice (the starting size), the whole rebuild
- * stays one transaction — rows, head and the dirty-marker clear commit together exactly as
- * before. Once measured transaction durations shrank the slice size below the work's record
- * count, the projection clears and marks dirty in its own transaction, the records fold in
- * adaptively sized slices (the head's counters live in memory across slices, and only the final
- * transaction publishes the head), and a kill mid-rebuild leaves a work with rows but no head —
- * a state every reader already repairs by rebuilding lazily — never a partially published head. */
-function rebuildWorkSliced(backend: RecordBackend, agentDir: string, workId: string): void {
+/** Sliced rebuild: while the work's records fit one slice, the whole rebuild stays one
+ * transaction — rows, head and the dirty-marker clear commit together exactly as before. Once
+ * the slice size sits below the work's record count, the projection clears and marks dirty in
+ * its own transaction, the records fold in adaptively sized slices (the head's counters live in
+ * memory across slices, and only the final transaction publishes the head), and a kill
+ * mid-rebuild leaves a work with rows but no head — a state every reader already repairs by
+ * rebuilding lazily — never a partially published head.
+ *
+ * A capture that commits between the pinned authority watermark and the publication is not in
+ * the folded pages: publishing anyway would erase its projection row and clear the dirty
+ * marker. The final transaction therefore re-checks the watermark inside the write lock (no
+ * writer can commit between that check and the publish) and the rebuild restarts whole from
+ * the new watermark when it moved, re-clearing and re-folding everything the capture touched.
+ * After REBUILD_RESTART_LIMIT restarts, one atomic whole-work transaction converges. */
+export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, workId: string): void {
   let sizer = rebuildSizers.get(agentDir);
   if (!sizer) {
-    sizer = createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_START);
+    sizer = createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_MAX);
     rebuildSizers.set(agentDir, sizer);
   }
-  const through = backend.recordWatermark();
-  const limit = sizer.size();
-  const first = backend.readWorkRecordPage(workId, 0, through, limit);
   const observe = () => {
     const last = backend.txDurations?.().lastMs;
     if (last !== undefined) sizer?.observe(last);
   };
-  if (first.length < limit) {
-    backend.tx(() => rebuildWorkInTx(backend, workId));
-    observe();
-    return;
-  }
-  const head = emptyHead(workId);
-  const rows = projectionRows(backend, head);
-  backend.tx(() => {
-    backend.clearProjection(workId);
-    backend.markDirty(workId);
-  });
-  let page = first;
-  let readLimit = limit;
-  for (;;) {
-    const records: WorkRecord[] = [];
-    for (const row of page) {
-      try {
-        records.push(JSON.parse(row.body) as WorkRecord);
-      } catch {
-        // Skip damaged bodies; rebuild must not fail because one row is unreadable.
-      }
+  for (let restarts = 0; ; restarts++) {
+    const through = backend.recordWatermark();
+    const limit = sizer.size();
+    // The single-transaction path is chosen by record count, so a fitting work never pages (and
+    // never re-reads) the authority the transaction below refolds anyway.
+    if (restarts >= REBUILD_RESTART_LIMIT || backend.recordCount(workId) <= limit) {
+      backend.tx(() => rebuildWorkInTx(backend, workId));
+      observe();
+      return;
     }
-    backend.tx(() => mergeRecordsInto(rows, records));
-    observe();
-    if (page.length < readLimit) break;
-    readLimit = sizer.size();
-    page = backend.readWorkRecordPage(workId, page[page.length - 1].position, through, readLimit);
-  }
-  backend.tx(() => {
-    backend.putHead({
-      ...head,
-      updatedAt: new Date().toISOString(),
-      ...summaryLatest((collection) => backend.readLog(workId, collection)),
+    const head = emptyHead(workId);
+    const rows = projectionRows(backend, head);
+    backend.tx(() => {
+      backend.clearProjection(workId);
+      backend.markDirty(workId);
     });
-    backend.clearDirty(workId);
-  });
-  observe();
+    let after = 0;
+    let readLimit = limit;
+    for (;;) {
+      const page = backend.readWorkRecordPage(workId, after, through, readLimit);
+      if (!page.length) break;
+      const records: WorkRecord[] = [];
+      for (const row of page) {
+        try {
+          records.push(JSON.parse(row.body) as WorkRecord);
+        } catch {
+          // Skip damaged bodies; rebuild must not fail because one row is unreadable.
+        }
+      }
+      backend.tx(() => mergeRecordsInto(rows, records));
+      observe();
+      if (page.length < readLimit) break;
+      after = page[page.length - 1].position;
+      readLimit = sizer.size();
+    }
+    let published = false;
+    backend.tx(() => {
+      if (backend.recordWatermark() !== through) return;
+      backend.putHead({
+        ...head,
+        updatedAt: new Date().toISOString(),
+        ...summaryLatest((collection) => backend.readLog(workId, collection)),
+      });
+      backend.clearDirty(workId);
+      published = true;
+    });
+    observe();
+    if (published) return;
+  }
 }
 
 function rebuildWorkInTx(backend: RecordBackend, workId: string): void {

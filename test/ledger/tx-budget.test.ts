@@ -11,9 +11,11 @@ import {
 } from "../../src/ledger/outbox.js";
 import {
   backendFor,
+  capture,
   closeBackends,
   ledgerTxDurations,
   readRecords,
+  readWorkHead,
   readWorkSummary,
   recoverDirty,
   resetLedgerTxDurations,
@@ -231,6 +233,176 @@ it("rebuild slices stay budgeted and produce the identical projection", () => {
   useTxClock(null);
   recoverDirty(dir);
   expect(readWorkSummary(dir, WORK)).toEqual(reference);
+});
+
+/** A request response record for the same request as `record()`, so a later one supersedes it. */
+function response(requestId: string, responseId: string): WorkRecord {
+  return {
+    version: 1,
+    type: "request_response",
+    workId: WORK,
+    sessionId: "session",
+    requestId,
+    responseId,
+    scope: null,
+    recordedAt: "2026-10-01T00:00:00.000Z",
+  };
+}
+
+it("a capture landing mid-rebuild cannot be erased from the projection", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  // Shrink the rebuild slices first, exactly as measured slow transactions would.
+  slowClock(300);
+  for (let round = 0; round < 16; round++) rebuildWork(dir, WORK);
+  useTxClock(null);
+  // A work with a superseded response and enough filler to span several slices.
+  capture(dir, record("req-keep"), "summary-native");
+  capture(dir, response("req-keep", "old"), "summary-native");
+  for (let index = 0; index < 60; index++)
+    capture(dir, record(`req-filler-${index}`), "summary-native");
+  rebuildWork(dir, WORK);
+  const requestOf = (view: ReturnType<typeof readWorkSummary>) =>
+    view?.requests.find((row) => row.requestId === "req-keep");
+  expect(requestOf(readWorkSummary(dir, WORK))).toEqual(
+    expect.objectContaining({ requestId: "req-keep", responseId: "old" }),
+  );
+  // The interleaving: while the rebuild pages its slices, another writer (a session capturing in
+  // another process) commits a newer response for the same request.
+  const page = backend.readWorkRecordPage;
+  let reads = 0;
+  backend.readWorkRecordPage = (...args: Parameters<typeof page>) => {
+    if (++reads === 2) capture(dir, response("req-keep", "new"), "summary-native");
+    return page(...args);
+  };
+  try {
+    rebuildWork(dir, WORK);
+  } finally {
+    backend.readWorkRecordPage = page;
+  }
+  // The projection keeps the newer response, exactly as a whole-authority rebuild would.
+  expect(requestOf(readWorkSummary(dir, WORK))).toEqual(
+    expect.objectContaining({ requestId: "req-keep", responseId: "new" }),
+  );
+  expect(backend.dirtyWorks()).toEqual([]);
+});
+
+it("a cold-start import splits its first slow window without prior observations", () => {
+  const dir = agentDir();
+  appendJournal(dir, 0, 2500);
+  // Open the backend first, so the measured window below counts only the import's batches.
+  expect(readRecords(dir)).toHaveLength(0);
+  slowClock(300);
+  resetLedgerTxDurations(dir);
+  importJournalSlice(dir);
+  // The very first window commits in several bounded batches, not one legacy-sized transaction.
+  expect(ledgerTxDurations(dir)?.count ?? 0).toBeGreaterThan(1);
+  expect(readRecords(dir)).toHaveLength(2500);
+});
+
+it("a cold-start rebuild splits its first slow pass without prior observations", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  for (let index = 0; index < 2500; index++)
+    backend.tx(() => {
+      backend.insertRecord({
+        recordHash: `cold-${index}`,
+        type: "request",
+        workId: WORK,
+        sessionId: "session",
+        body: JSON.stringify(record(`req-${index}`)),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: index,
+        importedAt: index,
+      });
+    });
+  slowClock(300);
+  resetLedgerTxDurations(dir);
+  rebuildWork(dir, WORK);
+  expect(ledgerTxDurations(dir)?.count ?? 0).toBeGreaterThan(1);
+  expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
+});
+
+it("capture, lazy head reads and import rebuild a missing projection in bounded slices", () => {
+  const seed = (dir: string, count: number) => {
+    const backend = backendFor(dir);
+    for (let index = 0; index < count; index++)
+      backend.tx(() => {
+        backend.insertRecord({
+          recordHash: `route-${index}`,
+          type: "request",
+          workId: WORK,
+          sessionId: "session",
+          body: JSON.stringify(record(`req-${index}`)),
+          sourcePath: "/journal",
+          sourceGeneration: 0,
+          sourceOffset: index,
+          importedAt: index,
+        });
+      });
+  };
+
+  // Capture on a work with records but no head.
+  const captured = agentDir();
+  seed(captured, 2500);
+  slowClock(300);
+  resetLedgerTxDurations(captured);
+  capture(captured, record("req-new"), "summary-native");
+  expect(ledgerTxDurations(captured)?.count ?? 0).toBeGreaterThan(1);
+  expect(readRecords(captured)).toHaveLength(2501);
+  expect(readWorkSummary(captured, WORK)?.sessions).toEqual(["session"]);
+
+  // A lazy head read on the same shape.
+  const lazy = agentDir();
+  seed(lazy, 2500);
+  resetLedgerTxDurations(lazy);
+  expect(readWorkHead(lazy, WORK)).toBeDefined();
+  expect(ledgerTxDurations(lazy)?.count ?? 0).toBeGreaterThan(1);
+
+  // Import whose batch work has no head.
+  const imported = agentDir();
+  seed(imported, 2500);
+  appendJournal(imported, 0, 50);
+  resetLedgerTxDurations(imported);
+  importJournalSlice(imported);
+  expect(ledgerTxDurations(imported)?.count ?? 0).toBeGreaterThan(1);
+  expect(readRecords(imported)).toHaveLength(2550);
+  expect(readWorkSummary(imported, WORK)?.sessions).toEqual(["session"]);
+  useTxClock(null);
+});
+
+it("a fast-path rebuild reads the authority once, not twice", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  for (let index = 0; index < 60; index++)
+    backend.tx(() => {
+      backend.insertRecord({
+        recordHash: `dup-${index}`,
+        type: "request",
+        workId: WORK,
+        sessionId: "session",
+        body: JSON.stringify(record(`req-${index}`)),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: index,
+        importedAt: index,
+      });
+    });
+  let pages = 0;
+  const page = backend.readWorkRecordPage;
+  backend.readWorkRecordPage = (...args: Parameters<typeof page>) => {
+    pages++;
+    return page(...args);
+  };
+  try {
+    rebuildWork(dir, WORK);
+  } finally {
+    backend.readWorkRecordPage = page;
+  }
+  // A work that fits one slice rebuilds in the single transaction without paging the authority.
+  expect(pages).toBe(0);
+  expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
 });
 
 /** Distinct-entity claim facts, the shape the translation path observes. */
