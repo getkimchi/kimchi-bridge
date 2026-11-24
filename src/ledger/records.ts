@@ -811,15 +811,17 @@ const REBUILD_RESTART_LIMIT = 8;
  * mid-rebuild leaves a work with rows but no head — a state every reader already repairs by
  * rebuilding lazily — never a partially published head.
  *
- * A capture on this work that commits between the pinned authority watermark and the
- * publication is not in the folded pages: publishing anyway would erase its projection row and
- * clear the dirty marker. The final transaction therefore re-checks the work's record count
- * inside the write lock (only a write to this work moves it, and no writer can commit between
- * that check and the publish) and the rebuild restarts whole from the new population when it
- * moved, re-clearing and re-folding everything the capture touched. Writes to other works
- * leave the count alone, so ordinary traffic on unrelated works cannot restart a rebuild or
- * drive it into the atomic fallback below. After REBUILD_RESTART_LIMIT restarts, one atomic
- * whole-work transaction converges. */
+ * A capture on this work that commits during the rebuild is not in the folded pages when it
+ * lands above the pinned watermark: publishing anyway would erase its projection row and clear
+ * the dirty marker. The population is therefore read before the watermark: a capture that
+ * commits between the two reads is below the watermark and folded by the pages, and one that
+ * commits after either read moves the count, so the final transaction re-checks the work's
+ * record count inside the write lock (only a write to this work moves it, and no writer can
+ * commit between that check and the publish) and the rebuild restarts whole from the new
+ * population when it moved, re-clearing and re-folding everything the capture touched. Writes
+ * to other works leave the count alone, so ordinary traffic on unrelated works cannot restart
+ * a rebuild or drive it into the atomic fallback below. After REBUILD_RESTART_LIMIT restarts,
+ * one atomic whole-work transaction converges. */
 export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, workId: string): void {
   const sizer = rememberSizer(rebuildSizers, agentDir, () =>
     createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_MAX),
@@ -829,10 +831,11 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
     if (last !== undefined) sizer?.observe(last);
   };
   for (let restarts = 0; ; restarts++) {
-    const through = backend.recordWatermark();
-    // The work's own population: the pinned pages cover it, and only a write to this work moves
-    // it before the publication re-check below.
+    // The work's own population, read before the watermark: the pinned pages cover everything
+    // the watermark includes, and only a write to this work moves the count before the
+    // publication re-check below.
     const population = backend.recordCount(workId);
+    const through = backend.recordWatermark();
     const limit = sizer.size();
     // The single-transaction path is chosen by record count, so a fitting work never pages (and
     // never re-reads) the authority the transaction below refolds anyway.
