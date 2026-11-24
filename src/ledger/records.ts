@@ -424,10 +424,15 @@ function appendSpoolRecord(path: string, line: string): boolean {
   // fsync; an append to an existing file leaves the directory unchanged and syncs only the
   // file, so sustained contention does not pay a blocking directory flush per capture.
   let created = false;
-  /** The directory entry the exclusive attempt's EEXIST saw, if any: its inode decides
-   *  whether the fallback open below appends to that same entry or lands on a fresh one. */
-  let existedIno: number | undefined;
+  /** Whether the exclusive attempt's EEXIST proved a name existed: whatever the fallback open
+   *  below lands on is then compared against the entry that EEXIST observed, so a replacement
+   *  is detected even though the fallback's own O_CREAT cannot report creation. */
   let sawEntry = false;
+  /** The stat of the entry the first EEXIST observed, when the lstat could still see it: its
+   *  identity against the stat the fallback open lands on decides whether that entry is fresh.
+   *  The inode alone cannot decide — a retirement between the attempts can recycle the number
+   *  onto another creator's replacement — so the size and timestamps are compared too. */
+  let existedStat: Stats | undefined;
   try {
     fd = openSync(
       path,
@@ -438,13 +443,13 @@ function appendSpoolRecord(path: string, line: string): boolean {
   } catch (error) {
     if (!object(error) || error.code !== "EEXIST") return false;
     // The entry the EEXIST observed: an importer can retire it (rename to a claim, then
-    // unlink) before the opens below, or another creator can replace it, so the inode is
-    // remembered rather than the mere fact that the name existed — whatever the fallback
+    // unlink) before the opens below, or another creator can replace it, so its full stat
+    // is remembered rather than the mere fact that the name existed — whatever the fallback
     // lands on is compared against it. A missing entry here (already retired) leaves the
     // fallback's creation undeniably fresh.
+    sawEntry = true;
     try {
-      sawEntry = true;
-      existedIno = lstatSync(path).ino;
+      existedStat = lstatSync(path);
     } catch {
       // Retired between the EEXIST and here: the exclusive retry below creates fresh.
     }
@@ -474,25 +479,46 @@ function appendSpoolRecord(path: string, line: string): boolean {
   try {
     const stat = fstatSync(fd);
     const uid = process.getuid?.();
-    if (!stat.isFile() || stat.nlink !== 1 || (uid !== undefined && stat.uid !== uid)) return false;
+    // A fresh directory entry THIS attempt is responsible for persisting: one its own
+    // exclusive create made, or one the fallback open landed on that is not the entry the
+    // first EEXIST observed (an importer's retirement let another creator — or the fallback's
+    // own O_CREAT — replace it; a recycled inode number alone cannot prove sameness).
+    const freshEntry =
+      created ||
+      (sawEntry &&
+        (existedStat === undefined ||
+          existedStat.ino !== stat.ino ||
+          existedStat.size !== stat.size ||
+          existedStat.mtimeMs !== stat.mtimeMs ||
+          existedStat.ctimeMs !== stat.ctimeMs));
+    /** Persists every entry this attempt created — before the append is acknowledged, and
+     *  equally before a failed attempt bails out or throws: the next attempt reopens the
+     *  entry as pre-existing, so deferring this fsync to a later success would acknowledge an
+     *  append whose pathname was never directory-fsynced (the creation-durability debt is
+     *  carried across retries, never dropped). */
+    const syncCreatedEntries = () => {
+      if (freshEntry) fsyncDirectoryDurable(directory);
+      for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
+    };
+    if (!stat.isFile() || stat.nlink !== 1 || (uid !== undefined && stat.uid !== uid)) {
+      syncCreatedEntries();
+      return false;
+    }
     let written = 0;
     while (written < bytes.length) {
       const count = writeSync(fd, bytes, written, bytes.length - written);
-      if (count <= 0) return false;
+      if (count <= 0) {
+        syncCreatedEntries();
+        return false;
+      }
       written += count;
     }
     fsyncSync(fd);
     // The append is durable. The directory entries a created file (or directory chain) added
     // need their directories' fsync too, or a kernel crash can lose the path the next import
-    // scans — an append to an existing entry syncs nothing but the file itself. Creation is
-    // decided by the exclusive-create attempts above and, on their fallback path, by
-    // comparing the opened entry's inode against the one the first EEXIST saw: an importer
-    // that retired the old name, or another creator that replaced it with a fresh entry,
-    // otherwise leaves the fallback's acknowledged append without a directory fsync — a
-    // crash could lose the pathname the next import scans. Windows cannot open a directory
-    // for fsync; the file's own fsync still holds.
-    if (created || (sawEntry && existedIno !== stat.ino)) fsyncDirectoryDurable(directory);
-    for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
+    // scans — an append to an existing entry syncs nothing but the file itself. Windows cannot
+    // open a directory for fsync; the file's own fsync still holds.
+    syncCreatedEntries();
     // Verify through this descriptor that the record is the file's last line, and then that
     // the live pathname is still this user's private single-link regular file at the same
     // inode, never following a symlink (a link swapped in for the path would otherwise hide
@@ -525,6 +551,19 @@ function appendSpoolRecord(path: string, line: string): boolean {
       return false;
     }
     return live.dev === stat.dev && live.ino === stat.ino;
+  } catch (error) {
+    // A failed attempt still owes the durability of any entry it may have created: the retry
+    // the caller performs reopens the entry as pre-existing, so the creation-debt cannot wait
+    // for a later success (the syncs already performed above are simply repeated, not owed).
+    if (created || sawEntry) {
+      try {
+        fsyncDirectoryDurable(directory);
+        for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
+      } catch {
+        // Best-effort on an already-failing path: the caller's fallback continues regardless.
+      }
+    }
+    throw error;
   } finally {
     closeSync(fd);
   }

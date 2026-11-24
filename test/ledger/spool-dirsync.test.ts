@@ -23,10 +23,19 @@ const realFs = await import("node:fs");
 const realOpenSync = realFs.openSync;
 const realCloseSync = realFs.closeSync;
 const realFsyncSync = realFs.fsyncSync;
+const realLstatSync = realFs.lstatSync;
+const realWriteSync = realFs.writeSync;
 let spoolPath = "";
 let retireBeforeCreate: (() => void) | undefined;
 let injected = false;
 let createdViaOpen = false;
+/** When set, the spool path's FIRST append writeSync returns zero bytes — the created entry
+ *  is then left with an unsynced directory entry until the caller's retry reopens it. */
+let failFirstWrite = false;
+/** When set, lstatSync on the spool path reports this inode number instead of the entry's
+ *  real one, simulating a filesystem that recycled a retired entry's inode onto another
+ *  creator's fresh replacement — only the rest of the stat can then tell the two apart. */
+let lstatInoOverride: number | undefined;
 const fdPaths = new Map<number, string>();
 const fsynced = new Map<string, number>();
 mock.module("node:fs", () => ({
@@ -55,6 +64,20 @@ mock.module("node:fs", () => ({
     fdPaths.delete(fd);
     return realCloseSync(fd);
   }) as typeof realFs.closeSync,
+  lstatSync: ((path: string, options?: { bigint?: boolean; throwIfNoEntry?: boolean }) => {
+    const result = realLstatSync(path, options);
+    if (lstatInoOverride !== undefined && String(path) === spoolPath)
+      return { ...result, ino: lstatInoOverride };
+    return result;
+  }) as typeof realFs.lstatSync,
+  writeSync: ((...args: unknown[]) => {
+    const fd = args[0] as number;
+    if (failFirstWrite && fdPaths.get(fd) === spoolPath) {
+      failFirstWrite = false;
+      return 0;
+    }
+    return realWriteSync(...(args as Parameters<typeof realWriteSync>));
+  }) as typeof realFs.writeSync,
   fsyncSync: ((fd: number) => {
     const result = realFsyncSync(fd);
     const path = fdPaths.get(fd);
@@ -81,6 +104,8 @@ afterEach(() => {
   retireBeforeCreate = undefined;
   injected = false;
   createdViaOpen = false;
+  failFirstWrite = false;
+  lstatInoOverride = undefined;
   records.closeBackends();
   while (dirs.length) rmSync(dirs.pop() as string, { recursive: true, force: true });
 });
@@ -224,6 +249,67 @@ it("an append to an existing spool file syncs the file only, not the directory",
   // Every record survives the round trip exactly once.
   expect(importer.importSpool(dir).imported).toBe(4);
   expect(records.readRecords(dir)).toHaveLength(4);
+  expect(importer.spoolFiles(dir)).toHaveLength(0);
+}, 20_000);
+
+it("a zero-byte first write on a created entry still fsyncs its directory", async () => {
+  const dir = agentDir();
+  expect(records.readRecords(dir)).toHaveLength(0);
+  spoolPath = records.spoolFilePath(dir, "session");
+  const spool = spoolPath;
+  // The first attempt's exclusive create makes the spool entry, but its first writeSync
+  // returns zero bytes: the append fails before any fsync, and the caller's retry reopens
+  // the entry as pre-existing. The creation's directory fsync cannot be dropped with the
+  // failed attempt — the acknowledged retry would leave the pathname the next import
+  // scans without the entry's durability.
+  failFirstWrite = true;
+  const holder = await holdWriter(dir, 1500);
+  try {
+    records.capture(dir, record("zero-write"), "summary-native");
+  } finally {
+    await holder.done;
+  }
+  expect(failFirstWrite).toBe(false);
+  expect(fsynced.get(spool) ?? 0).toBeGreaterThanOrEqual(1);
+  expect(fsynced.get(dirname(spool)) ?? 0).toBeGreaterThanOrEqual(1);
+  expect(importer.importSpool(dir).imported).toBe(1);
+  expect(records.readRecords(dir).map((row) => row.requestId)).toEqual(["zero-write"]);
+  expect(importer.spoolFiles(dir)).toHaveLength(0);
+}, 20_000);
+
+it("a fallback append onto a recycled-inode replacement entry fsyncs the directory", async () => {
+  const dir = agentDir();
+  expect(records.readRecords(dir)).toHaveLength(0);
+  spoolPath = records.spoolFilePath(dir, "session");
+  const spool = spoolPath;
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  writeFileSync(spool, `\n${JSON.stringify(record("old"))}\n`, { mode: 0o600 });
+  // Another creator's fresh replacement entry, prepared in advance: after the retirement
+  // below renames it over the spool path, the entry the exclusive attempt's EEXIST observed
+  // is reported with the replacement's inode number (a recycled inode), so the inode alone
+  // cannot distinguish the entry the fallback open lands on — only its size and timestamps
+  // can, and the append must then persist the fresh entry's directory record itself.
+  const other = join(dir, "other-creator-entry");
+  writeFileSync(other, "", { mode: 0o600 });
+  lstatInoOverride = statSync(other).ino;
+  retireBeforeCreate = () => {
+    renameSync(spool, join(dir, "retired-old-entry"));
+    renameSync(other, spool);
+    lstatInoOverride = undefined;
+    fsynced.clear();
+  };
+  const holder = await holdWriter(dir, 1500);
+  try {
+    records.capture(dir, record("appended"), "summary-native");
+  } finally {
+    await holder.done;
+  }
+  expect(injected).toBe(true);
+  expect(createdViaOpen).toBe(true);
+  expect(fsynced.get(dirname(spool)) ?? 0).toBeGreaterThanOrEqual(1);
+  // The appended record lands exactly once on the replacement entry the creator left.
+  expect(importer.importSpool(dir).imported).toBe(1);
+  expect(records.readRecords(dir).map((row) => row.requestId)).toEqual(["appended"]);
   expect(importer.spoolFiles(dir)).toHaveLength(0);
 }, 20_000);
 
