@@ -22,10 +22,16 @@ import { describe, expect, it } from "bun:test";
  * billing-tagged request the costs channel prices through the fake billing API; an accepted
  * saved-plan continuation the continuations channel repairs into a work_link row; and a
  * reporting session whose translated events are delivered to the fake ingestion endpoint.
- * Two consecutive passes run on each side, with a second request dispatched in between, so
- * cross-pass state (repository rotation, continuation progress, the reporting pass gate,
- * billing rechecks) is exercised. The driver freezes the clock (stepped 30 s between
- * passes), so timestamps, retry windows and budgets are deterministic.
+ * A second repository with its own tracked edit makes the files channel rotate: the first
+ * pass runs out of budget after one repository, so the second pass must start from the
+ * carried nextRepository — the driver records each pass's repository visit order, the working
+ * directory of every git command the moved code ran, and the cwd/host of every credentials,
+ * endpoints and gitToken read the host answered (the reporting session's credential cwd and
+ * the costs channel's per-record cwd included). Two consecutive passes run on each side, with
+ * a second request dispatched in between, so cross-pass state (repository rotation,
+ * continuation progress, the reporting pass gate, billing rechecks) is exercised. The driver
+ * freezes the clock (stepped 30 s between passes), so timestamps, retry windows and budgets
+ * are deterministic.
  *
  * The full end state is compared: every ledger table in row order, every file under the
  * agent directory, the pull-request updates the subscribers saw, the metrics, and every
@@ -48,7 +54,17 @@ interface DriverResult {
     first?: { channels?: Record<string, { outcome: string }> };
     second?: { channels?: Record<string, { outcome: string }> };
   };
-  state: { nextRepository?: string; progressRetained: boolean; settledJournals: boolean };
+  state: {
+    nextRepository?: string;
+    progressRetained: boolean;
+    settledJournals: boolean;
+    repositories: string[];
+    gitOrders: string[][];
+    filesOrders: string[][];
+    hostCalls: { kind: string; cwd?: string; host?: string; pass: number }[];
+    reportingCwd: string;
+    costRecordCwd: string;
+  };
 }
 
 function runLane(root: string, mode: "oracle" | "pass"): DriverResult {
@@ -127,7 +143,7 @@ describe("runReconciliationPass matches the supervisor's scan()", () => {
       // Sanity: every channel did real work in both lanes, so equivalence is not vacuous.
       for (const lane of [oracle, pass]) {
         const rows = lane.dump.tables.work_records.map((row) => String(row.type));
-        expect(rows.filter((type) => type === "file_transition")).toHaveLength(1);
+        expect(rows.filter((type) => type === "file_transition")).toHaveLength(2);
         expect(rows.filter((type) => type === "work_link")).toHaveLength(1);
         expect(rows.filter((type) => type === "request_cost")).toHaveLength(2);
         const commits = lane.dump.tables.work_records.filter((row) => row.type === "commit");
@@ -138,7 +154,7 @@ describe("runReconciliationPass matches the supervisor's scan()", () => {
         const urls = lane.dump.receipts.map((receipt) => receipt.url);
         expect(urls.some((url) => url.includes("/llm-requests"))).toBe(true);
         expect(urls.some((url) => url.includes("/pulls?"))).toBe(true);
-        expect(urls.filter((url) => url.endsWith("pr-cost-events:batchIngest"))).toHaveLength(1);
+        expect(urls.filter((url) => url.endsWith("pr-cost-events:batchIngest"))).toHaveLength(2);
         expect(urls.some((url) => url.endsWith("api-keys:verify"))).toBe(true);
         expect(lane.dump.updates.length).toBeGreaterThan(0);
         expect(
@@ -146,7 +162,10 @@ describe("runReconciliationPass matches the supervisor's scan()", () => {
         ).toBe(true);
       }
 
-      // The pass lane's channels all completed.
+      // The pass lane's channels all completed, except the first pass's files channel: its
+      // 3 s budget expired mid-rotation (the driver steps the clock past it), which the pass
+      // records as "canceled" — the supervisor silently swallowed the same exhaustion — and
+      // still runs the later channels.
       const ok = {
         files: { outcome: "ok" },
         "pull-requests": { outcome: "ok" },
@@ -154,7 +173,7 @@ describe("runReconciliationPass matches the supervisor's scan()", () => {
         continuations: { outcome: "ok" },
         reporting: { outcome: "ok" },
       };
-      expect(pass.worker?.first?.channels).toEqual(ok);
+      expect(pass.worker?.first?.channels).toEqual({ ...ok, files: { outcome: "canceled" } });
       expect(pass.worker?.second?.channels).toEqual(ok);
 
       // Cross-pass state agrees: the rotation and the retained continuation progress.
@@ -162,6 +181,34 @@ describe("runReconciliationPass matches the supervisor's scan()", () => {
       expect(pass.state.settledJournals).toBe(oracle.state.settledJournals);
       // The worker kept the continuation progress the pass returned (the supervisor kept its own).
       expect(pass.state.progressRetained).toBe(true);
+
+      // Rotation across passes: the first pass ran out of budget after its first repository
+      // and the second pass started exactly where the first one left off — the carried
+      // nextRepository — then rotated through the other repository.
+      const [first, second] = oracle.state.repositories;
+      for (const lane of [oracle, pass]) {
+        expect(lane.state.filesOrders).toEqual([[first], [second, first]]);
+        const secondPassStart = lane.state.filesOrders[1][0];
+        expect(lane.state.nextRepository).toBe(secondPassStart);
+        // The reporting channel resolved its credential at the reporting session's own cwd, in
+        // both passes, and the costs channel resolved the record's credential at the record's
+        // own cwd (its per-record lookup).
+        for (const index of [0, 1]) {
+          expect(lane.state.hostCalls).toContainEqual({
+            kind: "credentials",
+            cwd: lane.state.reportingCwd,
+            pass: index,
+          });
+          expect(lane.state.hostCalls).toContainEqual({
+            kind: "credentials",
+            cwd: lane.state.costRecordCwd,
+            pass: index,
+          });
+        }
+      }
+      // The full git-command and host-read sequences agree, cwd for cwd, in order.
+      expect(pass.state.gitOrders).toEqual(oracle.state.gitOrders);
+      expect(pass.state.hostCalls).toEqual(oracle.state.hostCalls);
 
       // The equivalence itself: the full end state at the identical path.
       const oracleText = normalize(oracle);

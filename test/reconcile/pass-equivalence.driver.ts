@@ -1,4 +1,6 @@
 import { execFileSync } from "node:child_process";
+import * as childProcess from "node:child_process";
+import { spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   constants,
@@ -33,6 +35,7 @@ import {
   transitionJournal,
   type SharedTypeReads,
 } from "../../src/reconcile/work-attribution/file-transitions.js";
+import * as fileTransitions from "../../src/reconcile/work-attribution/file-transitions.js";
 import { reconcileRepositoryTransitions } from "../../src/reconcile/work-attribution/file-transitions.js";
 import {
   type ContinuationProgress,
@@ -86,6 +89,15 @@ import {
  * the pull-request updates the subscribers saw, the metrics, and every request the fake
  * server received (method, URL, normalized body).
  *
+ * The fixture holds TWO repositories with tracked edits, so the files channel rotates. The
+ * first pass exhausts its 3 s budget inside the first repository's reconcile (the driver steps
+ * the frozen clock past the deadline on that pass's first git call, identically in both
+ * lanes), so it ends mid-rotation and the second pass proves it starts from the carried
+ * nextRepository: the working directory of every git command the moved code ran, per pass in
+ * order, is recorded alongside the cwd/host of every credentials, endpoints and gitToken read
+ * the host answered — the reporting channel's credential cwd and the costs channel's
+ * per-record cwd included.
+ *
  * The clock is frozen (and stepped 30 s between passes) so timestamps, retry windows and
  * budgets are deterministic and identical across the two lanes.
  */
@@ -101,6 +113,7 @@ const GH_REPO = "example/repo";
 const GH_REPO_ID = 999999;
 const WRITER = "10000000-0000-4000-8000-000000000001";
 const PLANNER = "10000000-0000-4000-8000-000000000002";
+const WRITER_B = "10000000-0000-4000-8000-000000000003";
 const SEGMENT = "11000000-0000-4000-8000-00000000000a";
 const REQUEST1 = "20000000-0000-4000-8000-000000000001";
 const REQUEST2 = "20000000-0000-4000-8000-000000000002";
@@ -246,10 +259,30 @@ interface Lane {
   agentDir: string;
   repo: string;
   gitDir: string;
+  repoB: string;
+  gitDirB: string;
   receipts: Receipt[];
   metrics: HostMetric[];
   updates: WorkPullRequestUpdate[];
+  events: LaneEvent[];
   host: HostPorts;
+}
+
+/** One credentials/endpoints/gitToken read the fake host answered, tagged with the pass it
+ * served (−1 while the fixture is seeded, before any pass runs). */
+interface HostCall {
+  kind: "credentials" | "endpoints" | "gitToken";
+  cwd?: string;
+  host?: string;
+  pass: number;
+}
+
+/** One observable side effect of a pass, in global order: a git command's working directory
+ * (the moved code's own git calls) or a host read, each tagged with its pass (−1 = seeding). */
+interface LaneEvent {
+  pass: number;
+  git?: string;
+  host?: HostCall;
 }
 
 function makeHost(lane: Lane, fetch: HostPorts["fetch"]): HostPorts {
@@ -259,15 +292,24 @@ function makeHost(lane: Lane, fetch: HostPorts["fetch"]): HostPorts {
     },
     e2eSeam: () => undefined,
     now: () => Date.now(),
-    credentials: () => ({ token: "test-key", apiUrl: API }),
-    gitToken: (host) => (host === "github.com" ? "gh-token" : undefined),
-    endpoints: () => ({
-      llmEndpoint: "https://gateway.example/openai/v1",
-      openAiBaseUrl: "https://gateway.example/openai/v1",
-      anthropicBaseUrl: "https://gateway.example/anthropic",
-      experimentalOpenAiBaseUrl: "https://gateway.example/experimental/openai/v1",
-      platformApiUrl: API,
-    }),
+    credentials: (cwd) => {
+      lane.events.push({ pass: passIndex, host: { kind: "credentials", cwd, pass: passIndex } });
+      return { token: "test-key", apiUrl: API };
+    },
+    gitToken: (host) => {
+      lane.events.push({ pass: passIndex, host: { kind: "gitToken", host, pass: passIndex } });
+      return host === "github.com" ? "gh-token" : undefined;
+    },
+    endpoints: (cwd) => {
+      lane.events.push({ pass: passIndex, host: { kind: "endpoints", cwd, pass: passIndex } });
+      return {
+        llmEndpoint: "https://gateway.example/openai/v1",
+        openAiBaseUrl: "https://gateway.example/openai/v1",
+        anthropicBaseUrl: "https://gateway.example/anthropic",
+        experimentalOpenAiBaseUrl: "https://gateway.example/experimental/openai/v1",
+        platformApiUrl: API,
+      };
+    },
     orgPolicy: () => ({ resourceEnabled: () => true }),
     telemetryConsent: () => true,
     metric: (metric) => {
@@ -277,8 +319,8 @@ function makeHost(lane: Lane, fetch: HostPorts["fetch"]): HostPorts {
   };
 }
 
-function git(lane: Lane, ...args: string[]): string {
-  return execFileSync("git", ["-C", lane.repo, ...args], {
+function git(repo: string, lane: Lane, ...args: string[]): string {
+  return execFileSync("git", ["-C", repo, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     env: {
@@ -363,12 +405,13 @@ async function trackedEdit(
   ctx: WorkContext,
   toolCallId: string,
   workId: string,
+  repo: string,
   path: string,
   from: string,
   to: string,
 ) {
   const ops = trackedOperations(lane, ctx, toolCallId, workId);
-  const absolute = resolve(lane.repo, path);
+  const absolute = resolve(repo, path);
   await ops.access(absolute);
   await ops.readFile(absolute);
   const content = readFileSync(absolute, "utf8");
@@ -499,20 +542,26 @@ function buildLane(root: string, name: string): Lane {
     agentDir: join(root, "agent"),
     repo: join(root, "repo"),
     gitDir: "",
+    repoB: join(root, "repo-b"),
+    gitDirB: "",
     receipts: [],
     metrics: [],
     updates: [],
+    events: [],
     host: undefined as unknown as HostPorts,
   };
   const server = makeServer();
   lane.host = makeHost(lane, server.fetch);
   lane.receipts = server.receipts;
   mkdirSync(lane.repo, { recursive: true });
+  mkdirSync(lane.repoB, { recursive: true });
   mkdirSync(lane.agentDir, { recursive: true });
-  git(lane, "init", "-q", "-b", "main");
-  git(lane, "config", "user.name", "Test");
-  git(lane, "config", "user.email", "test@example.test");
-  git(lane, "remote", "add", "origin", `https://github.com/${GH_REPO}.git`);
+  for (const repo of [lane.repo, lane.repoB]) {
+    git(repo, lane, "init", "-q", "-b", "main");
+    git(repo, lane, "config", "user.name", "Test");
+    git(repo, lane, "config", "user.email", "test@example.test");
+  }
+  git(lane.repo, lane, "remote", "add", "origin", `https://github.com/${GH_REPO}.git`);
   return lane;
 }
 
@@ -535,19 +584,38 @@ async function seedFixture(lane: Lane): Promise<void> {
   );
   // A baseline commit, a tracked edit in the writer session, and the commit it becomes.
   writeFileSync(join(lane.repo, "file.txt"), "one\ntwo\n");
-  git(lane, "add", ".");
-  git(lane, "commit", "-qm", "baseline");
+  git(lane.repo, lane, "add", ".");
+  git(lane.repo, lane, "commit", "-qm", "baseline");
   await trackedEdit(
     lane,
     context(lane, "writer"),
     "write-call",
     WRITER,
+    lane.repo,
     "file.txt",
     "one",
     "first",
   );
-  git(lane, "add", ".");
-  git(lane, "commit", "-qm", "feature");
+  git(lane.repo, lane, "add", ".");
+  git(lane.repo, lane, "commit", "-qm", "feature");
+  // A second repository the files channel rotates through: a tracked edit and its commit,
+  // with no remote, billing or reporting of its own.
+  lane.gitDirB = realpathSync(join(lane.repoB, ".git"));
+  writeFileSync(join(lane.repoB, "other.txt"), "one\ntwo\n");
+  git(lane.repoB, lane, "add", ".");
+  git(lane.repoB, lane, "commit", "-qm", "baseline-b");
+  await trackedEdit(
+    lane,
+    context(lane, "writer-b", lane.repoB),
+    "write-call-b",
+    WRITER_B,
+    lane.repoB,
+    "other.txt",
+    "one",
+    "first",
+  );
+  git(lane.repoB, lane, "add", ".");
+  git(lane.repoB, lane, "commit", "-qm", "feature-b");
   dispatchRequest(lane, "writer", WRITER, REQUEST1, DISPATCHED_AT);
   acceptedContinuation(lane);
 }
@@ -757,7 +825,7 @@ function oracleOwner(lane: Lane): Supervisor {
   owner.subscribers.add({
     kind: "reporting",
     onReport: (agentDir, signal, assertLease) =>
-      reconcileReporting(agentDir, lane.repo, signal, assertLease),
+      reconcileReporting(agentDir, join(lane.root, "session"), signal, assertLease),
   });
   for (const kind of ["pull-requests", "costs", "reporting"] as const)
     owner.channels.set(kind, { controller: new AbortController() });
@@ -812,7 +880,7 @@ async function workerPass(lane: Lane, state: WorkerState): Promise<PassResult> {
           },
         },
         costs: true,
-        reporting: { cwd: lane.repo },
+        reporting: { cwd: join(lane.root, "session") },
         nextRepository: state.nextRepository,
         progress: state.progress,
       },
@@ -931,12 +999,81 @@ function dumpLane(lane: Lane): unknown {
 
 // --- The driver entry: one lane, two passes, the end state on stdout -------------------------
 
+/** The pass currently running (−1 while the fixture is seeded); tags events to its pass. */
+let passIndex = -1;
+let firstPassBudgetStepped = false;
+/** The repositories the files channel visited (reconcileRepositoryTransitions checks the
+ * repository exists before anything else — the only existsSync on a repository path), per
+ * pass, in visit order. */
+const filesVisits: string[][] = [[], []];
+
+const realExecFile = childProcess.execFile;
+spyOn(childProcess, "execFile").mockImplementation(((
+  file: string,
+  args: unknown[],
+  ...rest: unknown[]
+) => {
+  if (
+    passIndex >= 0 &&
+    file === "git" &&
+    Array.isArray(args) &&
+    args[0] === "-C" &&
+    typeof args[1] === "string"
+  ) {
+    (laneNow as Lane).events.push({ pass: passIndex, git: args[1] });
+    // The first pass runs out of budget inside the first repository's reconcile, so that pass
+    // stops after one repository and the second pass must start from the carried
+    // nextRepository rather than the first repository again. Both lanes step identically.
+    if (passIndex === 0 && !firstPassBudgetStepped) {
+      firstPassBudgetStepped = true;
+      clockAt = T0 + 3001; // past the 3 s pass budget (deadline T0 + 3000)
+    }
+  }
+  return (realExecFile as (...call: unknown[]) => unknown)(file, args, ...rest);
+}) as unknown as typeof childProcess.execFile);
+
+// The files channel's own visit signal: reconcileRepositoryTransitions is exactly what the
+// rotation loop calls once per visited repository (the pull-request and continuation channels
+// never call it), and Bun's spyOn reaches every importer of the binding.
+const realReconcileRepositoryTransitions = fileTransitions.reconcileRepositoryTransitions;
+spyOn(fileTransitions, "reconcileRepositoryTransitions").mockImplementation(((
+  repository: string,
+  ...rest: unknown[]
+) => {
+  if (passIndex >= 0) filesVisits[passIndex].push(repository);
+  return (realReconcileRepositoryTransitions as (...call: unknown[]) => unknown)(
+    repository,
+    ...rest,
+  );
+}) as unknown as typeof fileTransitions.reconcileRepositoryTransitions);
+
+/** The lane the events above record into; set once in main. */
+let laneNow: Lane | undefined;
+
+/** Runs one pass with its git calls and host reads tagged to it (passes are numbered 0 and 1). */
+async function recordPass<T>(index: 0 | 1, run: () => Promise<T>): Promise<T> {
+  passIndex = index;
+  try {
+    return await run();
+  } finally {
+    passIndex = -1;
+  }
+}
+
+/** The pass's git working directories, in order — the moved code's own git calls only. */
+function gitOrder(lane: Lane, pass: 0 | 1): string[] {
+  return lane.events
+    .filter((event) => event.pass === pass && event.git !== undefined)
+    .map((event) => event.git as string);
+}
+
 async function main(): Promise<void> {
   const [root, mode] = process.argv.slice(2);
   if (!root || (mode !== "oracle" && mode !== "pass"))
     throw new Error("usage: driver <root> <oracle|pass>");
   freezeClock(T0);
   const lane = buildLane(root, mode);
+  laneNow = lane;
   await seedFixture(lane);
   let nextRepository: string | undefined;
   let progressRetained = false;
@@ -945,21 +1082,25 @@ async function main(): Promise<void> {
   let workerSecond: PassResult | undefined;
   if (mode === "oracle") {
     const owner = oracleOwner(lane);
-    await withHostPorts(lane.host, () => oracleScan(lane.agentDir, owner, lane.repo));
+    await withHostPorts(lane.host, () =>
+      recordPass(0, () => oracleScan(lane.agentDir, owner, lane.repo)),
+    );
     dispatchSecondRequest(lane);
     freezeClock(T1);
-    await withHostPorts(lane.host, () => oracleScan(lane.agentDir, owner, lane.repo));
+    await withHostPorts(lane.host, () =>
+      recordPass(1, () => oracleScan(lane.agentDir, owner, lane.repo)),
+    );
     nextRepository = owner.nextRepository;
     settledJournals = owner.settledJournals !== undefined;
   } else {
     const worker: WorkerState = {};
-    const first = await workerPass(lane, worker);
+    const first = await recordPass(0, () => workerPass(lane, worker));
     worker.nextRepository = first.nextRepository;
     worker.progress = first.progress;
     workerFirst = first;
     dispatchSecondRequest(lane);
     freezeClock(T1);
-    const second = await workerPass(lane, worker);
+    const second = await recordPass(1, () => workerPass(lane, worker));
     worker.nextRepository = second.nextRepository;
     worker.progress = second.progress;
     workerSecond = second;
@@ -969,11 +1110,24 @@ async function main(): Promise<void> {
   }
   await flushWorkSummaries();
   closeBackends();
+  const repositories = [lane.gitDir, lane.gitDirB].sort();
   process.stdout.write(
     `${JSON.stringify({
       dump: dumpLane(lane),
       worker: workerFirst === undefined ? undefined : { first: workerFirst, second: workerSecond },
-      state: { nextRepository, progressRetained, settledJournals },
+      state: {
+        nextRepository,
+        progressRetained,
+        settledJournals,
+        repositories,
+        gitOrders: [gitOrder(lane, 0), gitOrder(lane, 1)],
+        filesOrders: filesVisits,
+        hostCalls: lane.events
+          .filter((event) => event.host !== undefined)
+          .map((event) => event.host as HostCall),
+        reportingCwd: join(lane.root, "session"),
+        costRecordCwd: lane.repo,
+      },
     })}\n`,
   );
 }
