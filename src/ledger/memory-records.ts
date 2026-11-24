@@ -348,6 +348,23 @@ export function createMemoryRecords(): RecordBackend {
       logs.delete(workId);
       heads.delete(workId);
     },
+    clearProjectionHead: (workId) => {
+      touch();
+      heads.delete(workId);
+    },
+    deleteProjectionRows: (workId, limit) => {
+      touch();
+      const byLog = logs.get(workId);
+      if (!byLog) return 0;
+      let deleted = 0;
+      for (const byKey of byLog.values())
+        for (const key of [...byKey.keys()]) {
+          if (deleted >= limit) return deleted;
+          byKey.delete(key);
+          deleted++;
+        }
+      return deleted;
+    },
     getHead: (workId) => heads.get(workId),
     putHead: (head) => {
       touch();

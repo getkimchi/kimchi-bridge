@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -182,6 +182,13 @@ export interface RecordBackend {
   readLog(workId: string, log: LogName): Row[];
   /** Drops the work's projection rows and manifest; its records stay untouched. */
   clearProjection(workId: string): void;
+  /** Deletes the work's projection manifest (the head) only, leaving its rows: the sliced
+   *  rebuild's clear starts here, so a kill mid-clear leaves a headless work every reader
+   *  repairs — never a published head over missing rows. */
+  clearProjectionHead(workId: string): void;
+  /** Deletes at most `limit` of the work's projection rows, returning how many went: the sliced
+   *  rebuild drains the old rows in bounded transactions instead of one whole-work delete. */
+  deleteProjectionRows(workId: string, limit: number): number;
   getHead(workId: string): WorkHead | undefined;
   putHead(head: WorkHead): void;
   allHeads(): WorkHead[];
@@ -267,6 +274,21 @@ export function backendFor(agentDir: string): RecordBackend {
   const found = backends.get(agentDir);
   if (found) return found;
   const created = factory ? factory(agentDir) : sqliteBackend(agentDir);
+  backends.set(agentDir, created);
+  return created;
+}
+
+/** Capture's backend lookup: a warm cache returns as usual, but a COLD process — no cached
+ *  backend yet — opens the ledger inside capture's own bounded busy window, so a writer held
+ *  by another process fails the open (or its construction writes) with SQLITE_BUSY inside the
+ *  250 ms window instead of stalling the session's event loop for the reconciliation timeout
+ *  and escaping the spool path entirely. The opened connection is handed back with the normal
+ *  busy timeout restored, exactly as tryCaptureTx leaves it. */
+function captureBackendFor(agentDir: string): RecordBackend {
+  const found = backends.get(agentDir);
+  if (found) return found;
+  // The test factory (the in-memory double) cannot be busy; only the SQLite open is bounded.
+  const created = factory ? factory(agentDir) : captureSqliteBackend(agentDir);
   backends.set(agentDir, created);
   return created;
 }
@@ -546,7 +568,6 @@ function blockingCaptureCommit(commit: () => void): void {
 }
 
 export function capture(agentDir: string, record: WorkRecord, sourcePath: string | null): void {
-  const backend = backendFor(agentDir);
   const line = JSON.stringify(record);
   const stored: StoredRecord = {
     recordHash: recordHashOf(record),
@@ -559,7 +580,7 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
     sourceOffset: null,
     importedAt: Date.now(),
   };
-  const commit = () => {
+  const commitInto = (backend: RecordBackend) => {
     // A projection lost to a version bump or a bug is not rebuilt here: this commit must stay
     // one small transaction, and a rebuild that ran inside it would hold the write lock across
     // every slice (an outer tryCaptureTx transaction cannot see the slice boundaries). The work
@@ -575,10 +596,23 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
       if (projection) foldWork(backend, record.workId, [record]);
     });
   };
-  if (!backend.tryCaptureTx) {
-    commit();
+  // The backend lookup itself is inside the bounded capture path: a cold process whose ledger
+  // open (or its construction writes) hits the held writer spools the record like a busy commit
+  // would, and on a failed spool blocks on the open and the commit without a time limit.
+  let backend: RecordBackend;
+  try {
+    backend = captureBackendFor(agentDir);
+  } catch (error) {
+    if (!isBusyError(error)) throw error;
+    if (spoolCaptureLine(agentDir, record.sessionId, line)) return;
+    blockingCaptureCommit(() => commitInto(backendFor(agentDir)));
     return;
   }
+  if (!backend.tryCaptureTx) {
+    commitInto(backend);
+    return;
+  }
+  const commit = () => commitInto(backend);
   if (backend.tryCaptureTx(commit)) return;
   if (spoolCaptureLine(agentDir, record.sessionId, line)) return;
   blockingCaptureCommit(commit);
@@ -875,30 +909,76 @@ export function rebuildWork(agentDir: string, workId: string): void {
 const rebuildSizers = new Map<string, TxChunkSizer>();
 const REBUILD_SLICE_START = 1_000;
 const REBUILD_SLICE_MAX = 100_000;
-/** After this many population-moved restarts, one single-transaction rebuild finishes the
- * job: atomic, so a continuously capturing session on this work cannot keep the slices
- * restarting forever. */
+/** The ownership-generation note: each sliced rebuild's clear writes its unique generation, and
+ * its publication requires that same generation — a competing rebuild (another process's lazy
+ * repair, an importer's missing-projection rebuild) that cleared or replaced the projection
+ * mid-fold is detected at publish time, and this rebuild restarts instead of publishing a
+ * partial, clean-looking projection over the other's clear. */
+const REBUILD_OWNERSHIP_NOTE = "__rebuild-ownership";
+/** Publication retries before the atomic convergence transaction. Each failed publication
+ * folded only the delta that landed since the last fold, so the final transaction's work is
+ * bounded by what arrived during the retry loop — never the whole work. */
+const REBUILD_PUBLISH_RETRY_LIMIT = 8;
+/** Whole restarts tolerated against a competing rebuild before this rebuild gives up: it
+ * publishes nothing (no head, dirty marker intact — the state every reader and the next pass
+ * repair) rather than spinning forever against an equally determined other writer. */
 const REBUILD_RESTART_LIMIT = 8;
+
+/** Folds every record page in (after, through] into `rows`, parsing damaged bodies away. */
+function foldWorkRecordPages(
+  backend: RecordBackend,
+  workId: string,
+  rows: SummaryRows,
+  after: number,
+  through: number,
+  readLimit: number,
+  sizer?: TxChunkSizer,
+): number {
+  let position = after;
+  let limit = readLimit;
+  for (;;) {
+    const page = backend.readWorkRecordPage(workId, position, through, limit);
+    if (!page.length) return position;
+    const records: WorkRecord[] = [];
+    for (const row of page) {
+      try {
+        records.push(JSON.parse(row.body) as WorkRecord);
+      } catch {
+        // Skip damaged bodies; rebuild must not fail because one row is unreadable.
+      }
+    }
+    backend.tx(() => mergeRecordsInto(rows, records));
+    const last = backend.txDurations?.().lastMs;
+    if (last !== undefined) sizer?.observe(last);
+    if (page.length < limit) return page[page.length - 1].position;
+    position = page[page.length - 1].position;
+    limit = sizer ? sizer.size() : limit;
+  }
+}
 
 /** Sliced rebuild: while the work's records fit one slice, the whole rebuild stays one
  * transaction — rows, head and the dirty-marker clear commit together exactly as before. Once
- * the slice size sits below the work's record count, the projection clears and marks dirty in
- * its own transaction, the records fold in adaptively sized slices (the head's counters live in
- * memory across slices, and only the final transaction publishes the head), and a kill
- * mid-rebuild leaves a work with rows but no head — a state every reader already repairs by
- * rebuilding lazily — never a partially published head.
+ * the slice size sits below the work's record count, the rebuild runs as bounded units only:
+ * the head leaves first (with the dirty marker and this rebuild's ownership generation) so a
+ * kill mid-clear leaves a headless work every reader repairs, the old rows drain in bounded
+ * chunks, the records fold in adaptively sized slices (the head's counters live in memory
+ * across slices, and only the final transaction publishes the head), and a kill mid-rebuild
+ * leaves a work with rows but no head — never a partially published head.
  *
  * A capture on this work that commits during the rebuild is not in the folded pages when it
  * lands above the pinned watermark: publishing anyway would erase its projection row and clear
- * the dirty marker. The population is therefore read before the watermark: a capture that
- * commits between the two reads is below the watermark and folded by the pages, and one that
- * commits after either read moves the count, so the final transaction re-checks the work's
- * record count inside the write lock (only a write to this work moves it, and no writer can
- * commit between that check and the publish) and the rebuild restarts whole from the new
- * population when it moved, re-clearing and re-folding everything the capture touched. Writes
- * to other works leave the count alone, so ordinary traffic on unrelated works cannot restart
- * a rebuild or drive it into the atomic fallback below. After REBUILD_RESTART_LIMIT restarts,
- * one atomic whole-work transaction converges. */
+ * the dirty marker. The population is therefore always read BEFORE the watermark it publishes
+ * against: if the publication transaction re-checks the work's record count inside the write
+ * lock and finds it unchanged, every record was already folded (an unchanged count means no
+ * same-work insert since before the watermark read). A moved count no longer restarts the
+ * whole rebuild: only the delta above the folded watermark is folded — in slices again — and
+ * the publication retried, so a continuously capturing session cannot make the rebuild redo
+ * its work or fall back to an unbounded transaction. After REBUILD_PUBLISH_RETRY_LIMIT retries,
+ * one final transaction folds the (small, arrival-rate-bounded) delta and publishes under the
+ * write lock, which no capture can move. A competing rebuild is detected through the ownership
+ * generation instead: its clear replaced the note, so this rebuild restarts whole — and after
+ * REBUILD_RESTART_LIMIT such restarts gives up without publishing, leaving the repairable
+ * headless state rather than a partial projection. */
 export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, workId: string): void {
   const sizer = rememberSizer(rebuildSizers, agentDir, () =>
     createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_MAX),
@@ -916,54 +996,114 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
     const limit = sizer.size();
     // The single-transaction path is chosen by record count, so a fitting work never pages (and
     // never re-reads) the authority the transaction below refolds anyway.
-    if (restarts >= REBUILD_RESTART_LIMIT || backend.recordCount(workId) <= limit) {
+    if (backend.recordCount(workId) <= limit) {
       backend.tx(() => rebuildWorkInTx(backend, workId));
       observe();
       return;
     }
+    if (restarts >= REBUILD_RESTART_LIMIT) return;
+    const generation = randomUUID();
+    // `latest` and `pullRequests` are maintained incrementally while the records fold (the
+    // projection-rows hook observes each written row), so the publication transaction never
+    // scans the whole work's logs to derive them.
     const head = emptyHead(workId);
-    const rows = projectionRows(backend, head);
-    backend.tx(() => {
-      backend.clearProjection(workId);
-      backend.markDirty(workId);
+    const commits: Row[] = [];
+    const rows = projectionRows(backend, head, (collection, row) => {
+      observeLatest(head.latest, collection, row);
+      if (collection === "commits") commits.push(row);
     });
-    let after = 0;
-    let readLimit = limit;
-    for (;;) {
-      const page = backend.readWorkRecordPage(workId, after, through, readLimit);
-      if (!page.length) break;
-      const records: WorkRecord[] = [];
-      for (const row of page) {
-        try {
-          records.push(JSON.parse(row.body) as WorkRecord);
-        } catch {
-          // Skip damaged bodies; rebuild must not fail because one row is unreadable.
-        }
-      }
-      backend.tx(() => mergeRecordsInto(rows, records));
-      observe();
-      if (page.length < readLimit) break;
-      after = page[page.length - 1].position;
-      readLimit = sizer.size();
-    }
-    let published = false;
     backend.tx(() => {
-      if (backend.recordCount(workId) !== population) return;
-      backend.putHead({
-        ...head,
-        updatedAt: new Date().toISOString(),
-        ...summaryLatest((collection) => backend.readLog(workId, collection)),
-      });
-      backend.clearDirty(workId);
-      published = true;
+      // The head leaves with the dirty marker and this rebuild's ownership generation: a kill
+      // anywhere after this transaction leaves the headless-but-dirty state readers repair.
+      backend.clearProjectionHead(workId);
+      backend.markDirty(workId);
+      backend.putNote(workId, REBUILD_OWNERSHIP_NOTE, generation);
     });
     observe();
-    if (published) return;
+    // The old projection rows drain in bounded chunks: deleting them all in the transaction
+    // above would make the clear itself an unbounded write for a huge work. The chunk size is
+    // re-read from the sizer each round, so cheap deletions grow the chunks instead of paying
+    // one transaction per row after the sizer has shrunk.
+    for (;;) {
+      let deleted = 0;
+      backend.tx(() => {
+        deleted = backend.deleteProjectionRows(workId, sizer.size());
+      });
+      observe();
+      if (!deleted) break;
+    }
+    const foldedThrough = foldWorkRecordPages(
+      backend,
+      workId,
+      rows,
+      0,
+      through,
+      sizer.size(),
+      sizer,
+    );
+    let expected = population;
+    let publishedThrough = through;
+    for (let attempts = 0; ; attempts++) {
+      let published = false;
+      let foreign = false;
+      backend.tx(() => {
+        if (backend.getNote(workId, REBUILD_OWNERSHIP_NOTE) !== generation) {
+          foreign = true;
+          return;
+        }
+        if (backend.recordCount(workId) !== expected) {
+          if (attempts < REBUILD_PUBLISH_RETRY_LIMIT) return;
+          // Atomic convergence: fold whatever landed above the folded watermark inside this
+          // transaction — the write lock is held, so nothing more can land — and publish. The
+          // transaction is bounded by the delta that arrived during the retry loop, never by
+          // the whole work.
+          foldWorkRecordPages(
+            backend,
+            workId,
+            rows,
+            publishedThrough,
+            backend.recordWatermark(),
+            sizer.size(),
+          );
+        }
+        backend.putHead({
+          ...head,
+          updatedAt: new Date().toISOString(),
+          pullRequests: commitPullRequests(commits),
+        });
+        backend.clearDirty(workId);
+        backend.deleteNote(workId, REBUILD_OWNERSHIP_NOTE);
+        published = true;
+      });
+      observe();
+      if (published) return;
+      if (foreign) break;
+      // A same-work capture landed since the population was read: fold only the new delta —
+      // the population is re-read BEFORE the watermark so the same invariant covers the next
+      // publication attempt — and retry.
+      expected = backend.recordCount(workId);
+      const deltaThrough = backend.recordWatermark();
+      foldWorkRecordPages(
+        backend,
+        workId,
+        rows,
+        publishedThrough,
+        deltaThrough,
+        sizer.size(),
+        sizer,
+      );
+      publishedThrough = deltaThrough;
+    }
   }
 }
 
 function rebuildWorkInTx(backend: RecordBackend, workId: string): void {
   backend.clearProjection(workId);
+  // A fresh ownership generation rides the clear: a concurrent sliced rebuild detects this
+  // whole-work rebuild's interference at its own publication and restarts instead of
+  // publishing over rows this transaction replaced. This rebuild is atomic, so it never needs
+  // to check the note itself.
+  backend.putNote(workId, REBUILD_OWNERSHIP_NOTE, randomUUID());
   const records: WorkRecord[] = [];
   for (const row of backend.readRecords({ workId })) {
     try {
@@ -1114,6 +1254,27 @@ function sqliteBackend(agentDir: string): RecordBackend {
   const store: LedgerStore = openStore(agentDir);
   try {
     return sqliteBackendFor(store);
+  } catch (error) {
+    store.close();
+    throw error;
+  }
+}
+
+/** Capture's cold open: bounded by the capture busy window, with the optional additive-schema
+ *  apply deferred (the windowed read heals it lazily) and no open-retry budget, so the whole
+ *  lookup fits inside the window tryCaptureTx commits within. The connection's normal busy
+ *  timeout is restored once construction succeeded — a cached backend is a general ledger
+ *  connection, not a capture-only one. */
+function captureSqliteBackend(agentDir: string): RecordBackend {
+  const store: LedgerStore = openStore(agentDir, {
+    busyTimeoutMs: CAPTURE_BUSY_TIMEOUT_MS,
+    openRetryBudgetMs: 0,
+    deferAdditiveSchema: true,
+  });
+  try {
+    const backend = sqliteBackendFor(store);
+    store.db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
+    return backend;
   } catch (error) {
     store.close();
     throw error;
@@ -1313,6 +1474,9 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
   const allHeads = db.query<{ body: string }, []>("SELECT body FROM work_projection_head");
   const clearRows = db.query("DELETE FROM work_projection_rows WHERE work_id = ?");
   const clearHead = db.query("DELETE FROM work_projection_head WHERE work_id = ?");
+  const deleteRowsPage = db.query<[number, number], [string, number]>(
+    "DELETE FROM work_projection_rows WHERE rowid IN (SELECT rowid FROM work_projection_rows WHERE work_id = ? LIMIT ?)",
+  );
   const recordColumns = recordColumnsSql();
   const readRecordsAll = db.query<StoredRecord, []>(
     `SELECT ${recordColumns} FROM work_records ORDER BY rowid`,
@@ -1511,6 +1675,10 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
       clearRows.run(workId);
       clearHead.run(workId);
     },
+    clearProjectionHead: (workId) => {
+      clearHead.run(workId);
+    },
+    deleteProjectionRows: (workId, limit) => deleteRowsPage.run(workId, limit).changes,
     getHead: (workId) => {
       const found = getHead.get(workId);
       return found ? (JSON.parse(found.body) as WorkHead) : undefined;

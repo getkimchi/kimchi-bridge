@@ -687,3 +687,51 @@ it("unrelated captures do not restart a sliced rebuild or force the whole-work f
   expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
   expect(backend.dirtyWorks()).toEqual([]);
 }, 30_000);
+
+it("same-work captures never drive a rebuild into a whole-work transaction", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  seedUnheaded(dir, 2500);
+  // Shrink the rebuild slices, exactly as measured slow transactions would, so the rebuild
+  // pages and publishes repeatedly while captures keep landing on the same work.
+  slowClock(300);
+  for (let round = 0; round < 16; round++) rebuildWork(dir, WORK);
+  useTxClock(null);
+  const read = backend.readRecords;
+  let wholeReads = 0;
+  backend.readRecords = (opts: Parameters<typeof read>[0] = {}, checkBudget?: () => void) => {
+    if (opts?.workId === WORK) wholeReads++;
+    return read(opts, checkBudget);
+  };
+  // A capture on this work lands on the fold's page reads — between transactions, where a
+  // same-process capture can really commit — so the population keeps moving while the rebuild
+  // folds, the case the old restart limit's whole-work fallback existed for. Injection stops
+  // after the initial fold: a capture committed INSIDE the publication transaction is not a
+  // state production can reach (the write lock is held; the event loop cannot re-enter).
+  const page = backend.readWorkRecordPage;
+  let injected = 0;
+  backend.readWorkRecordPage = (...args: Parameters<typeof page>) => {
+    if (injected < 4) {
+      injected++;
+      capture(dir, record(`req-raced-${injected}`), "summary-native");
+    }
+    return page(...args);
+  };
+  try {
+    resetLedgerTxDurations(dir);
+    rebuildWork(dir, WORK);
+  } finally {
+    backend.readRecords = read;
+    backend.readWorkRecordPage = page;
+  }
+  // The rebuild converged without one whole-authority read: every publication retry folded only
+  // the delta that landed since the last fold, and the final atomic transaction is bounded by
+  // that delta, never by the work.
+  expect(wholeReads).toBe(0);
+  // Every captured record is in the projection, the dirty marker is clear, and the whole
+  // rebuild stayed inside the transaction budget the plan demands.
+  const projection = readWorkSummary(dir, WORK);
+  expect(projection?.requests).toHaveLength(backend.recordCount(WORK));
+  expect(backend.dirtyWorks()).toEqual([]);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(250);
+}, 30_000);
