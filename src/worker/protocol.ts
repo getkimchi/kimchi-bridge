@@ -865,15 +865,17 @@ function awsSpans(text: string): [number, number][] {
  * Scrubs tokens from a line the worker is about to log or report as an error.
  * `secrets` are the exact values the worker knows it handled (credential
  * tokens from reply messages): every nonempty one is replaced wherever it
- * appears, however short — it was accepted as a credential, so it is never an
- * ordinary word in this line. Everything else is matched by shape, where a
- * minimum length keeps ordinary words from being mangled. Over-redaction is
- * safe here; a missed token is not.
+ * appears, however short — including whitespace-only values, which Kimchi's
+ * config reader accepts as credentials just like any other nonempty string —
+ * so an accepted credential is never an ordinary run of characters in this
+ * line. Everything else is matched by shape, where a minimum length keeps
+ * ordinary words from being mangled. Over-redaction is safe here; a missed
+ * token is not.
  */
 export function redactTokens(text: string, secrets: Iterable<string> = []): string {
   let out = text;
   for (const secret of secrets) {
-    if (secret !== "" && secret.trim() !== "") out = out.split(secret).join("[redacted]");
+    if (secret !== "") out = out.split(secret).join("[redacted]");
   }
   out = replaceSpans(out, keyedSecretSpans(out));
   out = replaceSpans(out, bearerSpans(out));

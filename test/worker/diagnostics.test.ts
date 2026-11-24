@@ -62,3 +62,23 @@ test("short secrets are scrubbed from logged errors too", () => {
   const text = readFileSync(join(dir, "logs", "work-attribution.log"), "utf8");
   for (const secret of ["Q", "abcd", "abcdefgh"]) expect(text.includes(secret)).toBe(false);
 });
+
+test("whitespace-only accepted credentials are scrubbed from logged errors too", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kimchi-worker-diag-"));
+  dirs.push(dir);
+  process.env.NODE_DEBUG = "kimchi:work-attribution";
+  const host = { agentDir: dir } as HostPorts;
+  // A spaces-only and a tab-only token are nonempty accepted credentials,
+  // exactly like a short one: both are replaced, never persisted.
+  withHostPorts(host, () => {
+    setDiagnosticsRedactor((text) => redactTokens(text, ["   ", "\t"]));
+    debugWorkAttribution(
+      "Could not report PR costs: %o",
+      new Error("upload failed for '   ' and '\t' at the gateway"),
+    );
+  });
+  const text = readFileSync(join(dir, "logs", "work-attribution.log"), "utf8");
+  expect(text.includes("'   '")).toBe(false);
+  expect(text.includes("'\t'")).toBe(false);
+  expect(text.includes("[redacted]")).toBe(true);
+});

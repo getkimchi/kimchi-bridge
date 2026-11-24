@@ -623,16 +623,18 @@ test("a pass queued behind a blocked one is reported expired when its budget ran
   expect(await worker.exited()).toBe(0);
 }, 20000);
 
-test("no token, short or long, reaches any worker output or the diagnostics log", async () => {
+test("no token, short, long, or whitespace-only, reaches any worker output or the diagnostics log", async () => {
   const dir = agentDir();
   seedRecord(dir);
   // Opt-in diagnostics on: a channel failure is logged to work-attribution.log,
   // so the log is part of the token-free surface.
   const worker = spawnWorker(dir, { NODE_DEBUG: "kimchi:work-attribution" });
   await handshake(worker, dir);
-  const tokens = ["Q", "abcd", "abcdefgh", "kchi_lifecycle_fake_token_0123456789"];
+  const tokens = ["Q", "abcd", "abcdefgh", "kchi_lifecycle_fake_token_0123456789", " \t "];
   // One pass per token: each credentials answer carries it, so the registry
-  // holds one secret of every tested length once they are done.
+  // holds one secret of every tested shape once they are done. The last one
+  // is whitespace-only: a nonempty credential the reply accepts, so it must
+  // be registered and scrubbed like any other.
   for (let index = 0; index < tokens.length; index++) {
     worker.send({
       type: "pass",

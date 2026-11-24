@@ -264,8 +264,10 @@ export class StdioTransport {
 
   /** Registers a secret value (a credential token) for redaction on every error path. */
   addSecret(secret: string): void {
-    // Every nonempty accepted credential is a secret, however short.
-    if (secret !== "" && secret.trim() !== "") this.secrets.add(secret);
+    // Every nonempty accepted credential is a secret, however short — a
+    // whitespace-only token is accepted by the credential reply and by
+    // Kimchi's own config reader, so only the empty string is excluded.
+    if (secret !== "") this.secrets.add(secret);
   }
 
   /** Redacts every known secret and credential shape from a line about to be reported. */

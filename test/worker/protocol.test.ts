@@ -351,7 +351,18 @@ describe("token redaction", () => {
       expect(redacted).not.toContain(secret);
       expect(redacted).toContain("[redacted]");
     }
-    // Whitespace-only values are excluded: nothing is a secret about spaces.
-    expect(redactTokens("kept as is", ["  "])).toBe("kept as is");
+  });
+
+  test("whitespace-only accepted credentials are scrubbed, not treated as blank", () => {
+    // Kimchi's config reader accepts any nonempty apiKey string, and the
+    // credentials reply does the same, so a spaces-only or tab-only token is
+    // a live credential and must be replaced exactly wherever it appears.
+    expect(redactTokens("token=   ; suffix", ["   "])).toBe("token=[redacted]; suffix");
+    expect(redactTokens("key a\tb done", ["\t"])).toBe("key a[redacted]b done");
+    // A credentials value that is all whitespace still scrubs from every
+    // shape it can appear in, including quoted diagnostic fields.
+    expect(redactTokens('"token":"   "', ["   "])).toBe('"token":"[redacted]"');
+    // The empty string alone is not a credential and replaces nothing.
+    expect(redactTokens("kept as is", [""])).toBe("kept as is");
   });
 });
