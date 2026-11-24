@@ -155,13 +155,16 @@ function wrapBodyWithIdleTimeout(
  */
 export function makeWorkerFetch(userAgent: string): HostFetch {
   return async function workerFetch(input, init) {
-    const idleMs = resolveStreamIdleTimeoutMs();
-    if (idleMs <= 0) return fetch(input, init);
-
+    // Header handling comes first, in every mode: Kimchi applies its outer
+    // user-agent wrapper even when the idle-timeout wrapper is disabled, so
+    // turning the timeout off must never also drop the parent's identity.
     const headers = new Headers(
       init?.headers ?? (input instanceof Request ? input.headers : undefined),
     );
     if (!headers.has("user-agent")) headers.set("user-agent", userAgent);
+
+    const idleMs = resolveStreamIdleTimeoutMs();
+    if (idleMs <= 0) return fetch(input, { ...init, headers });
 
     const host = hostOf(input);
     const controller = new AbortController();

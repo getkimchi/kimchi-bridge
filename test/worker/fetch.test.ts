@@ -140,12 +140,27 @@ describe("the worker's fetch wrapper", () => {
     expect(await response.text()).toBe("one two three");
   });
 
-  test("zero disables the idle timeout", async () => {
-    const site = serve({ stall: () => new Promise<Response>(() => {}) });
+  test("zero disables the idle timeout but not the parent's user agent", async () => {
     process.env[STREAM_IDLE_TIMEOUT_ENV] = "0";
+    const site0 = serve({});
     const fetchWithAgent = makeWorkerFetch("kimchi/9.9.9-test");
-    const pending = fetchWithAgent(site.url("/stall"));
-    // Still pending (not rejected) well past a would-be short timeout.
+    // A completing request under the disabled timeout still carries the
+    // parent's user agent, and a caller-supplied one still wins.
+    const response = await fetchWithAgent(site0.url("/"));
+    expect(await response.text()).toBe("ok");
+    expect(site0.observed().userAgent).toBe("kimchi/9.9.9-test");
+    await fetchWithAgent(site0.url("/"), { headers: { "user-agent": "caller/1" } });
+    expect(site0.observed().userAgent).toBe("caller/1");
+    // The default setting applies the same headers: the two options are
+    // independent, and only the timeout differs.
+    delete process.env[STREAM_IDLE_TIMEOUT_ENV];
+    await fetchWithAgent(site0.url("/"));
+    expect(site0.observed().userAgent).toBe("kimchi/9.9.9-test");
+    // With the timeout disabled, a stalled request stays pending rather than
+    // failing at a would-be short timeout.
+    const stall = serve({ stall: () => new Promise<Response>(() => {}) });
+    process.env[STREAM_IDLE_TIMEOUT_ENV] = "0";
+    const pending = fetchWithAgent(stall.url("/stall"));
     const result = await Promise.race([
       pending.then(() => "settled"),
       Bun.sleep(400).then(() => "pending"),
