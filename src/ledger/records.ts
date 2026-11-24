@@ -5,10 +5,10 @@ import {
   existsSync,
   fstatSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readSync,
-  statSync,
   writeSync,
   type Stats,
 } from "node:fs";
@@ -385,7 +385,9 @@ function appendSpoolRecord(path: string, line: string): boolean {
     fsyncDirectoryDurable(directory);
     for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
     // Verify through this descriptor that the record is the file's last line, and then that
-    // the path still resolves to this same inode. The write completes before the identity
+    // the live pathname is still this user's private single-link regular file at the same
+    // inode, never following a symlink (a link swapped in for the path would otherwise hide
+    // the append from every importer scan). The write completes before the identity
     // check, so an importer that claimed the file away (renamed it to a claim, then unlinked)
     // between the open and this point is caught here: the append would otherwise live in an
     // inode no importer can ever scan again. A missing path or a different inode reports the
@@ -398,10 +400,20 @@ function appendSpoolRecord(path: string, line: string): boolean {
     if (!tail.equals(bytes)) return false;
     let live: Stats;
     try {
-      live = statSync(path);
+      live = lstatSync(path);
     } catch (error) {
       if (object(error) && error.code === "ENOENT") return false;
       throw error;
+    }
+    if (!live.isFile() || live.nlink !== 1 || (uid !== undefined && live.uid !== uid)) {
+      // The live pathname is not this user's private single-link regular file (a symlink
+      // swapped in for it, an added hardlink, or a foreign owner): the append is not
+      // acknowledged, the caller re-appends or falls back to the blocking SQLite wait, and the
+      // unsafe path is reported so it can be repaired.
+      process.stderr.write(
+        "kimchi: the capture spool path is unsafe; the record is being re-appended\n",
+      );
+      return false;
     }
     return live.dev === stat.dev && live.ino === stat.ino;
   } finally {
