@@ -14,8 +14,22 @@ import { describe, expect, it } from "bun:test";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const BOUNDARY_DIRS = [join(ROOT, "src/ledger"), join(ROOT, "src/reconcile")];
-const BOUNDARY_FILES = [...files(join(ROOT, "src/ledger")), join(ROOT, "src/reconcile/host.ts")];
+const BOUNDARY_FILES = [...files(join(ROOT, "src/ledger")), ...files(join(ROOT, "src/reconcile"))];
 const PLATFORM = join(ROOT, "src/platform.ts");
+/**
+ * The reconcile passes moved byte-identically from Kimchi and carry three library dependencies
+ * the ledger never had: proper-lockfile (the reporting queue's own state.json lock — not the
+ * supervisor lease, which stays in Kimchi), yaml (glab's config.yml parsing) and diff
+ * (file-hunk matching). Nothing else may be imported, and no @earendil-works/* or Kimchi path
+ * may appear in either library.
+ */
+const RECONCILE_ALLOWED_BARE = new Set(["proper-lockfile", "yaml", "diff"]);
+
+/** Windows-safe containment: `file` is inside `dir` (no separator-specific prefix matching). */
+function inside(file: string, dir: string): boolean {
+  const path = relative(dir, file);
+  return path !== "" && !path.startsWith("..") && !isAbsolute(path);
+}
 
 function files(directory: string): string[] {
   const out: string[] = [];
@@ -108,9 +122,13 @@ function classify({ specifier, file }: Import): { ok: boolean; reason?: string }
       return { ok: false, reason: "imports src/platform.ts, which throws on Windows" };
     return { ok: true };
   }
+  if (inside(file, join(ROOT, "src/reconcile")) && RECONCILE_ALLOWED_BARE.has(specifier))
+    return { ok: true };
   return {
     ok: false,
-    reason: `bare import ${specifier} (only node: builtins and bun:sqlite are allowed)`,
+    reason: `bare import ${specifier} (only node: builtins, bun:sqlite${
+      inside(file, join(ROOT, "src/reconcile")) ? ", and the reconcile libraries" : ""
+    } are allowed)`,
   };
 }
 
@@ -121,7 +139,7 @@ describe("ledger import boundary", () => {
     expect(BOUNDARY_FILES).toContain(join(ROOT, "src/ledger/index.ts"));
   });
 
-  it("every import in src/ledger and src/reconcile/host.ts is relative, node:, or bun:sqlite", () => {
+  it("every import in src/ledger and src/reconcile is relative, node:, bun:sqlite, or an allowed reconcile library", () => {
     const violations: string[] = [];
     for (const file of BOUNDARY_FILES) {
       for (const imp of importsOf(file)) {
@@ -160,5 +178,45 @@ describe("ledger import boundary", () => {
     // Sanity: the walk really started from the barrel and reached the library's leaves.
     expect(seen.has(join(ROOT, "src/ledger/store.ts"))).toBe(true);
     expect(seen.has(join(ROOT, "src/ledger/memory-records.ts"))).toBe(true);
+  });
+
+  it("the reconcile barrel's graph also stays inside the libraries and off platform.ts", () => {
+    const seen = new Set<string>();
+    const queue = [join(ROOT, "src/reconcile/index.ts")];
+    while (queue.length) {
+      const file = queue.shift()!;
+      if (seen.has(file)) continue;
+      seen.add(file);
+      expect(file === PLATFORM, `${relative(ROOT, file)} reaches src/platform.ts`).toBe(false);
+      const insideBoundary = BOUNDARY_DIRS.some((dir) => file === dir || inside(file, dir));
+      expect(insideBoundary, `${relative(ROOT, file)} escapes src/ledger|src/reconcile`).toBe(true);
+      for (const { specifier } of importsOf(file)) {
+        if (specifier.startsWith("./") || specifier.startsWith("../")) {
+          const target = resolveRelative(file, specifier);
+          expect(target, `broken relative import ${specifier}`).toBeDefined();
+          if (target) queue.push(target);
+        }
+      }
+    }
+    // Sanity: the walk reached the passes the plan moved in chunk B2.
+    expect(seen.has(join(ROOT, "src/reconcile/pr-cost-reporting/worker.ts"))).toBe(true);
+    expect(seen.has(join(ROOT, "src/reconcile/work-attribution/file-transitions.ts"))).toBe(true);
+    expect(seen.has(join(ROOT, "src/reconcile/pull-request-status/pull-requests.ts"))).toBe(true);
+  });
+
+  it("no ledger or reconcile file imports Kimchi paths or the @earendil-works SDK", () => {
+    const violations: string[] = [];
+    for (const file of BOUNDARY_FILES) {
+      for (const imp of importsOf(file)) {
+        if (imp.specifier.startsWith("@earendil-works/"))
+          violations.push(`${relative(ROOT, imp.file)}: ${imp.specifier}`);
+        else if (imp.specifier.startsWith("./") || imp.specifier.startsWith("../")) {
+          const target = resolveRelative(file, imp.specifier);
+          if (target && !BOUNDARY_DIRS.some((dir) => target === dir || inside(target, dir)))
+            violations.push(`${relative(ROOT, imp.file)}: ${imp.specifier} escapes the libraries`);
+        }
+      }
+    }
+    expect(violations.join("\n")).toBe("");
   });
 });

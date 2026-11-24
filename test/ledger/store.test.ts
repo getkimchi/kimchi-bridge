@@ -292,7 +292,7 @@ test("the planner answers the windowed read from the index, not a full scan (bun
   expect(plan).not.toContain("SCAN work_records");
 });
 
-test("PR lookup backoff migrates once and survives a real SQLite reopen", { timeout: 30_000 }, () => {
+test("PR lookup backoff migrates once and survives a real SQLite reopen", () => {
   const dir = agentDir();
   const repository = join(dir, "removed-worktree", ".git");
   const sha = "a".repeat(40);
@@ -323,4 +323,4 @@ test("PR lookup backoff migrates once and survives a real SQLite reopen", { time
   writeFileSync(path, "{}\n");
   expect(driver("pr-checks", dir)).toEqual({ note: body, records: 1 });
   expect(readFileSync(path, "utf8")).toBe("{}\n");
-});
+}, 30_000);

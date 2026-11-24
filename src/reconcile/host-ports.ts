@@ -1,5 +1,5 @@
-import { AsyncLocalStorage } from "node:async_hooks"
-import type { HostPorts } from "./host.js"
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { HostPorts } from "./host.js";
 
 /**
  * Host-port access for the reconcile passes. The passes' entry points (runReconciliationPass,
@@ -12,26 +12,26 @@ import type { HostPorts } from "./host.js"
  * outside any pass (an embedding process's command handlers in Kimchi chunk K1) can install a
  * process-wide default with `setDefaultHostPorts`.
  */
-const context = new AsyncLocalStorage<HostPorts>()
+const context = new AsyncLocalStorage<HostPorts>();
 
-let fallback: HostPorts | undefined
+let fallback: HostPorts | undefined;
 
 /** Binds `host` for the whole synchronous and asynchronous extent of `run`. */
 export function withHostPorts<T>(host: HostPorts, run: () => T): T {
-	return context.run(host, run)
+  return context.run(host, run);
 }
 
 /** A process-wide host for call sites outside any pass context (the embedding process's own wiring). */
 export function setDefaultHostPorts(host: HostPorts | undefined): void {
-	fallback = host
+  fallback = host;
 }
 
 /** The bound host; throws when reconcile code runs without one, so no call site silently guesses. */
 export function hostPorts(): HostPorts {
-	const current = context.getStore() ?? fallback
-	if (!current)
-		throw new Error(
-			"kimchi-bridge reconcile code requires HostPorts: bind one with withHostPorts or setDefaultHostPorts first",
-		)
-	return current
+  const current = context.getStore() ?? fallback;
+  if (!current)
+    throw new Error(
+      "kimchi-bridge reconcile code requires HostPorts: bind one with withHostPorts or setDefaultHostPorts first",
+    );
+  return current;
 }
