@@ -6,9 +6,17 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it, mock } from "bun:test";
 import type { PullRequestCostReport } from "../../../src/reconcile/work-attribution/costs.js";
-import { buildEvents, type CommonEvents } from "../../../src/reconcile/pr-cost-reporting/events.js";
+import type { CommonEvents } from "../../../src/reconcile/pr-cost-reporting/events.js";
 
 it("breathes the stretcher while parsing and attributing masses of requests", async () => {
+  // bun test shares one module registry across test files: worker.test.ts registers mock.module()
+  // for events.js, and that mock outlives its file, so a plain import here resolves to the
+  // worker's fake buildEvents whenever worker runs first. The query-qualified relative specifier
+  // loads this builder as its own module, beyond the mock registry's reach.
+  const events = "../../../src/reconcile/pr-cost-reporting/events.js?independent";
+  const { buildEvents } = (await import(
+    events
+  )) as typeof import("../../../src/reconcile/pr-cost-reporting/events.js");
   const stretch = mock(async () => {});
   const many = Array.from({ length: 2_003 }, (_, index) => ({
     ...records[0],

@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import {
-  macMachineId,
-  windowsMachineId,
-} from "../../../src/reconcile/pr-cost-reporting/machine.js";
+// bun test shares one module registry across test files: queue.test.ts registers a partial
+// mock.module() for machine.js that outlives its file, so a plain import here loses
+// macMachineId whenever queue runs first. The query-qualified relative specifier loads this
+// module as its own instance, beyond the mock registry's reach.
+const machine = "../../../src/reconcile/pr-cost-reporting/machine.js?independent";
+const { macMachineId, windowsMachineId } = (await import(
+  machine
+)) as typeof import("../../../src/reconcile/pr-cost-reporting/machine.js");
 
 describe("machine identity", () => {
   it("reads the hardware UUID from ioreg output", () => {
