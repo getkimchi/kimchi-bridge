@@ -40,7 +40,7 @@ import {
   resetTxDurations,
   txDurations,
 } from "./store.js";
-import { createTxChunkSizer, type TxChunkSizer } from "./tx-budget.js";
+import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "./tx-budget.js";
 
 /**
  * The one storage engine behind capture, import, the derived summary projection, and tracker bookkeeping. Both
@@ -273,6 +273,7 @@ export function backendFor(agentDir: string): RecordBackend {
 export function closeBackends(): void {
   for (const backend of backends.values()) backend.close();
   backends.clear();
+  rebuildSizers.clear();
 }
 
 /** Hash used for native capture; imported records retain the hash of their exact original line bytes. */
@@ -768,11 +769,9 @@ const REBUILD_RESTART_LIMIT = 8;
  * the new watermark when it moved, re-clearing and re-folding everything the capture touched.
  * After REBUILD_RESTART_LIMIT restarts, one atomic whole-work transaction converges. */
 export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, workId: string): void {
-  let sizer = rebuildSizers.get(agentDir);
-  if (!sizer) {
-    sizer = createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_MAX);
-    rebuildSizers.set(agentDir, sizer);
-  }
+  const sizer = rememberSizer(rebuildSizers, agentDir, () =>
+    createTxChunkSizer(REBUILD_SLICE_START, 1, REBUILD_SLICE_MAX),
+  );
   const observe = () => {
     const last = backend.txDurations?.().lastMs;
     if (last !== undefined) sizer?.observe(last);

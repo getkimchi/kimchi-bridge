@@ -31,7 +31,7 @@ import {
   rebuildWorkSliced,
   spoolDirectory,
 } from "./records.js";
-import { createTxChunkSizer, type TxChunkSizer } from "./tx-budget.js";
+import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "./tx-budget.js";
 
 /** Immutable legacy import: authority, projection, coverage and cursor commit together. */
 export type JournalMode = "fresh" | "clean-append" | "mutation";
@@ -865,12 +865,9 @@ const importBatchSizers = new Map<string, TxChunkSizer>();
 const IMPORT_BATCH_START = 512;
 const IMPORT_BATCH_MAX = 100_000;
 function importBatchSizerFor(agentDir: string): TxChunkSizer {
-  let sizer = importBatchSizers.get(agentDir);
-  if (!sizer) {
-    sizer = createTxChunkSizer(IMPORT_BATCH_START, 1, IMPORT_BATCH_MAX);
-    importBatchSizers.set(agentDir, sizer);
-  }
-  return sizer;
+  return rememberSizer(importBatchSizers, agentDir, () =>
+    createTxChunkSizer(IMPORT_BATCH_START, 1, IMPORT_BATCH_MAX),
+  );
 }
 
 export async function importJournals(

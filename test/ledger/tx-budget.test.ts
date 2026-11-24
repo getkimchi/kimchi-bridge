@@ -28,7 +28,12 @@ import {
   txDurations,
   useTxClock,
 } from "../../src/ledger/store.js";
-import { createTxChunkSizer } from "../../src/ledger/tx-budget.js";
+import {
+  createTxChunkSizer,
+  MAX_SIZER_KEYS,
+  rememberSizer,
+  type TxChunkSizer,
+} from "../../src/ledger/tx-budget.js";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
 
 /**
@@ -97,6 +102,21 @@ it("the sizer clamps at its hard min and max", () => {
   expect(sizer.size()).toBe(100);
 });
 
+it("the per-agent sizer registry is bounded and refreshes recency", () => {
+  const map = new Map<string, TxChunkSizer>();
+  const sizer = rememberSizer(map, "first", () => createTxChunkSizer(10));
+  expect(sizer.size()).toBe(10);
+  for (let index = 0; index < MAX_SIZER_KEYS + 50; index++)
+    rememberSizer(map, `other-${index}`, () => createTxChunkSizer(10));
+  expect(map.size).toBe(MAX_SIZER_KEYS);
+  expect(map.has("first")).toBe(false);
+  // A recently used key survives later inserts past the bound.
+  const kept = rememberSizer(map, map.keys().next().value as string, () => createTxChunkSizer(10));
+  for (let index = 0; index < 20; index++)
+    rememberSizer(map, `fresh-${index}`, () => createTxChunkSizer(10));
+  expect([...map.values()]).toContain(kept);
+});
+
 it("the store histogram counts, buckets and resets", () => {
   const dir = agentDir();
   const store = openStore(dir);
@@ -152,15 +172,20 @@ it("import batches shrink under slow transactions, grow back, and reach the iden
     appendJournal(adaptive, first, lines);
   };
 
-  // The slow phase: the same appends go to both directories; the fixed one commits every window
-  // whole under the real clock (today's behavior), the adaptive one under a slow clock. Slow
-  // windows halve the batch size, so later windows commit in several transactions each — every
-  // one ending on a line boundary (a cursor never covers half a row).
-  slowClock(300);
+  // The slow phase: the same appends go to both directories; the fixed control runs under the
+  // real clock and commits every window whole (today's behavior, one transaction per window),
+  // while the adaptive one runs under a slow clock. Slow windows halve the batch size, so later
+  // windows commit in several transactions each — every one ending on a line boundary (a cursor
+  // never covers half a row).
+  // Both backends open before any measurement, so the counted windows hold only import work.
+  expect(readRecords(fixed)).toHaveLength(0);
+  expect(readRecords(adaptive)).toHaveLength(0);
   let sliced = 0;
   for (let pass = 0; pass < 20; pass++) {
     appendBoth(pass * lines);
-    importSlice(fixed);
+    useTxClock(null);
+    expect(importSlice(fixed).txs).toBe(1);
+    slowClock(300);
     const slice = importSlice(adaptive);
     const journal = readFileSync(join(adaptive, "work-attribution", LEGACY));
     if (slice.offset > 0) expect(journal[slice.offset - 1]).toBe(0x0a);
@@ -434,8 +459,13 @@ function facts(count: number, first: number): Fact[] {
   }));
 }
 
-/** Delivers and acknowledges every pending event, recording each frozen batch's size. */
-function drain(dir: string): number[] {
+/** Delivers and acknowledges every pending event, recording each frozen batch's size. The
+ * optional aroundAck hook wraps each acknowledgement (the slow-ack regression toggles the clock
+ * only inside it). */
+function drain(
+  dir: string,
+  aroundAck: (acknowledge: () => void) => void = (acknowledge) => acknowledge(),
+): number[] {
   const backend = backendFor(dir);
   const sizes: number[] = [];
   for (;;) {
@@ -451,9 +481,14 @@ function drain(dir: string): number[] {
       return { id: event.id, revision: event.revision, status: "accepted" as const };
     });
     resetLedgerTxDurations(dir);
-    expect(acknowledgeBatch(dir, "account", batch, { batchId: batch.id, receipts }, () => {})).toBe(
-      true,
-    );
+    let acknowledged = false;
+    aroundAck(() => {
+      expect(
+        acknowledgeBatch(dir, "account", batch, { batchId: batch.id, receipts }, () => {}),
+      ).toBe(true);
+      acknowledged = true;
+    });
+    expect(acknowledged).toBe(true);
     // The atomic unit is unsplit: one acknowledgement with its receipt state is one transaction...
     expect(ledgerTxDurations(dir)?.count ?? 0).toBe(1);
     // ...and it settled the whole batch at once, never part of it.
@@ -463,33 +498,53 @@ function drain(dir: string): number[] {
   return sizes;
 }
 
-it("ack batches shrink under slow transactions and every event is acknowledged identically", () => {
+it("ack batches shrink under slow acknowledgements and every event is acknowledged identically", () => {
   const fixed = agentDir();
   const adaptive = agentDir();
   const count = 300;
-  observeEvents(fixed, "account", facts(count, 0), [], () => {});
-  observeEvents(adaptive, "account", facts(count, 0), [], () => {});
+  const allFacts = facts(count, 0);
+  observeEvents(fixed, "account", allFacts, [], () => {});
+  observeEvents(adaptive, "account", allFacts, [], () => {});
 
+  // The fixed control drains under the real clock: batches stay at the fixed size of 100.
+  useTxClock(null);
   const fixedSizes = drain(fixed);
-  slowClock(300);
-  const adaptiveSizes = drain(adaptive);
   expect(fixedSizes).toEqual([100, 100, 100]);
-  // The slow run's batches shrank below the fixed size.
+
+  // Only the acknowledgement transaction is slow here: freezing stays fast, so a shrinking
+  // batch size can only come from the ACK's own measured duration feeding the sizer.
+  let acknowledgeSlowly = false;
+  let now = 0;
+  useTxClock(() => (now += acknowledgeSlowly ? 300 : 1));
+  const adaptiveSizes = drain(adaptive, (acknowledge) => {
+    acknowledgeSlowly = true;
+    try {
+      acknowledge();
+    } finally {
+      acknowledgeSlowly = false;
+    }
+  });
   expect(adaptiveSizes.length).toBeGreaterThan(fixedSizes.length);
   expect(Math.min(...adaptiveSizes)).toBeLessThan(100);
 
-  // End state identical: every event acknowledged once, with its stored body and hash intact.
-  const stored = (dir: string) =>
+  // End state identical: every event acknowledged once, with its immutable id, hash and body
+  // verbatim — only the batch boundaries differed.
+  const eventsOf = (dir: string) =>
     backendFor(dir)
-      .outboxStatus()
-      .map((status) => ({
-        accountKey: status.accountKey,
-        pending: status.pending,
-        sendable: status.sendable,
-        acknowledged: status.acknowledged,
-      }));
-  expect(stored(adaptive)).toEqual(stored(fixed));
-  expect(stored(fixed)).toEqual([
-    { accountKey: "account", pending: 0, sendable: 0, acknowledged: count },
-  ]);
+      .outboxClaims(
+        "account",
+        allFacts.map((fact) => fact.entityId),
+      )
+      .map((event) => ({
+        id: event.id,
+        hash: event.hash,
+        body: Buffer.from(event.body).toString("hex"),
+        acked: event.ackedAt !== null,
+        blocked: event.blocked,
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  expect(eventsOf(adaptive)).toEqual(eventsOf(fixed));
+  expect(eventsOf(fixed).length).toBe(count);
+  expect(eventsOf(fixed).every((event) => event.acked && !event.blocked)).toBe(true);
+  useTxClock(null);
 });

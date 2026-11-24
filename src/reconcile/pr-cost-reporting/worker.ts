@@ -37,7 +37,7 @@ import {
   type RecordBackend,
   type StoredRecord,
 } from "../../ledger/records.js";
-import { createTxChunkSizer, type TxChunkSizer } from "../../ledger/tx-budget.js";
+import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "../../ledger/tx-budget.js";
 import { preludeStretch } from "./prelude.js";
 import type { Acknowledgement } from "../../ledger/protocol.js";
 import {
@@ -1086,12 +1086,7 @@ const CHUNK_UNITS = 100;
  * in-memory double keeps the fixed size. */
 const translationChunkSizers = new Map<string, TxChunkSizer>();
 function translationChunkSizerFor(agentDir: string): TxChunkSizer {
-  let sizer = translationChunkSizers.get(agentDir);
-  if (!sizer) {
-    sizer = createTxChunkSizer(CHUNK_UNITS);
-    translationChunkSizers.set(agentDir, sizer);
-  }
-  return sizer;
+  return rememberSizer(translationChunkSizers, agentDir, () => createTxChunkSizer(CHUNK_UNITS));
 }
 
 export { preludeStretch } from "./prelude.js";

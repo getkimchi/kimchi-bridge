@@ -24,7 +24,7 @@ import {
   type OutboxEvent,
   type RecordBackend,
 } from "./records.js";
-import { createTxChunkSizer, type TxChunkSizer } from "./tx-budget.js";
+import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "./tx-budget.js";
 
 const BATCH_EVENTS = 100;
 const BATCH_BYTES = 1 << 20;
@@ -34,12 +34,7 @@ const BATCH_BYTES = 1 << 20;
  * receipt state commits in one transaction — so only how many events share one batch adapts. */
 const batchEventSizers = new Map<string, TxChunkSizer>();
 function batchSizerFor(agentDir: string): TxChunkSizer {
-  let sizer = batchEventSizers.get(agentDir);
-  if (!sizer) {
-    sizer = createTxChunkSizer(BATCH_EVENTS);
-    batchEventSizers.set(agentDir, sizer);
-  }
-  return sizer;
+  return rememberSizer(batchEventSizers, agentDir, () => createTxChunkSizer(BATCH_EVENTS));
 }
 export type Fact = Omit<Event, "id" | "revision" | "baseRevision" | "baseEventId">;
 
@@ -438,7 +433,8 @@ export function acknowledgeBatch(
 ): boolean {
   if (sent.accountKey !== accountKey) throw new Error("Outbox account changed");
   const backend = backendFor(agentDir);
-  return backend.tx(() => {
+  const sizer = batchSizerFor(agentDir);
+  const result = backend.tx(() => {
     assertCurrent();
     const current = backend.getOutboxBatch(accountKey);
     if (!current || current.id !== sent.id) return false;
@@ -476,4 +472,9 @@ export function acknowledgeBatch(
     assertCurrent();
     return true;
   });
+  // The acknowledgement's own transaction (receipt validation, event updates, batch deletion)
+  // feeds the same sizer: a fast freeze with a slow ACK must shrink the next batch too.
+  const measured = backend.txDurations?.().lastMs;
+  if (measured !== undefined) sizer.observe(measured);
+  return result;
 }

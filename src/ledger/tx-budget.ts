@@ -46,3 +46,26 @@ export function createTxChunkSizer(start: number, min = 1, max = start): TxChunk
     },
   };
 }
+
+/** How many agent directories a per-agent sizer map may hold: a long-lived process visiting
+ * many directories cannot accumulate one entry forever; the least recently used evicts first. */
+export const MAX_SIZER_KEYS = 1024;
+
+/** Gets the key's sizer from the map, creating it on first use; a hit refreshes the key's
+ * recency, and an insert past the bound evicts the least recently used entry. */
+export function rememberSizer(
+  map: Map<string, TxChunkSizer>,
+  key: string,
+  create: () => TxChunkSizer,
+): TxChunkSizer {
+  const found = map.get(key);
+  if (found) {
+    map.delete(key);
+    map.set(key, found);
+    return found;
+  }
+  const sizer = create();
+  map.set(key, sizer);
+  while (map.size > MAX_SIZER_KEYS) map.delete(map.keys().next().value as string);
+  return sizer;
+}
