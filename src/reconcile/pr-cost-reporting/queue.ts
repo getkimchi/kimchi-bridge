@@ -513,15 +513,26 @@ async function update(
       compromised = error;
     },
   });
+  // Fence-aware lock acquisition: the writer epoch observed while the lock is held. Only a new
+  // lease holder moves it, so every check below re-reads it and aborts this update when a
+  // handover happened after the lock was acquired — a writer that slept through its own lease
+  // loss (a SIGSTOP, a stalled process) then refuses to rename its stale state over its
+  // successor's instead of publishing it. No atomic fence exists for a file rename, so a
+  // suspension between this check and the rename syscall itself remains a residual window.
+  const epoch = backendFor(agentDir).writerEpoch?.();
   const check = () => {
     if (compromised) throw compromised;
     assertCurrent();
     // The ledger's write fence covers this queue's file commits too, including the paths that
-    // arrive without their own assertion (an error note after a failed capture). The check runs
-    // while the queue lock is held, immediately before each durable rename. Residual window: a
-    // lease holder that bumps the ledger epoch after this check and before the rename completes
-    // is not covered by it — the lease assert and the worker's kill narrow it to milliseconds.
+    // arrive without their own assertion (an error note after a failed capture), and the epoch
+    // re-read below covers updates that run outside any pass fence (a session-side explicit
+    // choice). The check runs while the queue lock is held, immediately before each durable
+    // rename, and calls the fence's writable hook (the parent-heartbeat check) when one is
+    // installed.
     assertLedgerWritable(agentDir);
+    const backend = backendFor(agentDir);
+    if (backend.writerEpoch && backend.writerEpoch() !== epoch)
+      throw new Error("PR reporting queue state was fenced by a newer lease holder");
   };
   try {
     const { state, text } = await loadReportingState(agentDir);
