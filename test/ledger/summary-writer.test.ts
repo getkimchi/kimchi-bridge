@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "bun:test";
 import { importSpool } from "../../src/ledger/import.js";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
-import { closeBackends, readRecords, readWorkSummary } from "../../src/ledger/records.js";
+import { closeBackends, readRecords, readWorkSummary, spoolDirectory } from "../../src/ledger/records.js";
 import type { WorkHead } from "../../src/ledger/row-log.js";
 
 /**
@@ -432,24 +432,37 @@ it("serializes three native writers while a reader sees coherent authority, mark
     await Promise.all(
       writers.map(async (writer) => {
         for (let index = 0; index < 8; index++) {
-          expect(await writer.next()).toBe("pending");
-          reader.child.stdin?.write("read\n");
-          const message = await reader.next();
-          expect(message.phase).toBe("snapshot");
-          if (!message.state) throw new Error("Native reader omitted its snapshot");
-          observed.push(coherentState(message.state).requests.length);
-          writer.child.stdin?.write("c");
-          expect(await writer.next()).toBe("committed");
+          // A writer gated while another holds the open capture transaction waits only the
+          // capture busy window (250 ms) before it parks the record in the spool and returns:
+          // no pending phase, no gate, straight to the next "committed". Both paths must land
+          // the record exactly once — the spool import below proves the parked ones did.
+          const phase = await writer.next();
+          if (phase === "pending") {
+            reader.child.stdin?.write("read\n");
+            const message = await reader.next();
+            expect(message.phase).toBe("snapshot");
+            if (!message.state) throw new Error("Native reader omitted its snapshot");
+            observed.push(coherentState(message.state).requests.length);
+            writer.child.stdin?.write("c");
+            expect(await writer.next()).toBe("committed");
+          } else {
+            expect(phase).toBe("committed");
+          }
         }
         expect(await writer.next()).toBe("flushed");
         await writer.done;
       }),
     );
+    // Every reader snapshot stayed coherent, and the committed request count never went down.
+    for (let index = 1; index < observed.length; index++)
+      expect(observed[index]).toBeGreaterThanOrEqual(observed[index - 1]);
+    // The spool is the files channel's first step; drain it (twice: the second pass must be
+    // a no-op) so every parked record lands exactly once before the final state is read.
+    importSpool(dir);
+    importSpool(dir);
     const final = driver("summary-state", dir, workId) as NativeSummaryState;
     const view = coherentState(final);
-    expect([...observed, view.requests.length].sort((a, b) => a - b)).toEqual(
-      Array.from({ length: 25 }, (_, index) => index),
-    );
+    expect(view.requests.length).toBe(24);
     expect(view.requests.map((row) => row.requestId).sort()).toEqual(
       Array.from({ length: 3 }, (_, session) =>
         Array.from({ length: 8 }, (_, request) => `session-${session}-${request}`),
@@ -464,7 +477,10 @@ it("serializes three native writers while a reader sees coherent authority, mark
     ]);
     expect(final.authority).toHaveLength(24);
     expect(fs.existsSync(join(dir, "work", workId, "work.json"))).toBe(false);
-    expect(fs.existsSync(join(dir, "work-attribution"))).toBe(false);
+    // The drained spool keeps no file behind.
+    expect(fs.existsSync(spoolDirectory(dir)) ? fs.readdirSync(spoolDirectory(dir)) : []).toEqual(
+      [],
+    );
   } finally {
     await Promise.all(writers.map((writer) => writer.stop()));
     await reader.stop();
