@@ -1,0 +1,454 @@
+/**
+ * The reconciliation worker's entry point (reconcile-out-of-process plan,
+ * chunk B3), bundled to lib/worker.mjs and run by Kimchi's own binary. The
+ * parent owns the lease, the timer and the host answers; this process runs one
+ * reconciliation pass at a time over the shared ledger library.
+ *
+ * Startup contract: the parent sends `hello` with its protocol version, its
+ * bridge build and the agent directory it expects. The worker refuses (error,
+ * non-zero exit) on any mismatch — no mixed versions ever touch one ledger —
+ * and refuses an agent directory other than the one it inherited through
+ * KIMCHI_CODING_AGENT_DIR. It exits on stdin EOF (parent death), within 2 s,
+ * and after 10 idle minutes. Nothing here may import src/platform.ts or
+ * bun:ffi: the worker must run on Windows too.
+ */
+import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+import type { HostPorts } from "../reconcile/host.js";
+import { runReconciliationPass } from "../reconcile/pass.js";
+import type { ContinuationProgress } from "../reconcile/work-attribution/links.js";
+import {
+  HostRequestError,
+  StdioHostClient,
+  StdioTransport,
+  type TransportEvent,
+} from "./host-client.js";
+import {
+  PROTOCOL_VERSION,
+  type ChannelResult,
+  type DoneMessage,
+  type HelloMessage,
+  type ParentMessage,
+  type PassMessage,
+  type PassResult,
+} from "./protocol.js";
+
+/** The bridge commit, embedded at bundle time; "dev" only outside a git checkout. */
+declare const BRIDGE_BUILD: string | undefined;
+
+/** Idle exit: a worker nobody needs for 10 minutes shuts itself down. */
+export const IDLE_EXIT_MS = 10 * 60 * 1000;
+/** Parent death must end the worker well within 2 s of stdin EOF. */
+const PARENT_GONE_EXIT_MS = 1900;
+
+/** Why the pass in flight was aborted. */
+type AbortCause = "cancel" | "deadline" | "parent-gone";
+
+/** The state of the pass in flight; the pump and the cancel path share it. */
+interface ActivePass {
+  id: number;
+  controller: AbortController;
+  /** The parent controls lease validity: cancel invalidates it for the pass. */
+  leaseValid: boolean;
+  reason?: AbortCause;
+  /** The request kinds whose RPCs failed during this pass. */
+  hostFailures: Set<string>;
+  pullRequestErrors: unknown[];
+  /** Resolves when the pass has reported done. */
+  done: Promise<void>;
+}
+
+export function resolveWorkerBuild(): string {
+  const defined = typeof BRIDGE_BUILD === "undefined" ? undefined : BRIDGE_BUILD;
+  if (defined && defined.trim() !== "") return defined;
+  try {
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    if (commit) return commit;
+  } catch {
+    // No git checkout: the release bundle always embeds its commit instead.
+  }
+  return "dev";
+}
+
+/** Expands a leading ~ the way pi-coding-agent's getAgentDir does. */
+function expandTilde(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/")) return resolve(homedir(), path.slice(2));
+  return path;
+}
+
+/**
+ * The agent directory this worker inherited, resolved like Kimchi's
+ * getAgentDir: KIMCHI_CODING_AGENT_DIR (tilde-expanded), or the SDK default.
+ */
+export function inheritedAgentDir(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.KIMCHI_CODING_AGENT_DIR;
+  if (raw && raw.trim() !== "") return resolve(expandTilde(raw.trim()));
+  return resolve(homedir(), ".pi", "agent");
+}
+
+/** The refusal reason for a hello the worker must not accept, or undefined. */
+export function helloRefusal(
+  hello: HelloMessage,
+  own: { v: number; build: string; agentDir: string },
+): string | undefined {
+  if (hello.v !== own.v)
+    return `protocol version mismatch: the worker speaks ${own.v}, the parent sent ${hello.v}`;
+  if (hello.build !== own.build)
+    return `build mismatch: the worker is ${own.build}, the parent asked for ${hello.build}`;
+  // Paths are normalized before comparing, so an equivalent spelling is fine.
+  if (resolve(hello.agentDir) !== own.agentDir)
+    return `agent directory mismatch: the worker inherits ${own.agentDir}`;
+  return undefined;
+}
+
+function main(): void {
+  const build = resolveWorkerBuild();
+  const agentDir = inheritedAgentDir();
+  const events: TransportEvent[] = [];
+  let wake: (() => void) | undefined;
+  const fire = (): void => {
+    const listener = wake;
+    wake = undefined;
+    listener?.();
+  };
+  let closed = false;
+  const exit: (code: number) => never = (code) => {
+    if (!closed) {
+      closed = true;
+      transport.close();
+    }
+    process.exit(code);
+  };
+  /** Reports a fatal worker condition to the parent and dies; never carries a token. */
+  const refuse: (message: string, id?: number) => never = (message, id) => {
+    const redacted = transport.redact(message);
+    transport.send({ type: "error", message: redacted, ...(id === undefined ? {} : { id }) });
+    process.stderr.write(`${redacted}\n`);
+    exit(1);
+  };
+  const transport = new StdioTransport((event) => {
+    events.push(event);
+    fire();
+  });
+
+  let host: StdioHostClient | undefined;
+  const queued: PassMessage[] = [];
+  let active: ActivePass | undefined;
+  let parentGone = false;
+  let invalidLine: string | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const stopIdleTimer = (): void => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = undefined;
+  };
+  const armIdleTimer = (): void => {
+    stopIdleTimer();
+    idleTimer = setTimeout(() => {
+      // Ten minutes without a pass: nobody needs this worker any more.
+      if (active) active.controller.abort();
+      exit(0);
+    }, IDLE_EXIT_MS);
+  };
+
+  const abortActive = (reason: AbortCause): void => {
+    if (!active) return;
+    active.leaseValid = false;
+    active.reason = active.reason ?? reason;
+    active.controller.abort();
+  };
+
+  const handleParentMessage = (message: ParentMessage): void => {
+    switch (message.type) {
+      case "hello":
+        refuse("the parent sent a second hello; the worker already accepted one");
+        break;
+      case "pass": {
+        if (message.channels.reporting && message.reportingCwd === undefined) {
+          refuse("a pass with the reporting channel needs reportingCwd", message.id);
+          break;
+        }
+        queued.push(message);
+        break;
+      }
+      case "cancel":
+        // A cancel for a finished or unknown pass is ignored; the parent may
+        // not know which pass was in flight when it sent it.
+        if (active?.id === message.id) abortActive("cancel");
+        break;
+      case "reply":
+        // A late or duplicate reply: the request it belonged to already
+        // timed out or was answered. Never guessed from, never answered twice.
+        break;
+    }
+  };
+
+  /** The continuation repair state the supervisor used to hold in memory. */
+  const continuation: ContinuationProgress = {};
+
+  const startPass = (message: PassMessage): void => {
+    stopIdleTimer();
+    let finished: () => void;
+    const done = new Promise<void>((resolve) => {
+      finished = resolve;
+    });
+    const state: ActivePass = {
+      id: message.id,
+      controller: new AbortController(),
+      leaseValid: true,
+      hostFailures: new Set<string>(),
+      pullRequestErrors: [],
+      done,
+    };
+    active = state;
+    transport.activePassId = message.id;
+    transport.send({ type: "progress", id: message.id, note: "pass-started" });
+    void runPass(message, state)
+      .catch(() => {})
+      .finally(() => {
+        if (active === state) {
+          active = undefined;
+          transport.activePassId = 0;
+        }
+        armIdleTimer();
+        finished();
+        fire();
+      });
+  };
+
+  /**
+   * Records a failed host request against the pass and cancels it when the
+   * failure was a cancel that arrived while the request was blocked.
+   */
+  const noteHostFailure = (state: ActivePass, error: unknown): void => {
+    if (error instanceof HostRequestError) {
+      state.hostFailures.add(error.requestKind);
+      if (error.cause === "canceled") abortActive("cancel");
+    }
+  };
+
+  const runPass = async (message: PassMessage, state: ActivePass): Promise<void> => {
+    const deadline = setTimeout(() => abortActive("deadline"), message.deadlineMs);
+    const base = host as StdioHostClient;
+    // Every host read is observed, so a failed request reaches the done
+    // message even where the pass swallows the channel error into its debug log.
+    const observingHost: HostPorts = {
+      agentDir: base.agentDir,
+      e2eSeam: base.e2eSeam,
+      now: base.now,
+      metric: base.metric.bind(base),
+      fetch: base.fetch,
+      credentials(cwd) {
+        try {
+          return base.credentials(cwd);
+        } catch (error) {
+          noteHostFailure(state, error);
+          throw error;
+        }
+      },
+      endpoints(cwd) {
+        try {
+          return base.endpoints(cwd);
+        } catch (error) {
+          noteHostFailure(state, error);
+          throw error;
+        }
+      },
+      orgPolicy() {
+        try {
+          return base.orgPolicy();
+        } catch (error) {
+          noteHostFailure(state, error);
+          throw error;
+        }
+      },
+      telemetryConsent() {
+        try {
+          return base.telemetryConsent();
+        } catch (error) {
+          noteHostFailure(state, error);
+          throw error;
+        }
+      },
+    };
+    let nextRepository: string | undefined;
+    let passError: unknown;
+    try {
+      const result = await runReconciliationPass(
+        {
+          ...(message.channels.files ? { files: true } : {}),
+          ...(message.channels.pullRequests
+            ? {
+                pullRequests: {
+                  onError: (error) => state.pullRequestErrors.push(error),
+                },
+              }
+            : {}),
+          ...(message.channels.costs ? { costs: true } : {}),
+          ...(message.channels.reporting
+            ? { reporting: { cwd: message.reportingCwd as string } }
+            : {}),
+          ...(message.nextRepository === undefined
+            ? {}
+            : { nextRepository: message.nextRepository }),
+          progress: continuation,
+        },
+        observingHost,
+        {
+          signal: state.controller.signal,
+          assertLease: () => {
+            if (!state.leaseValid) throw new Error("the reconciliation lease was lost");
+            state.controller.signal.throwIfAborted();
+          },
+        },
+      );
+      nextRepository = result.nextRepository;
+    } catch (error) {
+      passError = error;
+    }
+    clearTimeout(deadline);
+    transport.send(buildDoneMessage(message, state, nextRepository, passError));
+  };
+
+  /** Which request kinds a channel's code can ask the parent for. */
+  const CHANNEL_REQUESTS: Record<string, string[]> = {
+    files: [],
+    pullRequests: [],
+    costs: ["credentials", "endpoints"],
+    reporting: ["credentials", "endpoints", "consent"],
+  };
+
+  const buildDoneMessage = (
+    message: PassMessage,
+    state: ActivePass,
+    nextRepository: string | undefined,
+    passError: unknown,
+  ): DoneMessage => {
+    const aborted = state.controller.signal.aborted;
+    const canceled = aborted && state.reason !== "deadline";
+    const outcome = aborted
+      ? canceled
+        ? "canceled"
+        : "failed"
+      : passError !== undefined || state.hostFailures.size > 0 || state.pullRequestErrors.length > 0
+        ? "failed"
+        : "ok";
+    const errorText = (error: unknown): string => transport.redact(describe(error));
+    const channels: PassResult["channels"] = {};
+    for (const [name, requested] of Object.entries(message.channels) as [string, boolean][])
+      if (!requested) continue;
+      else if (canceled) channels[name as keyof PassResult["channels"]] = { outcome: "canceled" };
+      else if (aborted)
+        channels[name as keyof PassResult["channels"]] = {
+          outcome: "failed",
+          error: "the pass exceeded its deadline",
+        };
+      else {
+        const kinds = CHANNEL_REQUESTS[name] ?? [];
+        if (state.hostFailures.size > 0 && kinds.some((kind) => state.hostFailures.has(kind))) {
+          channels[name as keyof PassResult["channels"]] = {
+            outcome: "failed",
+            error: "a host request failed",
+          };
+          continue;
+        }
+        if (name === "pullRequests" && state.pullRequestErrors.length > 0) {
+          channels[name as keyof PassResult["channels"]] = {
+            outcome: "failed",
+            error: errorText(state.pullRequestErrors[0]),
+          };
+          continue;
+        }
+        channels[name as keyof PassResult["channels"]] = { outcome: "ok" };
+      }
+    return {
+      type: "done",
+      id: message.id,
+      result: {
+        outcome,
+        channels,
+        ...(nextRepository === undefined ? {} : { nextRepository }),
+        // txDurations is filled by chunk B4's transaction budget.
+      },
+    };
+  };
+
+  const describe = (error: unknown): string =>
+    error instanceof Error ? error.message : String(error);
+
+  const awaitFirstEvent = async (): Promise<TransportEvent> => {
+    for (;;) {
+      const event = events.shift();
+      if (event) return event;
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  };
+
+  const pump = async (): Promise<void> => {
+    for (;;) {
+      // Drain everything that is already ready: parent messages first, so a
+      // cancel reaches the pass in flight before the next pass is started.
+      for (;;) {
+        if (parentGone) {
+          // stdin EOF is parent death: stop the pass, let it unwind, and leave.
+          if (active) abortActive("parent-gone");
+          const hardExit = setTimeout(() => exit(0), PARENT_GONE_EXIT_MS);
+          if (active) await active.done;
+          clearTimeout(hardExit);
+          exit(0);
+        }
+        if (invalidLine !== undefined) {
+          refuse(`the parent sent an invalid protocol line: ${invalidLine}`);
+        }
+        const event = events.shift();
+        if (event) {
+          if (event.kind === "message") handleParentMessage(event.message);
+          else if (event.kind === "invalid-line") invalidLine = event.reason;
+          else if (event.kind === "parent-gone") parentGone = true;
+          else refuse(`worker transport failed: ${event.reason}`);
+          continue;
+        }
+        if (!active && queued.length > 0) {
+          startPass(queued.shift() as PassMessage);
+          continue;
+        }
+        break;
+      }
+      // A new event, the end of the pass in flight, or nothing pending at all.
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  };
+
+  const first = awaitFirstEvent();
+  void first.then(async (event) => {
+    if (event.kind !== "message" || event.message.type !== "hello")
+      refuse("the first message must be hello");
+    const refusal = helloRefusal(event.message, { v: PROTOCOL_VERSION, build, agentDir });
+    if (refusal) refuse(refusal);
+    host = new StdioHostClient(transport, event.message);
+    transport.send({ type: "ready", v: PROTOCOL_VERSION, build });
+    armIdleTimer();
+    // A crash outside the pass must not take the ledger silently: report and die.
+    process.on("uncaughtException", (error) => {
+      refuse(`uncaught worker error: ${describe(error)}`);
+    });
+    process.on("unhandledRejection", (reason) => {
+      refuse(`unhandled worker rejection: ${describe(reason)}`);
+    });
+    await pump();
+  });
+}
+
+void (async () => {
+  main();
+})();

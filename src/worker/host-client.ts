@@ -1,0 +1,391 @@
+/**
+ * The worker process's HostPorts (reconcile-out-of-process plan, chunk B3).
+ *
+ * HostPorts' credential, endpoint, policy and consent reads are synchronous and
+ * are called at many synchronous sites inside the moved passes, whose timing
+ * must not change now that they run in the worker. So the worker answers them
+ * with a blocking RPC over its private stdin/stdout pipe:
+ *
+ *   - the main thread writes a `request` line to stdout with fs.writeSync and
+ *     blocks in Atomics.wait on a SharedArrayBuffer (10 s timeout);
+ *   - a helper thread (a Bun `Worker` with eval'd source) owns reading stdin:
+ *     it writes the matching `reply` line into the shared buffer and notifies,
+ *     and forwards every other parent line (hello, pass, cancel) to the main
+ *     thread through postMessage, which the (blocked) main thread drains once
+ *     it wakes. The helper also fast-wakes the main thread on stdin EOF and on
+ *     a cancel for the pass in flight, so neither waits out a pending timeout;
+ *   - a timeout (or a malformed reply) throws a typed error that fails the
+ *     current channel — never a guessed value, never a write.
+ *
+ * No answer is cached, not even within one pass: the mid-pass ownership
+ * re-check (pr-cost-reporting/worker.ts, assertOwnership) compares both the
+ * credential token and the platform API URL against the values captured at the
+ * start of delivery, so both must be live reads of the parent's answer.
+ */
+import { writeSync } from "node:fs";
+import { Worker } from "node:worker_threads";
+import type { HostPorts } from "../reconcile/host.js";
+import {
+  encodeWorkerMessage,
+  parseHostCredentials,
+  parseHostEndpoints,
+  parseParentLine,
+  parsePolicyReply,
+  parseConsentReply,
+  redactTokens,
+  type HostRequestKind,
+  type ParentMessage,
+  type WorkerMessage,
+} from "./protocol.js";
+
+/** The parent must answer a host request within this window. */
+export const REQUEST_TIMEOUT_MS = 10_000;
+
+/** SharedArrayBuffer header (int32 slots) followed by the reply line's bytes. */
+const STATE = 0;
+const LENGTH = 1;
+const RID = 2;
+const ACTIVE_PASS = 3;
+const HEADER_BYTES = 16;
+/** The longest reply line (a credentials or policy answer is a few hundred bytes). */
+const REPLY_BYTES = 64 * 1024;
+
+const STATE_IDLE = 0;
+const STATE_WAITING = 1;
+const STATE_READY = 2;
+const STATE_PARENT_GONE = 3;
+const STATE_CANCELLED = 4;
+
+/** What failed when a host request cannot be answered. */
+export type HostRequestCause = "timeout" | "parent-gone" | "invalid-reply" | "canceled";
+
+/** A failed host request. Fails the current channel; never falls back to a guess. */
+export class HostRequestError extends Error {
+  constructor(
+    message: string,
+    readonly requestKind: HostRequestKind,
+    readonly cause: HostRequestCause,
+  ) {
+    super(message);
+    this.name = "HostRequestError";
+  }
+}
+
+/** One note from the helper thread: a forwarded line, or a stdin condition. */
+interface HelperNote {
+  line?: string;
+  eof?: boolean;
+  oversized?: boolean;
+  readError?: string;
+}
+
+/** What the transport hands the entry point. */
+export type TransportEvent =
+  | { kind: "message"; message: ParentMessage }
+  | { kind: "invalid-line"; reason: string }
+  | { kind: "parent-gone" }
+  | { kind: "transport-error"; reason: string };
+
+/**
+ * The helper thread's whole program, eval'd so it needs no second file in the
+ * bundle (the worker ships as one lib/worker.mjs). It reads fd 0 in a blocking
+ * loop — a worker thread's `process.stdin` is not wired to the real stdin — and
+ * never touches stdout, which only the main thread writes.
+ */
+const HELPER_SOURCE = `
+"use strict";
+// SharedArrayBuffer slots: [0] state, [1] length, [2] expected rid, [3] active pass id.
+const { parentPort, workerData } = require("node:worker_threads");
+const { readSync } = require("node:fs");
+const ia = new Int32Array(workerData);
+const payload = new Uint8Array(workerData, ${HEADER_BYTES});
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const MAX_LINE_BYTES = 1048576;
+const chunk = Buffer.alloc(65536);
+let pending = "";
+function forward(line) { parentPort.postMessage({ line: line }); }
+function reply(line, parsed) {
+  if (Atomics.load(ia, 0) !== 1) return false; // nobody is waiting
+  if (parsed.rid !== Atomics.load(ia, 2)) return false; // late or stale reply
+  const bytes = encoder.encode(line);
+  if (bytes.length <= payload.length) { payload.set(bytes); Atomics.store(ia, 1, bytes.length); }
+  else Atomics.store(ia, 1, -1);
+  Atomics.store(ia, 0, 2);
+  Atomics.notify(ia, 0);
+  return true;
+}
+function cancel(parsed) {
+  // Fast wake: a cancel for the pass in flight must not sit behind a pending
+  // request's timeout. The line is still forwarded for the main thread to own.
+  if (parsed.id !== Atomics.load(ia, 3)) return;
+  if (Atomics.load(ia, 0) !== 1) return;
+  Atomics.store(ia, 0, 4);
+  Atomics.notify(ia, 0);
+}
+function gone() {
+  Atomics.store(ia, 0, 3);
+  Atomics.notify(ia, 0);
+  parentPort.postMessage({ eof: true });
+}
+function onLine(line) {
+  let parsed;
+  try { parsed = JSON.parse(line); } catch { return forward(line); }
+  if (parsed === null || typeof parsed !== "object") return forward(line);
+  if (parsed.type === "reply" && typeof parsed.rid === "number" && reply(line, parsed)) return;
+  if (parsed.type === "cancel" && typeof parsed.id === "number") cancel(parsed);
+  forward(line);
+}
+for (;;) {
+  let read;
+  try { read = readSync(0, chunk, 0, chunk.length, null); }
+  catch (error) { parentPort.postMessage({ readError: String(error) }); return; }
+  if (read === 0) return gone();
+  pending += decoder.decode(chunk.subarray(0, read), { stream: true });
+  for (;;) {
+    const index = pending.indexOf("\\n");
+    if (index === -1) break;
+    const line = pending.slice(0, index);
+    pending = pending.slice(index + 1);
+    if (line.trim() === "") continue;
+    if (line.length > MAX_LINE_BYTES) { parentPort.postMessage({ oversized: true }); return gone(); }
+    onLine(line);
+  }
+  if (pending.length > MAX_LINE_BYTES) { parentPort.postMessage({ oversized: true }); return gone(); }
+}
+`;
+
+/**
+ * The worker's side of the pipe: message emission, event delivery and the
+ * blocking host request. One instance per process; constructed before `hello`
+ * is read so that the helper thread owns stdin from its first byte.
+ */
+export class StdioTransport {
+  #activePassId = 0;
+  /** The id of the pass in flight; the reader thread matches cancel lines against it. */
+  get activePassId(): number {
+    return this.#activePassId;
+  }
+  set activePassId(id: number) {
+    this.#activePassId = id;
+    Atomics.store(this.slots, ACTIVE_PASS, id);
+  }
+  private readonly shared = new SharedArrayBuffer(HEADER_BYTES + REPLY_BYTES);
+  private readonly slots: Int32Array = new Int32Array(this.shared);
+  private readonly helper: Worker;
+  private rid = 0;
+  private closed = false;
+  private readonly secrets = new Set<string>();
+
+  constructor(private readonly emit: (event: TransportEvent) => void) {
+    this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
+    this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
+    this.helper.on("error", (error) => {
+      this.transportError(`the stdin reader thread failed: ${String(error)}`);
+    });
+    this.helper.on("exit", (code) => {
+      if (!this.closed)
+        this.transportError(`the stdin reader thread exited unexpectedly (${code})`);
+    });
+  }
+
+  private transportError(reason: string): void {
+    if (!this.closed) this.emit({ kind: "transport-error", reason });
+  }
+
+  private onHelperNote(note: HelperNote): void {
+    if (note.line !== undefined) {
+      const parsed = parseParentLine(note.line);
+      if (parsed.ok) this.emit({ kind: "message", message: parsed.value });
+      else this.emit({ kind: "invalid-line", reason: parsed.error });
+      return;
+    }
+    if (note.readError !== undefined) {
+      this.transportError(`stdin could not be read: ${note.readError}`);
+      return;
+    }
+    if (note.oversized === true) {
+      this.transportError("a parent line exceeded the 1 MiB protocol limit");
+      return;
+    }
+    if (note.eof === true) this.emit({ kind: "parent-gone" });
+  }
+
+  /** Writes one worker→parent message; blocking, so a request line is out before its wait.
+   *  A failed write means the parent is gone with its pipe; the exit path owns the rest. */
+  send(message: WorkerMessage): void {
+    try {
+      writeSync(1, encodeWorkerMessage(message));
+    } catch {
+      // The reader thread reports the EOF; nothing more can be delivered.
+    }
+  }
+
+  /** Registers a secret value (a credential token) for redaction on every error path. */
+  addSecret(secret: string): void {
+    if (secret.length >= 8 && secret.trim() !== "") this.secrets.add(secret);
+  }
+
+  /** Redacts every known secret and credential shape from a line about to be reported. */
+  redact(text: string): string {
+    return redactTokens(text, this.secrets);
+  }
+
+  /**
+   * The blocking host request. Throws HostRequestError on timeout, parent
+   * death, a cancel for the pass in flight, or a malformed reply — never
+   * returns a guessed value.
+   */
+  request(kind: HostRequestKind, cwd?: string): unknown {
+    // A parent that already died must not be overwritten by a new wait: the
+    // reader thread is gone with it, so the request would never be answered.
+    if (Atomics.load(this.slots, STATE) === STATE_PARENT_GONE)
+      throw new HostRequestError(
+        `the parent is gone; the ${kind} request cannot be answered`,
+        kind,
+        "parent-gone",
+      );
+    const rid = ++this.rid;
+    Atomics.store(this.slots, RID, rid);
+    Atomics.store(this.slots, LENGTH, 0);
+    Atomics.store(this.slots, STATE, STATE_WAITING);
+    writeSync(
+      1,
+      encodeWorkerMessage({
+        type: "request",
+        rid,
+        kind,
+        ...(cwd === undefined ? {} : { cwd }),
+      }),
+    );
+    const waited = Atomics.wait(this.slots, STATE, STATE_WAITING, REQUEST_TIMEOUT_MS);
+    if (waited === "timed-out") {
+      Atomics.store(this.slots, STATE, STATE_IDLE);
+      throw new HostRequestError(
+        `the parent did not answer the ${kind} request within ${REQUEST_TIMEOUT_MS} ms`,
+        kind,
+        "timeout",
+      );
+    }
+    const state = Atomics.load(this.slots, STATE);
+    if (state === STATE_PARENT_GONE)
+      throw new HostRequestError(
+        `the parent is gone; the ${kind} request cannot be answered`,
+        kind,
+        "parent-gone",
+      );
+    if (state === STATE_CANCELLED) {
+      Atomics.store(this.slots, STATE, STATE_IDLE);
+      throw new HostRequestError(
+        `the pass was canceled while the ${kind} request was pending`,
+        kind,
+        "canceled",
+      );
+    }
+    const length = Atomics.load(this.slots, LENGTH);
+    Atomics.store(this.slots, STATE, STATE_IDLE);
+    if (length < 0)
+      throw new HostRequestError(
+        `the parent's ${kind} reply exceeded the ${REPLY_BYTES} byte pipe buffer`,
+        kind,
+        "invalid-reply",
+      );
+    const line = Buffer.from(this.shared, HEADER_BYTES, length).toString("utf8");
+    const parsed = parseParentLine(line);
+    if (!parsed.ok || parsed.value.type !== "reply" || parsed.value.rid !== rid)
+      throw new HostRequestError(
+        `the parent's ${kind} reply was not a valid reply message`,
+        kind,
+        "invalid-reply",
+      );
+    return parsed.value.result;
+  }
+
+  /** Stops the reader thread; the process is exiting anyway. */
+  close(): void {
+    this.closed = true;
+    this.helper.terminate();
+  }
+}
+
+/**
+ * HostPorts over the pipe: credentials, endpoints, policy and consent are
+ * blocking requests; metrics are replayed as `metric` messages; fetch is the
+ * worker's own global fetch; the seam answers come from `hello.seams`; the
+ * agent directory and clock are local.
+ */
+export class StdioHostClient implements HostPorts {
+  private readonly seams: Record<string, string>;
+  constructor(
+    private readonly transport: StdioTransport,
+    private readonly hello: { agentDir: string; seams?: Record<string, string> },
+  ) {
+    this.seams = hello.seams ?? {};
+  }
+
+  get agentDir(): string {
+    return this.hello.agentDir;
+  }
+
+  e2eSeam(name: string): string | undefined {
+    return this.seams[name];
+  }
+
+  now(): number {
+    return Date.now();
+  }
+
+  credentials(cwd: string) {
+    const parsed = parseHostCredentials(this.transport.request("credentials", cwd));
+    if (!parsed.ok)
+      throw new HostRequestError(
+        `the parent's credentials reply was invalid: ${parsed.error}`,
+        "credentials",
+        "invalid-reply",
+      );
+    // The token is now known to this process: every reported error scrubs it.
+    this.transport.addSecret(parsed.value.token);
+    return parsed.value;
+  }
+
+  endpoints(cwd: string) {
+    const parsed = parseHostEndpoints(this.transport.request("endpoints", cwd));
+    if (!parsed.ok)
+      throw new HostRequestError(
+        `the parent's endpoints reply was invalid: ${parsed.error}`,
+        "endpoints",
+        "invalid-reply",
+      );
+    return parsed.value;
+  }
+
+  orgPolicy() {
+    const parsed = parsePolicyReply(this.transport.request("policy"));
+    if (!parsed.ok)
+      throw new HostRequestError(
+        `the parent's policy reply was invalid: ${parsed.error}`,
+        "policy",
+        "invalid-reply",
+      );
+    const resources = parsed.value.resources;
+    // Unknown resource ids fail closed: the parent answers for the ids it knows.
+    return { resourceEnabled: (resourceId: string) => resources[resourceId] === true };
+  }
+
+  telemetryConsent(): boolean {
+    const parsed = parseConsentReply(this.transport.request("consent"));
+    if (!parsed.ok)
+      throw new HostRequestError(
+        `the parent's consent reply was invalid: ${parsed.error}`,
+        "consent",
+        "invalid-reply",
+      );
+    return parsed.value.consent;
+  }
+
+  metric(metric: Parameters<HostPorts["metric"]>[0]): void {
+    this.transport.send({ type: "metric", metric });
+  }
+
+  readonly fetch: HostPorts["fetch"] = (input, init) => fetch(input, init);
+}
