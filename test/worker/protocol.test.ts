@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { nextRequestId } from "../../src/worker/host-client.js";
 import {
   encodeParentMessage,
   encodeWorkerMessage,
@@ -377,5 +378,24 @@ describe("token redaction", () => {
     expect(redactTokens('"token":"   "', ["   "])).toBe('"token":"[redacted]"');
     // The empty string alone is not a credential and replaces nothing.
     expect(redactTokens("kept as is", [""])).toBe("kept as is");
+  });
+});
+
+describe("request-id wraparound", () => {
+  test("a transport seeded at the rid limit wraps to one, never zero", () => {
+    expect(nextRequestId(0)).toBe(1);
+    expect(nextRequestId(1)).toBe(2);
+    expect(nextRequestId(0x0ffffffe)).toBe(0x0fffffff);
+    expect(nextRequestId(0x0fffffff)).toBe(1);
+    expect(nextRequestId(0x10000000)).toBe(2);
+  });
+
+  test("every rid a transport emits encodes on the wire", () => {
+    for (const current of [0, 1, 5, 0x7ffffffe, 0x7ffffff, 0x0fffffff]) {
+      const rid = nextRequestId(current);
+      expect(rid).toBeGreaterThanOrEqual(1);
+      expect(rid).toBeLessThanOrEqual(0x0fffffff);
+      expect(() => encodeWorkerMessage({ type: "request", rid, kind: "policy" })).not.toThrow();
+    }
   });
 });

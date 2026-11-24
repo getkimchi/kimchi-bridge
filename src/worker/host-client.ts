@@ -67,6 +67,11 @@ const RID_SHIFT = 3;
 const RID_MASK = 0x0fffffff;
 
 /** Packs a slot owner into one word: state in the low bits, rid above. */
+/** The next request id: cycles through 1..RID_MASK, never the zero the wire forbids. */
+export function nextRequestId(current: number): number {
+  return (current % RID_MASK) + 1;
+}
+
 function combined(rid: number, state: number): number {
   return (rid << RID_SHIFT) | state;
 }
@@ -229,7 +234,11 @@ export class StdioTransport {
   private closed = false;
   private readonly secrets = new Set<string>();
 
-  constructor(private readonly emit: (event: TransportEvent) => void) {
+  constructor(
+    private readonly emit: (event: TransportEvent) => void,
+    options?: { ridSeed?: number },
+  ) {
+    this.rid = options?.ridSeed ?? 0;
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
     this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
     this.helper.on("error", (error) => {
@@ -320,7 +329,7 @@ export class StdioTransport {
         kind,
         "parent-gone",
       );
-    const rid = ++this.rid & RID_MASK;
+    const rid = (this.rid = nextRequestId(this.rid));
     // One store claims the slot for this rid in WAITING, so the helper's
     // publication compare-exchange — not a separate rid check — decides
     // whether the slot still belongs to this request when a reply lands.
