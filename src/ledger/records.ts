@@ -8,7 +8,9 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  statSync,
   writeSync,
+  type Stats,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
@@ -24,7 +26,7 @@ import {
   type WorkHead,
   type WorkSummaryView,
 } from "./row-log.js";
-import type { WorkRecord } from "./work-record.js";
+import { type WorkRecord, object } from "./work-record.js";
 import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
   BUSY_TIMEOUT_MS,
@@ -354,13 +356,26 @@ function appendSpoolRecord(path: string, line: string): boolean {
     // The append is durable; a newly created directory or file entry needs the directory's
     // fsync too, or a kernel crash can lose the path the next import scans.
     if (directoryCreated || !fileExisted) fsyncDirectoryDurable(directory);
-    // Verify through this descriptor that the record is the live file's last line: an append
-    // that raced a rotation (a different inode at the path now) is retried on a fresh open.
+    // Verify through this descriptor that the record is the file's last line, and then that
+    // the path still resolves to this same inode. The write completes before the identity
+    // check, so an importer that claimed the file away (renamed it to a claim, then unlinked)
+    // between the open and this point is caught here: the append would otherwise live in an
+    // inode no importer can ever scan again. A missing path or a different inode reports the
+    // mismatch and the caller re-appends the same line to a fresh spool file — the importer's
+    // line-hash dedup keeps the record exactly-once either way.
     const size = fstatSync(fd).size;
     if (size < bytes.length) return false;
     const tail = Buffer.alloc(bytes.length);
     readSync(fd, tail, 0, bytes.length, size - bytes.length);
-    return tail.equals(bytes);
+    if (!tail.equals(bytes)) return false;
+    let live: Stats;
+    try {
+      live = statSync(path);
+    } catch (error) {
+      if (object(error) && error.code === "ENOENT") return false;
+      throw error;
+    }
+    return live.dev === stat.dev && live.ino === stat.ino;
   } finally {
     closeSync(fd);
   }

@@ -2,6 +2,7 @@ import { createHash, randomUUID, type Hash } from "node:crypto";
 import {
   closeSync,
   fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -951,14 +952,18 @@ export function spoolQuarantineDirectory(agentDir: string): string {
 }
 
 /** Deletes a spool file whose committed cursor reached its end — but only after claiming it by
- * an atomic rename to a unique name and verifying the claimed file's identity (dev and inode)
- * against the stat the cursor validation used. Two importers can validate the same old file; the
- * first renames it away, and a capture can create a same-length replacement at the original
- * path before the second renames. The second importer's rename then claims the replacement, and
- * the identity check fails: the claim is left in the spool directory (still scanned and imported
- * as its own file), never deleted. A file whose cursor covers the whole file but whose saved
- * problems are non-empty (a corrupt or unknown-type line, never a pending incomplete tail) moves
- * to quarantine instead of being unlinked. */
+ * an atomic rename to a unique name and verifying the claimed file's identity (dev and inode),
+ * and that it has not grown past the committed cursor, against the stat the cursor validation
+ * used. Two importers can validate the same old file; the first renames it away, and a capture
+ * can create a same-length replacement at the original path before the second renames. The
+ * second importer's rename then claims the replacement, and the identity check fails: the claim
+ * is left in the spool directory (still scanned and imported as its own file), never deleted. A
+ * capture that appended through a still-open descriptor after the validation lands in the
+ * claim's growth, and the size check keeps that claim too. An inode that is not this user's
+ * private single-link regular file is never unlinked: it is reported and left in place. A file
+ * whose cursor covers the whole file but whose saved problems are non-empty (a corrupt or
+ * unknown-type line, never a pending incomplete tail) moves to quarantine instead of being
+ * unlinked. */
 function retireImportedSpool(agentDir: string, files: string[], checkBudget?: () => void): void {
   const backend = backendFor(agentDir);
   for (const path of files) {
@@ -969,15 +974,35 @@ function retireImportedSpool(agentDir: string, files: string[], checkBudget?: ()
       const stat = statSync(path);
       if (cursor.offset !== stat.size || cursor.dev !== stat.dev || cursor.ino !== stat.ino)
         continue;
+      // The inode must be this user's private, single-link regular file before it may be
+      // unlinked. A hardlink planted at the spool path matches dev/ino while its raw record
+      // stays reachable at the external name, so retirement refuses (the file stays a scannable
+      // spool file; re-imports are deduped) and reports the unsafe inode instead of deleting it.
+      const uid = process.getuid?.();
+      const link = lstatSync(path);
+      if (!link.isFile() || link.nlink !== 1 || (uid !== undefined && link.uid !== uid)) {
+        diagnostic(agentDir, "spool-unsafe-inode");
+        continue;
+      }
       // The epoch/writable fence covers this destructive file step, like every pass write.
       assertLedgerWritable(agentDir);
       const claim = join(dirname(path), `claim-${randomUUID()}-${basename(path)}`);
       renameSync(path, claim);
       const claimed = statSync(claim);
-      if (claimed.dev !== stat.dev || claimed.ino !== stat.ino) {
-        // A replacement a capture created after this validation: leave the claim in the spool
-        // directory; the next pass imports it as its own file (line-hash dedup keeps it
-        // exactly-once) and retires it when its own cursor reaches its end.
+      if (
+        claimed.dev !== stat.dev ||
+        claimed.ino !== stat.ino ||
+        // A capture appended through its still-open descriptor after the validation above: the
+        // claim now holds a line no importer has committed, so it is never unlinked. It stays a
+        // scannable spool file and the next pass imports it as its own file (line-hash dedup
+        // keeps the re-scanned lines exactly-once), retiring it once its own cursor reaches its
+        // end.
+        claimed.size !== cursor.offset
+      ) {
+        // A replacement a capture created after this validation, or a growth inside the claim:
+        // leave the claim in the spool directory; the next pass imports it as its own file
+        // (line-hash dedup keeps it exactly-once) and retires it when its own cursor reaches its
+        // end.
         continue;
       }
       const problems =
