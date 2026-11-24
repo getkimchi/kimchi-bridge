@@ -3576,13 +3576,7 @@ describe("idle reporting passes", () => {
 describe("gated quiet passes", () => {
   beforeEach(resetReportingPassGates);
 
-  // SKIPPED (port follow-up): the inter-run `pendingFrozenSnapshots(directory, check, Date.now() - 1)
-  // below commits one ledger transaction under Bun (the backend's ownCommits/dataVersion slot in
-  // the pass-gate signature moves 12 -> 13 between run 1's stamp and run 2's probe), so the gate
-  // re-opens where Kimchi's vitest run stays quiet. Kimchi's own suite still runs this test
-  // unchanged; unskipping needs either a read-only pendingFrozenSnapshots or an ownCommit rule
-  // that does not count its read transaction under Bun.
-  it.skip("stays quiet between due times, honors opt-outs, and fires the deferred retry at its stamped time", async () => {
+  it("stays quiet between due times, honors opt-outs, and fires the deferred retry at its stamped time", async () => {
     await seedLinked();
     let refuse = true;
     http.mockImplementation(

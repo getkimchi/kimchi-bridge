@@ -1385,13 +1385,17 @@ export async function pendingFrozenSnapshots(
   if (start && !SHA256_HEX.test(start)) throw new Error("Invalid frozen PR cursor");
   let after = start;
   let wrapped = false;
-  const save = () =>
-    backend.tx(() => {
-      check();
-      if (backend.getNote("agent", "legacy-snapshot-cursor") !== after)
+  // An unchanged cursor commits nothing at all: a read-only no-op transaction would still bump
+  // the SQLite backend's own-commit counter, and with it the pass-gate dataVersion signature,
+  // re-opening every otherwise-quiet tick.
+  const save = () => {
+    if (backend.getNote("agent", "legacy-snapshot-cursor") !== after)
+      backend.tx(() => {
+        check();
         backend.putNote("agent", "legacy-snapshot-cursor", after);
-      check();
-    });
+        check();
+      });
+  };
   for (;;) {
     check();
     const page = backend.readNotePage(FROZEN_SNAPSHOTS, after, 16);
