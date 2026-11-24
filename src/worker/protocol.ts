@@ -202,8 +202,9 @@ function exactKeys(
   optional: string[],
 ): Parsed<true> {
   const allowed = new Set([...required, ...optional]);
+  // The rejected key is parent input; the error never echoes it.
   for (const key of Object.keys(source))
-    if (!allowed.has(key)) return reject(`unexpected field "${key}"`);
+    if (!allowed.has(key)) return reject("the message has a field outside its shape");
   for (const key of required) if (!(key in source)) return reject(`missing field "${key}"`);
   return accept(true);
 }
@@ -258,7 +259,8 @@ function parseRecordOfStrings(value: unknown, what: string): Parsed<Record<strin
   if (!object.ok) return object;
   const out: Record<string, string> = {};
   for (const [key, entry] of Object.entries(object.value)) {
-    if (typeof entry !== "string") return reject(`${what} has a non-string value at "${key}"`);
+    // The key is parent input; the error never echoes it.
+    if (typeof entry !== "string") return reject(`${what} has a non-string value`);
     out[key] = entry;
   }
   return accept(out);
@@ -463,9 +465,10 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       return accept({ type: "reply", rid: rid.value, result: object.value.result });
     }
     default:
+      // The supplied type is parent input; the error never echoes it.
       return reject(
         typeof object.value.type === "string"
-          ? `unknown message type "${object.value.type}"`
+          ? "the message type is not one this side accepts"
           : 'field "type" is not a string',
       );
   }
@@ -542,9 +545,10 @@ function parseWorkerValue(value: unknown): Parsed<WorkerMessage> {
       });
     }
     default:
+      // The supplied type is parent input; the error never echoes it.
       return reject(
         typeof object.value.type === "string"
-          ? `unknown message type "${object.value.type}"`
+          ? "the message type is not one this side accepts"
           : 'field "type" is not a string',
       );
   }
@@ -653,8 +657,8 @@ export function parsePolicyReply(value: unknown): Parsed<PolicyReply> {
   if (!resourcesObject.ok) return resourcesObject;
   const resources: Record<string, boolean> = {};
   for (const [key, entry] of Object.entries(resourcesObject.value)) {
-    if (typeof entry !== "boolean")
-      return reject(`policy reply resource "${key}" is not a boolean`);
+    // The resource id is parent input; the error never echoes it.
+    if (typeof entry !== "boolean") return reject("policy reply resources has a non-boolean value");
     resources[key] = entry;
   }
   return accept({ resources });
@@ -853,13 +857,16 @@ function awsSpans(text: string): [number, number][] {
 /**
  * Scrubs tokens from a line the worker is about to log or report as an error.
  * `secrets` are the exact values the worker knows it handled (credential
- * tokens from reply messages); everything else is matched by shape. A secret
- * shorter than 8 characters is too likely to be an ordinary word to scrub.
+ * tokens from reply messages): every nonempty one is replaced wherever it
+ * appears, however short — it was accepted as a credential, so it is never an
+ * ordinary word in this line. Everything else is matched by shape, where a
+ * minimum length keeps ordinary words from being mangled. Over-redaction is
+ * safe here; a missed token is not.
  */
 export function redactTokens(text: string, secrets: Iterable<string> = []): string {
   let out = text;
   for (const secret of secrets) {
-    if (secret.length >= 8 && secret.trim() !== "") out = out.split(secret).join("[redacted]");
+    if (secret !== "" && secret.trim() !== "") out = out.split(secret).join("[redacted]");
   }
   out = replaceSpans(out, keyedSecretSpans(out));
   out = replaceSpans(out, bearerSpans(out));

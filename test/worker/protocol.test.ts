@@ -193,6 +193,25 @@ describe("strict line rejection", () => {
     }
   });
 
+  test("parse and validation errors never echo the input's values", () => {
+    const SECRET = "unregisteredSecret123";
+    const lines: string[] = [
+      `{"type":"${SECRET}"}`,
+      `{"type":"hello","v":1,"build":"b","agentDir":"/a","${SECRET}":true}`,
+      '{"type":"hello","v":1,"build":"b","agentDir":"/a","seams":{"k":1}}',
+    ];
+    for (const line of lines) {
+      const parsed = parseParentLine(line);
+      expect(parsed.ok, line).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.error.includes(SECRET)).toBe(false);
+        expect(parsed.error.includes("FORGED")).toBe(false);
+        // A single-letter key must not leak through a "value at" clause either.
+        expect(parsed.error.includes('"k"')).toBe(false);
+      }
+    }
+  });
+
   test("a hello for another protocol version is rejected", () => {
     const line = encodeParentMessage({ ...HELLO, v: PROTOCOL_VERSION + 1 });
     const parsed = parseParentLine(line);
@@ -326,7 +345,13 @@ describe("token redaction", () => {
     }
   });
 
-  test("short secrets are not scrubbed: too likely to be ordinary words", () => {
-    expect(redactTokens("the token is short", ["short"])).toBe("the token is short");
+  test("every nonempty known secret is scrubbed, however short", () => {
+    for (const secret of ["Q", "abcd", "abcdefgh", "a".repeat(64)]) {
+      const redacted = redactTokens(`the token is ${secret} in full`, [secret]);
+      expect(redacted).not.toContain(secret);
+      expect(redacted).toContain("[redacted]");
+    }
+    // Whitespace-only values are excluded: nothing is a secret about spaces.
+    expect(redactTokens("kept as is", ["  "])).toBe("kept as is");
   });
 });

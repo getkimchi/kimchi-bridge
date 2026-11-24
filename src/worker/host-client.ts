@@ -244,7 +244,8 @@ export class StdioTransport {
 
   /** Registers a secret value (a credential token) for redaction on every error path. */
   addSecret(secret: string): void {
-    if (secret.length >= 8 && secret.trim() !== "") this.secrets.add(secret);
+    // Every nonempty accepted credential is a secret, however short.
+    if (secret !== "" && secret.trim() !== "") this.secrets.add(secret);
   }
 
   /** Redacts every known secret and credential shape from a line about to be reported. */

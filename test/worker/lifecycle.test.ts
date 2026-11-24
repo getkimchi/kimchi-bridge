@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -70,11 +70,11 @@ interface WorkerHandle {
   lines(): string[];
 }
 
-function spawnWorker(dir: string): WorkerHandle {
+function spawnWorker(dir: string, extraEnv: Record<string, string> = {}): WorkerHandle {
   const proc = Bun.spawn({
     cmd: [process.execPath, WORKER],
     cwd: ROOT,
-    env: { ...process.env, KIMCHI_CODING_AGENT_DIR: dir },
+    env: { ...process.env, KIMCHI_CODING_AGENT_DIR: dir, ...extraEnv },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -615,6 +615,98 @@ test("a pass queued behind a blocked one is reported expired when its budget ran
   worker.end();
   expect(await worker.exited()).toBe(0);
 }, 20000);
+
+test("no token, short or long, reaches any worker output or the diagnostics log", async () => {
+  const dir = agentDir();
+  seedRecord(dir);
+  // Opt-in diagnostics on: a channel failure is logged to work-attribution.log,
+  // so the log is part of the token-free surface.
+  const worker = spawnWorker(dir, { NODE_DEBUG: "kimchi:work-attribution" });
+  await handshake(worker, dir);
+  const tokens = ["Q", "abcd", "abcdefgh", "kchi_lifecycle_fake_token_0123456789"];
+  // One pass per token: each credentials answer carries it, so the registry
+  // holds one secret of every tested length once they are done.
+  for (let index = 0; index < tokens.length; index++) {
+    worker.send({
+      type: "pass",
+      id: 20 + index,
+      channels: { reporting: true },
+      reportingCwd: "/project",
+      deadlineMs: 30000,
+      epoch: 1,
+    });
+    for (;;) {
+      const message = await worker.next();
+      if (message.type === "request") {
+        const reply =
+          message.kind === "credentials"
+            ? { token: tokens[index], apiUrl: NO_NETWORK_API }
+            : message.kind === "consent"
+              ? { consent: true }
+              : REPLIES[message.kind];
+        worker.send({ type: "reply", rid: message.rid, result: reply });
+        continue;
+      }
+      if (message.type === "done") break;
+    }
+  }
+  // A pass whose consent reply is invalid fails the reporting channel, which
+  // the diagnostics log records — with every token already registered.
+  worker.send({
+    type: "pass",
+    id: 30,
+    channels: { reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 30000,
+    epoch: 1,
+  });
+  for (;;) {
+    const message = await worker.next();
+    if (message.type === "request") {
+      worker.send({
+        type: "reply",
+        rid: message.rid,
+        result: message.kind === "consent" ? { consent: "not a boolean" } : REPLIES[message.kind],
+      });
+      continue;
+    }
+    if (message.type === "done") break;
+  }
+  worker.end();
+  expect(await worker.exited()).toBe(0);
+  for (const token of tokens) {
+    for (const line of worker.lines()) expect(line.includes(token)).toBe(false);
+    expect(worker.stderrText().includes(token)).toBe(false);
+  }
+  const log = join(dir, "logs", "work-attribution.log");
+  expect(existsSync(log)).toBe(true);
+  const text = readFileSync(log, "utf8");
+  expect(text.includes("Could not report PR costs")).toBe(true);
+  for (const token of tokens) expect(text.includes(token)).toBe(false);
+}, 40000);
+
+test("a mismatching build cannot forge stderr lines with control characters", async () => {
+  const dir = agentDir();
+  const worker = spawnWorker(dir);
+  worker.send({
+    type: "hello",
+    v: PROTOCOL_VERSION,
+    build: "oops\nFORGED-stderr-line",
+    agentDir: dir,
+  });
+  const first = await worker.next();
+  expect(first.type).toBe("error");
+  const code = await worker.exited();
+  expect(code).not.toBe(0);
+  // The refusal stays on one stderr line and never echoes the supplied build.
+  const lines = worker
+    .stderrText()
+    .split("\n")
+    .filter((line) => line.trim() !== "");
+  expect(lines.length).toBe(1);
+  expect(lines[0].includes("FORGED")).toBe(false);
+  expect(lines[0].includes("oops")).toBe(false);
+}, 15000);
 
 test("a pass that fails before any channel reports the channels as failed, not ok", async () => {
   const dir = agentDir();

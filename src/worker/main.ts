@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { HostPorts } from "../reconcile/host.js";
 import { runReconciliationPass } from "../reconcile/pass.js";
+import { setDiagnosticsRedactor } from "../reconcile/work-attribution/diagnostics.js";
 import type { ContinuationProgress } from "../reconcile/work-attribution/links.js";
 import {
   HostRequestError,
@@ -81,6 +82,16 @@ export function resolveWorkerBuild(): string {
   return "dev";
 }
 
+/** Keeps a diagnostic on one line: control characters cannot forge log lines. */
+function singleLine(text: string): string {
+  let out = "";
+  for (const char of text) {
+    const code = char.charCodeAt(0);
+    out += code < 32 || code === 127 ? " " : char;
+  }
+  return out;
+}
+
 /** Expands a leading ~ the way pi-coding-agent's getAgentDir does. */
 function expandTilde(path: string): string {
   if (path === "~") return homedir();
@@ -104,9 +115,9 @@ export function helloRefusal(
   own: { v: number; build: string; agentDir: string },
 ): string | undefined {
   if (hello.v !== own.v)
-    return `protocol version mismatch: the worker speaks ${own.v}, the parent sent ${hello.v}`;
+    return "protocol version mismatch: the worker and the parent speak different versions";
   if (hello.build !== own.build)
-    return `build mismatch: the worker is ${own.build}, the parent asked for ${hello.build}`;
+    return "build mismatch: the worker and the parent were built from different commits";
   // Paths are normalized before comparing, so an equivalent spelling is fine.
   if (resolve(hello.agentDir) !== own.agentDir)
     return `agent directory mismatch: the worker inherits ${own.agentDir}`;
@@ -133,7 +144,7 @@ function main(): void {
   };
   /** Reports a fatal worker condition to the parent and dies; never carries a token. */
   const refuse: (message: string, id?: number) => never = (message, id) => {
-    const redacted = transport.redact(message);
+    const redacted = singleLine(transport.redact(message));
     transport.send({ type: "error", message: redacted, ...(id === undefined ? {} : { id }) });
     process.stderr.write(`${redacted}\n`);
     exit(1);
@@ -142,6 +153,9 @@ function main(): void {
     events.push(event);
     fire();
   });
+  // Worker diagnostics flow through the same live secret registry as every
+  // other reported line, so a credential in a logged error never persists.
+  setDiagnosticsRedactor((text) => transport.redact(text));
 
   let host: StdioHostClient | undefined;
   const queued: QueuedPass[] = [];
@@ -292,7 +306,9 @@ function main(): void {
     // message even where the pass swallows the channel error into its debug log.
     const observingHost: HostPorts = {
       agentDir: base.agentDir,
-      e2eSeam: base.e2eSeam,
+      // Bound like metric below: an unbound method reads the decorator's
+      // fields, not the client's seams.
+      e2eSeam: (name: string) => base.e2eSeam(name),
       now: base.now,
       metric: base.metric.bind(base),
       fetch: base.fetch,
