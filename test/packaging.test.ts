@@ -22,7 +22,7 @@ test("the stub dispatches runtime first, then the standalone binary, then a tty-
   // The harness exec line is confined to the runtime branch.
   expect(stub.slice(binary)).not.toContain("current.mjs");
   // One hint text, shared by both installers, in all three stub copies.
-  expect(stub.match(/run the kimchi-bridge installer/g)!.length).toBe(1);
+  expect(stub.split("run the kimchi-bridge installer").length - 1).toBe(1);
 });
 
 test("the generated assets agree with the packager's names, manifests and payload bytes", () => {

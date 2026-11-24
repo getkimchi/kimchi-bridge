@@ -10,9 +10,12 @@ function observeFull(store: ActivityStore, native: Native, source: "claude-code"
 }
 
 test("native mod caches its version and avoids helper calls for irrelevant telemetry", async () => {
-  const { register } = await import(
-    new URL("../plugins/kimchi-work/claude/hooks/register.js", import.meta.url).href
-  );
+  // register.js caches the version in module state, and bun test shares one module registry
+  // across tests: the sibling mod test in this file imports the same module first in a
+  // shuffled order and populates that cache. The query-qualified specifier loads a fresh
+  // instance whose cache starts empty, so this test observes the first version read itself.
+  const registerModule = "../plugins/kimchi-work/claude/hooks/register.js?independent";
+  const { register } = await import(registerModule);
   const handlers = new Map<string, (...args: any[]) => any>();
   register((event: string, ...args: any[]) => handlers.set(event, args.at(-1)));
   let versionReads = 0;

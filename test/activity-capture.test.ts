@@ -9,6 +9,16 @@ import {
   validateActivityEvent,
   type ActivityInput,
 } from "../src/work/activity.ts";
+/** Hex-encoded SHA-256 digests, checked without a regex literal. */
+function isHex64(value: string): boolean {
+  return (
+    value.length === 64 &&
+    [...value].every(
+      (character) =>
+        (character >= "0" && character <= "9") || (character >= "a" && character <= "f"),
+    )
+  );
+}
 
 const before: ActivityInput = {
   source: "claude-code",
@@ -320,8 +330,8 @@ test("long generic payloads are bounded with complete hashes and a lossless frag
   expect(Buffer.byteLength(payload.data)).toBe(TOOL_ACTIVITY_LIMITS.maxPayloadBytes);
   expect(payload.originalBytes).toBe("90000");
   expect(payload.capturedBytes).toBe(String(TOOL_ACTIVITY_LIMITS.maxPayloadBytes));
-  expect(payload.dataSha256).toMatch(/^[a-f0-9]{64}$/);
-  expect(payload.originalSha256).toMatch(/^[a-f0-9]{64}$/);
+  expect(isHex64(payload.dataSha256 ?? "")).toBe(true);
+  expect(isHex64(payload.originalSha256 ?? "")).toBe(true);
   expect(payload.dataSha256).not.toBe(payload.originalSha256);
   expect(contentPayload(payload.data).dataSha256).toBe(payload.dataSha256);
 });

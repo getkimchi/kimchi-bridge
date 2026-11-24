@@ -1,0 +1,358 @@
+import { readdir, stat } from "node:fs/promises";
+import { join } from "node:path";
+import { setImmediate, setTimeout } from "node:timers/promises";
+import { isWorkId } from "../../ledger/work-id.js";
+import {
+  IMPORT_SLICE_MS,
+  importJournalSlice,
+  importJournals,
+  reportJournalProblems,
+} from "../../ledger/import.js";
+import {
+  readRecords as ledgerReadRecords,
+  readRecordsAsync as ledgerReadRecordsAsync,
+  readRecordsSinceAsync as ledgerReadRecordsSinceAsync,
+  readTransitionRepositories as ledgerTransitionRepositories,
+  fingerprint as recordsFingerprint,
+  type WindowedRecord,
+} from "../../ledger/records.js";
+import { debugWorkAttribution } from "./diagnostics.js";
+
+interface SummaryEntry {
+  sessionId: string;
+  [key: string]: unknown;
+}
+const WORK_RECORD_TYPES = [
+  "work",
+  "work_link",
+  "request",
+  "request_dispatch",
+  "request_response",
+  "request_cost",
+  "tool_execution",
+  "plan",
+  "commit",
+  "file_transition",
+  "file_observation",
+] as const;
+const KNOWN_RECORD_TYPES: ReadonlySet<unknown> = new Set(WORK_RECORD_TYPES);
+export interface WorkRecord extends SummaryEntry {
+  version: 1;
+  type: (typeof WORK_RECORD_TYPES)[number];
+  workId: string;
+}
+/**
+ * A journal line that readWorkRecords did not return. "invalid" is damage: an unparseable line or a record that fails
+ * validation. "unknown-type" is a complete version-1 record of a type this version does not know, usually written by a
+ * newer Kimchi sharing this history. The C3 importer reports both; DB reads are already validated at capture.
+ */
+export type WorkRecordProblem =
+  | { kind: "invalid"; path: string; line: number }
+  | { kind: "unknown-type"; path: string; line: number; record: Record<string, unknown> };
+export function object(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+/** Hex SHA-256 digests that Kimchi writes for hashes, fingerprints and boundaries. */
+export const SHA256_HEX = /^[a-f\d]{64}$/;
+function entry(value: unknown, fields: string[]): value is SummaryEntry {
+  return (
+    object(value) &&
+    typeof value.sessionId === "string" &&
+    fields.every((field) => typeof value[field] === "string")
+  );
+}
+function record(value: unknown): value is WorkRecord {
+  if (
+    !object(value) ||
+    value.version !== 1 ||
+    !isWorkId(value.workId) ||
+    typeof value.sessionId !== "string"
+  )
+    return false;
+  switch (value.type) {
+    case "work":
+      return true;
+    case "work_link":
+      return (
+        entry(value, ["linkId", "sourceWorkId", "targetWorkId"]) && Array.isArray(value.requestIds)
+      );
+    case "request":
+    case "request_dispatch":
+    case "request_response":
+    case "request_cost":
+      return entry(value, ["requestId"]);
+    case "tool_execution":
+      return entry(value, ["requestId", "toolCallId", "toolName", "outcome"]);
+    case "plan":
+      return entry(value, ["path"]);
+    case "commit":
+      return entry(value, ["sha", "repository", "worktree"]);
+    case "file_transition":
+      return entry(value, ["transitionId", "toolCallId", "repository", "worktree", "path"]);
+    case "file_observation":
+      return (
+        entry(value, ["observationId", "toolCallId", "repository", "worktree", "source"]) &&
+        Array.isArray(value.files) &&
+        typeof value.complete === "boolean"
+      );
+    default:
+      return false;
+  }
+}
+function unknownType(value: unknown): value is Record<string, unknown> {
+  return (
+    object(value) &&
+    value.version === 1 &&
+    isWorkId(value.workId) &&
+    typeof value.sessionId === "string" &&
+    typeof value.type === "string" &&
+    !KNOWN_RECORD_TYPES.has(value.type)
+  );
+}
+/** An interrupted append leaves a record cut off mid-value; any other unparseable line is damage. */
+function truncated(line: string): boolean {
+  const closing: string[] = [];
+  let inString = false;
+  // Where an escape sequence such as \n or \u001b began, and how many \u hex digits it still needs.
+  let escapeStart = -1;
+  let hexDigits = 0;
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (escapeStart >= 0) {
+      if (hexDigits) {
+        if (--hexDigits === 0) escapeStart = -1;
+      } else if (char === "u") hexDigits = 4;
+      else escapeStart = -1;
+    } else if (inString) {
+      if (char === "\\") escapeStart = index;
+      else if (char === '"') inString = false;
+    } else if (char === '"') inString = true;
+    else if (char === "{" || char === "[") closing.push(char === "{" ? "}" : "]");
+    else if ((char === "}" || char === "]") && closing.pop() !== char) return false;
+  }
+  if (!closing.length) return false;
+  // Close an open string before any partial escape, or drop a partial number or literal in a value position,
+  // then complete the value.
+  const start = inString
+    ? `${escapeStart >= 0 ? line.slice(0, escapeStart) : line}"`
+    : line.replace(/(?<=[:[,])[\w.+-]+$/, "");
+  const end = closing.reverse().join("");
+  return ["", "null", ":null", '"":null'].some((value) => {
+    try {
+      JSON.parse(`${start}${value}${end}`);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+/**
+ * Parses one journal line by line; `final` marks the text after its last newline, which may still be in progress.
+ * Used by the C3 legacy importer only: the record store replaces journal reads for everything else.
+ */
+export function journalParser(
+  path: string,
+  records: WorkRecord[],
+  onRecordProblem?: (problem: WorkRecordProblem) => void,
+  onTruncatedTail: ((problem: WorkRecordProblem) => void) | undefined = onRecordProblem,
+) {
+  let line = 0;
+  let cut: number[] = [];
+  return (text: string, final: boolean): void => {
+    line++;
+    if (!text.trim()) {
+      if (final)
+        for (const number of cut) onTruncatedTail?.({ kind: "invalid", path, line: number });
+      return;
+    }
+    // A later line shows that the cut-off records before it were interrupted appends.
+    cut = [];
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      if (final) return;
+      if (truncated(text)) cut.push(line);
+      else onRecordProblem?.({ kind: "invalid", path, line });
+      return;
+    }
+    if (record(value)) records.push(value);
+    else
+      onRecordProblem?.(
+        unknownType(value)
+          ? { kind: "unknown-type", path, line, record: value }
+          : { kind: "invalid", path, line },
+      );
+  };
+}
+/** The legacy journals the C3 importer scans, session ledgers and transitions, in a stable order. */
+export async function workJournals(agentDir: string): Promise<string[]> {
+  const directory = join(agentDir, "work-attribution");
+  const paths: string[] = [];
+  for (const source of [directory, join(directory, "transitions")]) {
+    try {
+      for (const file of await readdir(source, { withFileTypes: true }))
+        if (file.isFile() && file.name.endsWith(".jsonl")) paths.push(join(source, file.name));
+    } catch (error) {
+      if (!object(error) || error.code !== "ENOENT") throw error;
+    }
+  }
+  return paths;
+}
+/**
+ * The authority records, oldest first. Legacy journals import in the background; only the C3 importer still parses
+ * files.
+ */
+export function readWorkRecords(
+  agentDir: string,
+  modifiedSince?: number,
+  checkBudget?: () => void,
+  onRecordProblem?: (problem: WorkRecordProblem) => void,
+): WorkRecord[] {
+  if (onRecordProblem || checkBudget) {
+    // Strict history readers must see current local coverage, including damage consumed by another reader.
+    // A failed scan, exhausted budget or unfinished import cannot silently authorize work from incomplete history.
+    if (importJournalSlice(agentDir, checkBudget))
+      throw new Error("Legacy work history is still importing");
+    if (onRecordProblem) reportJournalProblems(agentDir, onRecordProblem, checkBudget);
+  } else hydrateQuietly(agentDir);
+  return ledgerReadRecords(agentDir, { modifiedSince }, checkBudget);
+}
+
+/** The strict windowed read, breathing between ledger pages for a caller driving the UI loop. */
+export async function readWorkRecordsSinceAsync(
+  agentDir: string,
+  modifiedSince: number,
+  checkBudget: () => void,
+  stretch: () => Promise<void>,
+  onRecordProblem: (problem: WorkRecordProblem) => void,
+): Promise<WindowedRecord[]> {
+  // Same strictness as readWorkRecords: an unfinished import or consumed damage never authorizes silently.
+  if (importJournalSlice(agentDir, checkBudget))
+    throw new Error("Legacy work history is still importing");
+  reportJournalProblems(agentDir, onRecordProblem, checkBudget);
+  return ledgerReadRecordsSinceAsync(agentDir, modifiedSince, checkBudget, stretch);
+}
+
+/** The strict anchored history read, breathing between ledger pages for a caller driving the UI loop;
+ * each row carries its record hash and import time so callers dedup and bound on fixed-size anchors. */
+export async function readWorkRecordsForHistoryAsync(
+  agentDir: string,
+  checkBudget: () => void,
+  stretch: () => Promise<void>,
+  onRecordProblem: (problem: WorkRecordProblem) => void,
+): Promise<WindowedRecord[]> {
+  // Same strictness as readWorkRecords: an unfinished import or consumed damage never authorizes silently.
+  if (importJournalSlice(agentDir, checkBudget))
+    throw new Error("Legacy work history is still importing");
+  reportJournalProblems(agentDir, onRecordProblem, checkBudget);
+  return ledgerReadRecordsAsync(agentDir, checkBudget, stretch);
+}
+/** Records of one type, oldest first; background scans read only the rows they use through the type index. */
+export function readWorkRecordsOfType(agentDir: string, type: WorkRecord["type"]): WorkRecord[] {
+  hydrateQuietly(agentDir);
+  return ledgerReadRecords(agentDir, { type });
+}
+/** Stored native-capture repository discovery; legacy journals import first. */
+export function readFileTransitionRepositories(agentDir: string): string[] {
+  hydrateQuietly(agentDir);
+  return ledgerTransitionRepositories(agentDir);
+}
+
+function hydrateQuietly(agentDir: string): void {
+  try {
+    hydrate(agentDir);
+  } catch (error) {
+    debugWorkAttribution("Legacy hydration unavailable:", error);
+  }
+}
+/** Like readWorkRecords, but yields between bounded imports and honors shutdown between each committed batch. */
+export async function readWorkRecordsAsync(
+  agentDir: string,
+  signal: AbortSignal,
+  onRecordProblem?: (problem: WorkRecordProblem) => void,
+): Promise<WorkRecord[]> {
+  const checkBudget = () => signal.throwIfAborted();
+  await importWorkRecordsAsync(agentDir, checkBudget, onRecordProblem);
+  return (await ledgerReadRecordsAsync(agentDir, checkBudget)).map((row) => row.record);
+}
+
+/** Import once before reading an authority prefix with its original hashes or parsed work records. */
+export async function importWorkRecordsAsync(
+  agentDir: string,
+  checkBudget: () => void,
+  onRecordProblem?: (problem: WorkRecordProblem) => void,
+  /** Background capture verifies consumed prefixes cooperatively before its synchronous slice. */
+  verifyCapturePrefix = false,
+): Promise<void> {
+  checkBudget();
+  for (;;) {
+    await setImmediate();
+    checkBudget();
+    const imported = await importJournals(agentDir, {
+      checkBudget,
+      until: Date.now() + IMPORT_SLICE_MS,
+      verifyCapturePrefix,
+    });
+    if (!imported.pending) break;
+  }
+  if (onRecordProblem) reportJournalProblems(agentDir, onRecordProblem, checkBudget);
+}
+/** Notice old-process appends and rewrites without reading journal bodies on idle passes. */
+export async function workJournalFingerprint(
+  agentDir: string,
+  checkBudget?: () => void,
+): Promise<string> {
+  checkBudget?.();
+  const paths = (await workJournals(agentDir)).sort();
+  checkBudget?.();
+  const files: string[][] = [];
+  for (const path of paths) {
+    checkBudget?.();
+    const value = await stat(path, { bigint: true });
+    checkBudget?.();
+    files.push([
+      path,
+      String(value.dev),
+      String(value.ino),
+      String(value.size),
+      String(value.mtimeNs),
+      String(value.ctimeNs),
+    ]);
+  }
+  const fingerprint = JSON.stringify([recordsFingerprint(agentDir), files]);
+  checkBudget?.();
+  return fingerprint;
+}
+/** Agent directories whose legacy journals finished importing in this process. */
+const hydrated = new Set<string>();
+/** The background legacy import of each agent directory while one runs. */
+const importing = new Map<string, Promise<void>>();
+/**
+ * Imports one short slice of legacy history now and the rest in the background, once per process; reporting passes
+ * and strict readers import later appends themselves. Cursors resume an import cut short by an exit.
+ */
+function hydrate(agentDir: string): void {
+  if (hydrated.has(agentDir) || importing.has(agentDir)) return;
+  if (!importJournalSlice(agentDir)) {
+    hydrated.add(agentDir);
+    return;
+  }
+  const run = (async () => {
+    try {
+      // An unreferenced timer lets a finished command exit mid-import.
+      do await setTimeout(0, undefined, { ref: false });
+      while (importJournalSlice(agentDir));
+      hydrated.add(agentDir);
+    } catch (error) {
+      debugWorkAttribution("Work summary recovery unavailable:", error);
+    } finally {
+      importing.delete(agentDir);
+    }
+  })();
+  importing.set(agentDir, run);
+}
+/** Waits for the background import of legacy history. */
+export async function flushWorkSummaries(): Promise<void> {
+  await Promise.all(importing.values());
+}

@@ -1,0 +1,871 @@
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import { preludeStretch } from "../shared/prelude-stretch.js";
+import { isWorkId } from "../../ledger/work-id.js";
+import { appendWorkRecord, isWorkSegment, type WorkContinuation } from "../work-attribution.js";
+import {
+  isWorkAccount,
+  isWorkScope,
+  readWorkScope,
+  sameWorkAccount,
+  sameWorkScope,
+  type WorkScope,
+} from "./scope.js";
+import {
+  object,
+  readWorkRecords,
+  readWorkRecordsForHistoryAsync,
+  readWorkRecordsSinceAsync,
+  SHA256_HEX,
+  type WorkRecord,
+  type WorkRecordProblem,
+  workJournalFingerprint,
+} from "./summary.js";
+
+interface RequestLink {
+  workIds: Set<string>;
+  linkIds: Set<string>;
+  unresolved: boolean;
+}
+
+const REPAIR_BUDGET_MS = 3000;
+const MAX_CONTINUATIONS_PER_PASS = 25;
+// Coarse filesystem timestamps must not hide an append.
+const MTIME_SLACK_MS = 2000;
+/** Retained incremental index rows above which the accumulated state is released: while a receipt
+ * stays pending, the index would otherwise grow with the whole history forever. The release re-arms
+ * only on growth past the previous release point, so an over-cap history pays one extra full read —
+ * not one per pass; `done` and `quiet` survive the release. */
+const HISTORY_RETAINED_MAX_ROWS = 100_000;
+/** Rows between time-budget checks: a clock read per row is measurable on long histories. */
+const BUDGET_CHECK_ROWS = 1024;
+
+/** Direct request corrections only: never merge sessions or follow transitive work links. */
+export function requestWorkLinks(records: readonly WorkRecord[]): Map<string, RequestLink> {
+  const groups = new Map<string, WorkRecord[]>();
+  const requests = new Map<string, WorkRecord[]>();
+  const workRequests = new Map<string, WorkRecord[]>();
+  for (const row of records) {
+    if (row.type === "request" && typeof row.requestId === "string") {
+      const copies = requests.get(row.requestId) ?? [];
+      copies.push(row);
+      requests.set(row.requestId, copies);
+      const work = workRequests.get(row.workId) ?? [];
+      work.push(row);
+      workRequests.set(row.workId, work);
+    }
+    if (row.type === "work_link" && typeof row.linkId === "string") {
+      const history = groups.get(row.linkId) ?? [];
+      history.push(row);
+      groups.set(row.linkId, history);
+    }
+  }
+  const result = new Map<string, RequestLink>();
+  for (const [linkId, rows] of groups) {
+    const revision = Math.max(
+      ...rows.map((row) => (typeof row.revision === "number" ? row.revision : 0)),
+    );
+    const latest = rows.filter((row) => row.revision === revision);
+    const selected = latest[0];
+    const fingerprints = new Set(
+      latest.map((row) =>
+        JSON.stringify([
+          row.workId,
+          row.sourceWorkId,
+          row.targetWorkId,
+          row.status,
+          isWorkScope(row.scope)
+            ? [
+                row.scope.repository,
+                row.scope.account.apiUrl,
+                row.scope.account.organizationId,
+                row.scope.account.userId,
+              ]
+            : null,
+          Array.isArray(row.requestIds) ? [...row.requestIds].sort() : null,
+          row.evidence,
+        ]),
+      ),
+    );
+    const ids = new Set(
+      rows.flatMap((row) =>
+        Array.isArray(row.requestIds)
+          ? row.requestIds.filter((id): id is string => typeof id === "string")
+          : [],
+      ),
+    );
+    const scope = selected && isWorkScope(selected.scope) ? selected.scope : undefined;
+    const target =
+      selected && typeof selected.targetWorkId === "string" ? selected.targetWorkId : "";
+    const targetRequests = workRequests.get(target) ?? [];
+    const selectedIds = Array.isArray(selected?.requestIds) ? selected.requestIds : [];
+    const evidence =
+      selected?.evidence && typeof selected.evidence === "object" ? selected.evidence : undefined;
+    const automatic =
+      evidence &&
+      "source" in evidence &&
+      (evidence.source === "saved-plan" ||
+        evidence.source === "pasted-plan" ||
+        evidence.source === "named-artifact");
+    const valid =
+      selected &&
+      scope &&
+      isWorkId(linkId) &&
+      Number.isSafeInteger(revision) &&
+      revision > 0 &&
+      fingerprints.size === 1 &&
+      selected.status === "active" &&
+      isWorkId(selected.sourceWorkId) &&
+      isWorkId(target) &&
+      selected.workId === target &&
+      selectedIds.length > 0 &&
+      selectedIds.every(isWorkId) &&
+      evidence &&
+      "source" in evidence &&
+      (evidence.source === "work-command" ||
+        (automatic &&
+          selected.sourceWorkId === target &&
+          "requestId" in evidence &&
+          isWorkId(evidence.requestId) &&
+          selectedIds.includes(evidence.requestId) &&
+          "segmentId" in evidence &&
+          isWorkId(evidence.segmentId))) &&
+      // Requests before a new work's delayed first scope stay unscoped; only another scope conflicts.
+      targetRequests.some((row) => isWorkScope(row.scope)) &&
+      targetRequests.every((row) => !isWorkScope(row.scope) || sameWorkScope(row.scope, scope));
+    for (const requestId of ids) {
+      const value = result.get(requestId) ?? {
+        workIds: new Set(),
+        linkIds: new Set(),
+        unresolved: false,
+      };
+      for (const row of valid ? latest : rows)
+        if (typeof row.targetWorkId === "string") value.workIds.add(row.targetWorkId);
+      value.linkIds.add(linkId);
+      const originals = requests.get(requestId) ?? [];
+      value.unresolved ||=
+        !valid ||
+        !selectedIds.includes(requestId) ||
+        !originals.length ||
+        !originals.every(
+          (row) =>
+            row.workId === selected.sourceWorkId &&
+            isWorkScope(row.scope) &&
+            sameWorkScope(row.scope, scope) &&
+            (!automatic ||
+              (isWorkSegment(row.segment) &&
+                "segmentId" in evidence &&
+                row.segment.id === evidence.segmentId)),
+        );
+      result.set(requestId, value);
+    }
+  }
+  for (const value of result.values()) value.unresolved ||= value.workIds.size !== 1;
+  return result;
+}
+
+/** Lookups over one journal snapshot, so checking a receipt never rescans the whole history. */
+interface ContinuationIndex {
+  /** Indexed rows so far — the exact retained-row count the eviction cap reads (O(1)). */
+  retainedRows: number;
+  /** Request IDs named by any correction or confirmation, whatever its revision or status. */
+  linked: Set<unknown>;
+  /** Request rows in journal order by request ID, by work, and by work plus input segment. */
+  requests: Map<string, WorkRecord[]>;
+  workRequests: Map<string, WorkRecord[]>;
+  segmentRequests: Map<string, WorkRecord[]>;
+  /** Possible producers in journal order: plans by work plus content hash, native edits by work plus transition. */
+  plans: Map<string, WorkRecord[]>;
+  transitions: Map<string, WorkRecord[]>;
+}
+
+function addRow(rows: Map<string, WorkRecord[]>, key: string, row: WorkRecord): void {
+  const existing = rows.get(key);
+  if (existing) existing.push(row);
+  else rows.set(key, [row]);
+}
+
+// Work IDs are fixed-length UUIDs, so prefixing one keeps each composite key unambiguous.
+function indexRecord(index: ContinuationIndex, row: WorkRecord): void {
+  index.retainedRows++;
+  if (row.type === "work_link" && Array.isArray(row.requestIds))
+    for (const id of row.requestIds) index.linked.add(id);
+  else if (row.type === "request" && typeof row.requestId === "string") {
+    addRow(index.requests, row.requestId, row);
+    addRow(index.workRequests, row.workId, row);
+    if (isWorkSegment(row.segment)) addRow(index.segmentRequests, row.workId + row.segment.id, row);
+  } else if (row.type === "plan" && typeof row.contentHash === "string")
+    addRow(index.plans, row.workId + row.contentHash, row);
+  else if (row.type === "file_transition" && typeof row.transitionId === "string")
+    addRow(index.transitions, row.workId + row.transitionId, row);
+}
+
+function newContinuationIndex(): ContinuationIndex {
+  return {
+    linked: new Set(),
+    requests: new Map(),
+    workRequests: new Map(),
+    segmentRequests: new Map(),
+    plans: new Map(),
+    transitions: new Map(),
+    retainedRows: 0,
+  };
+}
+
+function indexContinuationRecords(
+  records: readonly WorkRecord[],
+  checkBudget: () => void = () => {},
+): ContinuationIndex {
+  const index = newContinuationIndex();
+  for (let position = 0; position < records.length; position++) {
+    if (position % BUDGET_CHECK_ROWS === 0) checkBudget();
+    indexRecord(index, records[position]);
+  }
+  return index;
+}
+
+/** The same index, breathing between rows for a caller driving the UI loop. */
+async function indexContinuationRecordsAsync(
+  records: readonly WorkRecord[],
+  checkBudget: () => void,
+  stretch: () => Promise<void>,
+): Promise<ContinuationIndex> {
+  const index = newContinuationIndex();
+  for (let position = 0; position < records.length; position++) {
+    await stretch();
+    if (position % BUDGET_CHECK_ROWS === 0) checkBudget();
+    indexRecord(index, records[position]);
+  }
+  return index;
+}
+
+/** One complete journal snapshot for continuation checks. */
+export interface ContinuationHistory {
+  records: WorkRecord[];
+  index: ContinuationIndex;
+  /** Complete records of types this version does not know, with every UUID each one names. */
+  unknown: { problem: WorkRecordProblem; ids: Set<string> }[];
+}
+
+/** Every UUID a record names: an unknown record type may concern any of those works or requests. */
+function namedIds(value: unknown, ids = new Set<string>()): Set<string> {
+  if (isWorkId(value)) ids.add(value);
+  else if (Array.isArray(value)) for (const item of value) namedIds(item, ids);
+  else if (object(value))
+    for (const [key, item] of Object.entries(value)) {
+      if (isWorkId(key)) ids.add(key);
+      namedIds(item, ids);
+    }
+  return ids;
+}
+
+/** Names each affected journal once, with its first problem line, so it can be found and repaired. */
+function journals(problems: readonly WorkRecordProblem[]): string {
+  const lines = new Map<string, number>();
+  for (const { path, line } of problems) if (!lines.has(path)) lines.set(path, line);
+  const named = [...lines].map(([path, line]) => `${path}:${line}`);
+  return named.length > 3
+    ? `${named.slice(0, 3).join(", ")} and ${named.length - 3} more`
+    : named.join(", ");
+}
+
+/** The strict-reader damage error, buildable where the `journals` helper is shadowed by a fingerprint value. */
+function invalidRecordsError(invalid: readonly WorkRecordProblem[]): Error {
+  return new Error(`Incomplete work history contains invalid records in ${journals(invalid)}`);
+}
+
+/** Damage anywhere could hide a revocation, so it blocks every confirmation until the journal is repaired. */
+export function readContinuationHistory(
+  agentDir: string,
+  checkBudget?: () => void,
+): ContinuationHistory {
+  const invalid: WorkRecordProblem[] = [];
+  const unknown: ContinuationHistory["unknown"] = [];
+  const records = readWorkRecords(agentDir, undefined, checkBudget, (problem) => {
+    if (problem.kind === "invalid") invalid.push(problem);
+    else unknown.push({ problem, ids: namedIds(problem.record) });
+  });
+  if (invalid.length)
+    throw new Error(`Incomplete work history contains invalid records in ${journals(invalid)}`);
+  return { records, index: indexContinuationRecords(records, checkBudget), unknown };
+}
+
+/** The same snapshot, breathing through the ledger walk and the index build. `mergedSince` also
+ * collects the record hashes of rows imported at or after it — from this read's own snapshot, never a
+ * later one — so the caller's incremental-overlap memory covers only rows it also indexed. */
+export async function readContinuationHistoryAsync(
+  agentDir: string,
+  checkBudget: () => void = () => {},
+  stretch: () => Promise<void> = preludeStretch(),
+  mergedSince?: number,
+): Promise<ContinuationHistory & { merged: Set<string> }> {
+  const invalid: WorkRecordProblem[] = [];
+  const unknown: ContinuationHistory["unknown"] = [];
+  const anchored = await readWorkRecordsForHistoryAsync(
+    agentDir,
+    checkBudget,
+    stretch,
+    (problem) => {
+      if (problem.kind === "invalid") invalid.push(problem);
+      else unknown.push({ problem, ids: namedIds(problem.record) });
+    },
+  );
+  if (invalid.length)
+    throw new Error(`Incomplete work history contains invalid records in ${journals(invalid)}`);
+  const records = anchored.map((row) => row.record);
+  const merged = new Set<string>();
+  for (const { hash, importedAt } of anchored)
+    if (mergedSince !== undefined && importedAt >= mergedSince) merged.add(hash);
+  return {
+    records,
+    index: await indexContinuationRecordsAsync(records, checkBudget, stretch),
+    unknown,
+    merged,
+  };
+}
+
+/** Unknown record types naming this work or one of its requests; this version cannot tell what they change. */
+function unknownRecords(
+  history: Pick<ContinuationHistory, "index" | "unknown">,
+  workId: string,
+): WorkRecordProblem[] {
+  return history.unknown
+    .filter(({ ids }) =>
+      [...ids].some(
+        (id) =>
+          id === workId || history.index.requests.get(id)?.some((row) => row.workId === workId),
+      ),
+    )
+    .map(({ problem }) => problem);
+}
+
+/** A newer record type blocks only the work it concerns; unrelated works stay decidable. */
+function workIndex(history: ContinuationHistory, workId: string): ContinuationIndex {
+  const unknown = unknownRecords(history, workId);
+  if (unknown.length)
+    throw new Error(`Work history contains unknown record types in ${journals(unknown)}`);
+  return history.index;
+}
+
+/** Index key of the records that can have produced an accepted plan or artifact; a receipt without one never resolves. */
+function producerKey({ workId, source, evidence }: WorkContinuation): string | undefined {
+  if (source === "named-artifact")
+    return isWorkId(evidence.transitionId) ? workId + evidence.transitionId : undefined;
+  // Plan receipts saved before acceptance hashes cannot tell the accepted version apart.
+  if (
+    source !== "semantic" &&
+    typeof evidence.contentHash === "string" &&
+    SHA256_HEX.test(evidence.contentHash)
+  )
+    return workId + evidence.contentHash;
+}
+
+function continuationProducers(
+  continuation: WorkContinuation,
+  index: ContinuationIndex,
+  checkBudget: () => void = () => {},
+) {
+  const { source, evidence } = continuation;
+  const key = producerKey(continuation);
+  if (!key) return [];
+  if (source === "named-artifact") return index.transitions.get(key) ?? [];
+  const producers = (index.plans.get(key) ?? []).filter((row) =>
+    [row.path, row.snapshotPath].some((path) => {
+      if (typeof path !== "string") return false;
+      if (path === evidence.path) return true;
+      try {
+        return realpathSync(path) === evidence.path;
+      } catch {
+        return false;
+      }
+    }),
+  );
+  // Missing or damaged bytes cannot eliminate a competing producer and make ownership certain.
+  const retained = producers.every((row) => {
+    checkBudget();
+    try {
+      if (typeof row.snapshotPath !== "string") return false;
+      const saved = readFileSync(row.snapshotPath);
+      return createHash("sha256").update(saved).digest("hex") === evidence.contentHash;
+    } catch {
+      return false;
+    }
+  });
+  return retained ? producers : [];
+}
+
+/** Keep a known producer's identity even if its source journal is unavailable during a later pass. */
+export function pinWorkContinuation(
+  continuation: WorkContinuation,
+  history: ContinuationHistory,
+): WorkContinuation {
+  const producers = continuationProducers(continuation, workIndex(history, continuation.workId));
+  const ids = new Set(producers.map((row) => row.requestId));
+  const requestId = producers[0]?.requestId;
+  if (!isWorkId(requestId) || !producers.every((row) => isWorkId(row.requestId)) || ids.size !== 1)
+    return continuation;
+  return { ...continuation, evidence: { ...continuation.evidence, requestId } };
+}
+
+/** Null when the receipt can never link; undefined while missing or conflicting evidence leaves it unresolved. */
+function continuationLink(
+  continuation: WorkContinuation,
+  scope: WorkScope,
+  index: ContinuationIndex,
+  checkBudget: () => void = () => {},
+  acceptedAt?: number,
+) {
+  const { workId, source, evidence } = continuation;
+  const originalScope = readWorkScope(workId);
+  if (
+    !originalScope ||
+    !sameWorkScope(originalScope, scope) ||
+    (evidence.repository !== undefined && evidence.repository !== scope.repository) ||
+    (evidence.account !== undefined &&
+      (!isWorkAccount(evidence.account) || !sameWorkAccount(evidence.account, scope.account))) ||
+    (evidence.requestId !== undefined && !isWorkId(evidence.requestId))
+  )
+    return;
+  const producers = continuationProducers(continuation, index, checkBudget).filter((row) => {
+    // A later identical save cannot explain an earlier acceptance. Restored source
+    // records retain their original timestamp; genuinely later production stays unknown.
+    return (
+      source === "named-artifact" ||
+      evidence.requestId !== undefined ||
+      acceptedAt === undefined ||
+      (typeof row.recordedAt === "string" &&
+        Number.isFinite(Date.parse(row.recordedAt)) &&
+        Date.parse(row.recordedAt) < acceptedAt)
+    );
+  });
+  if (!producers.length || !producers.every((row) => isWorkId(row.requestId))) return;
+  const producerIds = new Set(producers.map((row) => row.requestId));
+  if (
+    producerIds.size !== 1 ||
+    (evidence.requestId !== undefined && !producerIds.has(evidence.requestId))
+  )
+    return;
+  const origins = index.requests.get(String(producers[0].requestId)) ?? [];
+  const segment = origins[0]?.segment;
+  // An explicit input already chose its work, so there is nothing to confirm.
+  if (isWorkSegment(segment) && segment.attribution === "explicit") return null;
+  if (
+    !isWorkSegment(segment) ||
+    !isWorkId(segment.id) ||
+    !origins.every(
+      (row) =>
+        row.workId === workId &&
+        isWorkSegment(row.segment) &&
+        row.segment.id === segment.id &&
+        isWorkScope(row.scope) &&
+        sameWorkScope(row.scope, scope),
+    )
+  )
+    return;
+  const requests = index.segmentRequests.get(workId + segment.id) ?? [];
+  if (
+    !requests.every(
+      (row) => isWorkId(row.requestId) && isWorkScope(row.scope) && sameWorkScope(row.scope, scope),
+    )
+  )
+    return;
+  const requestIds = [...new Set(requests.map((row) => String(row.requestId)))].sort();
+  // An existing correction or confirmation takes precedence, even when it was revoked.
+  if (requestIds.some((id) => index.linked.has(id))) return null;
+  if (
+    // Requests before a new work's delayed first scope stay unscoped; only another scope conflicts.
+    (index.workRequests.get(workId) ?? []).some(
+      (row) => isWorkScope(row.scope) && !sameWorkScope(row.scope, scope),
+    ) ||
+    requestIds.some((id) =>
+      (index.requests.get(id) ?? []).some(
+        (row) =>
+          row.workId !== workId ||
+          !isWorkSegment(row.segment) ||
+          row.segment.id !== segment.id ||
+          !isWorkScope(row.scope) ||
+          !sameWorkScope(row.scope, scope),
+      ),
+    )
+  )
+    return;
+  checkBudget();
+  return {
+    type: "work_link" as const,
+    linkId: randomUUID(),
+    revision: 1,
+    status: "active",
+    sourceWorkId: workId,
+    targetWorkId: workId,
+    requestIds,
+    scope,
+    evidence: { ...evidence, source, requestId: origins[0].requestId, segmentId: segment.id },
+  };
+}
+
+/**
+ * confirmWorkContinuation stays in Kimchi: it resolves the live session's current work
+ * identity (getWorkId) and writes on its behalf during input attribution.
+ */
+
+function acceptedContinuation(row: WorkRecord): WorkContinuation | undefined {
+  if (row.type !== "work" || !row.continuation || typeof row.continuation !== "object") return;
+  const value = row.continuation;
+  if (!("source" in value) || !("evidence" in value)) return;
+  const { source, evidence } = value;
+  if (source !== "saved-plan" && source !== "pasted-plan" && source !== "named-artifact") return;
+  if (
+    !evidence ||
+    typeof evidence !== "object" ||
+    !("path" in evidence) ||
+    typeof evidence.path !== "string"
+  )
+    return;
+  return { workId: row.workId, source, evidence: { ...evidence, path: evidence.path } };
+}
+
+/** A receipt that can name its producer; any other receipt never resolves. */
+function receipt(row: WorkRecord): { key: string; continuation: WorkContinuation } | undefined {
+  const continuation = acceptedContinuation(row);
+  if (continuation && producerKey(continuation) && typeof row.cwd === "string")
+    return { key: JSON.stringify([row.workId, row.sessionId, continuation]), continuation };
+}
+
+export interface ContinuationProgress {
+  /** The rotation position. */
+  nextContinuation?: string;
+  /** The journals of the last pass that examined every receipt and wrote nothing. */
+  settledJournals?: string;
+  /** Receipts confirmed or never linkable. Later passes skip them, so they cannot keep history from settling. */
+  done?: Set<string>;
+  /** Set while no receipt can link: every receipt known then, and when that history was read. */
+  quiet?: { since: number; receipts: Set<string> };
+  /**
+   * Incremental history: the index, unknown-type problems, receipt keys, and pending candidates
+   * accumulated so far, plus the watermark (epoch ms) through which records were read. Kept on
+   * the progress object so a bounded work quota per pass does not re-read the whole ledger every
+   * pass. Held in memory only — not JSON-serializable (Sets/Maps).
+   *
+   * Safety shape: the LEDGER is the authority and only ever grows (no production code deletes
+   * records; a rewritten journal's re-import adds both generations' rows with fresh import
+   * times, so a modifiedSince read never misses content a rewrite removed). The stat gate below
+   * is defense in depth: shrinking and same-size rewrites force a full rebuild, and the strict
+   * problem check on every incremental read surfaces the damage a growing rewrite carries.
+   * The watermark is wall-clock: a large clock rollback strands rows until a full rebuild.
+   */
+  historyIndex?: ContinuationIndex;
+  historyUnknown?: ContinuationHistory["unknown"];
+  historyReceipts?: Set<string>;
+  historyCandidates?: Map<string, { row: WorkRecord; continuation: WorkContinuation }>;
+  /** Record hashes merged by the immediately-preceding pass within the recent slack tail, so the
+   * overlap of the next incremental read does not re-append rows. Bounded by construction: only
+   * rows a future pass's window can still re-read (imported at or after this pass's start minus
+   * the slack) are retained — fixed-size hashes, never serialized bodies. */
+  historyMerged?: Set<string>;
+  historySince?: number;
+  /** Index rows at the last eviction release. The cap re-arms from here: the next rebuild is
+   * retained, so an over-cap history does not repeat a full read every journal-changing pass. */
+  historyEvictedRows?: number;
+  /** Per-journal stats of the last pass that built the incremental state, to tell append-only growth from rewrites. */
+  journalStats?: Map<string, { size: string; mtimeNs: string; ctimeNs: string }>;
+  /**
+   * The ledger record count when the state was built; a decrease forces a full rebuild. Snapshot
+   * comparison only: a shrink that re-grows past this count within one pass interval is invisible
+   * until an unrelated rebuild (closing that needs a monotone ledger position, not a count).
+   */
+  historyRecords?: number;
+}
+
+/** File stats from a workJournalFingerprint value; coupled to its JSON shape by construction. */
+function fingerprintFiles(
+  fingerprint: string,
+):
+  | { files: Map<string, { size: string; mtimeNs: string; ctimeNs: string }>; records: number }
+  | undefined {
+  try {
+    const parsed = JSON.parse(fingerprint) as [string, string[][]];
+    const records = Number(parsed[0]);
+    if (!Array.isArray(parsed[1]) || !Number.isFinite(records)) return undefined;
+    const files = new Map<string, { size: string; mtimeNs: string; ctimeNs: string }>();
+    for (const entry of parsed[1]) {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string") return undefined;
+      const [path, , , size, mtimeNs, ctimeNs] = entry;
+      if (typeof size !== "string" || typeof mtimeNs !== "string" || typeof ctimeNs !== "string")
+        return undefined;
+      files.set(path, { size, mtimeNs, ctimeNs });
+    }
+    return { files, records };
+  } catch {
+    // A shape change in workJournalFingerprint must fail toward a full rebuild, not toward "grew".
+    return undefined;
+  }
+}
+
+/** Appends only ever grow a journal: shrink or same-size-change means a rewrite, which the incremental state cannot absorb. */
+function journalGrewOnly(
+  previous: Map<string, { size: string; mtimeNs: string; ctimeNs: string }>,
+  current: Map<string, { size: string; mtimeNs: string; ctimeNs: string }>,
+): boolean {
+  if (previous.size > current.size) return false;
+  for (const [path, was] of previous) {
+    const now = current.get(path);
+    if (!now) return false;
+    if (Number(now.size) < Number(was.size)) return false;
+    if (now.size === was.size && (now.mtimeNs !== was.mtimeNs || now.ctimeNs !== was.ctimeNs))
+      return false;
+  }
+  return true;
+}
+
+/** Retry accepted evidence locally; unresolved receipts are never marked permanently complete. */
+export async function reconcileWorkContinuations(
+  agentDir: string,
+  signal: AbortSignal,
+  assertLease: () => void,
+  progress: ContinuationProgress = {},
+  stretch: () => Promise<void> = preludeStretch(),
+  retainedMax: number = HISTORY_RETAINED_MAX_ROWS,
+): Promise<void> {
+  const startedAt = Date.now();
+  const deadline = startedAt + REPAIR_BUDGET_MS;
+  const checkBudget = () => {
+    signal.throwIfAborted();
+    assertLease();
+    if (Date.now() > deadline)
+      throw new Error("Work continuation reconciliation time limit exceeded");
+  };
+  // Fingerprint before reading: an append during the read only makes the next pass read again.
+  const journals = await workJournalFingerprint(agentDir, checkBudget);
+  checkBudget();
+  // Until a journal changes, such a pass would only repeat itself.
+  if (progress.settledJournals === journals) return;
+  progress.settledJournals = undefined;
+  if (progress.quiet) {
+    // Journals only grow, so only those changed since can hold a new receipt; nothing else needs the whole history.
+    // Non-strict read, safe only because this path never confirms: any real change falls
+    // through to the strict reads below before a link is written.
+    const { since, receipts } = progress.quiet;
+    const changed = readWorkRecords(agentDir, since - MTIME_SLACK_MS, checkBudget);
+    const known = (row: WorkRecord) => {
+      const found = receipt(row);
+      return !found || receipts.has(found.key);
+    };
+    if (changed.every(known)) {
+      progress.quiet = { since: startedAt, receipts };
+      progress.settledJournals = journals;
+      // Nothing pending: release the accumulated index — the quiet path handles future
+      // appends, so resident memory is bounded to periods with an actual backlog.
+      progress.historyIndex = undefined;
+      progress.historyUnknown = undefined;
+      progress.historyReceipts = undefined;
+      progress.historyCandidates = undefined;
+      progress.historyMerged = undefined;
+      progress.journalStats = undefined;
+      progress.historyRecords = undefined;
+      return;
+    }
+    progress.quiet = undefined;
+  }
+  progress.done ??= new Set();
+  const done = progress.done;
+  const parsedFingerprint = fingerprintFiles(journals);
+  const since = progress.historySince;
+  const incremental =
+    parsedFingerprint !== undefined &&
+    progress.historyIndex !== undefined &&
+    progress.historyReceipts !== undefined &&
+    progress.historyCandidates !== undefined &&
+    since !== undefined &&
+    // journalStats must exist too: an empty previous map makes journalGrewOnly vacuous,
+    // undoing the rewrite detection the stats are taken for. Fail toward the full rebuild.
+    progress.journalStats !== undefined &&
+    (progress.historyRecords === undefined ||
+      parsedFingerprint.records >= progress.historyRecords) &&
+    journalGrewOnly(progress.journalStats, parsedFingerprint.files);
+  let index: ContinuationIndex;
+  let receipts: Set<string>;
+  let candidates: Map<string, { row: WorkRecord; continuation: WorkContinuation }>;
+  if (
+    incremental &&
+    parsedFingerprint &&
+    progress.historyIndex &&
+    progress.historyReceipts &&
+    progress.historyCandidates
+  ) {
+    // Append-only since the last pass: merge the new records into the accumulated state.
+    index = progress.historyIndex;
+    receipts = progress.historyReceipts;
+    candidates = progress.historyCandidates;
+    // The strict problem check guards every link write: damage blocks confirmation
+    // ("Damage anywhere could hide a revocation"), and unknown record types block the
+    // work they name. Problem notes are persisted, so this replays them cheaply.
+    const invalid: WorkRecordProblem[] = [];
+    const fresh = await readWorkRecordsSinceAsync(
+      agentDir,
+      since - MTIME_SLACK_MS,
+      checkBudget,
+      stretch,
+      (problem) => {
+        if (problem.kind === "invalid") invalid.push(problem);
+        else {
+          progress.historyUnknown ??= [];
+          const unknown = progress.historyUnknown;
+          if (!unknown.some((seen) => JSON.stringify(seen.problem) === JSON.stringify(problem)))
+            unknown.push({ problem, ids: namedIds(problem.record) });
+        }
+      },
+    );
+    if (invalid.length) throw invalidRecordsError(invalid);
+    // The slack window re-reads rows the previous pass already merged; rows share a body only when
+    // they share a record hash — the ledger dedups on it — so the hash is a stable, fixed-size
+    // identity. Only rows a future pass's window can still re-read (imported within the slack tail)
+    // need remembering, which bounds the set to the recent tail instead of the whole merged window.
+    const previous = progress.historyMerged;
+    const merged = new Set<string>();
+    // All-or-nothing: a mid-merge throw drops the accumulated state so the next pass
+    // rebuilds from one full read, instead of re-merging this window forever.
+    try {
+      for (const { record: row, hash, importedAt } of fresh) {
+        checkBudget();
+        await stretch();
+        if (importedAt >= startedAt - MTIME_SLACK_MS) merged.add(hash);
+        if (previous?.has(hash)) continue;
+        indexRecord(index, row);
+        const found = receipt(row);
+        if (!found) continue;
+        receipts.add(found.key);
+        if (index.linked.has(found.continuation.evidence.requestId)) done.add(found.key);
+        if (
+          !done.has(found.key) &&
+          !unknownRecords({ index, unknown: progress.historyUnknown ?? [] }, row.workId).length
+        )
+          candidates.set(found.key, { row, continuation: found.continuation });
+      }
+    } catch (error) {
+      progress.historyIndex = undefined;
+      progress.historyReceipts = undefined;
+      progress.historyCandidates = undefined;
+      progress.historyMerged = undefined;
+      progress.journalStats = undefined;
+      progress.historyRecords = undefined;
+      throw error;
+    }
+    progress.historyMerged = merged;
+    // Settled receipts must leave the pending map, or the per-pass cap counts dead work forever.
+    for (const key of done) candidates.delete(key);
+    // A work named by an unknown record type that arrived this pass must not confirm from a
+    // candidate registered before the record was known — matching the rebuild branch, which
+    // only ever adds candidates the unknown gate already cleared.
+    for (const [key, candidate] of candidates)
+      if (
+        unknownRecords({ index, unknown: progress.historyUnknown ?? [] }, candidate.row.workId)
+          .length
+      )
+        candidates.delete(key);
+  } else {
+    // First pass, or a rewrite invalidated the accumulated state: one full read rebuilds it.
+    // mergedSince comes from THIS read's snapshot: a record captured after the read is absent from
+    // merged (and from the index), so the next incremental pass indexes it instead of skipping it.
+    const history = await readContinuationHistoryAsync(
+      agentDir,
+      checkBudget,
+      stretch,
+      startedAt - MTIME_SLACK_MS,
+    );
+    index = history.index;
+    receipts = new Set();
+    candidates = new Map();
+    for (const row of history.records) {
+      await stretch();
+      const found = receipt(row);
+      if (!found) continue;
+      receipts.add(found.key);
+      // A linked producer is already confirmed or corrected, and its link would be refused anyway.
+      if (index.linked.has(found.continuation.evidence.requestId)) done.add(found.key);
+      // A work named by an unknown record type waits without holding back the other receipts.
+      if (!done.has(found.key) && !unknownRecords(history, row.workId).length)
+        candidates.set(found.key, { row, continuation: found.continuation });
+    }
+    progress.historyIndex = index;
+    progress.historyUnknown = history.unknown;
+    progress.historyReceipts = receipts;
+    progress.historyCandidates = candidates;
+    progress.historyMerged = history.merged;
+  }
+  progress.historySince = startedAt;
+  if (parsedFingerprint) {
+    progress.journalStats = parsedFingerprint.files;
+    progress.historyRecords = parsedFingerprint.records;
+  } else {
+    progress.journalStats = undefined;
+    progress.historyRecords = undefined;
+  }
+  const keys = [...candidates.keys()].sort();
+  const start = Math.max(0, keys.indexOf(progress.nextContinuation ?? ""));
+  let wrote = false;
+  for (let offset = 0; offset < Math.min(keys.length, MAX_CONTINUATIONS_PER_PASS); offset++) {
+    checkBudget();
+    const position = (start + offset) % keys.length;
+    // A slow or broken receipt yields its place; it remains eligible on a later pass.
+    progress.nextContinuation = keys[(position + 1) % keys.length];
+    const candidate = candidates.get(keys[position]);
+    if (!candidate) continue;
+    const { row, continuation } = candidate;
+    const acceptedAt = typeof row.recordedAt === "string" ? Date.parse(row.recordedAt) : Number.NaN;
+    if (continuation.source !== "named-artifact" && !Number.isFinite(acceptedAt)) continue;
+    const scope = readWorkScope(row.workId);
+    if (!scope) continue;
+    const link = continuationLink(continuation, scope, index, checkBudget, acceptedAt);
+    if (link === null) done.add(keys[position]);
+    if (!link) continue;
+    checkBudget();
+    appendWorkRecord(
+      { cwd: String(row.cwd), sessionManager: { getSessionId: () => row.sessionId } },
+      link,
+      row.workId,
+      join(agentDir, "work-attribution", `${encodeURIComponent(row.sessionId)}.jsonl`),
+    );
+    wrote = true;
+    done.add(keys[position]);
+    indexRecord(index, { ...link, version: 1, workId: row.workId, sessionId: row.sessionId });
+  }
+  // Bound the retained incremental state: while a receipt stays pending (quiet never set), the
+  // accumulated index would otherwise grow with the whole history forever. Release past the cap
+  // (exact row count) — but re-arm the cap at the release point, so the next rebuild is retained
+  // and incremental work resumes: an over-cap history pays one extra full read, not one per pass.
+  // `done` and `quiet` survive the release; `done` regenerates from index.linked on the next
+  // rebuild, so releasing it too would bound nothing.
+  if (
+    progress.historyIndex &&
+    progress.historyIndex.retainedRows >
+      Math.max(retainedMax, (progress.historyEvictedRows ?? 0) + retainedMax)
+  ) {
+    progress.historyEvictedRows = progress.historyIndex.retainedRows;
+    progress.historyIndex = undefined;
+    progress.historyUnknown = undefined;
+    progress.historyReceipts = undefined;
+    progress.historyCandidates = undefined;
+    progress.historyMerged = undefined;
+    progress.journalStats = undefined;
+    progress.historyRecords = undefined;
+  }
+  if (keys.length > MAX_CONTINUATIONS_PER_PASS) return;
+  if (!wrote) progress.settledJournals = journals;
+  if (keys.every((key) => done.has(key))) {
+    progress.quiet = { since: startedAt, receipts };
+    // Same release as the quiet fast path above: nothing pending, drop the index.
+    progress.historyIndex = undefined;
+    progress.historyUnknown = undefined;
+    progress.historyReceipts = undefined;
+    progress.historyCandidates = undefined;
+    progress.historyMerged = undefined;
+    progress.journalStats = undefined;
+    progress.historyRecords = undefined;
+  }
+}
+
+/**
+ * correctWorkLink stays in Kimchi: it is the /work link|unlink command handler, which
+ * captures the live session scope and resolves its current work identity.
+ */

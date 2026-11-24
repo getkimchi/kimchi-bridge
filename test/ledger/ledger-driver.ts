@@ -19,15 +19,18 @@
  *   rows           print the saved projection view for work <arg>
  *   listfiles      print every file path under <agentDir> (zero-write evidence)
  *
- * Kimchi-only commands (native-usage*, producer, legacy-freeze, read-work-records,
- * read-history*, pr-checks, note, remove-note) stay in Kimchi's
+ * Kimchi-only commands (native-usage*, pr-checks, note, remove-note) stay in Kimchi's
  * tests/e2e/tui/support/ledger-driver.ts: they exercise code that has not moved to the
- * bridge (pull-request-status, queue.js, worker.js, work-attribution hydration such as
- * readWorkRecordsAsync and flushWorkSummaries). The removed scenarios whose core operations
- * are moved ledger code run in the bridge's own suites instead: the capture-stage rollback
- * (capture-atomic.test.ts), the async stored reader (stored-read-regressions.test.ts), and the
- * gated competing writer below (summary-writer.test.ts). summary-writer keeps the gated
- * putHead dance but drops the flushWorkSummaries tail, which is Kimchi-only hydration.
+ * bridge (pull-request-status lookups against provider accounts). The read-work-records,
+ * read-history and read-history-async lanes moved here with B2, which moved summary.ts
+ * (readWorkRecords/readWorkRecordsAsync) into the bridge.
+ * The producer and legacy-freeze lanes moved here with B2: the queue, machine and snapshot
+ * code they drive is bridge code now, and each scenario runs bound to driverHost. The
+ * removed scenarios whose core operations are moved ledger code run in the bridge's own
+ * suites instead: the capture-stage rollback (capture-atomic.test.ts) and the async stored
+ * reader (stored-read-regressions.test.ts). summary-writer keeps the gated putHead dance,
+ * the multi-record loop and the flushWorkSummaries tail (moved summary.ts), and the
+ * summary-reader command answers gated reads with a fresh store per snapshot.
  */
 
 import { Database } from "bun:sqlite";
@@ -51,12 +54,36 @@ import {
   workRecordsImportedPresent,
 } from "../../src/ledger/records.js";
 import { ledgerDbPath, openStore } from "../../src/ledger/store.js";
+import { setDefaultHostPorts } from "../../src/reconcile/host-ports.js";
+import type { HostPorts } from "../../src/reconcile/host.js";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
 
 const [, , command, agentDir, arg] = process.argv;
 
 function out(value: unknown): void {
   console.log(JSON.stringify(value));
+}
+
+/** The reconcile pass needs HostPorts; the driver answers with the agent directory and no network. */
+function driverHost(agent: string): HostPorts {
+  return {
+    agentDir: agent,
+    e2eSeam: () => undefined,
+    now: () => Date.now(),
+    credentials: () => ({ token: "", apiUrl: "https://api.example" }),
+    gitToken: () => undefined,
+    endpoints: () => ({
+      llmEndpoint: "https://llm.example",
+      openAiBaseUrl: "https://llm.example/openai/v1",
+      anthropicBaseUrl: "https://llm.example/anthropic",
+      experimentalOpenAiBaseUrl: "https://llm.example/experimental/openai/v1",
+      platformApiUrl: "https://api.example",
+    }),
+    orgPolicy: () => ({ resourceEnabled: () => true }),
+    telemetryConsent: () => false,
+    metric: () => {},
+    fetch: () => Promise.reject(new Error("the ledger driver never reaches the network")),
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1228,26 +1255,232 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return Buffer.from(left).equals(Buffer.from(right));
 }
 
-function summaryState(agent: string, workId: string): void {
+/** Kimchi's producer scenario: the new producer freezes alongside legacy pending bytes in real SQLite. */
+async function producerScenario(agent: string): Promise<void> {
+  setDefaultHostPorts(driverHost(agent));
+  const { readReportingState, reportingProducer } = await import(
+    "../../src/reconcile/pr-cost-reporting/queue.js"
+  );
+  const { backendFor, closeBackends } = await import("../../src/ledger/records.js");
+  const { observeEvents, pendingBatch } = await import("../../src/ledger/outbox.js");
+  const { machineFingerprint } = await import("../../src/reconcile/pr-cost-reporting/machine.js");
+  const { accountKey } = await import("../../src/reconcile/pr-cost-reporting/snapshot.js");
+  const state = await readReportingState(agent);
+  const entry = Object.values(state.entries)[0];
+  if (!entry?.pending) throw new Error("Missing legacy pending producer fixture");
+  const account = accountKey(entry.account);
+  const current = () => {};
+  observeEvents(
+    agent,
+    account,
+    [
+      {
+        entityId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        source: "kimchi",
+        sourceVersion: "test",
+        deviceId: state.producerId,
+        observeTime: "2026-10-24T00:00:00Z",
+        coverage: { code: "observed", count: "1" },
+      },
+    ],
+    [],
+    current,
+  );
+  const frozen = pendingBatch(agent, account, current);
+  if (!frozen) throw new Error("Missing frozen producer fixture");
+  const producerId = await reportingProducer(agent, current);
+  const pending = pendingBatch(agent, account, current);
+  out({
+    producerId,
+    machineKnown: !!(await machineFingerprint()),
+    note: JSON.parse(backendFor(agent).getNote("agent", "reporting-producer") ?? "null"),
+    legacyRetained: JSON.stringify(await readReportingState(agent)) === JSON.stringify(state),
+    batchRetained: pending?.id === frozen.id && sameBytes(pending.body, frozen.body),
+    frozenProducer: JSON.parse(Buffer.from(frozen.body).toString("utf8")).batch.events[0].deviceId,
+  });
+  closeBackends();
+}
+
+/** Kimchi's legacy-freeze scenario: frozen ACK rollback, receipts, bounded scans in real SQLite. */
+async function legacyFreezeScenario(agent: string): Promise<void> {
+  setDefaultHostPorts(driverHost(agent));
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const {
+    acknowledgeFrozenSnapshot,
+    freezeSnapshots,
+    pendingFrozenSnapshots,
+    queueSnapshots,
+    readReportingState,
+    reportingStatePath,
+    setReportingEnabled,
+  } = await import("../../src/reconcile/pr-cost-reporting/queue.js");
+  const { backendFor, closeBackends } = await import("../../src/ledger/records.js");
+  const check = () => {};
+  const path = reportingStatePath(agent);
+  const originalState = readFileSync(path);
+  const initial = Object.values((await readReportingState(agent)).entries)[0];
+  if (!initial.pending) throw new Error("Missing original legacy fixture");
+  const originalBody = JSON.stringify(initial.pending);
+  const all = () => pendingFrozenSnapshots(agent, check, Date.now() + 30_000);
+  await freezeSnapshots(agent, check);
+  const [first] = await all();
+  if (!first || first.body !== originalBody) throw new Error("Legacy bytes changed during freeze");
+  const backend = backendFor(agent);
+  const remove = backend.deleteNote.bind(backend);
+  let removed = false;
+  backend.deleteNote = (workId: string, name: string) => {
+    remove(workId, name);
+    removed = true;
+    throw new Error("after actual pending deletion");
+  };
+  let rejected = false;
+  try {
+    await acknowledgeFrozenSnapshot(
+      agent,
+      first,
+      { status: "accepted", revision: "1", receivedAt: new Date().toISOString() },
+      check,
+    );
+  } catch (error) {
+    rejected = error instanceof Error && error.message === "after actual pending deletion";
+  } finally {
+    backend.deleteNote = remove;
+  }
+  const ackRollback =
+    removed &&
+    rejected &&
+    (await all())[0]?.body === originalBody &&
+    backend.readNotePage("legacy-pr-cost-snapshot-receipts", "", 64).length === 0;
+  if (!ackRollback) throw new Error("Frozen ACK did not roll back");
+  await acknowledgeFrozenSnapshot(
+    agent,
+    first,
+    { status: "accepted", revision: "1", receivedAt: new Date().toISOString() },
+    check,
+  );
+  const receipt = backend.getNote("legacy-pr-cost-snapshot-receipts", first.id);
+  if (receipt === undefined) throw new Error("Missing completed legacy receipt");
+  const { ack: _ack, ...invalidReceipt } = JSON.parse(receipt);
+  backend.putNote("legacy-pr-cost-snapshot-receipts", first.id, JSON.stringify(invalidReceipt));
+  writeFileSync(path, originalState);
+  let receiptCorruptionRejected = false;
+  try {
+    await freezeSnapshots(agent, check);
+  } catch {
+    receiptCorruptionRejected = readFileSync(path).equals(originalState);
+  }
+  backend.putNote("legacy-pr-cost-snapshot-receipts", first.id, receipt);
+  await freezeSnapshots(agent, check);
+  const cleanupReplay =
+    (await all()).length === 0 &&
+    !Object.values((await readReportingState(agent)).entries)[0].pending;
+  for (let index = 0; index < 20; index++) {
+    await queueSnapshots(agent, [
+      {
+        account: initial.account,
+        content: {
+          repository: initial.pending.repository,
+          pullRequests: initial.pending.pullRequests,
+          coverage: initial.pending.coverage,
+          requests: initial.pending.requests.map((request) => ({
+            ...request,
+            allocation: { ...request.allocation, kind: index % 2 ? "unlinked" : "unknown" },
+          })),
+        },
+      },
+    ]);
+    await freezeSnapshots(agent, check);
+  }
+  const [partial] = await pendingFrozenSnapshots(agent, check, Date.now() - 1);
+  closeBackends();
+  const [next] = await pendingFrozenSnapshots(agent, check, Date.now() - 1);
+  const partialScanProgress = !!partial && !!next && partial.id !== next.id;
+  const pending = await all();
+  if (pending.length !== 20)
+    throw new Error(`Expected twenty frozen versions, got ${pending.length}`);
+  const latest = pending.reduce((a, b) =>
+    BigInt(a.entry.revision) > BigInt(b.entry.revision) ? a : b,
+  );
+  for (const frozen of pending) {
+    if (frozen.id === latest.id) continue;
+    await acknowledgeFrozenSnapshot(
+      agent,
+      frozen,
+      {
+        status: "accepted",
+        revision: frozen.entry.revision,
+        receivedAt: new Date().toISOString(),
+      },
+      check,
+    );
+  }
+  const reopened = backendFor(agent);
+  const page = reopened.readNotePage.bind(reopened);
+  const namespaces: string[] = [];
+  reopened.readNotePage = (workId: string, after: string, limit: number) => {
+    namespaces.push(workId);
+    return page(workId, after, limit);
+  };
+  await setReportingEnabled(agent, true);
+  const resumeScans = namespaces.length;
+  const remaining = await all();
+  const receiptScan = namespaces.some((name) => name === "legacy-pr-cost-snapshot-receipts");
+  reopened.readNotePage = page;
+  const receipts = page("legacy-pr-cost-snapshot-receipts", "", 64);
+  const archived = receipts.map((row) => JSON.parse(row.body));
+  out({
+    initialBytes: first.body === originalBody,
+    ackRollback,
+    receiptCorruptionRejected,
+    cleanupReplay,
+    partialScanProgress,
+    retainedReceipts: receipts.length,
+    archivedOriginalBytes: archived.some((row) => row.body === originalBody),
+    pendingAfterArchive: remaining.length,
+    latestRetained: remaining[0]?.body === latest.body,
+    receiptScan,
+    resumeScans,
+    reopened: true,
+  });
+  closeBackends();
+}
+
+function summaryState(
+  agent: string,
+  workId: string,
+): {
+  authority: Record<string, unknown>[];
+  markers: Record<string, unknown>[];
+  head: string | null;
+  rows: Record<string, unknown>[];
+} {
   const store = openStore(agent);
   try {
-    out({
-      authority: store.db
-        .query("SELECT * FROM work_records WHERE work_id = ? ORDER BY rowid")
-        .all(workId),
-      markers: store.db
-        .query("SELECT * FROM pending_translation WHERE work_id = ? ORDER BY record_hash")
-        .all(workId),
-      head:
-        store.db
-          .query<{ body: string }, [string]>(
-            "SELECT body FROM work_projection_head WHERE work_id = ?",
+    return store.db
+      .transaction(() => ({
+        authority: store.db
+          .query<Record<string, unknown>, [string]>(
+            "SELECT * FROM work_records WHERE work_id = ? ORDER BY rowid",
           )
-          .get(workId)?.body ?? null,
-      rows: store.db
-        .query("SELECT * FROM work_projection_rows WHERE work_id = ? ORDER BY log, pos")
-        .all(workId),
-    });
+          .all(workId),
+        markers: store.db
+          .query<Record<string, unknown>, [string]>(
+            "SELECT * FROM pending_translation WHERE work_id = ? ORDER BY record_hash",
+          )
+          .all(workId),
+        head:
+          store.db
+            .query<{ body: string }, [string]>(
+              "SELECT body FROM work_projection_head WHERE work_id = ?",
+            )
+            .get(workId)?.body ?? null,
+        rows: store.db
+          .query<Record<string, unknown>, [string]>(
+            "SELECT * FROM work_projection_rows WHERE work_id = ? ORDER BY log, pos",
+          )
+          .all(workId),
+      }))
+      .deferred();
   } finally {
     store.close();
   }
@@ -1255,10 +1488,21 @@ function summaryState(agent: string, workId: string): void {
 
 /** A synchronous pipe gate holds a real transaction after its head write, never across await.
  * Writing 'r' cancels the writer after its head publish (the capture rolls back); 'c' lets it
- * commit. The rolled-back writer stays alive across a competing writer's commit, then closes. */
+ * commit. The rolled-back writer stays alive across a competing writer's commit, then closes.
+ * `count` captures several records one gated publish at a time, and `beforeFlush` gates once
+ * more before the shutdown flush. */
 async function summaryWriter(agent: string, json: string): Promise<void> {
   const { backendFor, closeBackends } = await import("../../src/ledger/records.js");
-  const { record } = JSON.parse(json) as { record: WorkRecord };
+  const { flushWorkSummaries } = await import("../../src/reconcile/work-attribution/summary.js");
+  const {
+    record,
+    count = 1,
+    beforeFlush = false,
+  } = JSON.parse(json) as {
+    record: WorkRecord;
+    count?: number;
+    beforeFlush?: boolean;
+  };
   const backend = backendFor(agent);
   const publish = backend.putHead;
   const cancelled = new Error("writer ownership cancelled before commit");
@@ -1275,16 +1519,25 @@ async function summaryWriter(agent: string, json: string): Promise<void> {
   };
   try {
     signal("ready");
-    try {
-      capture(agent, record, "summary-native");
-    } catch (error) {
-      if (error !== cancelled) throw error;
-      signal("rolled-back");
-      // Stay alive while the competing writer commits: the cancelled head must never reappear.
-      gate();
-      return;
+    for (let index = 0; index < count; index++) {
+      try {
+        capture(
+          agent,
+          count === 1 ? record : { ...record, requestId: `${record.sessionId}-${index}` },
+          "summary-native",
+        );
+      } catch (error) {
+        if (error !== cancelled) throw error;
+        signal("rolled-back");
+        // Stay alive while the competing writer commits: the cancelled head must never reappear.
+        gate();
+        return;
+      }
+      signal("committed");
     }
-    signal("committed");
+    if (beforeFlush && !gate()) throw new Error("Missing flush release");
+    await flushWorkSummaries();
+    signal("flushed");
   } finally {
     backend.putHead = publish;
     closeBackends();
@@ -1576,6 +1829,15 @@ const commands: Record<string, (agent: string, arg?: string) => void | Promise<v
   head: (agent, workId) => printHead(agent, workId ?? ""),
   rows: (agent, workId) => printRows(agent, workId ?? ""),
   records: (agent, workId) => printRecords(agent, workId || undefined),
+  "pr-checks": async (agent) => {
+    setDefaultHostPorts(driverHost(agent));
+    const { getNote } = await import("../../src/ledger/records.js");
+    const { reconcileWorkPullRequests } = await import(
+      "../../src/reconcile/pull-request-status/pull-requests.js"
+    );
+    await reconcileWorkPullRequests(agent, new AbortController().signal, () => {});
+    out({ note: getNote(agent, "agent", "pr-checks"), records: readRecords(agent).length });
+  },
   "transition-repositories": async (agent, damaged) => {
     if (damaged) {
       const store = openStore(agent);
@@ -1759,6 +2021,8 @@ const commands: Record<string, (agent: string, arg?: string) => void | Promise<v
     out(repositories);
   },
   "import-journals": (agent) => importJournalsCommand(agent),
+  producer: (agent) => producerScenario(agent),
+  "legacy-freeze": (agent) => legacyFreezeScenario(agent),
   outbox: (agent, mode) => outboxScenario(agent, mode ?? "sqlite"),
   "delivery-status": (agent, mode) => deliveryStatusScenario(agent, mode ?? "sqlite"),
   "outbox-transport": (agent) => outboxTransport(agent),
@@ -1769,7 +2033,60 @@ const commands: Record<string, (agent: string, arg?: string) => void | Promise<v
     out({ imported: result.imported, modes: result.files.map((file) => file.mode) });
   },
   listfiles: (agent) => listFiles(agent),
-  "summary-state": (agent, workId) => summaryState(agent, workId ?? ""),
+  "read-work-records": async (agent) => {
+    setDefaultHostPorts(driverHost(agent));
+    const { readWorkRecords } = await import("../../src/reconcile/work-attribution/summary.js");
+    out(readWorkRecords(agent));
+  },
+  "read-history": async (agent) => {
+    setDefaultHostPorts(driverHost(agent));
+    const { readWorkRecords } = await import("../../src/reconcile/work-attribution/summary.js");
+    const problems: unknown[] = [];
+    const records = readWorkRecords(agent, undefined, undefined, (problem) =>
+      problems.push(problem),
+    );
+    out({ records, problems });
+  },
+  "read-history-async": async (agent) => {
+    setDefaultHostPorts(driverHost(agent));
+    const { readWorkRecordsAsync } = await import(
+      "../../src/reconcile/work-attribution/summary.js"
+    );
+    const problems: unknown[] = [];
+    let turns = 0;
+    let reading = true;
+    const spin = () => {
+      turns++;
+      if (reading) setImmediate(spin);
+    };
+    setImmediate(spin);
+    try {
+      const records = await readWorkRecordsAsync(agent, new AbortController().signal, (problem) =>
+        problems.push(problem),
+      );
+      out({
+        records: records.length,
+        requestIds: records.filter((row) => row.type === "request").map((row) => row.requestId),
+        problems,
+        turns,
+      });
+    } finally {
+      reading = false;
+    }
+  },
+  "summary-state": (agent, workId) => out(summaryState(agent, workId ?? "")),
+  "summary-reader": async (agent, workId) => {
+    // Process startup must finish before the test holds any writer transaction.
+    summaryState(agent, workId ?? "");
+    const input = createInterface({ input: process.stdin });
+    out({ phase: "ready" });
+    try {
+      for await (const _ of input)
+        out({ phase: "snapshot", state: summaryState(agent, workId ?? "") });
+    } finally {
+      input.close();
+    }
+  },
   "summary-writer": (agent, json) => summaryWriter(agent, json ?? "{}"),
   "known-record-regressions": (agent, json) => knownRecordRegressions(agent, json ?? "{}"),
   "known-schema-race": (agent) => knownSchemaRace(agent),
