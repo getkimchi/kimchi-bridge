@@ -19,7 +19,9 @@ const BUILD = "worker-windows-smoke-build";
 interface Child {
   send(message: unknown): void;
   end(): void;
-  exited(): Promise<number>;
+  exited(timeoutMs?: number): Promise<{ code: number | null; signal: string | null }>;
+  kill(): void;
+  gone(): Promise<void>;
   lines(): string[];
   stderrText(): string;
 }
@@ -60,11 +62,27 @@ function spawnBundle(bundle: string, agentDir: string): Child {
     end() {
       proc.stdin.end();
     },
-    async exited() {
+    async exited(timeoutMs = 10_000): Promise<{ code: number | null; signal: string | null }> {
+      const exited = Promise.all([read, readErr, proc.exited]);
+      const timedOut = await Promise.race([
+        exited.then(() => false),
+        Bun.sleep(timeoutMs).then(() => true),
+      ]);
+      if (timedOut) {
+        proc.kill();
+        await exited;
+        fail(`the worker did not exit within ${timeoutMs} ms`);
+      }
+      // A signal death is never a clean exit: Bun leaves exitCode null.
+      return { code: proc.exitCode, signal: proc.signalCode };
+    },
+    kill() {
+      proc.kill();
+    },
+    async gone() {
       await read;
       await readErr;
       await proc.exited;
-      return proc.exitCode ?? 0;
     },
     lines: () => lines,
     stderrText: () => stderr,
@@ -81,40 +99,73 @@ async function firstLine(child: Child, timeoutMs = 15000): Promise<string> {
 }
 
 function fail(message: string): never {
-  console.error(`worker-windows smoke failed: ${message}`);
-  process.exit(1);
+  // Throwing (not exiting here) lets every child's try/finally kill-and-reap
+  // cleanup and the outer stage teardown run before the process exits.
+  throw new Error(`worker-windows smoke failed: ${message}`);
 }
 
 const stage = mkdtempSync(join(tmpdir(), "kimchi-worker-windows-"));
-try {
-  const bundle = join(stage, "worker.mjs");
-  await buildWorkerBundle(BUILD, bundle);
 
-  // A parent built from a different commit must be refused, with nothing but
-  // the refusal emitted, and no secret-shaped field in it.
-  const refused = spawnBundle(bundle, stage);
-  refused.send({ type: "hello", v: PROTOCOL_VERSION, build: "a-different-build", agentDir: stage });
-  const refusal = JSON.parse(await firstLine(refused));
-  if (refusal.type !== "error" || !String(refusal.message).includes("build mismatch"))
-    fail(`expected a build-mismatch refusal, got ${JSON.stringify(refusal)}`);
-  refused.end();
-  if ((await refused.exited()) === 0) fail("the refused worker exited zero");
-  if (refused.lines().length !== 1) fail("the refusal emitted more than one line");
-  const emitted = JSON.stringify(refused.lines()).toLowerCase();
-  if (emitted.includes("token") || emitted.includes("bearer "))
-    fail("the refusal mentions a token");
+async function main(): Promise<void> {
+  try {
+    const bundle = join(stage, "worker.mjs");
+    await buildWorkerBundle(BUILD, bundle);
 
-  // Its own build is accepted, and stdin EOF exits it cleanly.
-  const accepted = spawnBundle(bundle, stage);
-  accepted.send({ type: "hello", v: PROTOCOL_VERSION, build: BUILD, agentDir: stage });
-  const ready = JSON.parse(await firstLine(accepted));
-  if (ready.type !== "ready" || ready.v !== PROTOCOL_VERSION || ready.build !== BUILD)
-    fail(`expected a ready handshake, got ${JSON.stringify(ready)}`);
-  accepted.end();
-  const code = await accepted.exited();
-  if (code !== 0) fail(`the accepted worker exited ${code}: ${accepted.stderrText()}`);
+    // A parent built from a different commit must be refused, with nothing but
+    // the refusal emitted, and no secret-shaped field in it.
+    const refused = spawnBundle(bundle, stage);
+    try {
+      refused.send({
+        type: "hello",
+        v: PROTOCOL_VERSION,
+        build: "a-different-build",
+        agentDir: stage,
+      });
+      const refusal = JSON.parse(await firstLine(refused));
+      if (refusal.type !== "error" || !String(refusal.message).includes("build mismatch"))
+        fail(`expected a build-mismatch refusal, got ${JSON.stringify(refusal)}`);
+      refused.end();
+      const exit = await refused.exited();
+      if (exit.code === 0 && exit.signal === null) fail("the refused worker exited zero");
+      if (refused.lines().length !== 1) fail("the refusal emitted more than one line");
+      const emitted = JSON.stringify(refused.lines()).toLowerCase();
+      if (emitted.includes("token") || emitted.includes("bearer "))
+        fail("the refusal mentions a token");
+    } finally {
+      refused.kill();
+      await refused.gone();
+    }
 
-  console.log("worker-windows smoke: refused a mismatched build, accepted its own, exited on EOF");
-} finally {
-  rmSync(stage, { recursive: true, force: true });
+    // Its own build is accepted, and stdin EOF exits it cleanly within two seconds.
+    const accepted = spawnBundle(bundle, stage);
+    try {
+      accepted.send({ type: "hello", v: PROTOCOL_VERSION, build: BUILD, agentDir: stage });
+      const ready = JSON.parse(await firstLine(accepted));
+      if (ready.type !== "ready" || ready.v !== PROTOCOL_VERSION || ready.build !== BUILD)
+        fail(`expected a ready handshake, got ${JSON.stringify(ready)}`);
+      accepted.end();
+      const started = Date.now();
+      const exit = await accepted.exited(2_000);
+      if (exit.code !== 0 || exit.signal !== null)
+        fail(
+          `the accepted worker exited ${exit.code} (signal ${exit.signal}): ${accepted.stderrText()}`,
+        );
+      if (Date.now() - started > 2_000)
+        fail("the accepted worker took longer than two seconds to exit");
+    } finally {
+      accepted.kill();
+      await accepted.gone();
+    }
+
+    console.log(
+      "worker-windows smoke: refused a mismatched build, accepted its own, exited on EOF",
+    );
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
 }
+
+main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});
