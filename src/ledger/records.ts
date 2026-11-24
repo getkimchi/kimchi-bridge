@@ -351,9 +351,38 @@ function spoolCaptureLine(agentDir: string, sessionId: string, line: string): bo
  * record line in the session's spool (fsynced) and returns normally — callers are void and need no new
  * handling. The in-memory/UI projection lags on that path: the record reaches the ledger, the projection
  * and the outbox when the reconciliation pass's files channel imports the spool exactly once. If the spool
- * itself cannot be written, capture falls back to today's blocking wait with the original busy timeout —
- * it never drops.
+ * itself cannot be written, capture blocks on the writer without a time limit — a frozen session in that
+ * rare case is preferred to a lost record. A spooled record is not visible to this process's reads
+ * (listWorks, /work details, identity resolution) until the next pass imports it; the alternative — an
+ * in-memory overlay merged into every read path — was rejected because those readers are synchronous,
+ * hot and numerous, while the spool path only triggers while another process holds the writer.
  */
+/** How often a blocked capture reports that it is still waiting. */
+const BLOCKED_NOTE_MS = 5000;
+
+/** The spool could not be written, so capture blocks on the SQLite writer without a time limit:
+ * the record commits once the holder releases the lock and is never dropped. A diagnostic line
+ * goes to stderr each time another 5 s elapses (the ledger itself may be the busy resource, so
+ * the note cannot go there). Any non-busy error keeps today's behavior and propagates. */
+function blockingCaptureCommit(commit: () => void): void {
+  let noted = Date.now();
+  for (;;) {
+    try {
+      commit();
+      return;
+    } catch (error) {
+      if (!isBusyError(error)) throw error;
+      const now = Date.now();
+      if (now - noted >= BLOCKED_NOTE_MS) {
+        noted = now;
+        process.stderr.write(
+          "kimchi: the work ledger's writer is busy; capture is blocking until it can commit\n",
+        );
+      }
+    }
+  }
+}
+
 export function capture(agentDir: string, record: WorkRecord, sourcePath: string | null): void {
   const backend = backendFor(agentDir);
   const line = JSON.stringify(record);
@@ -383,7 +412,7 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
   }
   if (backend.tryCaptureTx(commit)) return;
   if (spoolCaptureLine(agentDir, record.sessionId, line)) return;
-  commit();
+  blockingCaptureCommit(commit);
 }
 
 /** One journal line handed to the importer; the line bytes are the dedup key (sha256 of the exact line). */

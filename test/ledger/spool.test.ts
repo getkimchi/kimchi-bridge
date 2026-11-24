@@ -121,6 +121,34 @@ it("a spool that cannot be written falls back to the blocking wait and still lan
   expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
 }, 20_000);
 
+it("an unwritable spool under a writer longer than the busy timeout still lands the record", async () => {
+  const dir = agentDir();
+  expect(readRecords(dir)).toHaveLength(0);
+  // The spool path is unusable (a directory where the file would go), so the spool write fails.
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(spool, { recursive: true });
+  const holder = await holdWriter(dir, 6000);
+  let notes = 0;
+  const stderr = process.stderr.write;
+  process.stderr.write = ((chunk: unknown) => {
+    if (String(chunk).includes("capture is blocking")) notes++;
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    const start = Date.now();
+    // The spool cannot take the record, so capture blocks on the writer until it commits: the
+    // 5 s busy timeout must not turn into a lost record when the holder outlasts it.
+    capture(dir, record("req-long"), "summary-native");
+    expect(Date.now() - start).toBeGreaterThanOrEqual(4000);
+    expect(notes).toBeGreaterThanOrEqual(1);
+  } finally {
+    process.stderr.write = stderr;
+    await holder.done;
+  }
+  expect(readRecords(dir)).toHaveLength(1);
+  expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
+}, 20_000);
+
 /** A child that keeps the writer busy with short transactions and WAL checkpoints, the load the
  * plan's risk section calls out: checkpoints in the worker must not stall or drop capture. */
 async function checkpointLoad(dir: string, ms: number): Promise<{ done: Promise<number | null> }> {
