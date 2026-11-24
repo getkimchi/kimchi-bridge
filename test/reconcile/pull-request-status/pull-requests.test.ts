@@ -1838,6 +1838,11 @@ describe("unchanged lookup results", () => {
   });
   it("does not append a row per commit on every pass while the provider is rate limited", async () => {
     for (let index = 0; index < 20; index++) seed({ sha: index.toString(16).padStart(40, "0") });
+    // The 429 pauses this host for the hour the response asks for, and the pause lives in
+    // provider-api's module state for the rest of the run; use a host no other case touches
+    // so a shuffled order cannot carry the cooldown into an unrelated lookup.
+    remote("https://paused.example/team/repo.git");
+    stubEnv("GH_HOST", "paused.example");
     http.mockImplementation(
       async () => new Response(null, { status: 429, headers: { "retry-after": "3600" } }),
     );

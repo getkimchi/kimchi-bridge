@@ -291,25 +291,33 @@ it("projects distinct transition repositories, without including other record ty
   const dir = agentDir();
   const backend = createMemoryRecords();
   useBackendFactory(() => backend);
-  for (const record of records) capture(dir, record, "/ignored/source");
-  for (const repository of ["/b", "/a", "/b"])
-    capture(
-      dir,
-      { ...records[3], type: "file_transition", repository, transitionId: repository },
-      "/ignored/source",
-    );
-  backend.insertRecord({
-    recordHash: "damaged",
-    type: "file_transition",
-    workId: WORK,
-    sessionId: SESSION,
-    body: "{invalid",
-    sourcePath: null,
-    sourceGeneration: 0,
-    sourceOffset: null,
-    importedAt: 0,
-  });
-  expect(readTransitionRepositories(dir)).toEqual(["/a", "/b"]);
+  try {
+    for (const record of records) capture(dir, record, "/ignored/source");
+    for (const repository of ["/b", "/a", "/b"])
+      capture(
+        dir,
+        { ...records[3], type: "file_transition", repository, transitionId: repository },
+        "/ignored/source",
+      );
+    backend.insertRecord({
+      recordHash: "damaged",
+      type: "file_transition",
+      workId: WORK,
+      sessionId: SESSION,
+      body: "{invalid",
+      sourcePath: null,
+      sourceGeneration: 0,
+      sourceOffset: null,
+      importedAt: 0,
+    });
+    expect(readTransitionRepositories(dir)).toEqual(["/a", "/b"]);
+  } finally {
+    // The factory is module state shared with every later file in the run; a shuffled order
+    // can make this the last factory-touching test, so it restores the default itself.
+    useBackendFactory(null);
+    closeBackends();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe("records conformance (SQLite via Bun driver)", () => {
@@ -429,6 +437,10 @@ describe("records conformance (SQLite via Bun driver)", () => {
       const files = driver("listfiles", dir) as string[];
       expect(files.filter((file) => !file.startsWith("pr-cost-reporting/ledger.db"))).toEqual([]);
     } finally {
+      // The factory is module state shared with every later file in the run; a shuffled order
+      // can make this the last factory-touching test, so it restores the default itself.
+      useBackendFactory(null);
+      closeBackends();
       rmSync(dir, { recursive: true, force: true });
     }
   }, 90_000);

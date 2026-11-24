@@ -25,6 +25,9 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm format:check
       - run: pnpm test
+      # Second full pass in a random file/test order (a fresh seed each run), so a suite that
+      # only passes in the checked-in order fails here instead of slipping through silently.
+      - run: bun test --randomize
       # bash -n checks only its first file; the rest become arguments.
       - run: for script in install.sh scripts/*.sh; do bash -n "$script"; done
       - run: sh -n scripts/install-standalone.sh
