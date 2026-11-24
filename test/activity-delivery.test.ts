@@ -169,7 +169,10 @@ test("bad receipts do not advance the queue and terminal rejection is not retrie
     if (!valid)
       return Response.json({
         batchId: batch.batchId,
-        receipts: batch.events.map((event) => ({ eventId: event.eventId, status: "accepted" })),
+        receipts: batch.events.map((event) => ({
+          eventId: event.eventId,
+          status: "accepted",
+        })),
       });
     return Response.json({
       batchId: batch.batchId,
@@ -184,9 +187,82 @@ test("bad receipts do not advance the queue and terminal rejection is not retrie
   expect(value.allEvents()).toHaveLength(4);
   valid = true;
   await flushAllActivities(value, url);
-  expect(value.status()).toMatchObject({ pending_events: 0, rejected: 4, acknowledgements: 0 });
+  expect(value.status()).toMatchObject({
+    pending_events: 0,
+    rejected: 4,
+    acknowledgements: 0,
+  });
   recordFixture(value);
   expect(value.allEvents()).toHaveLength(0);
+});
+
+for (const reason of ["invalid_activity_batch", "control_not_recording"]) {
+  test(`recognized KCP 400 ${reason} is terminal and releases later batches`, async () => {
+    const value = store();
+    recordFixture(value);
+    const url = endpoint(async (request) => {
+      const batch = parseJson(await request.text()) as ActivityBatch;
+      if (batch.batchId === value.pendingBatch()?.batchId && value.status().rejected === 0) {
+        return Response.json({ message: reason }, { status: 400 });
+      }
+      return ack(batch);
+    });
+    await flushAllActivities(value, url);
+    expect(value.status()).toMatchObject({
+      pending_events: 0,
+      rejected: 4,
+      acknowledgements: 0,
+    });
+    const receipts = value.db.query("SELECT reason_code FROM receipts").all() as {
+      reason_code: string;
+    }[];
+    expect(receipts).toHaveLength(4);
+    expect(receipts.every((receipt) => receipt.reason_code === reason)).toBe(true);
+
+    // A distinct subsequent call is deliverable rather than trapped behind the
+    // permanent rejection. Frozen batch IDs and immutable event IDs stay distinct.
+    const another = nativeHooks()[0];
+    another.event.tool_use_id = "next-valid-call";
+    observeFull(value, another, "claude-code");
+    await flushAllActivities(value, url);
+    expect(value.status()).toMatchObject({
+      pending_events: 0,
+      rejected: 4,
+      acknowledgements: 1,
+    });
+  });
+}
+
+test("unknown or non-JSON 400 responses retain the exact frozen batch", async () => {
+  for (const { body, contentType } of [
+    { body: "<html>proxy failure</html>", contentType: undefined },
+    {
+      body: JSON.stringify({ message: "permission-denied" }),
+      contentType: undefined,
+    },
+    {
+      body: JSON.stringify({ message: "invalid_activity_batch" }),
+      contentType: "text/plain",
+    },
+    {
+      body: JSON.stringify({ message: "control_not_recording" }),
+      contentType: "text/html",
+    },
+  ]) {
+    const value = store();
+    recordFixture(value);
+    const frozen = value.pendingBatch()!;
+    const url = endpoint(
+      () =>
+        new Response(body, {
+          status: 400,
+          headers: contentType ? { "Content-Type": contentType } : undefined,
+        }),
+    );
+    await expect(flushActivity(value, url)).rejects.toThrow("batch retained");
+    expect(value.pendingBatch()).toEqual(frozen);
+    expect(value.allEvents()).toHaveLength(4);
+  }
 });
 
 test("workspace activity accepts the exact sidekick IMDS destination", () => {

@@ -17,7 +17,10 @@ export async function flushActivity(
       endpoint,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
         body,
       },
       signal,
@@ -38,6 +41,23 @@ export async function flushActivity(
     store.dropBatch(batch);
     return true;
   }
+  if (response.status === 400) {
+    const reasonCode = await permanentBadRequestReason(response);
+    if (reasonCode) {
+      // KCP's explicit deterministic rejection is local terminal evidence. Do
+      // not keep replaying the same malformed batch forever.
+      store.acknowledge(batch, {
+        batchId: batch.batchId,
+        receipts: batch.events.map((event) => ({
+          eventId: event.eventId,
+          status: "RECEIPT_STATUS_REJECTED",
+          reasonCode,
+        })),
+      });
+      store.diagnostic("activity_delivery_rejected");
+      return true;
+    }
+  }
   if (response.status !== 200) {
     await response.body?.cancel().catch(() => {});
     store.diagnostic(`activity_http_${response.status}`);
@@ -51,6 +71,24 @@ export async function flushActivity(
   }
   store.acknowledge(batch, ack);
   return true;
+}
+
+/** Returns only structured KCP errors known to require correction, never arbitrary client/proxy text. */
+async function permanentBadRequestReason(response: Response): Promise<string | undefined> {
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  // JSON-looking proxy text is not proof of KCP's terminal rejection.
+  if (contentType !== "application/json") return undefined;
+  try {
+    const error = parseJson(await readBody(response, 4 << 10)) as {
+      message?: unknown;
+    };
+    if (error.message === "invalid_activity_batch" || error.message === "control_not_recording") {
+      return error.message;
+    }
+  } catch {
+    // An unknown HTML/text body is not proof of KCP's terminal rejection.
+  }
+  return undefined;
 }
 
 export async function flushAllActivities(
