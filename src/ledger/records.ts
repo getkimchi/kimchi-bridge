@@ -1,5 +1,15 @@
 import { createHash } from "node:crypto";
-import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import {
@@ -271,58 +281,80 @@ export function recordHashOf(record: WorkRecord): string {
 }
 
 /** The capture spool: where capture parks records it could not commit while another process held
- * the ledger's writer. Plain append with fsync, no locks, so it is safe on every platform. */
+ * the ledger's writer. Plain append with fsync, no locks, so it is safe on every platform.
+ *
+ * Downgrade note: records parked here are invisible to older releases, which do not scan this
+ * directory — they stay durable on disk and are imported exactly once by the next release that
+ * does. Drain the spool (one pass with the files channel) before rolling back if immediate
+ * visibility is required. */
 export function spoolDirectory(agentDir: string): string {
   return join(agentDir, "work-attribution", "spool");
 }
 
-/** The session's spool file; the id is encoded so any character set stays filename-safe. */
+/** The session's spool file. The fixed `s-` prefix and the `.jsonl` suffix always surround the
+ * encoded id, so Windows-reserved basenames (CON, NUL, COM1, …) and trailing dots or spaces can
+ * never form the name on their own, and path separators never split it. */
 export function spoolFilePath(agentDir: string, sessionId: string): string {
-  return join(spoolDirectory(agentDir), `${encodeURIComponent(sessionId)}.jsonl`);
+  return join(spoolDirectory(agentDir), `s-${encodeURIComponent(sessionId)}.jsonl`);
 }
 
-/** True when the file is empty or ends on a line boundary; a truncated earlier append must not
- * glue the next record onto a damaged line. */
-function endsOnLineBoundary(path: string): boolean {
-  let fd: number;
+/** Directory-entry fsync: persists a newly created spool directory or file (and the rotation
+ * renames below) so a kernel crash cannot lose the path the next import scans. Windows cannot
+ * open a directory for fsync, so the sync is skipped there — the file's own fsync still holds. */
+function fsyncDirectorySync(path: string): void {
+  if (process.platform === "win32") return;
+  const fd = openSync(path, "r");
   try {
-    fd = openSync(path, "r");
-  } catch {
-    return true;
-  }
-  try {
-    const size = fstatSync(fd).size;
-    if (size === 0) return true;
-    const one = Buffer.alloc(1);
-    readSync(fd, one, 0, 1, size - 1);
-    return one[0] === 0x0a;
-  } finally {
-    closeSync(fd);
-  }
-}
-
-/** Appends the exact bytes to the spool file, fsynced, repairing a missing trailing newline first. */
-function appendSpoolBytes(path: string, bytes: Buffer): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const fd = openSync(path, "a", 0o600);
-  try {
-    if (!endsOnLineBoundary(path)) writeSync(fd, "\n");
-    writeSync(fd, bytes);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
 }
 
-/** True when the file at `path` ends with exactly these bytes as its final line. */
-function spoolTailIs(path: string, bytes: Buffer): boolean {
+/** O_NOFOLLOW where the platform has it, so a symlinked spool path cannot capture the append. */
+const O_NOFOLLOW = (constants.O_NOFOLLOW ?? 0) as number;
+
+/** Appends the record's self-delimiting bytes to the spool file in ONE write: a leading newline
+ * (which completes any torn earlier append as its own, separately quarantined line), the exact
+ * line, and a trailing newline. The write loops until every byte is written, so a short write
+ * cannot leave a torn record behind. The file must be a regular file with no other link and
+ * owned by this user — anything else (a symlink or hardlink planted at the predictable path) is
+ * refused so the caller falls back to the blocking SQLite wait. */
+function appendSpoolRecord(path: string, line: string): boolean {
+  const directory = dirname(path);
+  const bytes = Buffer.from(`\n${line}\n`, "utf8");
+  let directoryCreated = false;
+  if (!existsSync(directory)) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    directoryCreated = true;
+  }
+  const fileExisted = existsSync(path);
   let fd: number;
   try {
-    fd = openSync(path, "r");
+    fd = openSync(
+      path,
+      constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | O_NOFOLLOW,
+      0o600,
+    );
   } catch {
     return false;
   }
   try {
+    const stat = fstatSync(fd);
+    const uid = process.getuid?.();
+    if (!stat.isFile() || stat.nlink !== 1 || (uid !== undefined && stat.uid !== uid)) return false;
+    let written = 0;
+    while (written < bytes.length) {
+      const count = writeSync(fd, bytes, written, bytes.length - written);
+      if (count <= 0) return false;
+      written += count;
+    }
+    fsyncSync(fd);
+    // The append is durable; a newly created directory or file entry needs the directory's
+    // fsync too, or a kernel crash can lose the path the next import scans.
+    if (directoryCreated || !fileExisted) fsyncDirectorySync(directory);
+    // Verify through this descriptor that the record is the live file's last line: an append
+    // that raced a rotation (a different inode at the path now) is retried on a fresh open.
     const size = fstatSync(fd).size;
     if (size < bytes.length) return false;
     const tail = Buffer.alloc(bytes.length);
@@ -339,12 +371,8 @@ function spoolTailIs(path: string, bytes: Buffer): boolean {
  * the caller then falls back to the blocking capture wait, so a record is never dropped. */
 function spoolCaptureLine(agentDir: string, sessionId: string, line: string): boolean {
   const path = spoolFilePath(agentDir, sessionId);
-  const bytes = Buffer.from(`${line}\n`, "utf8");
   try {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      appendSpoolBytes(path, bytes);
-      if (spoolTailIs(path, bytes)) return true;
-    }
+    for (let attempt = 0; attempt < 5; attempt++) if (appendSpoolRecord(path, line)) return true;
   } catch {
     return false;
   }

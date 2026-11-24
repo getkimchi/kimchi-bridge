@@ -1,7 +1,17 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, readdirSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { afterEach, expect, it } from "bun:test";
@@ -79,11 +89,15 @@ it("capture under a 6 s writer in another process returns within 260 ms and spoo
     capture(dir, rec, "summary-native");
     const elapsed = Date.now() - start;
     expect(elapsed).toBeLessThan(260);
-    // The exact record line is fsynced in the session's spool, and nothing reached the ledger.
+    // The exact record line is fsynced in the session's spool as one append carrying its own
+    // leading newline, so a torn earlier append can never glue onto it; nothing reached the ledger.
     const spool = spoolFilePath(dir, "session");
     expect(existsSync(spool)).toBe(true);
-    expect(readFileSync(spool, "utf8")).toBe(`${JSON.stringify(rec)}\n`);
+    expect(readFileSync(spool, "utf8")).toBe(`\n${JSON.stringify(rec)}\n`);
     expect(readRecords(dir)).toHaveLength(0);
+    // The spool directory and file are private to this user.
+    expect(statSync(spool).mode & 0o777).toBe(0o600);
+    expect(statSync(dirname(spool)).mode & 0o777).toBe(0o700);
   } finally {
     await holder.done;
   }
@@ -98,6 +112,101 @@ it("capture under a 6 s writer in another process returns within 260 ms and spoo
   expect(readWorkSummary(dir, WORK)?.sessions).toEqual(["session"]);
   // The spool file is gone: its cursor reached EOF after the rows committed.
   expect(existsSync(spoolFilePath(dir, "session"))).toBe(false);
+}, 20_000);
+
+it("each spooled record is one self-delimiting append, so a killed writer's torn line never glues onto it", async () => {
+  const dir = agentDir();
+  expect(readRecords(dir)).toHaveLength(0);
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  // A killed writer left a partial line behind (no trailing newline).
+  writeFileSync(spool, '{"version":1,"type":"request","workId":"00000000');
+  const first = record("req-torn-1");
+  const second = record("req-torn-2");
+  let holder = await holdWriter(dir, 2500);
+  try {
+    capture(dir, first, "summary-native");
+  } finally {
+    await holder.done;
+  }
+  holder = await holdWriter(dir, 2500);
+  try {
+    capture(dir, second, "summary-native");
+  } finally {
+    await holder.done;
+  }
+  // The torn fragment ends on its own line; every record carries its leading newline.
+  const lines = readFileSync(spool, "utf8").split("\n");
+  expect(lines[0]).toBe('{"version":1,"type":"request","workId":"00000000');
+  expect(lines[1]).toBe(JSON.stringify(first));
+  expect(lines[3]).toBe(JSON.stringify(second));
+  // The importer skips empty lines, consumes only complete lines, and lands both records.
+  const result = importSpool(dir);
+  expect(result.imported).toBe(2);
+  expect(readRecords(dir)).toHaveLength(2);
+}, 20_000);
+
+it("session ids encode into safe spool filenames, Windows reserved names included", async () => {
+  for (const id of ["CON", "NUL", "COM1", "LPT9", "AUX", "con", "prn", "a/b", "..", "x.", "tail "])
+    expect(basename(spoolFilePath("/agents", id))).toBe(`s-${encodeURIComponent(id)}.jsonl`);
+  // The reserved basenames never appear with their extension, and separators never split the path.
+  for (const id of ["CON", "NUL", "COM1"])
+    expect(basename(spoolFilePath("/agents", id))).not.toBe(`${id}.jsonl`);
+  // A contended capture with a reserved-name session still spools: prefix and suffix always
+  // surround the encoded id, so the name is legal on every platform.
+  const dir = agentDir();
+  expect(readRecords(dir)).toHaveLength(0);
+  const holder = await holdWriter(dir, 2500);
+  try {
+    capture(dir, record("req-con", "CON"), "summary-native");
+  } finally {
+    await holder.done;
+  }
+  const spool = spoolFilePath(dir, "CON");
+  expect(existsSync(spool)).toBe(true);
+  expect(importSpool(dir).imported).toBe(1);
+  expect(readRecords(dir)).toHaveLength(1);
+}, 20_000);
+
+it("a spool path that is a symlink is refused, so capture blocks instead of writing elsewhere", async () => {
+  const dir = agentDir();
+  expect(readRecords(dir)).toHaveLength(0);
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  const outside = join(dir, "outside.jsonl");
+  writeFileSync(outside, "keep\n");
+  symlinkSync(outside, spool);
+  const holder = await holdWriter(dir, 1500);
+  try {
+    const start = Date.now();
+    capture(dir, record("req-link"), "summary-native");
+    // Unsafe spool: capture blocks on the writer and commits the record itself.
+    expect(Date.now() - start).toBeGreaterThanOrEqual(1000);
+  } finally {
+    await holder.done;
+  }
+  expect(readRecords(dir)).toHaveLength(1);
+  expect(readFileSync(outside, "utf8")).toBe("keep\n");
+}, 20_000);
+
+it("a spool path with another hardlink is refused, so capture blocks instead of sharing an inode", async () => {
+  const dir = agentDir();
+  expect(readRecords(dir)).toHaveLength(0);
+  const spool = spoolFilePath(dir, "session");
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  const outside = join(dir, "outside.jsonl");
+  writeFileSync(outside, "keep\n");
+  linkSync(outside, spool);
+  const holder = await holdWriter(dir, 1500);
+  try {
+    const start = Date.now();
+    capture(dir, record("req-hard"), "summary-native");
+    expect(Date.now() - start).toBeGreaterThanOrEqual(1000);
+  } finally {
+    await holder.done;
+  }
+  expect(readRecords(dir)).toHaveLength(1);
+  expect(readFileSync(outside, "utf8")).toBe("keep\n");
 }, 20_000);
 
 it("a spool that cannot be written falls back to the blocking wait and still lands the record", async () => {
