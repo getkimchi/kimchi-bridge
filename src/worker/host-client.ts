@@ -29,6 +29,7 @@ import type { HostPorts } from "../reconcile/host.js";
 import { DEFAULT_WORKER_USER_AGENT, makeWorkerFetch } from "./fetch.js";
 import {
   encodeWorkerMessage,
+  HEARTBEAT_TIMEOUT_MS,
   parseConsentReply,
   parseGitTokenReply,
   parseHostCredentials,
@@ -46,8 +47,8 @@ import {
 export const REQUEST_TIMEOUT_MS = 10_000;
 
 /** SharedArrayBuffer header (int32 slots, then the aligned 64-bit heartbeat slot) followed by
- *  the reply line's bytes. The heartbeat's arrival time is epoch milliseconds, which does not
- *  fit an int32 slot, so it lives in its own BigInt64 slot at an 8-byte-aligned offset. */
+ *  the reply line's bytes. The heartbeat's arrival time lives in its own BigInt64 slot at an
+ *  8-byte-aligned offset, measured on the reader thread's monotonic clock (see below). */
 /** Slot 0 holds the state in its low bits and the owning request's rid above. */
 const COMBINED = 0;
 const LENGTH = 1;
@@ -79,16 +80,21 @@ function combined(rid: number, state: number): number {
   return (rid << RID_SHIFT) | state;
 }
 
-/** The worker refuses ledger writes when no heartbeat arrived for this long. */
-export const HEARTBEAT_TIMEOUT_MS = 2000;
+/** The worker refuses ledger writes when no heartbeat arrived for this long. The value is the
+ *  protocol module's: it must stay inside proper-lockfile's 5 s stale-lock window (Decision 7).
+ *  Re-exported so the parent and the worker share one constant through the package. */
+export { HEARTBEAT_TIMEOUT_MS };
 
 /** The heartbeat window, overridable through the environment (the tests use a shorter or longer
- *  one); the parent that spawns the worker controls its environment, like the idle exit. */
+ *  one); the parent that spawns the worker controls its environment, like the idle exit. Values
+ *  above the protocol's timeout are clamped to it: an override that reached or passed the
+ *  proper-lockfile stale window would defeat the old-release fence the timeout exists for
+ *  (Decision 7). Shorter values stay as given, so tests can tighten the window. */
 export function heartbeatTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.KIMCHI_WORKER_HEARTBEAT_TIMEOUT_MS;
   if (raw !== undefined && raw.trim() !== "") {
     const parsed = Number(raw.trim());
-    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.min(parsed, HEARTBEAT_TIMEOUT_MS);
   }
   return HEARTBEAT_TIMEOUT_MS;
 }
@@ -133,6 +139,9 @@ interface HelperNote {
   line?: string;
   /** When the helper read the line (ms since epoch): the true receipt time. */
   at?: number;
+  /** The helper's monotonic clock at startup (performance.now of its own thread), so the main
+   *  thread can compute the cross-thread offset both sides' heartbeat ages share. */
+  clock?: number;
   eof?: boolean;
   oversized?: boolean;
   readError?: string;
@@ -165,6 +174,14 @@ const decoder = new TextDecoder();
 const MAX_LINE_BYTES = 1048576;
 const chunk = Buffer.alloc(65536);
 let pending = "";
+// The heartbeat clock is this thread's monotonic performance.now, never the wall clock: a
+// backward wall-clock move (an NTP step) must not turn a stale heartbeat fresh. The worker
+// thread's performance.now origin differs from the main thread's, so the first action reports
+// this clock to the main thread, which derives the constant cross-thread offset from the
+// message's arrival; both sides then measure ages in the same monotonic domain. The startup
+// baseline below is the grace period the transport's construction used to seed itself with.
+Atomics.store(hb, 0, BigInt(Math.round(performance.now())));
+parentPort.postMessage({ clock: performance.now() });
 // Test-only hook: a delay inserted between the reply checks and the
 // publication, so a test can hold a checked reply across a request's
 // timeout and the next request's start. Zero (unset) keeps it dormant.
@@ -202,10 +219,11 @@ function cancel(parsed) {
 }
 function heartbeat(parsed) {
   // The reader thread records each heartbeat's arrival directly in the shared buffer, so
-  // a busy main thread still observes fresh data whenever it next checks. The parent's own
-  // clock value is not trusted for staleness; the arrival time is.
+  // a busy main thread still observes fresh data whenever it next checks. The arrival is
+  // stamped on this thread's monotonic clock, not the parent's own clock value and not
+  // the wall clock: staleness must not depend on either moving backwards.
   if (parsed.type !== "heartbeat" || typeof parsed.at !== "number") return;
-  Atomics.store(hb, 0, BigInt(Date.now()));
+  Atomics.store(hb, 0, BigInt(Math.round(performance.now())));
 }
 function gone() {
   Atomics.store(ia, ${COMBINED}, ${STATE_PARENT_GONE});
@@ -279,17 +297,22 @@ export class StdioTransport {
   private rid = 0;
   private closed = false;
   private readonly secrets = new Set<string>();
+  /** The constant offset between the main thread's and the helper thread's monotonic clocks
+   *  (both performance.now; their origins differ by the helper's startup). Derived once from
+   *  the helper's startup clock report — undefined until then, which reads as infinitely
+   *  stale, the safe direction. */
+  #monoOffsetMs: number | undefined;
 
   constructor(
     private readonly emit: (event: TransportEvent) => void,
     options?: { ridSeed?: number },
   ) {
     this.rid = options?.ridSeed ?? 0;
-    // The heartbeat clock starts at the transport's construction: the parent has not had a
-    // chance to send one yet. From then on only the reader thread records arrivals, so a
-    // parent that never heartbeats locks the worker out of writes after the window —
-    // exactly the old-release fence decision 7 calls for.
-    Atomics.store(this.heartbeatSlot, 0, BigInt(Date.now()));
+    // The heartbeat clock starts at the helper thread's startup (it seeds the shared slot and
+    // reports its clock so this thread can derive the cross-thread offset above): the parent
+    // has not had a chance to send one yet. From then on only the reader thread records
+    // arrivals, so a parent that never heartbeats locks the worker out of writes after the
+    // window — exactly the old-release fence decision 7 calls for.
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
     this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
     this.helper.on("error", (error) => {
@@ -301,9 +324,16 @@ export class StdioTransport {
     });
   }
 
-  /** How long ago the reader thread last saw a parent heartbeat, in milliseconds. */
+  /** How long ago the reader thread last saw a parent heartbeat, in milliseconds, measured on
+   *  the monotonic clocks both threads share (never the wall clock, whose backward moves
+   *  would turn a stale heartbeat fresh). */
   heartbeatAgeMs(): number {
-    return Date.now() - Number(Atomics.load(this.heartbeatSlot, 0));
+    if (this.#monoOffsetMs === undefined) return Number.POSITIVE_INFINITY;
+    const arrival = Number(Atomics.load(this.heartbeatSlot, 0));
+    // A slot that never landed (the helper died before its first store) reads as ancient, not
+    // as fresh: refusing writes is the safe direction.
+    if (arrival === 0) return Number.POSITIVE_INFINITY;
+    return Math.max(0, performance.now() - (arrival + this.#monoOffsetMs));
   }
 
   /** Throws LeaseHeartbeatLost when no heartbeat arrived within the window; the write fence's
@@ -318,6 +348,15 @@ export class StdioTransport {
   }
 
   private onHelperNote(note: HelperNote): void {
+    if (note.clock !== undefined) {
+      // The helper's startup clock report: derive the constant offset between the two
+      // threads' monotonic clocks. The message's arrival latency makes the offset slightly
+      // overestimate ages' freshness (by well under a millisecond), negligible against the
+      // 2 s window; the alternative — comparing raw cross-thread monotonic readings — is
+      // meaningless, since each thread's clock starts at its own startup.
+      this.#monoOffsetMs = performance.now() - note.clock;
+      return;
+    }
     if (note.line !== undefined) {
       // The helper's read time is the true receipt moment: the main thread
       // may sit blocked in a host request long before it drains the event,

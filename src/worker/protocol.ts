@@ -24,6 +24,13 @@ import type { HostCredentials, HostEndpoints, HostMetric } from "../reconcile/ho
 /** Bumped only on a breaking protocol change; the worker refuses any other version. */
 export const PROTOCOL_VERSION = 1;
 
+/** How long the worker tolerates silence between the parent's lease heartbeats before it
+ *  refuses every ledger write. The value must stay inside proper-lockfile's 5 s stale-lock
+ *  window (plan Decision 7), so an old release's lease handover can never leave a stale worker
+ *  writable longer than the lease itself could. Exported here because the parent (K2) shares
+ *  this contract with the worker through ./worker-protocol. */
+export const HEARTBEAT_TIMEOUT_MS = 2000;
+
 /** The host services the worker cannot resolve itself and must ask the parent for. */
 export type HostRequestKind = "credentials" | "endpoints" | "policy" | "consent" | "gitToken";
 
@@ -124,7 +131,12 @@ export interface CancelMessage {
 /** The lease holder's heartbeat: the parent is alive and still holds the lease.
  *  The worker's reader thread records each one's arrival, and the write fence refuses
  *  ledger writes once none has arrived for the heartbeat window — the fence that stops a
- *  stale worker an old release's lease handover never covers (it never bumps the epoch). */
+ *  stale worker an old release's lease handover never covers (it never bumps the epoch).
+ *
+ *  Required parent send cadence: the parent must send heartbeats at a fixed interval of at
+ *  most 1 s (proper-lockfile's own lease-update interval; K2's supervisor sends every 500 ms
+ *  while the worker lives), starting immediately after `ready`. A parent that only heartbeats
+ *  around passes will find its worker refusing writes mid-pass once the window elapses. */
 export interface HeartbeatMessage {
   type: "heartbeat";
   /** When the parent sent it, in milliseconds since the epoch. */
