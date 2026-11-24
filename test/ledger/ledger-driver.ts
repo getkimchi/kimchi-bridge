@@ -51,12 +51,35 @@ import {
   workRecordsImportedPresent,
 } from "../../src/ledger/records.js";
 import { ledgerDbPath, openStore } from "../../src/ledger/store.js";
+import { setDefaultHostPorts } from "../../src/reconcile/host-ports.js";
+import type { HostPorts } from "../../src/reconcile/host.js";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
 
 const [, , command, agentDir, arg] = process.argv;
 
 function out(value: unknown): void {
   console.log(JSON.stringify(value));
+}
+
+/** The reconcile pass needs HostPorts; the driver answers with the agent directory and no network. */
+function driverHost(agent: string): HostPorts {
+  return {
+    agentDir: agent,
+    e2eSeam: () => undefined,
+    now: () => Date.now(),
+    credentials: () => ({ token: "", apiUrl: "https://api.example" }),
+    endpoints: () => ({
+      llmEndpoint: "https://llm.example",
+      openAiBaseUrl: "https://llm.example/openai/v1",
+      anthropicBaseUrl: "https://llm.example/anthropic",
+      experimentalOpenAiBaseUrl: "https://llm.example/experimental/openai/v1",
+      platformApiUrl: "https://api.example",
+    }),
+    orgPolicy: () => ({ resourceEnabled: () => true }),
+    telemetryConsent: () => false,
+    metric: () => {},
+    fetch: () => Promise.reject(new Error("the ledger driver never reaches the network")),
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1576,6 +1599,15 @@ const commands: Record<string, (agent: string, arg?: string) => void | Promise<v
   head: (agent, workId) => printHead(agent, workId ?? ""),
   rows: (agent, workId) => printRows(agent, workId ?? ""),
   records: (agent, workId) => printRecords(agent, workId || undefined),
+  "pr-checks": async (agent) => {
+    setDefaultHostPorts(driverHost(agent));
+    const { getNote } = await import("../../src/ledger/records.js");
+    const { reconcileWorkPullRequests } = await import(
+      "../../src/reconcile/pull-request-status/pull-requests.js"
+    );
+    await reconcileWorkPullRequests(agent, new AbortController().signal, () => {});
+    out({ note: getNote(agent, "agent", "pr-checks"), records: readRecords(agent).length });
+  },
   "transition-repositories": async (agent, damaged) => {
     if (damaged) {
       const store = openStore(agent);
