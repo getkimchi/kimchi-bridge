@@ -317,6 +317,34 @@ export function fsyncDirectoryDurable(path: string): void {
 /** O_NOFOLLOW where the platform has it, so a symlinked spool path cannot capture the append. */
 const O_NOFOLLOW = (constants.O_NOFOLLOW ?? 0) as number;
 
+/** Creates the directory and any missing ancestors one level at a time, returning every
+ * directory whose new entry needs its parent fsynced: each created directory plus the first
+ * existing ancestor above them. Empty when the directory already existed. An ancestor that
+ * appeared concurrently reads as already created — the EEXIST from the level's mkdir is
+ * tolerated and the entry still needs no extra durability from this writer. */
+function ensureDirectoryChain(directory: string): string[] {
+  if (existsSync(directory)) return [];
+  const created: string[] = [];
+  for (let current = directory; !existsSync(current); ) {
+    created.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  // The loop above collected the missing levels deepest-first; creation runs topmost-first.
+  created.reverse();
+  for (const path of created) {
+    try {
+      mkdirSync(path, { mode: 0o700 });
+    } catch (error) {
+      if (!object(error) || error.code !== "EEXIST") throw error;
+    }
+  }
+  // Each created level's new entry lives in the level above it, whose fsync persists it; the
+  // topmost level's parent is the first existing ancestor.
+  return created.map((path) => dirname(path));
+}
+
 /** Appends the record's self-delimiting bytes to the spool file in ONE write: a leading newline
  * (which completes any torn earlier append as its own, separately quarantined line), the exact
  * line, and a trailing newline. The write loops until every byte is written, so a short write
@@ -326,12 +354,7 @@ const O_NOFOLLOW = (constants.O_NOFOLLOW ?? 0) as number;
 function appendSpoolRecord(path: string, line: string): boolean {
   const directory = dirname(path);
   const bytes = Buffer.from(`\n${line}\n`, "utf8");
-  let directoryCreated = false;
-  if (!existsSync(directory)) {
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    directoryCreated = true;
-  }
-  const fileExisted = existsSync(path);
+  const fsyncDirectories = ensureDirectoryChain(directory);
   let fd: number;
   try {
     fd = openSync(
@@ -353,9 +376,14 @@ function appendSpoolRecord(path: string, line: string): boolean {
       written += count;
     }
     fsyncSync(fd);
-    // The append is durable; a newly created directory or file entry needs the directory's
-    // fsync too, or a kernel crash can lose the path the next import scans.
-    if (directoryCreated || !fileExisted) fsyncDirectoryDurable(directory);
+    // The append is durable; the directory entries the O_CREAT open may have created need the
+    // directories' fsync too, or a kernel crash can lose the path the next import scans. Creation
+    // is never inferred from a pre-open existsSync — a retirement or replacement between the
+    // check and the open would hide a fresh directory entry — so every append fsyncs the spool
+    // directory, and a created chain fsyncs every level it added plus the first existing
+    // ancestor. Windows cannot open a directory for fsync; the file's own fsync still holds.
+    fsyncDirectoryDurable(directory);
+    for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
     // Verify through this descriptor that the record is the file's last line, and then that
     // the path still resolves to this same inode. The write completes before the identity
     // check, so an importer that claimed the file away (renamed it to a claim, then unlinked)
