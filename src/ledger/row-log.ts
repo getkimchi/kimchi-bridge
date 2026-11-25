@@ -82,6 +82,12 @@ export interface WorkHead {
   latest: WorkLatest;
   /** PR links of every commit row, merged. */
   pullRequests: Record<string, unknown>[];
+  /** True when the stored head is a REDUCED publication: the merged body exceeded the
+   *  publication budget, so `pullRequests` keeps only the newest links that fit and the full
+   *  set stays rebuildable from the authority's commit rows. An additive field — an older
+   *  release reading this head simply ignores it, exactly as this reader ignores fields it
+   *  does not know. */
+  truncated?: true;
 }
 
 /** Every row of a work, as folding its logs returns them. */

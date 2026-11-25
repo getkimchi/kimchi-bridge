@@ -9,11 +9,12 @@ import {
   mkdirSync,
   openSync,
   readSync,
-  writeSync,
   type Stats,
+  writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
+import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
   COLLECTIONS,
   type Collection,
@@ -26,8 +27,6 @@ import {
   type WorkHead,
   type WorkSummaryView,
 } from "./row-log.js";
-import { type WorkRecord, object } from "./work-record.js";
-import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
   BUSY_TIMEOUT_MS,
   CAPTURE_BUSY_TIMEOUT_MS,
@@ -37,12 +36,13 @@ import {
   LedgerFencedError,
   type LedgerStore,
   openStore,
-  type TxDurations,
   readWriterEpoch,
   resetTxDurations,
+  type TxDurations,
   txDurations,
 } from "./store.js";
 import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "./tx-budget.js";
+import { object, type WorkRecord } from "./work-record.js";
 
 /**
  * The one storage engine behind capture, import, the derived summary projection, and tracker bookkeeping. Both
@@ -195,7 +195,12 @@ export interface RecordBackend {
   putHead(head: WorkHead, body?: string): void;
   allHeads(): WorkHead[];
   readRecords(
-    opts: { workId?: string; sessionId?: string; modifiedSince?: number; type?: string },
+    opts: {
+      workId?: string;
+      sessionId?: string;
+      modifiedSince?: number;
+      type?: string;
+    },
     checkBudget?: () => void,
   ): StoredRecord[];
   /** Pins an async read to the records committed when it started. */
@@ -224,6 +229,10 @@ export interface RecordBackend {
     limit: number,
     checkBudget?: () => void,
   ): PositionedRecord[];
+  /** The stored body bytes of the work's records: the rebuild's whole-work branch gate,
+   *  so a record-count-sized work whose merged projection is still large takes the sliced
+   *  path instead of one unbounded transaction. */
+  recordBytes(workId: string): number;
   recordCount(workId?: string): number;
   /** Whether the projection has any plan or commit rows for the work. */
   hasProjectionOutput(workId: string): boolean;
@@ -445,7 +454,7 @@ function appendSpoolRecord(path: string, line: string): boolean {
   // replacement, a concurrent creator's mid-flight entry — is durable at the pathname before
   // the append is acknowledged. Later appends through the cached descriptor sync only the
   // file: the directory is unchanged and its entry was already made durable by the landing.
-  let firstLanding = fd === undefined;
+  const firstLanding = fd === undefined;
   if (firstLanding) {
     const fsyncDirectories = ensureDirectoryChain(directory);
     try {
@@ -718,7 +727,11 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
 /** Replays stored records in capture/import order. */
 export function readRecords(
   agentDir: string,
-  opts: { workId?: string; modifiedSince?: number; type?: WorkRecord["type"] } = {},
+  opts: {
+    workId?: string;
+    modifiedSince?: number;
+    type?: WorkRecord["type"];
+  } = {},
   checkBudget?: () => void,
 ): WorkRecord[] {
   checkBudget?.();
@@ -966,10 +979,77 @@ const REBUILD_RESTART_LIMIT = 8;
 /** The largest head body the publication transaction may write: the SQLite put of a body at
  *  this bound measures well under the 250 ms ceiling (~1.5 ms/MB; the 200,000-link acceptance
  *  shape is ~29 MB and writes in ~90 ms), while the reproduced 500,000-distinct-commit head
- *  (~73 MB) measured 493-778 ms inside the lock. A head whose body exceeds the bound defers
- *  publication — the work keeps the headless-dirty state every reader and the next pass repair
- *  in bounded slices — exactly like retry exhaustion, rather than paying one unbounded write. */
+ *  (~73 MB) measured 493-778 ms inside the lock. A merged head above the bound is PUBLISHED
+ *  REDUCED — the newest PR links up to the bound, with an explicit `truncated` marker in the
+ *  head object — never deferred: a recorded work must never become unreadable, and the full
+ *  link set stays in the authority rows every rebuild refolds. */
 const HEAD_PUBLISH_MAX_BYTES = 48 * 1024 * 1024;
+/** Record body bytes the whole-work rebuild's single atomic transaction may cover. The
+ *  branch is otherwise chosen by record count alone, and a count-sized work can still merge
+ *  to an arbitrarily large projection (the reviewed probe: 1,000 commit records carrying
+ *  500 links each published a 76 MB head and its rows in one 1,638 ms transaction). A work
+ *  over this bound runs the sliced rebuild instead, whose folds and publication are each
+ *  bounded; a work under it stays one atomic transaction exactly as before. */
+const WHOLE_WORK_REBUILD_MAX_BYTES = 4 * 1024 * 1024;
+/** Record body bytes one fold transaction may write. The sliced rebuild's fold pages are
+ *  sized by record count, and a count-sized page of link-heavy records can still write tens
+ *  of megabytes of projection rows in one transaction; the fold therefore batches the page's
+ *  records by the bytes it is about to write (a single record is atomic and never split),
+ *  keeping every fold transaction inside the plan's ceiling even on a cold, unsized start. */
+const FOLD_TX_MAX_BYTES = 2 * 1024 * 1024;
+
+/** The head as it may be published: the serialization is precomputed OUTSIDE the write lock
+ *  (the publication transaction only writes), and a merged body above HEAD_PUBLISH_MAX_BYTES
+ *  is REDUCED rather than deferred — the newest links up to the bound with an explicit
+ *  `truncated` marker, so the work keeps a readable head instead of a permanent headless
+ *  state (data safety outranks the transaction ceiling). The `truncated` field is additive:
+ *  an older release parsing the body simply ignores it. */
+function headForPublication(head: WorkHead): { head: WorkHead; body: string } {
+  const whole = JSON.stringify(head);
+  if (Buffer.byteLength(whole) <= HEAD_PUBLISH_MAX_BYTES) return { head, body: whole };
+  // Reduced publication: rank the merged links newest-first (by checkedAt, ties and missing
+  // timestamps by first-seen order) and keep the newest that fit the budget. The kept links
+  // keep their original relative order, so a reader sees a prefix-consistent subsequence of
+  // the merged set, and the authority's commit rows still hold every link for a rebuild.
+  const ranked = head.pullRequests
+    .map((link, index) => ({
+      index,
+      bytes: Buffer.byteLength(JSON.stringify(link)),
+      at: typeof link.checkedAt === "string" ? Date.parse(link.checkedAt) : Number.NaN,
+    }))
+    .sort(
+      (a, b) =>
+        (Number.isFinite(b.at) ? b.at : 0) - (Number.isFinite(a.at) ? a.at : 0) ||
+        a.index - b.index,
+    );
+  const base = JSON.stringify({ ...head, truncated: true, pullRequests: [] });
+  // The base carries every other field; the budget is what remains for the links themselves
+  // (the separators and the marker's few bytes stay inside the slack).
+  const budget = HEAD_PUBLISH_MAX_BYTES - Buffer.byteLength(base) - 64;
+  const taken: number[] = [];
+  let bytes = 0;
+  for (const item of ranked) {
+    if (bytes + item.bytes > budget) continue;
+    taken.push(item.index);
+    bytes += item.bytes + 1;
+  }
+  for (;;) {
+    const kept = [...taken].sort((a, b) => a - b).map((index) => head.pullRequests[index]);
+    const reduced: WorkHead = { ...head, truncated: true, pullRequests: kept };
+    const body = JSON.stringify(reduced);
+    // The accounting above is exact up to the slack, so this normally publishes on the first
+    // pass; a body still over the bound drops the oldest taken link and reserializes, and a
+    // base that is itself over the bound (structurally impossible — logs and latest are
+    // counters) publishes anyway: a readable head outranks the budget.
+    if (Buffer.byteLength(body) <= HEAD_PUBLISH_MAX_BYTES || !taken.length) {
+      writeDiagnosticNote(
+        "kimchi: a work's projection head exceeded the publication budget; it was published reduced, keeping the newest PR links\n",
+      );
+      return { head: reduced, body };
+    }
+    taken.pop();
+  }
+}
 
 /** Folds every record page in (after, through] into `rows`, parsing damaged bodies away. */
 function foldWorkRecordPages(
@@ -986,17 +1066,33 @@ function foldWorkRecordPages(
   for (;;) {
     const page = backend.readWorkRecordPage(workId, position, through, limit);
     if (!page.length) return position;
-    const records: WorkRecord[] = [];
+    // The page's records fold in BYTE-BATCHED transactions: a record-count-sized page of
+    // link-heavy records would otherwise write its whole merged projection in one
+    // transaction (the reviewed probe: one 1,000-record page carried 76 MB of rows). A
+    // single record is an atomic unit and never splits across transactions.
+    let batch: WorkRecord[] = [];
+    let bytes = 0;
+    const fold = () => {
+      if (!batch.length) return;
+      backend.tx(() => mergeRecordsInto(rows, batch));
+      const last = backend.txDurations?.().lastMs;
+      if (last !== undefined) sizer?.observe(last);
+      batch = [];
+      bytes = 0;
+    };
     for (const row of page) {
+      let record: WorkRecord;
       try {
-        records.push(JSON.parse(row.body) as WorkRecord);
+        record = JSON.parse(row.body) as WorkRecord;
       } catch {
         // Skip damaged bodies; rebuild must not fail because one row is unreadable.
+        continue;
       }
+      if (bytes && bytes + row.body.length > FOLD_TX_MAX_BYTES) fold();
+      batch.push(record);
+      bytes += row.body.length;
     }
-    backend.tx(() => mergeRecordsInto(rows, records));
-    const last = backend.txDurations?.().lastMs;
-    if (last !== undefined) sizer?.observe(last);
+    fold();
     if (page.length < limit) return page[page.length - 1].position;
     position = page[page.length - 1].position;
     limit = sizer ? sizer.size() : limit;
@@ -1042,9 +1138,14 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
     const population = backend.recordCount(workId);
     const through = backend.recordWatermark();
     const limit = sizer.size();
-    // The single-transaction path is chosen by record count, so a fitting work never pages (and
-    // never re-reads) the authority the transaction below refolds anyway.
-    if (backend.recordCount(workId) <= limit) {
+    // The single-transaction path is chosen by record count AND the authority's stored bytes,
+    // so a fitting work never pages (and never re-reads) the authority the transaction below
+    // refolds anyway — while a count-sized work whose records merge to a large projection
+    // (link-heavy commits) runs the sliced rebuild instead of one unbounded transaction.
+    if (
+      backend.recordCount(workId) <= limit &&
+      backend.recordBytes(workId) <= WHOLE_WORK_REBUILD_MAX_BYTES
+    ) {
       backend.tx(() => rebuildWorkInTx(backend, workId));
       observe();
       return;
@@ -1109,21 +1210,14 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
       const pullRequests = commitPullRequests(commits.values());
       // The head's serialization is also precomputed OUTSIDE the write lock, so the
       // publication transaction only writes — and the body's size is the bound on that write:
-      // a head too large to publish inside the transaction budget defers publication to the
-      // repairable headless-dirty state (the same convergence retry exhaustion takes) instead
-      // of holding the write lock across one unbounded put.
-      const publishedHead = {
+      // a merged head above the publication budget is PUBLISHED REDUCED (the newest links up
+      // to the bound, an explicit `truncated` marker; the authority rows keep every link), so
+      // the work always keeps a readable head and the transaction stays one small write.
+      const { head: publishable, body } = headForPublication({
         ...head,
         updatedAt: new Date().toISOString(),
         pullRequests,
-      };
-      const body = JSON.stringify(publishedHead);
-      if (Buffer.byteLength(body) > HEAD_PUBLISH_MAX_BYTES) {
-        writeDiagnosticNote(
-          "kimchi: a work's projection head exceeds the publication budget; publication is deferred to the repairable dirty state\n",
-        );
-        return;
-      }
+      });
       backend.tx(() => {
         if (backend.getNote(workId, REBUILD_OWNERSHIP_NOTE) !== generation) {
           foreign = true;
@@ -1134,7 +1228,7 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
         // write lock is held for the whole transaction, so nothing can move while it runs, and
         // the transaction itself stays one small write — it never folds records.
         if (backend.recordCount(workId) !== expected) return;
-        backend.putHead(publishedHead, body);
+        backend.putHead(publishable, body);
         backend.clearDirty(workId);
         backend.deleteNote(workId, REBUILD_OWNERSHIP_NOTE);
         published = true;
@@ -1184,12 +1278,25 @@ function rebuildWorkInTx(backend: RecordBackend, workId: string): void {
     }
   }
   const head = emptyHead(workId);
-  mergeRecordsInto(projectionRows(backend, head), records);
-  backend.putHead({
+  // `latest` and `pullRequests` are maintained incrementally while the records fold — the
+  // same reference semantics the sliced rebuild's publication and the capture fold use — so
+  // this transaction never rescans the work's logs to derive them, and its head publication
+  // is precomputed and budget-capped like every other publication path (a body above the
+  // bound publishes reduced with the `truncated` marker instead of one unbounded put).
+  const commits = new Map<string, Row>();
+  mergeRecordsInto(
+    projectionRows(backend, head, (collection, row) => {
+      observeLatest(head.latest, collection, row);
+      if (collection === "commits") commits.set(ROW_KEYS.commits(row), row);
+    }),
+    records,
+  );
+  const { head: publishable, body } = headForPublication({
     ...head,
     updatedAt: new Date().toISOString(),
-    ...summaryLatest((collection) => backend.readLog(workId, collection)),
+    pullRequests: commitPullRequests(commits.values()),
   });
+  backend.putHead(publishable, body);
   backend.clearDirty(workId);
 }
 
@@ -1205,11 +1312,26 @@ function foldWork(backend: RecordBackend, workId: string, records: WorkRecord[])
     records,
   );
   if (commits) head.pullRequests = commitPullRequests(backend.readLog(workId, "commits"));
-  backend.putHead({ ...head, updatedAt: new Date().toISOString() });
+  // The publication is capped like every other head write: a capture folding onto an already
+  // reduced head re-derives the full merged set from the rows, and a body above the budget
+  // publishes reduced again (the `truncated` marker) instead of one unbounded put inside the
+  // capture transaction.
+  const { head: publishable, body } = headForPublication({
+    ...head,
+    updatedAt: new Date().toISOString(),
+  });
+  backend.putHead(publishable, body);
 }
 
 function emptyHead(workId: string): WorkHead {
-  return { version: 2, workId, updatedAt: "", logs: {}, latest: {}, pullRequests: [] };
+  return {
+    version: 2,
+    workId,
+    updatedAt: "",
+    logs: {},
+    latest: {},
+    pullRequests: [],
+  };
 }
 
 /**
@@ -1524,7 +1646,12 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
 		ORDER BY a.account_key
 	`);
   const outboxDeliveryRows = db.query<
-    { accountKey: string; sendable: number; hasBatch: number; firstBatchId: string | null },
+    {
+      accountKey: string;
+      sendable: number;
+      hasBatch: number;
+      firstBatchId: string | null;
+    },
     []
   >(OUTBOX_DELIVERY_STATUS_SQL);
   const getRow = db.query<{ body: string }, [string, string, string]>(
@@ -1597,6 +1724,9 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
   );
   const recordCountWork = db.query<{ count: number }, [string]>(
     "SELECT COUNT(*) AS count FROM work_records WHERE work_id = ?",
+  );
+  const recordBytesWork = db.query<{ bytes: number | null }, [string]>(
+    "SELECT sum(length(body)) AS bytes FROM work_records WHERE work_id = ?",
   );
   const dirty = db.query<{ work_id: string }, []>("SELECT work_id FROM work_dirty");
   const markDirty = db.query("INSERT OR IGNORE INTO work_dirty (work_id) VALUES (?)");
@@ -1715,7 +1845,10 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
     getOutboxBatch: (accountKey) => {
       const batch = pendingBatch.get(accountKey);
       return batch
-        ? { ...batch, eventIds: JSON.parse(Buffer.from(batch.eventIds).toString("utf8")) }
+        ? {
+            ...batch,
+            eventIds: JSON.parse(Buffer.from(batch.eventIds).toString("utf8")),
+          }
         : undefined;
     },
     insertOutboxBatch: (batch) =>
@@ -1816,6 +1949,7 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
       readLog.all(workId, "plans").length > 0 || readLog.all(workId, "commits").length > 0,
     recordCount: (workId) =>
       workId ? (recordCountWork.get(workId)?.count ?? 0) : (recordCountAll.get()?.count ?? 0),
+    recordBytes: (workId) => recordBytesWork.get(workId)?.bytes ?? 0,
     hasNote: (workId, name) => hasNote.get(workId, name) != null,
     getNote: (workId, name) => getNote.get(workId, name)?.body,
     readNotePage: (workId, after, limit) => notePage.all(workId, after, limit),

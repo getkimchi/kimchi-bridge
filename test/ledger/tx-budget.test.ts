@@ -1,28 +1,29 @@
+import { afterEach, expect, it, vi } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it, vi } from "bun:test";
 import { importJournalSlice } from "../../src/ledger/import.js";
-import { commitPullRequests } from "../../src/ledger/row-log.js";
-import * as rowLog from "../../src/ledger/row-log.js";
 import {
   acknowledgeBatch,
+  type Fact,
   observeEvents,
   pendingBatch,
-  type Fact,
 } from "../../src/ledger/outbox.js";
 import {
   backendFor,
   capture,
   closeBackends,
   ledgerTxDurations,
+  listWorks,
   readRecords,
   readWorkHead,
   readWorkSummary,
+  rebuildWork,
   recoverDirty,
   resetLedgerTxDurations,
-  rebuildWork,
 } from "../../src/ledger/records.js";
+import * as rowLog from "../../src/ledger/row-log.js";
+import { commitPullRequests } from "../../src/ledger/row-log.js";
 import {
   openStore,
   resetTxDurations,
@@ -162,7 +163,10 @@ function importSlice(dir: string): { txs: number; offset: number } {
   resetLedgerTxDurations(dir);
   importJournalSlice(dir);
   const cursor = backendFor(dir).getJournalCursor(join(dir, "work-attribution", LEGACY));
-  return { txs: ledgerTxDurations(dir)?.count ?? 0, offset: cursor ? cursor.offset : -1 };
+  return {
+    txs: ledgerTxDurations(dir)?.count ?? 0,
+    offset: cursor ? cursor.offset : -1,
+  };
 }
 
 it("import batches shrink under slow transactions, grow back, and reach the identical end state", () => {
@@ -488,7 +492,11 @@ function drain(
         id: string;
         revision: string;
       };
-      return { id: event.id, revision: event.revision, status: "accepted" as const };
+      return {
+        id: event.id,
+        revision: event.revision,
+        status: "accepted" as const,
+      };
     });
     resetLedgerTxDurations(dir);
     let acknowledged = false;
@@ -578,7 +586,10 @@ try {
 } finally {
   db.close();
 }`;
-  const child = Bun.spawnSync(["bun", "-e", code], { cwd: ROOT, timeout: 60_000 });
+  const child = Bun.spawnSync(["bun", "-e", code], {
+    cwd: ROOT,
+    timeout: 60_000,
+  });
   return `${child.stdout}${child.stderr}`.trim();
 }
 
@@ -937,13 +948,16 @@ it("a many-distinct-commit work publishes its merged PR summary outside the writ
   const head = readWorkHead(dir, WORK);
   expect(backend.readLog(WORK, "commits")).toHaveLength(commits);
   expect(head?.pullRequests).toHaveLength(commits * linksPerCommit);
+  // The 200,000-link acceptance shape fits the publication budget: it is NOT reduced —
+  // the merged head carries every link and no `truncated` marker.
+  expect(head?.truncated).toBeUndefined();
   // The merged links are exactly what the whole-work rebuild derives from the projection's
   // stored rows — the reference semantics the capture fold and the single-transaction
   // rebuild already use.
   expect(head?.pullRequests).toEqual(commitPullRequests(backend.readLog(WORK, "commits")));
 }, 60_000);
 
-it("an oversized publication head defers to the repairable dirty state instead of one unbounded write", () => {
+it("an oversized publication head publishes reduced, so the work stays readable and every transaction stays bounded", () => {
   const dir = agentDir();
   const backend = backendFor(dir);
   const OTHER = "00000000-0000-4000-8000-000000000002";
@@ -969,9 +983,10 @@ it("an oversized publication head defers to the repairable dirty state instead o
   useTxClock(null);
   // The round-3 reproduction's shape, scaled past the publication bound: 500,000 merged PR
   // links (2,000 distinct commits × 250 links each), a head body of ~73 MB whose single
-  // unbounded put inside the write lock measured 493-778 ms on the pre-fix code. The
-  // publication must stay a bounded write: an oversized head defers to the same repairable
-  // headless-dirty state retry exhaustion takes, and no transaction crosses the ceiling.
+  // unbounded put inside the write lock measured 493-778 ms on the pre-fix code. A head this
+  // large must never strand the work: it PUBLISHES REDUCED — the newest links up to the
+  // budget, an explicit `truncated` marker — while every transaction stays inside the
+  // ceiling and the full link set stays in the authority rows.
   const commits = 2_000;
   const linksPerCommit = 250;
   const at = new Date().toISOString();
@@ -1017,24 +1032,138 @@ it("an oversized publication head defers to the repairable dirty state instead o
   expect(backend.recordCount(WORK)).toBe(commits);
   resetLedgerTxDurations(dir);
   rebuildWork(dir, WORK);
-  // Every transaction of the rebuild — folds, drains and publication attempt — stayed inside
-  // the plan's ceiling: the oversized head was never written inside the lock.
+  // Every transaction of the rebuild — folds, drains and the publication itself — stayed
+  // inside the plan's ceiling: the reduced head's put is the only large write, and it fits
+  // the publication budget.
   const histogram = ledgerTxDurations(dir);
   expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(250);
   expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
-  // The work keeps the repairable state instead of a published head: no head, the dirty
-  // marker intact — every reader's lazy repair and the next pass rebuild it in bounded
-  // slices, exactly like retry exhaustion's convergence.
-  expect(backend.getHead(WORK)).toBeUndefined();
-  expect(backend.dirtyWorks()).toContain(WORK);
-  expect(backend.readLog(WORK, "commits")).toHaveLength(commits);
-  // A repair attempt is bounded too: the deferred shape reproduces without any transaction
-  // crossing the ceiling.
+  // The work is READABLE, not stranded: a head exists, the dirty marker is cleared, the
+  // reader's summary view returns the work with its full commit rows, and /work discovery
+  // lists it — the pre-fix code left this exact shape permanently headless.
+  const head = readWorkHead(dir, WORK);
+  expect(head).toBeDefined();
+  expect(backend.dirtyWorks()).not.toContain(WORK);
+  const summary = readWorkSummary(dir, WORK);
+  expect(summary?.commits).toHaveLength(commits);
+  expect(listWorks(dir).map((work) => work.workId)).toContain(WORK);
+  // The head is explicitly REDUCED: it keeps the newest links that fit the publication
+  // budget (a strict subsequence of the 500,000 merged links — every kept link is one of
+  // them), while the authority's commit rows still hold the full set for any rebuild.
+  expect(head?.truncated).toBe(true);
+  expect(head?.pullRequests.length ?? 0).toBeGreaterThan(0);
+  expect(head?.pullRequests.length ?? 0).toBeLessThan(commits * linksPerCommit);
+  const full = commitPullRequests(backend.readLog(WORK, "commits"));
+  expect(full).toHaveLength(commits * linksPerCommit);
+  const keptIds = new Set(head?.pullRequests.map((link) => link.id));
+  for (const link of full) keptIds.delete(link.id);
+  expect(keptIds.size).toBe(0);
+  // The stored body parses exactly as an older release's reader parses it — the `truncated`
+  // marker is an additive field the legacy v2 reader ignores: every legacy field survives
+  // the round trip untouched.
+  const store = openStore(dir);
+  try {
+    const raw = store.db
+      .query("SELECT body FROM work_projection_head WHERE work_id = ?")
+      .get(WORK) as { body: string };
+    const parsed = JSON.parse(raw.body) as {
+      version: number;
+      workId: string;
+      updatedAt: string;
+      logs: Record<string, { rows: number }>;
+      latest: Record<string, unknown>;
+      pullRequests: Record<string, unknown>[];
+      truncated?: boolean;
+    };
+    expect(parsed.version).toBe(2);
+    expect(parsed.workId).toBe(WORK);
+    expect(typeof parsed.updatedAt).toBe("string");
+    expect(parsed.logs.commits.rows).toBe(commits);
+    expect(parsed.pullRequests).toHaveLength(head?.pullRequests.length ?? 0);
+    expect(parsed.truncated).toBe(true);
+    expect(Buffer.byteLength(raw.body)).toBeLessThanOrEqual(48 * 1024 * 1024);
+  } finally {
+    store.close();
+  }
+  // A repair rebuild of the same oversized shape is equally bounded and stays readable.
   resetLedgerTxDurations(dir);
   rebuildWork(dir, WORK);
   expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(250);
-  expect(backend.getHead(WORK)).toBeUndefined();
-  expect(backend.dirtyWorks()).toContain(WORK);
+  expect(readWorkHead(dir, WORK)?.truncated).toBe(true);
+  expect(backend.readLog(WORK, "commits")).toHaveLength(commits);
+}, 120_000);
+
+it("a cold whole-work rebuild at the default slice limit stays inside the transaction ceiling and publishes through the same capped path", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  // NO sizer warm-up: the directory's rebuild sizer starts cold at its 1,000-record default,
+  // so this work's record count fits the whole-work branch exactly — the reviewed probe's
+  // shape (1,000 commit records × 500 valid links each) that merged to a 76,500,322-byte head
+  // and published it inside ONE 1,638.992 ms transaction on the pre-fix code.
+  const commits = 1_000;
+  const linksPerCommit = 500;
+  const at = new Date().toISOString();
+  let seeded = 0;
+  for (let round = 0; seeded < commits; round++) {
+    const from = seeded;
+    backend.tx(() => {
+      for (let index = from; index < from + 200 && index < commits; index++) {
+        const links = Array.from({ length: linksPerCommit }, (_, k) => ({
+          provider: "github",
+          host: "github.com",
+          id: String(100_000 + index * linksPerCommit + k),
+          url: `https://github.com/o/r/pull/${100_000 + index * linksPerCommit + k}`,
+          checkedAt: at,
+          state: "open",
+        }));
+        backend.insertRecord({
+          recordHash: `commit-${index}`,
+          type: "commit",
+          workId: WORK,
+          sessionId: "session",
+          body: JSON.stringify({
+            version: 1,
+            type: "commit",
+            workId: WORK,
+            sessionId: "session",
+            sha: `sha${index.toString(16).padStart(6, "0")}`,
+            repository: "github.com/o/r",
+            worktree: "/w",
+            recordedAt: at,
+            pullRequests: links,
+          }),
+          sourcePath: "/journal",
+          sourceGeneration: 0,
+          sourceOffset: index,
+          importedAt: index,
+        });
+        backend.upsertMarker(`commit-${index}`, WORK, "commit");
+        seeded = index + 1;
+      }
+    });
+  }
+  expect(backend.recordCount(WORK)).toBe(commits);
+  // The whole-work branch is routed by the authority's stored bytes too: this count-sized
+  // work merges to a projection far past the whole-work bound, so the rebuild runs sliced —
+  // its folds batch by bytes and its publication is the same capped, precomputed-body path.
+  expect(backend.recordBytes(WORK)).toBeGreaterThan(4 * 1024 * 1024);
+  resetLedgerTxDurations(dir);
+  rebuildWork(dir, WORK);
+  // Every transaction of the cold rebuild — the clear, the byte-batched folds, the drain
+  // and the reduced publication — stayed inside the plan's 250 ms ceiling (the pre-fix
+  // whole-work transaction measured 1,638.992 ms on this exact shape).
+  const histogram = ledgerTxDurations(dir);
+  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(250);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  // The same capped publication as the sliced acceptance shape: a readable, explicitly
+  // reduced head over the full authority rows.
+  const head = readWorkHead(dir, WORK);
+  expect(head).toBeDefined();
+  expect(head?.truncated).toBe(true);
+  expect(head?.pullRequests.length ?? 0).toBeLessThan(commits * linksPerCommit);
+  expect(head?.pullRequests.length ?? 0).toBeGreaterThan(0);
+  expect(readWorkSummary(dir, WORK)?.commits).toHaveLength(commits);
+  expect(backend.dirtyWorks()).toEqual([]);
 }, 120_000);
 
 it("retry exhaustion abandons publication in bounded transactions instead of one convergence fold", () => {
