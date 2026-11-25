@@ -44,13 +44,72 @@ function observationAt(item: PullRequestObservation): number {
  *  checkedAt, equal identity strength — keeps the merge's long-standing behavior: the
  *  observation processed later wins. Rows only ever accumulate links and each row merges
  *  its own observations temporally, so the later observation is the temporally newest
- *  evidence; two DISTINCT rows carrying conflicting equal-timestamp id-bearing observations
- *  of one alias remain inherently ambiguous, and each path picks a valid merge of them. */
+ *  evidence. Two DISTINCT sources carrying conflicting equal-timestamp id-bearing observations
+ *  of one alias remain inherently ambiguous: the incremental fold never picks a winner between
+ *  them — pullRequestFoldAmbiguous detects the case and the fold defers to the rebuild. */
 function outranks(a: PullRequestObservation, b: PullRequestObservation): boolean {
   const left = observationAt(a);
   const right = observationAt(b);
   if (left !== right) return left > right;
   return typeof a.id === "string" && typeof b.id !== "string";
+}
+
+/** One merge-input observation with the rank fields the ambiguity check compares. */
+interface RankedObservation {
+  at: number;
+  hasId: boolean;
+  body: string;
+}
+
+function rankObservation(item: PullRequestObservation): RankedObservation | undefined {
+  if (typeof item?.url !== "string" || typeof item.checkedAt !== "string") return undefined;
+  return {
+    at: observationAt(item),
+    hasId: typeof item.id === "string",
+    body: JSON.stringify(item),
+  };
+}
+
+/** The aliases one observation is known by: its merge key and its URL (the merge folds
+ *  URL-only observations into the id-bearing entry of the same URL). */
+function observationAliases(item: PullRequestObservation): Set<string> {
+  return new Set([pullRequestKey(item), item.url as string]);
+}
+
+/** True when the incremental fold CANNOT order its PR-summary merge exactly the way the
+ *  whole-row rebuild does: the saved head's summary and a touched commit row hold two
+ *  observations of one alias that rank exactly equal — same checkedAt, same identity strength —
+ *  yet are not identical, so the merged entry depends on which group the merge processes first,
+ *  and the fold's grouping (head summary first, then the touched rows) is not the rebuild's
+ *  (every commit row in projection order). The fold must not pick a winner inline; it marks
+ *  the work dirty and the bounded rebuild — one deterministic pass over every row — publishes
+ *  the head, so capture and rebuild produce the same state from the same rows. Observations
+ *  that rank equal and are identical merge to themselves either way, and pairs inside one
+ *  group keep that group's own later-wins order in both paths, so neither is ambiguous. */
+export function pullRequestFoldAmbiguous(
+  head: readonly PullRequestObservation[],
+  rows: readonly (readonly PullRequestObservation[])[],
+): boolean {
+  const rankedHead = new Map<string, RankedObservation[]>();
+  for (const item of head) {
+    const ranked = rankObservation(item);
+    if (!ranked) continue;
+    for (const alias of observationAliases(item)) {
+      const list = rankedHead.get(alias) ?? [];
+      list.push(ranked);
+      rankedHead.set(alias, list);
+    }
+  }
+  for (const group of rows)
+    for (const item of group) {
+      const ranked = rankObservation(item);
+      if (!ranked) continue;
+      for (const alias of observationAliases(item))
+        for (const prior of rankedHead.get(alias) ?? [])
+          if (prior.at === ranked.at && prior.hasId === ranked.hasId && prior.body !== ranked.body)
+            return true;
+    }
+  return false;
 }
 
 /** Upgrade URL-only records, and keep one provider identity across repository renames. */

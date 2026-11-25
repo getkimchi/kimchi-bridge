@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
-import { mergePullRequestLinks } from "./links.js";
+import { mergePullRequestLinks, pullRequestFoldAmbiguous } from "./links.js";
 import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
   COLLECTIONS,
@@ -1493,6 +1493,10 @@ function planCaptureFold(backend: RecordBackend, record: WorkRecord): PlannedCap
   const saved = backend.getHead(record.workId);
   if (!saved && backend.recordCount(record.workId) > 0) return { dirty: true, version };
   const plan = planFold(backend, saved ?? emptyHead(record.workId), [record]);
+  // A fold that cannot order its PR observations the way the rebuild would never publishes:
+  // the work takes the dirty marker exactly as the oversize/dirty cases above, and the bounded
+  // rebuild owns the head derivation.
+  if (plan.ambiguous) return { dirty: true, version };
   return {
     dirty: false,
     version,
@@ -1516,16 +1520,22 @@ function replayPlannedRows(
  *  PR summary is maintained INCREMENTALLY — the touched commit rows' final links merge into
  *  the head's existing summary — so the fold never rescans every commit row of a large work
  *  (a capture on a 2,000 × 250-link work paid a 76 MB row rescan inside its transaction). The
- *  incremental merge equals the full rescan the rebuild performs: every commit row only ever
- *  accumulates links (an empty or failed lookup never removes one), so the union of the head's
- *  summary and the touched rows' merged links is the same merged set `commitPullRequests`
- *  derives from every row. The serialized publication body is computed here too, so the caller
- *  can keep the whole derivation outside the write lock. */
+ *  incremental merge equals the full rescan the rebuild performs for every pair the merge's
+ *  rank order can separate: every commit row only ever accumulates links (an empty or failed
+ *  lookup never removes one), so the union of the head's summary and the touched rows' merged
+ *  links is the same merged set `commitPullRequests` derives from every row. The one exception
+ *  is `ambiguous`: the head's summary and a touched row hold two observations of one alias the
+ *  rank order cannot separate (equal checkedAt, equal identity strength, differing content),
+ *  so the merged entry depends on the fold's grouping order — head first — where the rebuild
+ *  uses row order (correctness-013: capture published `merged`, rebuildWork `closed`, from the
+ *  same final rows). The fold never picks a winner inline; the caller marks the work dirty and
+ *  the bounded rebuild publishes the head. The serialized publication body is computed here too,
+ *  so the caller can keep the whole derivation outside the write lock. */
 function planFold(
   backend: RecordBackend,
   head: WorkHead,
   records: WorkRecord[],
-): { head: WorkHead; body: string; writes: PlannedRowWrite[] } {
+): { head: WorkHead; body: string; writes: PlannedRowWrite[]; ambiguous: boolean } {
   const merged: WorkHead = {
     ...head,
     logs: Object.fromEntries(Object.entries(head.logs).map(([name, log]) => [name, { ...log }])),
@@ -1545,24 +1555,36 @@ function planFold(
     ),
     records,
   );
-  if (commits.size)
-    merged.pullRequests = mergePullRequestLinks(
-      merged.pullRequests,
-      ...[...commits.values()].map((row) =>
-        Array.isArray(row.pullRequests) ? row.pullRequests.filter(object) : [],
-      ),
+  if (commits.size) {
+    const rowLinks = [...commits.values()].map((row) =>
+      Array.isArray(row.pullRequests) ? row.pullRequests.filter(object) : [],
     );
+    // The head's summary and the touched rows hold conflicting observations the rank order
+    // cannot separate: the merged entry would depend on this fold's grouping order, not the
+    // rebuild's row order. Report it instead of merging; the caller defers to the rebuild.
+    if (pullRequestFoldAmbiguous(merged.pullRequests, rowLinks))
+      return { head: merged, body: "", writes, ambiguous: true };
+    merged.pullRequests = mergePullRequestLinks(merged.pullRequests, ...rowLinks);
+  }
   const { head: publishable, body } = headForPublication({
     ...merged,
     updatedAt: new Date().toISOString(),
   });
-  return { head: publishable, body, writes };
+  return { head: publishable, body, writes, ambiguous: false };
 }
 
-/** Folds records into the saved head like the journal-era summary writer: only the rows they touch are read. */
+/** Folds records into the saved head like the journal-era summary writer: only the rows they touch are read.
+ *  A fold whose PR observations the merge cannot order the way the rebuild does (ambiguous)
+ *  publishes nothing: the work takes the dirty marker, and the bounded rebuild — the next
+ *  read's lazy repair or the pass's recovery — publishes the head from every row in one
+ *  deterministic order. */
 function foldWork(backend: RecordBackend, workId: string, records: WorkRecord[]): void {
   const head = backend.getHead(workId) ?? emptyHead(workId);
   const plan = planFold(backend, head, records);
+  if (plan.ambiguous) {
+    backend.markDirty(workId);
+    return;
+  }
   replayPlannedRows(backend, workId, plan.writes);
   // The publication is capped like every other head write: a capture folding onto an already
   // reduced head merges incrementally, and a body above the budget publishes reduced again
