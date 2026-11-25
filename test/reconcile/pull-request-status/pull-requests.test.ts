@@ -1746,6 +1746,23 @@ describe("provider pagination links", () => {
         .pullRequests.map((pr: { number: number }) => pr.number),
     ).toEqual([7, 8]);
   });
+  it("keeps one checkedAt per lookup response across a clock-tick boundary", async () => {
+    const iso = Date.prototype.toISOString;
+    let tick = Date.parse("2026-10-01T12:00:00.000Z");
+    try {
+      seed();
+      replies(() => [pull(7), pull(8)]);
+      Date.prototype.toISOString = function () {
+        return iso.call(new RealDate(tick++));
+      };
+      await lookup();
+      const links = saved().at(-1).pullRequests;
+      expect(links.map((pr: { number: number }) => pr.number)).toEqual([7, 8]);
+      expect(new Set(links.map((pr: { checkedAt: string }) => pr.checkedAt)).size).toBe(1);
+    } finally {
+      Date.prototype.toISOString = iso;
+    }
+  });
   it("follows GitLab's next link when it repeats route parameters in the query", async () => {
     seed();
     useProvider("gitlab");

@@ -354,9 +354,10 @@ async function scan(
             : `commits/${first.sha}/pulls`,
         );
         url.searchParams.set("per_page", "100");
-        request = pages(remote, url, signal, deadline).then((values) =>
-          values.map((value) => pullRequest(value, remote, new Date().toISOString())),
-        );
+        request = pages(remote, url, signal, deadline).then((values) => {
+          const checkedAt = new Date().toISOString();
+          return values.map((value) => pullRequest(value, remote, checkedAt));
+        });
         associations.set(requestKey, request);
       }
       found = await request;
