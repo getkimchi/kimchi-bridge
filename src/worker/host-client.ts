@@ -429,22 +429,43 @@ export class StdioTransport {
         /* A real block: the helper thread cannot start until it ends. */
       }
     }
+    // The construction-time start handshake: the helper's first action puts its startup clock
+    // in SHARED MEMORY and wakes this bounded wait through the futex path, so the reading
+    // carries no postMessage delivery latency — no blocked event loop can stretch it. The
+    // observation's start is sampled BEFORE the helper thread is constructed (the line
+    // above): the helper can publish its startup clock — and read the parent's first
+    // heartbeat — as soon as `new Worker` starts the thread, so a sample taken after the
+    // construction returns would leave the gap between them unmeasured, and a deschedule
+    // there inflated the offset while the observation looked prompt (the round-5 probe
+    // delivered one heartbeat 50 ms into a 500 ms gap and read it back 31.8 ms fresh with
+    // refused:false). Sampled before the construction, the measured window covers
+    // EVERYTHING between the sample and the observation — the construction itself, the
+    // helper's start, and any pause in between. The whole wait-and-read is additionally
+    // bounded by monotonic timestamps (and one test-only hook can deschedule exactly the
+    // post-wake read, reproducing the delayed observation); the resulting offset is the
+    // only sound yardstick for bounding later notes' delivery, and it is trusted only when
+    // the whole observation stayed inside the delivery bound — an observation descheduled
+    // past it leaves the offset uncalibrated and the conservative fallback above in force
+    // (which never folds a note, the safe direction).
+    const handshakeStartedAt = performance.now();
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
+    // Test-only hook: a delay inserted between the helper's construction and the handshake
+    // wait — precisely the gap a pre-fix sample after the construction left unmeasured. The
+    // helper thread has already started here and may already have published its startup
+    // clock and read the parent's first heartbeat, so a block here is a real deschedule the
+    // measured window must cover. Zero (unset) keeps it dormant.
+    const TEST_GAP_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_HANDSHAKE_GAP_MS || 0);
+    if (TEST_GAP_DELAY_MS > 0) {
+      const until = performance.now() + TEST_GAP_DELAY_MS;
+      while (performance.now() < until) {
+        /* A real deschedule-shaped block between the helper's start and the observation. */
+      }
+    }
     // The conservative fallback is pinned the moment the pre-construction sample exists: the
     // helper's clock cannot have started before it, and no later note — however delivered — can
     // move it (the startup note used to replace it with a value biased by the helper's whole
     // startup delay, locking a slow-started helper out of writes for the transport's lifetime).
     this.#monoOffsetMs = this.#constructedAtMs;
-    // The construction-time start handshake: the helper's first action puts its startup clock
-    // in SHARED MEMORY and wakes this bounded wait through the futex path, so the reading
-    // carries no postMessage delivery latency — no blocked event loop can stretch it. The
-    // whole wait-and-read is bounded by monotonic timestamps (and one test-only hook can
-    // deschedule exactly the post-wake read, reproducing the delayed observation); the
-    // resulting offset is the only sound yardstick for bounding later notes' delivery, and it
-    // is trusted only when the whole observation stayed inside the delivery bound — an
-    // observation descheduled past it leaves the offset uncalibrated and the conservative
-    // fallback above in force (which never folds a note, the safe direction).
-    const handshakeStartedAt = performance.now();
     Atomics.wait(this.syncState, 0, 0, STARTUP_HANDSHAKE_MS);
     const TEST_OBSERVE_DELAY_MS = Number(
       process.env.KIMCHI_WORKER_TEST_HANDSHAKE_OBSERVE_DELAY_MS || 0,

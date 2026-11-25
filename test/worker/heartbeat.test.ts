@@ -282,6 +282,56 @@ it("a delayed handshake observation never calibrates a late first heartbeat to i
   expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
 }, 20_000);
 
+it("a deschedule in the handshake's pre-sample gap never calibrates a stale first heartbeat", async () => {
+  // The round-5 reproduced defect (security-005): the handshake observation's start was
+  // sampled only AFTER the helper thread's construction returned, but the helper can publish
+  // its startup clock — and read the parent's first heartbeat — as soon as the Worker starts.
+  // A deschedule in that unmeasured gap then inflated #syncOffsetMs while the observation
+  // itself looked prompt: the delivery guard subtracted the inflated offset, the first
+  // heartbeat's equally inflated estimate folded, and its ~450 ms-old arrival read ~30 ms
+  // fresh (the reviewer's real-helper probe: ageMs 31.8, refused:false, against a 100 ms
+  // fence). The observation's start is now sampled BEFORE the helper is constructed, so the
+  // measured window covers the construction, the helper's start and any pause between: an
+  // observation descheduled past the delivery bound is rejected outright, no note is ever
+  // folded, and the pre-construction fallback keeps the age honest.
+  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "sample-gap"], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      HEARTBEAT_WINDOW_MS: "100",
+      KIMCHI_WORKER_TEST_HANDSHAKE_GAP_MS: "500",
+    },
+    stdio: ["pipe", "ignore", "pipe"],
+  });
+  const lines: string[] = [];
+  createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
+  // The parent delivers exactly one heartbeat 50 ms after the spawn and then goes silent:
+  // the line reaches the pipe before the child's transport is constructed, the already-
+  // started helper reads it early in the constructor's 500 ms gap, and its note can only
+  // drain once the constructor returns — hundreds of ms after its true arrival.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+  expect(code).toBe(0);
+  const summary = lines
+    .map((line) => {
+      try {
+        return JSON.parse(line) as { phase?: string; ageMs?: number; refused?: boolean };
+      } catch {
+        return {} as { phase?: string; ageMs?: number; refused?: boolean };
+      }
+    })
+    .find((note) => note.phase === "summary");
+  expect(summary).toBeDefined();
+  // The descheduled observation never calibrates anything: the drained note's delivery
+  // latency is never erased from the age, the fence refuses the stale write, and the age
+  // covers the true silent span since the heartbeat's arrival (the pre-fix child reported
+  // ~30 ms and refused:false on this exact shape).
+  expect(summary?.refused).toBe(true);
+  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(250);
+  expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
+}, 20_000);
+
 it("a helper whose first action is delayed past the window keeps accepting live heartbeats", async () => {
   // The missed-handshake availability consequence (correctness-p02 / design-p10): the helper
   // thread's ACTUAL first action is delayed past the 250 ms handshake bound and the fence

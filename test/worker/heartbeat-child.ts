@@ -24,6 +24,16 @@
  *    child reports that first heartbeat's age once its note has drained: the FIRST note
  *    must not calibrate the offset to itself, or its delivery latency is erased from the
  *    age and a stale parent's write passes the fence.
+ *  - "sample-gap": the transport's constructor (the top-level one above) inserts a 500 ms
+ *    deschedule (the test-only hook in the constructor, via KIMCHI_WORKER_TEST_HANDSHAKE_GAP_MS)
+ *    in the gap between the helper thread's construction and the handshake observation. The
+ *    helper has already started there: it publishes its startup clock and reads the parent's
+ *    first heartbeat early in the gap, so the queued note can only drain once the constructor
+ *    returns, hundreds of ms after its true arrival. The child reports that heartbeat's age
+ *    once the constructor has returned: a handshake observation whose window does not cover
+ *    that whole gap would accept an offset inflated by it and authenticate the stale
+ *    heartbeat as fresh (the round-5 probe reported 31.8 ms with refused:false on this exact
+ *    shape).
  *
  * The summary goes to stderr as one JSON line; stdout carries only the transport's own
  * request lines (none in these scenarios).
@@ -66,6 +76,23 @@ if (mode === "slow-construction" || mode === "slow-helper") {
   while (Date.now() - start < 500) {
     /* A real block: neither note can drain until it ends. */
   }
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  let refused = false;
+  try {
+    transport.assertHeartbeatFresh(windowMs);
+  } catch (error) {
+    refused = error instanceof LeaseHeartbeatLost;
+  }
+  const ageMs = transport.heartbeatAgeMs();
+  transport.close();
+  report({ mode, phase: "summary", ageMs, refused });
+} else if (mode === "sample-gap") {
+  // The handshake-gap shape: the 500 ms block lived INSIDE the top-level transport's
+  // constructor above, between the helper's construction and the handshake observation — the
+  // helper was already running and read the parent's single heartbeat early in it, so its
+  // note could only drain once the constructor returned. The constructor has returned by
+  // now; the fence is sampled immediately after one event-loop turn so the queued note has
+  // drained.
   await new Promise((resolve) => setTimeout(resolve, 30));
   let refused = false;
   try {
