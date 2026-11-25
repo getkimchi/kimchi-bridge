@@ -6,6 +6,7 @@ import type { HostFetch } from "../host.js";
 import { hostPorts } from "../host-ports.js";
 import { isWorkId } from "../../ledger/work-id.js";
 import { getNote, hasNote, setNote } from "../../ledger/records.js";
+import { pinAgentDir } from "../../ledger/store.js";
 import { appendWorkRecord } from "../work-attribution.js";
 import {
   BEFORE_PAGE_TIMEOUT_MESSAGE,
@@ -376,7 +377,7 @@ export async function reconcileWorkCosts(
   signal.throwIfAborted();
   assertLease();
   let changed = false;
-  const pollingPath = join(agentDir, "work-attribution", "billing-polls.json");
+  const pollingPath = join(pinAgentDir(agentDir), "work-attribution", "billing-polls.json");
   const polls = readBillingPolls(agentDir, pollingPath);
   const previousPolls = JSON.stringify(polls);
   const deadline = Date.now() + PASS_MS;

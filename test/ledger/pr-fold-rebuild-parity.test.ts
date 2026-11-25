@@ -12,6 +12,7 @@ import {
   useBackendFactory,
 } from "../../src/ledger/records.js";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
+import { pullRequestFoldAmbiguous } from "../../src/ledger/links.js";
 
 /**
  * Capture/rebuild parity on equal-timestamp PR observations (correctness-013). Two commit rows
@@ -102,6 +103,15 @@ describe("capture/rebuild parity on equal-timestamp PR observations", () => {
     const fromRebuild = prStates(readWorkHead(dir, WORK));
     expect(fromCapture).toEqual(fromRebuild);
     expect(backendFor(dir).hasDirty?.(WORK)).toBe(false);
+  });
+
+  it("detects equal-rank conflicts between touched rows, not within one row", () => {
+    expect(pullRequestFoldAmbiguous([], [[observation("open")], [observation("closed")]])).toBe(
+      true,
+    );
+    expect(pullRequestFoldAmbiguous([], [[observation("open"), observation("closed")]])).toBe(
+      false,
+    );
   });
 
   it("unambiguous observations keep folding inline: capture still publishes without a rebuild", () => {

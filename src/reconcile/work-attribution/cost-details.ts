@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { isWorkId } from "../../ledger/work-id.js";
 import { getNote } from "../../ledger/records.js";
+import { pinAgentDir } from "../../ledger/store.js";
 import type { BillingDisplay } from "./billing-evidence.js";
 import {
   decimalNanos,
@@ -208,7 +209,7 @@ export function costReportSource(workId: string): string {
 /** /work reads the last durable result; opening the command never waits for the network or reads the full report. */
 export function workCostDetails(agentDir: string, workId: string): string[] {
   if (!isWorkId(workId)) return [];
-  const folder = join(agentDir, "work", workId);
+  const folder = join(pinAgentDir(agentDir), "work", workId);
   // A5: the note is the authority for new reports; a legacy cost-totals.json still answers for old installs.
   const note = getNote(agentDir, workId, "cost-totals");
   try {

@@ -560,18 +560,27 @@ async function update(
     if (compromised) throw compromised;
     assertCurrent();
     // The ledger's write fence covers this queue's file commits too, including the paths that
-    // arrive without their own assertion (an error note after a failed capture), and the epoch
-    // re-read below covers updates that run outside any pass fence (a session-side explicit
-    // choice). The check runs while the queue lock is held, immediately before each durable
-    // rename, and calls the fence's writable hook (the parent-heartbeat check) when one is
-    // installed.
+    // arrive without their own assertion (an error note after a failed capture). The epoch
+    // re-read is pass-only: a session-side state change must not depend on ledger availability.
+    // The check runs while the queue lock is held, immediately before each durable rename.
     assertLedgerWritable(agentDir);
+    if (reportingPassContext.getStore() !== agentDir) return;
     const backend = backendFor(agentDir);
-    if (epoch !== undefined && backend.writerEpoch && backend.writerEpoch() !== epoch)
+    if (
+      epoch !== undefined &&
+      backend.writerEpoch &&
+      backend.writerEpoch() !== epoch
+    )
       throw new Error("PR reporting queue state was fenced by a newer lease holder");
   };
   try {
-    epoch = backendFor(agentDir).writerEpoch?.();
+    try {
+      epoch = backendFor(agentDir).writerEpoch?.();
+    } catch (error) {
+      // Session-side queue state is independent of an unreadable ledger. A pass still goes
+      // through the full ledger fence above; outside one, there is no epoch comparison to make.
+      console.warn("kimchi: could not inspect the reporting queue's ledger epoch", error);
+    }
     const { state, text } = await loadReportingState(agentDir);
     const before = JSON.stringify(state);
     check();

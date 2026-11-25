@@ -9,6 +9,7 @@ import { type VerifyApiKeyResponse, verifyApiKey } from "../shared/verify-api-ke
 import { canonicalPlatformApiUrl } from "../shared/platform-url.js";
 import { isWorkId } from "../../ledger/work-id.js";
 import { backendFor, getNote, hasNote, setNote } from "../../ledger/records.js";
+import { pinAgentDir } from "../../ledger/store.js";
 import { object } from "./summary.js";
 
 export interface WorkAccount {
@@ -97,7 +98,7 @@ export async function captureWorkScope(cwd: string): Promise<WorkScopeSnapshot |
 
 function scopePath(workId: string): string {
   if (!isWorkId(workId)) throw new Error("Invalid work UUID");
-  return join(hostPorts().agentDir, "work", workId, "scope.json");
+  return join(pinAgentDir(hostPorts().agentDir), "work", workId, "scope.json");
 }
 
 function parseWorkScope(text: string, workId: string): WorkScope | undefined {

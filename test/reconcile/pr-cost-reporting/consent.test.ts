@@ -2,16 +2,18 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { HostPorts } from "../../../src/reconcile/host.js";
 import { setDefaultHostPorts } from "../../../src/reconcile/host-ports.js";
 import {
   readReportingState,
   readReportingStateFresh,
+  setReportingEnabled,
   takeReportingNotice,
   type FreshReportingState,
 } from "../../../src/reconcile/pr-cost-reporting/queue.js";
-import { closeBackends } from "../../../src/ledger/records.js";
+import { backendFor, closeBackends } from "../../../src/ledger/records.js";
+import { acquireWriterEpoch, openStore } from "../../../src/ledger/store.js";
 
 /**
  * The reportingConsent host port: when the host owns the PR-reporting choice, "on"/"off" is the
@@ -154,6 +156,45 @@ describe("the reportingConsent host port", () => {
     );
     expect(onDisk.enabled).toBe(false);
     expect(onDisk.followsTelemetry).toBeUndefined();
+  });
+
+  it("a session-side queue update survives an epoch bump", async () => {
+    choice = "absent";
+    installHost();
+    await setReportingEnabled(directory, false);
+    const backend = backendFor(directory);
+    const readEpoch = backend.writerEpoch?.bind(backend);
+    let reads = 0;
+    backend.writerEpoch = () => {
+      reads++;
+      if (reads === 1) {
+        const other = openStore(directory);
+        try {
+          acquireWriterEpoch(other);
+        } finally {
+          other.close();
+        }
+      }
+      return readEpoch?.() ?? 0;
+    };
+    await setReportingEnabled(directory, true);
+    expect(reads).toBe(1);
+    expect((await readReportingState(directory)).enabled).toBe(true);
+  });
+
+  it("a session-side queue update survives an unreadable ledger", async () => {
+    choice = "absent";
+    installHost();
+    await writeState({ enabled: true, followsTelemetry: true, producerId });
+    await writeFile(join(directory, "pr-cost-reporting", "ledger.db"), "not a sqlite database");
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(await takeReportingNotice(directory)).toBe(true);
+      expect(warning).toHaveBeenCalled();
+      expect((await readReportingState(directory)).enabled).toBe(true);
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it("a fresh queue's defaults follow the port", async () => {
