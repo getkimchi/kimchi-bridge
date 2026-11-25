@@ -69,8 +69,14 @@ export function writeWorkerBuild(build: string, outfile: string) {
   writeFileSync(outfile, `${build}\n`);
 }
 
-/** The commit being packaged; the release and its worker bundle must agree on it. */
+/** The commit being packaged; the release and its worker bundle must agree on it. An installed
+ *  package supplies it explicitly because the package is no longer its own Git checkout. */
 function checkoutCommit(root: string): string {
+  const configured = process.env.KIMCHI_BRIDGE_COMMIT?.trim();
+  if (configured !== undefined && configured !== "") {
+    if (!/^[0-9a-f]{40}$/.test(configured)) throw new Error("Invalid packaged bridge commit");
+    return configured;
+  }
   const commit = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
     cwd: root,
     stdout: "pipe",
