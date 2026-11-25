@@ -100,7 +100,7 @@ export function pullRequestFoldAmbiguous(
       rankedHead.set(alias, list);
     }
   }
-  for (const group of rows)
+  for (const group of rows) {
     for (const item of group) {
       const ranked = rankObservation(item);
       if (!ranked) continue;
@@ -109,6 +109,18 @@ export function pullRequestFoldAmbiguous(
           if (prior.at === ranked.at && prior.hasId === ranked.hasId && prior.body !== ranked.body)
             return true;
     }
+    // Only comparisons between distinct rows are ambiguous. Conflicts inside one row retain
+    // their own deterministic order in both the incremental fold and a whole-work rebuild.
+    for (const item of group) {
+      const ranked = rankObservation(item);
+      if (!ranked) continue;
+      for (const alias of observationAliases(item)) {
+        const list = rankedHead.get(alias) ?? [];
+        list.push(ranked);
+        rankedHead.set(alias, list);
+      }
+    }
+  }
   return false;
 }
 

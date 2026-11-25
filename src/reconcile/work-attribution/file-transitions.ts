@@ -38,10 +38,12 @@ export const RECONCILIATION_BUDGET_MS = 3000;
 /** The direct-call budget in force: the production constant, or the test-only override a
  *  loaded runner sets before running this file's suites. */
 export function reconciliationBudgetMs(): number {
+  if (process.env.NODE_ENV !== "test") return RECONCILIATION_BUDGET_MS;
   return Number(process.env.KIMCHI_FILE_TRANSITIONS_TEST_BUDGET_MS) || RECONCILIATION_BUDGET_MS;
 }
 /** The per-command git timeout in force: the production constant, or the test-only override. */
 function gitTimeoutMs(): number {
+  if (process.env.NODE_ENV !== "test") return GIT_TIMEOUT_MS;
   return Number(process.env.KIMCHI_FILE_TRANSITIONS_TEST_GIT_TIMEOUT_MS) || GIT_TIMEOUT_MS;
 }
 export interface FileState {

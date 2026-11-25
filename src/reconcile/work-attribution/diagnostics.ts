@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { format } from "node:util";
 import { hostPorts } from "../host-ports.js";
+import { pinAgentDir } from "../../ledger/store.js";
 
 /** Redacts a diagnostics line before it is persisted; set by the worker process. */
 let redactLine: ((text: string) => string) | undefined;
@@ -24,7 +25,7 @@ export function debugWorkAttribution(message: string, ...details: unknown[]): vo
     .replace(/,/g, "$|^");
   if (!new RegExp(`^${namespaces}$`, "i").test("kimchi:work-attribution")) return;
   try {
-    const directory = join(hostPorts().agentDir, "logs");
+    const directory = join(pinAgentDir(hostPorts().agentDir), "logs");
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const line = format(message, ...details);
     appendFileSync(
