@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import type { WorkRecord } from "../../src/ledger/work-record.js";
+import type { StatOptions } from "node:fs";
 import { afterEach, expect, it, mock } from "bun:test";
 
 /**
@@ -51,8 +52,12 @@ mock.module("node:fs", () => ({
     fdPaths.delete(fd);
     return realCloseSync(fd);
   }) as typeof realFs.closeSync,
-  fstatSync: ((fd: number) => {
-    const result = realFstatSync(fd);
+  // The options argument is forwarded: bun's mock.module outlives this file, and a later
+  // suite's platform code calls fstatSync(fd, { bigint: true }) — dropping the options here
+  // would hand it a non-bigint Stats whose number size never equals the caller's BigInt reads,
+  // so every safeRead in that later file fails as if its file changed during capture.
+  fstatSync: ((fd: number, options?: StatOptions) => {
+    const result = realFstatSync(fd, options);
     if (fstatOverride !== undefined && fdPaths.get(fd) === spoolPath) {
       // Keep the Stats prototype: the append's identity checks call isFile().
       const overridden = Object.create(Object.getPrototypeOf(result));
