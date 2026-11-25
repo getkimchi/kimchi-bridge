@@ -1071,7 +1071,9 @@ export function readWorkSummary(agentDir: string, workId: string): WorkSummaryVi
   return { workId, sessions, ...collections } as WorkSummaryView;
 }
 
-/** Every work that has a projection; `/work` discovery reads this instead of directories. */
+/** Every work that has a projection; `/work` discovery reads this fast snapshot instead of
+ * directories. A dirty head can be behind authority here: discovery never pays an unbounded
+ * rebuild for it, while detail reads through readWorkHead read the repaired head. */
 export function listWorks(agentDir: string): { workId: string; head: WorkHead }[] {
   return backendFor(agentDir)
     .allHeads()

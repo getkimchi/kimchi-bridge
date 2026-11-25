@@ -1394,11 +1394,32 @@ function commitRowPullRequests(backend: RecordBackend, workId: string): Record<s
   return links;
 }
 
+/** One complete-link index per backend/work, refreshed only when that work's head or
+ * authority count changes. Unrelated active works therefore never rescan a stable large head. */
+const truncatedHeadIndexes = new WeakMap<
+  RecordBackend,
+  Map<string, { updatedAt: string; records: number; links: Record<string, unknown>[] }>
+>();
+
+function truncatedHeadPullRequests(
+  backend: RecordBackend,
+  head: { workId: string; updatedAt: string },
+): Record<string, unknown>[] {
+  const indexes = truncatedHeadIndexes.get(backend) ?? new Map();
+  truncatedHeadIndexes.set(backend, indexes);
+  const records = backend.recordCount(head.workId);
+  const cached = indexes.get(head.workId);
+  if (cached?.updatedAt === head.updatedAt && cached.records === records) return cached.links;
+  const links = commitRowPullRequests(backend, head.workId);
+  indexes.set(head.workId, { updatedAt: head.updatedAt, records, links });
+  return links;
+}
+
 /**
  * Works that share a PR or a work link change each other's events: a PR's state and issue keys and a link's target
  * come from all of them. Each group holding a changed work translates together.
  */
-function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>): string[][] {
+export function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>): string[][] {
   const parent = new Map<string, string>();
   const root = (node: string) => {
     let top = node;
@@ -1419,7 +1440,7 @@ function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>)
     // although its link lives on in the authority's commit rows. A truncated head therefore
     // derives its connectivity from its commit rows — the complete per-row link set every
     // rebuild refolds — instead of the head's reduced summary.
-    const links = head.truncated ? commitRowPullRequests(backend, head.workId) : head.pullRequests;
+    const links = head.truncated ? truncatedHeadPullRequests(backend, head) : head.pullRequests;
     for (const link of links) {
       join(head.workId, `pr:${pullRequestKey(link)}`);
       if (typeof link.url === "string") join(head.workId, `url:${link.url}`);
