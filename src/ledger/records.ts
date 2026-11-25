@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
-import { mergePullRequestLinks } from "./links.js";
+import { mergePullRequestLinks, pullRequestFoldAmbiguous } from "./links.js";
 import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
   COLLECTIONS,
@@ -179,11 +179,15 @@ export interface RecordBackend {
   clearDirty(workId: string): void;
   dirtyWorks(): string[];
   /** Whether the work carries the dirty marker (its head is stale or missing and the next
-   *  read repairs it); a cheap routing read, unlike `dirtyWorks`' full scan. */
-  hasDirty(workId: string): boolean;
+   *  read repairs it); a cheap routing read, unlike `dirtyWorks`' full scan. OPTIONAL: the
+   *  member was added after round 6, and backends written against round 6 do not have it —
+   *  internal callers go through backendHasDirty, which falls back to dirtyWorks(). */
+  hasDirty?(workId: string): boolean;
   /** The stored serialization's byte length of the work's saved head (0 when there is none):
-   *  the oversize gate for the inline fold, read WITHOUT parsing the head. */
-  headBodyBytes(workId: string): number;
+   *  the oversize gate for the inline fold, read WITHOUT parsing the head. OPTIONAL for the
+   *  same reason: backendHeadBodyBytes falls back to Buffer.byteLength(JSON.stringify(
+   *  getHead())) when the backend predates the member. */
+  headBodyBytes?(workId: string): number;
   getRow(workId: string, log: LogName, key: string): Row | undefined;
   /** A new key takes position `pos`; a later write of the same key replaces the body and keeps its position. */
   putRow(workId: string, log: LogName, key: string, body: Row, pos: number): void;
@@ -266,6 +270,23 @@ export interface RecordBackend {
 
 const backends = new Map<string, RecordBackend>();
 let factory: ((agentDir: string) => RecordBackend) | undefined;
+
+/** RecordBackend.hasDirty for internal callers: the member is optional (backends written
+ *  against round 6 do not have it), so a backend without it falls back to the full
+ *  dirtyWorks() scan — correct, only slower — instead of breaking at runtime. */
+function backendHasDirty(backend: RecordBackend, workId: string): boolean {
+  return backend.hasDirty?.(workId) ?? backend.dirtyWorks().includes(workId);
+}
+
+/** RecordBackend.headBodyBytes for internal callers: the member is optional, so a backend
+ *  without it falls back to reading and reserializing the head — the same stored body the
+ *  member would have measured, at the cost of the parse the member exists to avoid. */
+function backendHeadBodyBytes(backend: RecordBackend, workId: string): number {
+  const measured = backend.headBodyBytes?.(workId);
+  if (measured !== undefined) return measured;
+  const head = backend.getHead(workId);
+  return head ? Buffer.byteLength(JSON.stringify(head)) : 0;
+}
 
 /** Tests register the in-memory backend; production always resolves the SQLite one. */
 export function useBackendFactory(next: ((agentDir: string) => RecordBackend) | null): void {
@@ -698,8 +719,8 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
         // instead, and a work already marked dirty keeps its marker rather than folding onto
         // a stale head the next read must repair anyway.
         if (
-          backend.headBodyBytes(record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
-          backend.hasDirty(record.workId)
+          backendHeadBodyBytes(backend, record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+          backendHasDirty(backend, record.workId)
         ) {
           backend.markDirty(record.workId);
           return;
@@ -813,6 +834,12 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
   }
   for (const workId of touched) {
     const records = insertedByWork.get(workId);
+    // A duplicate-only batch inserted nothing for this head: there is no new row to fold,
+    // and nothing this batch did can have invalidated the head — the importer's own preflight
+    // repaired a missing one before the transaction — so the head is left exactly as it is.
+    // Marking it dirty anyway (the pre-fix behavior) forced every clean oversized head touched
+    // by a duplicate re-import into a full deferred rebuild (design-008).
+    if (!records?.length) continue;
     // A projection lost to a version bump, a bug or another process's head removal (the
     // round-5 probe removed it between the importer's preflight rebuild and this batch's
     // commit) is NOT rebuilt here: this whole-work fallback ran the complete authority merge
@@ -828,14 +855,14 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
     // inserted rows.
     if (
       backend.recordCount(workId) > 0 &&
-      (backend.hasDirty(workId) ||
-        backend.headBodyBytes(workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
-        (backend.headBodyBytes(workId) === 0 && preexisting.has(workId)))
+      (backendHasDirty(backend, workId) ||
+        backendHeadBodyBytes(backend, workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+        (backendHeadBodyBytes(backend, workId) === 0 && preexisting.has(workId)))
     ) {
       backend.markDirty(workId);
       continue;
     }
-    if (records?.length) foldWork(backend, workId, records);
+    foldWork(backend, workId, records);
   }
   return inserted;
 }
@@ -1014,7 +1041,7 @@ export function fingerprint(agentDir: string): string {
 export function readWorkHead(agentDir: string, workId: string): WorkHead | undefined {
   const backend = backendFor(agentDir);
   const head = backend.getHead(workId);
-  if (head && !backend.hasDirty(workId)) return head;
+  if (head && !backendHasDirty(backend, workId)) return head;
   if (backend.recordCount(workId) === 0) return head;
   rebuildWorkSliced(backend, agentDir, workId);
   return backend.getHead(workId);
@@ -1486,13 +1513,17 @@ function planCaptureFold(backend: RecordBackend, record: WorkRecord): PlannedCap
   // The oversize/dirty gate reads only the stored body's byte length and the dirty marker:
   // neither parses the head, so even a 30 MB head costs microseconds to route around.
   if (
-    backend.headBodyBytes(record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
-    backend.hasDirty(record.workId)
+    backendHeadBodyBytes(backend, record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+    backendHasDirty(backend, record.workId)
   )
     return { dirty: true, version };
   const saved = backend.getHead(record.workId);
   if (!saved && backend.recordCount(record.workId) > 0) return { dirty: true, version };
   const plan = planFold(backend, saved ?? emptyHead(record.workId), [record]);
+  // A fold that cannot order its PR observations the way the rebuild would never publishes:
+  // the work takes the dirty marker exactly as the oversize/dirty cases above, and the bounded
+  // rebuild owns the head derivation.
+  if (plan.ambiguous) return { dirty: true, version };
   return {
     dirty: false,
     version,
@@ -1516,16 +1547,22 @@ function replayPlannedRows(
  *  PR summary is maintained INCREMENTALLY — the touched commit rows' final links merge into
  *  the head's existing summary — so the fold never rescans every commit row of a large work
  *  (a capture on a 2,000 × 250-link work paid a 76 MB row rescan inside its transaction). The
- *  incremental merge equals the full rescan the rebuild performs: every commit row only ever
- *  accumulates links (an empty or failed lookup never removes one), so the union of the head's
- *  summary and the touched rows' merged links is the same merged set `commitPullRequests`
- *  derives from every row. The serialized publication body is computed here too, so the caller
- *  can keep the whole derivation outside the write lock. */
+ *  incremental merge equals the full rescan the rebuild performs for every pair the merge's
+ *  rank order can separate: every commit row only ever accumulates links (an empty or failed
+ *  lookup never removes one), so the union of the head's summary and the touched rows' merged
+ *  links is the same merged set `commitPullRequests` derives from every row. The one exception
+ *  is `ambiguous`: the head's summary and a touched row hold two observations of one alias the
+ *  rank order cannot separate (equal checkedAt, equal identity strength, differing content),
+ *  so the merged entry depends on the fold's grouping order — head first — where the rebuild
+ *  uses row order (correctness-013: capture published `merged`, rebuildWork `closed`, from the
+ *  same final rows). The fold never picks a winner inline; the caller marks the work dirty and
+ *  the bounded rebuild publishes the head. The serialized publication body is computed here too,
+ *  so the caller can keep the whole derivation outside the write lock. */
 function planFold(
   backend: RecordBackend,
   head: WorkHead,
   records: WorkRecord[],
-): { head: WorkHead; body: string; writes: PlannedRowWrite[] } {
+): { head: WorkHead; body: string; writes: PlannedRowWrite[]; ambiguous: boolean } {
   const merged: WorkHead = {
     ...head,
     logs: Object.fromEntries(Object.entries(head.logs).map(([name, log]) => [name, { ...log }])),
@@ -1545,24 +1582,36 @@ function planFold(
     ),
     records,
   );
-  if (commits.size)
-    merged.pullRequests = mergePullRequestLinks(
-      merged.pullRequests,
-      ...[...commits.values()].map((row) =>
-        Array.isArray(row.pullRequests) ? row.pullRequests.filter(object) : [],
-      ),
+  if (commits.size) {
+    const rowLinks = [...commits.values()].map((row) =>
+      Array.isArray(row.pullRequests) ? row.pullRequests.filter(object) : [],
     );
+    // The head's summary and the touched rows hold conflicting observations the rank order
+    // cannot separate: the merged entry would depend on this fold's grouping order, not the
+    // rebuild's row order. Report it instead of merging; the caller defers to the rebuild.
+    if (pullRequestFoldAmbiguous(merged.pullRequests, rowLinks))
+      return { head: merged, body: "", writes, ambiguous: true };
+    merged.pullRequests = mergePullRequestLinks(merged.pullRequests, ...rowLinks);
+  }
   const { head: publishable, body } = headForPublication({
     ...merged,
     updatedAt: new Date().toISOString(),
   });
-  return { head: publishable, body, writes };
+  return { head: publishable, body, writes, ambiguous: false };
 }
 
-/** Folds records into the saved head like the journal-era summary writer: only the rows they touch are read. */
+/** Folds records into the saved head like the journal-era summary writer: only the rows they touch are read.
+ *  A fold whose PR observations the merge cannot order the way the rebuild does (ambiguous)
+ *  publishes nothing: the work takes the dirty marker, and the bounded rebuild — the next
+ *  read's lazy repair or the pass's recovery — publishes the head from every row in one
+ *  deterministic order. */
 function foldWork(backend: RecordBackend, workId: string, records: WorkRecord[]): void {
   const head = backend.getHead(workId) ?? emptyHead(workId);
   const plan = planFold(backend, head, records);
+  if (plan.ambiguous) {
+    backend.markDirty(workId);
+    return;
+  }
   replayPlannedRows(backend, workId, plan.writes);
   // The publication is capped like every other head write: a capture folding onto an already
   // reduced head merges incrementally, and a body above the budget publishes reduced again
@@ -1981,8 +2030,12 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
   const hasDirtyStmt = db.query<{ one: number }, [string]>(
     "SELECT 1 AS one FROM work_dirty WHERE work_id = ?",
   );
+  // The stored body's BYTE length: SQLite's length() on TEXT counts CHARACTERS, so a head
+  // holding multibyte content measured smaller here than the memory backend's
+  // Buffer.byteLength and the two backends routed the same head to different sides of the
+  // inline fold gate (contracts-003). CAST to BLOB makes length() count UTF-8 bytes.
   const headBodyBytesStmt = db.query<{ bytes: number | null }, [string]>(
-    "SELECT length(body) AS bytes FROM work_projection_head WHERE work_id = ?",
+    "SELECT length(CAST(body AS BLOB)) AS bytes FROM work_projection_head WHERE work_id = ?",
   );
   const markDirty = db.query("INSERT OR IGNORE INTO work_dirty (work_id) VALUES (?)");
   const clearDirty = db.query("DELETE FROM work_dirty WHERE work_id = ?");

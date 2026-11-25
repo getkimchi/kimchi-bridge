@@ -296,7 +296,7 @@ it("a warm contended capture on an oversized head meets the 260 ms acceptance bo
   const body = JSON.stringify(bigHead);
   expect(Buffer.byteLength(body)).toBeGreaterThan(8 * 1024 * 1024);
   backend.putHead(bigHead as never, body);
-  expect(backend.headBodyBytes(WORK)).toBeGreaterThan(8 * 1024 * 1024);
+  expect(backend.headBodyBytes?.(WORK) ?? 0).toBeGreaterThan(8 * 1024 * 1024);
   const holder = await holdWriter(dir, 4000);
   let big: { elapsedMs?: number } | undefined;
   try {

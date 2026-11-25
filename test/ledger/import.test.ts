@@ -238,6 +238,58 @@ describe("import loop over the memory backend", () => {
     expect(records.map((record) => record.type).sort()).toEqual(["request", "work"]);
   });
 
+  it("a duplicate-only import leaves a clean oversized head alone instead of forcing a rebuild", async () => {
+    const dir = agentDir();
+    dirs.push(dir);
+    const backend = createMemoryRecords();
+    useBackendFactory(() => backend);
+    const folder = journal(dir);
+    const file = join(folder, "parent.jsonl");
+    writeFileSync(file, line(work()) + line(request("req-1")));
+    expect((await importJournals(dir)).imported).toBe(2);
+    // A saved head OVER the inline fold bound: the oversize gate's target. It is clean — no
+    // dirty marker — so only a batch that actually inserted a row for the work may defer it.
+    const filler = Array.from({ length: 5_000 }, (_, index) => ({
+      provider: "github",
+      host: "github.com",
+      id: `PR_filler_${index}`,
+      url: `https://github.com/example/repo/pull/${index}`,
+      number: index,
+      state: "open",
+      checkedAt: "2026-10-01T00:00:00.000Z",
+      pad: "x".repeat(900),
+    }));
+    const oversized = {
+      version: 2 as const,
+      workId: WORK,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      logs: {},
+      latest: {},
+      pullRequests: filler,
+    };
+    expect(backend.headBodyBytes?.(WORK) ?? 0).toBeGreaterThan(0);
+    backend.putHead(oversized);
+    expect(backend.headBodyBytes?.(WORK) ?? 0).toBeGreaterThan(4 * 1024 * 1024);
+    expect(backend.dirtyWorks()).toEqual([]);
+    // A replaced journal (new inode, same lines): the file mutated, so the whole file is
+    // re-imported — but every line hash already exists, so the batch inserts NOTHING.
+    rmSync(file);
+    writeFileSync(file, line(work()) + line(request("req-1")));
+    const result = await importJournals(dir);
+    expect(result.imported).toBe(0);
+    expect(result.skipped).toBe(2);
+    // The all-duplicate batch must not mark the oversized head dirty (design-008): a clean
+    // oversized head keeps its head and its projection until a batch with new rows — or a
+    // read, or the pass — actually owes it a rebuild.
+    expect(backend.dirtyWorks()).toEqual([]);
+    expect(backend.getHead(WORK)?.pullRequests).toHaveLength(filler.length);
+    // Positive control: the same oversized head with a batch that DOES insert a row still
+    // defers to the bounded rebuild instead of folding a multi-megabyte head inline.
+    appendFileSync(file, line(request("req-2")));
+    expect((await importJournals(dir)).imported).toBe(1);
+    expect(backend.dirtyWorks()).toEqual([WORK]);
+  });
+
   it("re-imports over unchanged journals insert nothing and skip the known rows", async () => {
     const dir = agentDir();
     dirs.push(dir);
