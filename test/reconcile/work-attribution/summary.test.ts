@@ -15,6 +15,7 @@ import {
   type WorkRecord,
   type WorkRecordProblem,
 } from "../../../src/reconcile/work-attribution/summary.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /**
  * Ported from Kimchi's src/extensions/work-attribution/summary.test.ts, keeping only the
@@ -59,7 +60,7 @@ const each = (
 
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "kimchi-work-summary-"));
+  dir = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-work-summary-")));
   setDefaultHostPorts(host);
 });
 afterEach(async () => {

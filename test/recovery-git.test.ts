@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { Recorder, repository, type Scope } from "../src/work/capture.ts";
+import { Recorder, repository, SSH_NEGATIVE_TTL_MS, type Scope } from "../src/work/capture.ts";
 import {
   git,
   issueKeys,
@@ -1293,6 +1293,80 @@ test("an SSH host alias names its provider through ssh's own config, as Kimchi r
     host: "github.com",
     name: "testOrg/widgets",
   });
+}, 30_000);
+
+// A hanging `ssh -G` must not stall every capture that resolves the alias: the first
+// lookup is bounded by the spawn timeout (tolerant of a loaded machine), and a failed
+// resolution is remembered for a short negative TTL instead of being retried on every
+// capture or cached forever.
+test("a failed SSH alias resolution backs off instead of stalling every capture", () => {
+  const { base, root } = fixture();
+  git(root, "init", "--initial-branch=main");
+  const bin = join(base, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "ssh"), "#!/bin/sh\nsleep 30\n", { mode: 0o700 });
+  const prior = process.env.PATH;
+  process.env.PATH = `${bin}:${prior}`;
+  cleanups.push(() => {
+    process.env.PATH = prior;
+  });
+  git(root, "remote", "add", "origin", "git@ssh-hang-alias:testOrg/widgets.git");
+  // The first resolution pays the bounded spawn wait (the load-tolerant 5 s ceiling); the
+  // unresolved alias stands in for the host, exactly as one unresolved lookup always has.
+  const firstStart = Date.now();
+  expect(repository(root)[2]).toMatchObject({ host: "ssh-hang-alias" });
+  const firstElapsed = Date.now() - firstStart;
+  expect(firstElapsed).toBeGreaterThanOrEqual(4000);
+  expect(firstElapsed).toBeLessThan(15_000);
+  // The repeated lookups inside the negative TTL do not spawn ssh again: they return in
+  // milliseconds instead of stalling the capture path for another bounded wait each.
+  for (let round = 0; round < 3; round++) {
+    const start = Date.now();
+    expect(repository(root)[2]).toMatchObject({ host: "ssh-hang-alias" });
+    expect(Date.now() - start).toBeLessThan(1000);
+  }
+}, 30_000);
+
+// The negative TTL's expiry is measured on the monotonic clock: a backward wall-clock move
+// (an NTP step) after a failed lookup must not turn the elapsed interval negative and hold
+// the backoff for the whole displacement plus its 60 s — a fixed SSH config is retried as
+// soon as the real TTL has elapsed, whatever the wall clock says.
+test("a backward wall-clock move cannot extend the SSH negative-TTL backoff", () => {
+  const { base, root } = fixture();
+  git(root, "init", "--initial-branch=main");
+  const bin = join(base, "bin");
+  mkdirSync(bin);
+  const ssh = join(bin, "ssh");
+  writeFileSync(ssh, "#!/bin/sh\nsleep 30\n", { mode: 0o700 });
+  const prior = process.env.PATH;
+  process.env.PATH = `${bin}:${prior}`;
+  cleanups.push(() => {
+    process.env.PATH = prior;
+  });
+  git(root, "remote", "add", "origin", "git@ssh-clock-alias:testOrg/widgets.git");
+  // The first lookup fails against the hanging ssh and arms the backoff.
+  expect(repository(root)[2]).toMatchObject({ host: "ssh-clock-alias" });
+  // The config is fixed: ssh -G now answers as OpenSSH prints it.
+  writeFileSync(ssh, '#!/bin/sh\nprintf "user git\nhostname github.com\nport 22\n"\n', {
+    mode: 0o700,
+  });
+  // An hour of backward wall-clock movement, with the real TTL already elapsed on the
+  // monotonic clock: the next lookup must retry the (fixed) config instead of holding the
+  // alias for the whole backward displacement.
+  const realDateNow = Date.now;
+  const realPerformanceNow = performance.now.bind(performance);
+  Date.now = () => realDateNow() - 3_600_000;
+  performance.now = () => realPerformanceNow() + SSH_NEGATIVE_TTL_MS + 1000;
+  try {
+    expect(repository(root)[2]).toMatchObject({
+      provider: "github",
+      host: "github.com",
+      name: "testOrg/widgets",
+    });
+  } finally {
+    Date.now = realDateNow;
+    performance.now = realPerformanceNow;
+  }
 }, 30_000);
 
 function withBridgeHome<T>(base: string, run: () => T): T {

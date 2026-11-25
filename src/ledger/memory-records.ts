@@ -1,4 +1,3 @@
-import type { LogName, Row, WorkHead } from "./row-log.js";
 import type {
   DeliveryAccountStatus,
   JournalCursor,
@@ -9,6 +8,7 @@ import type {
   RecordBackend,
   StoredRecord,
 } from "./records.js";
+import type { LogName, Row, WorkHead } from "./row-log.js";
 
 /** The in-memory RecordBackend used by vitest: identical semantics to the SQLite one, over plain Maps. The shared
  * conformance suite runs the same scenario against both, so this double cannot drift from production behavior. */
@@ -136,7 +136,11 @@ export function createMemoryRecords(): RecordBackend {
       markers.delete(recordHash);
     },
     markedRecords: () =>
-      [...markers].map(([recordHash, { workId, type }]) => ({ recordHash, workId, type })),
+      [...markers].map(([recordHash, { workId, type }]) => ({
+        recordHash,
+        workId,
+        type,
+      })),
     latestOutboxEvent: (accountKey, entityId) =>
       structuredClone(
         [...events.values()].findLast(
@@ -248,7 +252,12 @@ export function createMemoryRecords(): RecordBackend {
       const account = (accountKey: string) => {
         let status = accounts.get(accountKey);
         if (!status) {
-          status = { accountKey, sendable: false, hasBatch: false, firstBatchId: null };
+          status = {
+            accountKey,
+            sendable: false,
+            hasBatch: false,
+            firstBatchId: null,
+          };
           accounts.set(accountKey, status);
         }
         return status;
@@ -326,6 +335,11 @@ export function createMemoryRecords(): RecordBackend {
       dirty.delete(workId);
     },
     dirtyWorks: () => [...dirty],
+    hasDirty: (workId) => dirty.has(workId),
+    headBodyBytes: (workId) => {
+      const head = heads.get(workId);
+      return head ? Buffer.byteLength(JSON.stringify(head)) : 0;
+    },
     getRow: (workId, log, key) => workLogs(workId).get(log)?.get(key)?.body,
     putRow: (workId, log, key, body, pos) => {
       touch();
@@ -347,6 +361,23 @@ export function createMemoryRecords(): RecordBackend {
       touch();
       logs.delete(workId);
       heads.delete(workId);
+    },
+    clearProjectionHead: (workId) => {
+      touch();
+      heads.delete(workId);
+    },
+    deleteProjectionRows: (workId, limit) => {
+      touch();
+      const byLog = logs.get(workId);
+      if (!byLog) return 0;
+      let deleted = 0;
+      for (const byKey of byLog.values())
+        for (const key of [...byKey.keys()]) {
+          if (deleted >= limit) return deleted;
+          byKey.delete(key);
+          deleted++;
+        }
+      return deleted;
     },
     getHead: (workId) => heads.get(workId),
     putHead: (head) => {
@@ -395,6 +426,8 @@ export function createMemoryRecords(): RecordBackend {
     },
     recordCount: (workId) =>
       workId ? order.filter((row) => row.workId === workId).length : order.length,
+    recordBytes: (workId) =>
+      order.reduce((sum, row) => (row.workId === workId ? sum + row.body.length : sum), 0),
     hasProjectionOutput: (workId) => {
       const byLog = logs.get(workId);
       return (byLog?.get("plans")?.size ?? 0) > 0 || (byLog?.get("commits")?.size ?? 0) > 0;

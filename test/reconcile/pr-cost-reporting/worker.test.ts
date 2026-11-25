@@ -156,7 +156,7 @@ const { requestTagSelector } = await import(
   "../../../src/reconcile/work-attribution/billing-source.js"
 );
 const { reportJournalProblems } = await import("../../../src/ledger/import.js");
-const { backendFor, readRecords } = await import("../../../src/ledger/records.js");
+const { backendFor, capture, readRecords } = await import("../../../src/ledger/records.js");
 const { appendWorkRecord } = await import("../../../src/reconcile/work-attribution.js");
 const {
   HOLD_EXPIRY_MS,
@@ -182,8 +182,10 @@ const {
   reconcileReporting,
   resetReportingPassGates,
   serverLimit,
+  TranslationPreludeTimeoutError,
 } = await import("../../../src/reconcile/pr-cost-reporting/worker.js");
 import type { Batch } from "../../../src/ledger/protocol.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /** Bun's it.each types reject the vitest-style tables below (plain and object rows). */
 const each = (rows: readonly unknown[]): ((name: string, fn: (...args: any[]) => void) => void) =>
@@ -275,7 +277,7 @@ const workerHost: HostPorts = {
 // summary the test wrote, so a loaded machine can legitimately need more than the 5 s default
 // test timeout; 30 s keeps these hooks from reporting a timeout that is really contention.
 beforeEach(async () => {
-  directory = await mkdtemp(join(tmpdir(), "kimchi-reporting-http-"));
+  directory = pinAgentDir(await mkdtemp(join(tmpdir(), "kimchi-reporting-http-")));
   ssoAgentDir = undefined;
   credential = { token: "test-key", apiUrl: "https://api.example" };
   endpoint = "https://api.example";
@@ -1232,6 +1234,105 @@ describe("account-fenced reporting delivery", () => {
       });
     },
   );
+  it("still groups works whose shared PR a reduced head no longer carries", async () => {
+    // The round-6 correctness-p03 shape: two works share one PR, and one work's head is a
+    // REDUCED publication (the `truncated` marker) whose budget dropped exactly that shared
+    // link — the full set stays in the authority's commit rows. Grouping over the head's
+    // reduced pullRequests array would split the two works into separate translation groups;
+    // a truncated head must derive its connectivity from its commit rows instead, so the
+    // works still translate together as one group.
+    const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const at = "2026-10-04T12:00:00.000Z";
+    const link = (id: string, number: number) => ({
+      provider: "github",
+      host: "github.com",
+      id,
+      url: `https://github.com/example/repo/pull/${number}`,
+      number,
+      state: "open",
+      checkedAt: at,
+    });
+    const rows = [A, B].flatMap((workId, index) => [
+      {
+        version: 1,
+        type: "request",
+        workId,
+        sessionId: `session-${index}`,
+        requestId: `cccccccc-cccc-4ccc-8ccc-${String(index).padStart(12, "0")}`,
+        startedAt: at,
+        scope: { account: content.account, repository: `/repo-${index}/.git` },
+        recordedAt: at,
+      },
+      {
+        version: 1,
+        type: "commit",
+        workId,
+        sessionId: `session-${index}`,
+        repository: `/repo-${index}/.git`,
+        worktree: `/repo-${index}`,
+        sha: `${index.toString(16).repeat(40)}`,
+        recordedAt: at,
+        // Work A shares PR 101 with work B and carries its own PR 201; work B shares 101 and
+        // carries its own 202 — the shared link is the only thing joining the two works.
+        pullRequests: [
+          link("101", 101),
+          link(index === 0 ? "201" : "202", index === 0 ? 201 : 202),
+        ],
+      },
+    ]);
+    await mkdir(join(directory, "work-attribution"), { recursive: true });
+    await writeFile(
+      join(directory, "work-attribution", "source.jsonl"),
+      `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+    );
+    const run = () =>
+      reconcileReporting(directory, "/project", new AbortController().signal, () => {});
+    await run();
+    const backend = backendFor(directory);
+    expect(backend.getHead(A)?.pullRequests).toHaveLength(2);
+    expect(backend.getHead(B)?.pullRequests).toHaveLength(2);
+    // Reduce work A's head exactly as the publication budget would: the `truncated` marker,
+    // and the newest-links-that-fit policy drops the SHARED link while keeping A's own.
+    backend.putHead({
+      ...backend.getHead(A)!,
+      truncated: true,
+      pullRequests: backend.getHead(A)!.pullRequests.filter((pr) => pr.id !== "101"),
+    });
+    // Both works change again, so the next pass must re-translate them.
+    for (const [index, workId] of [A, B].entries())
+      capture(
+        directory,
+        {
+          version: 1,
+          type: "request",
+          workId,
+          sessionId: `session-${index}`,
+          requestId: `dddddddd-dddd-4ddd-8ddd-${String(index).padStart(12, "0")}`,
+          startedAt: at,
+          scope: { account: content.account, repository: `/repo-${index}/.git` },
+          recordedAt: at,
+        },
+        "summary-native",
+      );
+    buildEvents.mockClear();
+    await run();
+    // The two works translated as ONE group — one buildEvents call whose stored records span
+    // both works. Grouping over the reduced head's PR array instead splits them into two
+    // calls (the pre-fix code translated them separately on this exact shape).
+    const calls = buildEvents.mock.calls.filter(([stored]) =>
+      stored.some((row) => JSON.parse(row.body).workId === A || JSON.parse(row.body).workId === B),
+    );
+    expect(calls).toHaveLength(1);
+    const works = new Set(calls[0][0].map((row) => JSON.parse(row.body).workId));
+    expect(works).toContain(A);
+    expect(works).toContain(B);
+    // The reduced head itself is untouched by the grouping: A's own link stays, the shared
+    // one stays reduced away, and the authority keeps every commit row.
+    expect(backend.getHead(A)?.truncated).toBe(true);
+    expect(backend.getHead(A)?.pullRequests.map((pr) => pr.id)).toEqual(["201"]);
+    expect(backend.readLog(A, "commits")).toHaveLength(1);
+  });
   it("retains every same-repository post-merge candidate for common event construction", async () => {
     await seedLinked();
     const path = join(directory, "work-attribution", "source.jsonl");
@@ -2918,6 +3019,69 @@ describe("incremental translation", () => {
     );
     await run();
     expect(buildEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off a group whose translation prelude exceeds its time limit", async () => {
+    await seedLinked();
+    const backend = backendFor(directory);
+    buildEvents.mockRejectedValueOnce(
+      new TranslationPreludeTimeoutError("PR reporting translation time limit exceeded"),
+    );
+    const run = () =>
+      reconcileReporting(directory, "/project", new AbortController().signal, () => {});
+    await run();
+    expect(
+      Object.keys(JSON.parse(backend.getNote("agent", "translation-stalled") ?? "{}")),
+    ).toHaveLength(1);
+    expect(backend.getNote("agent", "translation-plan")).toBeUndefined();
+    expect(backend.getNote("agent", "translation-progress")).toBeUndefined();
+    expect(backend.markedRecords()).not.toEqual([]);
+    // The identical group does not pay for another prelude until its retry window expires.
+    await run();
+    expect(buildEvents).toHaveBeenCalledTimes(1);
+    expect((await readReportingState(directory)).error).toBe(
+      "Some PR cost events are waiting for complete original evidence or a repository identity",
+    );
+    const clock = spyOn(Date, "now");
+    try {
+      clock.mockReturnValue(Date.now() + 5 * 60_000 + 1_000);
+      await run();
+      expect(buildEvents).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not stall a group when its parent capture is cancelled", async () => {
+    await seedLinked();
+    const backend = backendFor(directory);
+    const controller = new AbortController();
+    buildEvents.mockImplementationOnce(() => {
+      controller.abort();
+      return Promise.reject(controller.signal.reason);
+    });
+    await reconcileReporting(directory, "/project", controller.signal, () => {});
+    expect(backend.getNote("agent", "translation-stalled")).toBeUndefined();
+    expect(backend.getNote("agent", "translation-plan")).toBeUndefined();
+    expect(backend.markedRecords()).not.toEqual([]);
+    expect((await readReportingState(directory)).error).toBeUndefined();
+  });
+
+  it("does not stall on an unrelated error with the prelude timeout message", async () => {
+    await seedLinked();
+    buildEvents.mockRejectedValueOnce(new Error("PR reporting translation time limit exceeded"));
+    await reconcileReporting(directory, "/project", new AbortController().signal, () => {});
+    expect(backendFor(directory).getNote("agent", "translation-stalled")).toBeUndefined();
+  });
+
+  it("does not stall on a reconciliation lease failure", async () => {
+    await seedLinked();
+    await expect(
+      reconcileReporting(directory, "/project", new AbortController().signal, () => {
+        throw new Error("lease lost");
+      }),
+    ).rejects.toThrow("lease lost");
+    expect(backendFor(directory).getNote("agent", "translation-stalled")).toBeUndefined();
   });
 
   it("a persistently unsettled group retries only after the stalled window passes", async () => {

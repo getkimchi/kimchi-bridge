@@ -10,7 +10,8 @@ import { isWorkId } from "../../ledger/work-id.js";
 import { hostPorts } from "../host-ports.js";
 import { isWorkAccount, type WorkAccount } from "../work-attribution/scope.js";
 import { object, SHA256_HEX } from "../work-attribution/summary.js";
-import { backendFor, diagnostic } from "../../ledger/records.js";
+import { assertLedgerWritable, backendFor, diagnostic } from "../../ledger/records.js";
+import { pinAgentDir } from "../../ledger/store.js";
 import { machineFingerprint } from "./machine.js";
 import {
   accountKey,
@@ -147,7 +148,9 @@ export interface ReportingState {
 }
 
 export function reportingDirectory(agentDir: string): string {
-  return join(agentDir, "pr-cost-reporting");
+  // Pinned: the reporting queue's state stays in the real tree the agentDir link pointed at
+  // when the process first used it, so a repointed link cannot split the queue mid-session.
+  return join(pinAgentDir(agentDir), "pr-cost-reporting");
 }
 
 export function reportingStatePath(agentDir: string): string {
@@ -222,14 +225,42 @@ export function snapshotMarkers(content: SnapshotContent): string[] {
   return [...markers].sort();
 }
 
+/** The user's PR-reporting consent, read live from the host port: "on"/"off" decide enabled
+ *  outright, "follow-telemetry" defers to telemetry consent, and a host without the port (or
+ *  an undefined answer) leaves the choice to state.json exactly as before. Never cached: a
+ *  mid-session change must be honored by the next consent read. */
+export function hostReportingConsent(): "on" | "off" | "follow-telemetry" | undefined {
+  return hostPorts().reportingConsent?.();
+}
+
+/** Applies the port's answer to a state's enabled/followsTelemetry mirror. The port wins over
+ *  state.json whenever the host owns the choice, so a pass suspended past its queue lock's stale
+ *  window cannot rename a stale consent value back into effect — the resumed rename only flips
+ *  the MIRROR state.json carries for old readers, and the next read re-derives the real answer
+ *  from the port (and the next pass that rewrites the file repairs the mirror). A host without
+ *  the port keeps the legacy semantics untouched: the callers' own followsTelemetry re-clamp
+ *  below still runs. */
+function applyHostConsent(state: ReportingState): void {
+  const consent = hostPorts().reportingConsent?.();
+  if (consent === "on" || consent === "off") {
+    state.enabled = consent === "on";
+    state.followsTelemetry = undefined;
+  } else if (consent === "follow-telemetry") {
+    state.followsTelemetry = true;
+    state.enabled = hostPorts().telemetryConsent();
+  }
+}
+
 function empty(): ReportingState {
-  return {
+  const state: ReportingState = {
     version: 1,
     enabled: hostPorts().telemetryConsent(),
     followsTelemetry: true,
     producerId: randomUUID(),
     entries: {},
   };
+  applyHostConsent(state);
+  return state;
 }
 
 export async function readReportingState(agentDir: string): Promise<ReportingState> {
@@ -295,7 +326,9 @@ export async function readReportingStateFresh(
     signature.size === cached.signature.size &&
     signature.ino === cached.signature.ino
   ) {
-    // Telemetry config lives outside state.json; re-derive the toggle on a cache hit.
+    // Consent is derived live on every cache hit: the port owns the choice when present, and
+    // telemetry config lives outside state.json either way.
+    applyHostConsent(cached.state);
     if (cached.state.followsTelemetry) cached.state.enabled = hostPorts().telemetryConsent();
     return { state: cached.state, signature: cached.signature };
   }
@@ -479,6 +512,7 @@ async function loadReportingState(
         ))
     )
       throw new Error("Invalid PR reporting state");
+    applyHostConsent(value);
     if (value.followsTelemetry) value.enabled = hostPorts().telemetryConsent();
     hostPorts().metric({
       kind: "queueDepth",
@@ -513,11 +547,31 @@ async function update(
       compromised = error;
     },
   });
+  // Fence-aware lock acquisition: the writer epoch observed while the lock is held. Only a new
+  // lease holder moves it, so every check below re-reads it and aborts this update when a
+  // handover happened after the lock was acquired — a writer that slept through its own lease
+  // loss (a SIGSTOP, a stalled process) then refuses to rename its stale state over its
+  // successor's instead of publishing it. No atomic fence exists for a file rename, so a
+  // suspension between this check and the rename syscall itself remains a residual window.
+  // The first epoch read happens inside the try: a backend that fails to open (a corrupted
+  // ledger.db) must still reach the finally below and release the queue lock it holds.
+  let epoch: number | undefined;
   const check = () => {
     if (compromised) throw compromised;
     assertCurrent();
+    // The ledger's write fence covers this queue's file commits too, including the paths that
+    // arrive without their own assertion (an error note after a failed capture), and the epoch
+    // re-read below covers updates that run outside any pass fence (a session-side explicit
+    // choice). The check runs while the queue lock is held, immediately before each durable
+    // rename, and calls the fence's writable hook (the parent-heartbeat check) when one is
+    // installed.
+    assertLedgerWritable(agentDir);
+    const backend = backendFor(agentDir);
+    if (epoch !== undefined && backend.writerEpoch && backend.writerEpoch() !== epoch)
+      throw new Error("PR reporting queue state was fenced by a newer lease holder");
   };
   try {
+    epoch = backendFor(agentDir).writerEpoch?.();
     const { state, text } = await loadReportingState(agentDir);
     const before = JSON.stringify(state);
     check();
@@ -1361,6 +1415,9 @@ export async function withReportingConsent(
       if (state.followsTelemetry && !hostPorts().telemetryConsent()) return;
       const consent = () => {
         check();
+        // The port is read live here too: a choice flipped to "off" while the action runs
+        // must stop it, not just the one read under the load the state came from.
+        if (hostReportingConsent() === "off") throw new Error("PR reporting is disabled");
         if (state.followsTelemetry && !hostPorts().telemetryConsent())
           throw new Error("PR reporting is disabled");
       };

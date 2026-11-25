@@ -62,6 +62,7 @@ export {
   readWorkCostReportAsync,
 } from "./work-attribution/cost-sync.js";
 export { reconcileReporting, deliverEvents, deliverSnapshots } from "./pr-cost-reporting/worker.js";
+export { buildEvents } from "./pr-cost-reporting/events.js";
 export { USAGE_SCHEMAS } from "./pr-cost-reporting/native.js";
 export {
   dueLimitNotices,
@@ -75,7 +76,13 @@ export {
   type ReportingState,
   type ServerLimit,
 } from "./pr-cost-reporting/queue.js";
+export { queueSnapshots } from "./pr-cost-reporting/queue.js";
+export {
+  calculatePullRequestCosts,
+  calculatePullRequestCostsAsync,
+} from "./work-attribution/costs.js";
 export type { ReportingRepository } from "./pr-cost-reporting/snapshot.js";
+export { accountKey, buildSnapshots } from "./pr-cost-reporting/snapshot.js";
 export {
   captureBillingSource,
   requestTagSelector,
@@ -88,6 +95,7 @@ export {
   workCostDetails,
 } from "./work-attribution/cost-details.js";
 export { decimalNanos, roundedUsd, time, usd } from "./work-attribution/costs.js";
+export { requestWorkLinks } from "./work-attribution/links.js";
 export { debugWorkAttribution } from "./work-attribution/diagnostics.js";
 export {
   knownTransitionRepositories,

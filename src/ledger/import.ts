@@ -1,6 +1,18 @@
-import { createHash, type Hash } from "node:crypto";
-import { closeSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { createHash, randomUUID, type Hash } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import {
   journalParser,
@@ -10,13 +22,19 @@ import {
   workJournals,
 } from "./work-record.js";
 import {
+  assertLedgerWritable,
   backendFor,
   diagnostic,
+  fsyncDirectoryDurable,
   type ImportEntry,
   importBatchInTx,
   type JournalCursor,
   type RecordBackend,
+  rebuildWorkSliced,
+  spoolDirectory,
 } from "./records.js";
+import { pinAgentDir, pinnedAgentDirIfPresent } from "./store.js";
+import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "./tx-budget.js";
 
 /** Immutable legacy import: authority, projection, coverage and cursor commit together. */
 export type JournalMode = "fresh" | "clean-append" | "mutation";
@@ -46,6 +64,8 @@ export interface ImportResult {
 }
 
 const EMPTY_HASH = createHash("sha256").digest("hex");
+/** O_NOFOLLOW where the platform has it, so a claimed spool file is never opened through a symlink. */
+const O_NOFOLLOW = (constants.O_NOFOLLOW ?? 0) as number;
 const COVERAGE_NOTES = "journal-coverage";
 const TAIL_NOTES = "journal-tail";
 const REVERIFY_NOTES = "journal-reverify";
@@ -217,6 +237,13 @@ const continued = new Map<
     boundaryHash: string;
     hash: Hash;
     lines: number;
+    /** Set when the preflight took this memo while the file grew mid-verification: the hash
+     *  covers bytes read BEFORE the growth was observed, and a same-length rewrite landing in
+     *  that window (between the final prefix readSync and the post-read fstatSync) would leave
+     *  it describing bytes the file no longer holds. No consumer may then trust the memo's
+     *  hash — the synchronous importer re-hashes the current prefix itself; the memo's identity,
+     *  stat and line count stay usable (the line count only ever rides a hash that verifies). */
+    grew?: boolean;
   }
 >();
 /** The journal each agent directory's last timed slice stopped at; the next slice starts there instead of rewalking. */
@@ -236,6 +263,7 @@ function rememberContinued(
     boundaryHash: string;
     hash: Hash;
     lines: number;
+    grew?: boolean;
   },
 ): void {
   continued.delete(path);
@@ -263,7 +291,9 @@ const rechecked = new Set<string>();
 /** Capture-only preflight: verify every old byte before the synchronous importer can reuse its running hash.
  * The whole-prefix re-read this function performs is the one an append always owes — but cooperatively,
  * yielding between pages, so it never holds the event loop. Memoized with the post-read stat, so an
- * unchanged file skips even this; a file that changed during the read invalidates the memo and re-runs. */
+ * unchanged file skips even this. Growth during the read cannot change the consumed prefix without
+ * leaving the memo growth-marked — the importer then re-hashes the prefix itself instead of trusting
+ * the memo's hash — and any other change invalidates the memo and re-runs. */
 async function verifyCapturePrefix(
   path: string,
   cursor: JournalCursor,
@@ -319,13 +349,14 @@ async function verifyCapturePrefix(
       await setImmediate();
     }
     const after = fstatSync(fd);
-    if (
-      after.dev !== before.dev ||
-      after.ino !== before.ino ||
-      after.size !== before.size ||
-      after.mtimeMs !== before.mtimeMs ||
-      after.ctimeMs !== before.ctimeMs
-    ) {
+    const unchanged =
+      after.dev === before.dev &&
+      after.ino === before.ino &&
+      after.size === before.size &&
+      after.mtimeMs === before.mtimeMs &&
+      after.ctimeMs === before.ctimeMs;
+    const grew = after.dev === before.dev && after.ino === before.ino && after.size > before.size;
+    if (!unchanged && !grew) {
       continued.delete(path);
       return;
     }
@@ -339,6 +370,11 @@ async function verifyCapturePrefix(
       boundaryHash: cursor.boundaryHash,
       hash: prefix,
       lines,
+      // Growth is the one acceptance that cannot prove the prefix bytes this hash covers are
+      // still the file's: the memo keeps its cooperative re-read skip (an unchanged stat still
+      // means nothing else wrote) but is marked so the synchronous importer re-hashes the
+      // current prefix instead of trusting this hash against the cursor's boundaryHash.
+      grew,
     });
   } finally {
     closeSync(fd);
@@ -388,10 +424,14 @@ function prepareJournal(
     let lineOffset = samePrefix ? known.lines : 0;
     // A settled file's memo is trustworthy for every caller (its times predate the cursor that
     // committed it); a fresh file's exact-stat memo only for capture, whose preflight read the
-    // bytes behind it. Strict readers keep their inline verification on fresh files — the
-    // budget-checked cancellation their preparation contract requires.
+    // bytes behind it. A growth-marked memo is trusted by neither: its hash covers bytes read
+    // before the growth was observed, so the importer re-hashes the current prefix itself —
+    // the check a rewrite between the final prefix readSync and the post-read fstatSync needs.
+    // Strict readers keep their inline verification on fresh files — the budget-checked
+    // cancellation their preparation contract requires.
     if (
       samePrefix &&
+      !known.grew &&
       (untouched(stat) ||
         (verifiedPrefix &&
           known.size === size &&
@@ -401,8 +441,11 @@ function prepareJournal(
       prefix = known.hash.copy();
     } else if (cursor && cursor.dev === dev && cursor.ino === ino && size >= cursor.offset) {
       // Only the capture path defers: it runs the cooperative preflight first, and its slice never
-      // pays the synchronous prefix re-read. Strict readers verify here, as they always did.
-      if (verifiedPrefix && cursor.offset > 0) return "pending" as const;
+      // pays the synchronous prefix re-read. A growth-marked memo is the exception — the preflight
+      // could not prove the prefix bytes it hashed are still the file's, so this slice re-hashes
+      // the consumed prefix synchronously (budget-checked) and only a later settled import skips.
+      if (verifiedPrefix && cursor.offset > 0 && !(samePrefix && known.grew))
+        return "pending" as const;
       let position = 0;
       while (position < cursor.offset) {
         checkBudget?.();
@@ -474,10 +517,14 @@ function prepareJournal(
 }
 
 function syncWorkJournals(agentDir: string): string[] {
+  // Pinned: the scan stays on the real tree the agentDir link pointed at when first used. A
+  // missing agent directory has no journals — the same read as the ENOENT handling below.
+  const pinned = pinnedAgentDirIfPresent(agentDir);
+  if (pinned === undefined) return [];
   const paths: string[] = [];
   for (const source of [
-    join(agentDir, "work-attribution"),
-    join(agentDir, "work-attribution", "transitions"),
+    join(pinned, "work-attribution"),
+    join(pinned, "work-attribution", "transitions"),
   ]) {
     try {
       for (const file of readdirSync(source, { withFileTypes: true }))
@@ -611,6 +658,8 @@ function importJournalFiles(
       cursor?.boundaryHash === reverify.boundaryHash;
     const parsed: WorkRecord[] = [];
     const entries: ImportEntry[] = [];
+    /** The absolute file offset each entry's line ends at, so a batch's cursor covers exactly its rows. */
+    const entryEnds: number[] = [];
     // A mutated prefix does not itself mark a healthy journal incomplete: every line is
     // re-imported from the start and earlier generations' records stay in the store. A journal
     // that already carried problems keeps them through a rewrite, because a rewrite can hide the
@@ -638,7 +687,7 @@ function importJournalFiles(
       if (line.text.trim()) tail = [];
       const before = parsed.length;
       parser(line.text, false);
-      if (parsed.length > before)
+      if (parsed.length > before) {
         entries.push({
           line: line.text,
           record: parsed[before],
@@ -646,6 +695,8 @@ function importJournalFiles(
           sourceGeneration: decision.generation,
           sourceOffset: decision.offset + line.start,
         });
+        entryEnds.push(decision.offset + line.end);
+      }
     }
     // Preserve a pending cut across batches; only a later nonblank line resolves it.
     parser("", true);
@@ -653,42 +704,76 @@ function importJournalFiles(
     const consumedEnd = decision.offset + consumed;
     const endReached = consumedEnd >= size;
     checkBudget?.();
-    prefix.update(data.subarray(0, consumed));
-    const hash = prefix.copy();
-    const boundaryHash = prefix.digest("hex");
     let imported = 0;
-    backend.tx(() => {
-      // A read from the start, or a continuing re-verification, that reached the end without a
-      // problem retires problems saved against older content; every other window keeps the
-      // clean marker fresh as before.
-      if (
-        !problems.length &&
-        savedProblems.length > 0 &&
-        endReached &&
-        (decision.offset === 0 || reverifying)
-      )
-        putProblems(backend, path, COVERAGE_NOTES, []);
-      else saveCoverage(backend, path, problems);
-      putProblems(backend, path, TAIL_NOTES, tail);
-      // Progress of the from-start re-verification persists across windows and passes. Damage
-      // found along the way ends it: the note then describes the current file again.
-      if (savedProblems.length > 0 && (recheck || reverifying)) {
-        if (!endReached && !problems.length) saveReverify(backend, path, consumedEnd, boundaryHash);
-        else clearReverify(backend, path);
-      } else if (reverify !== undefined && !recheck && !reverifying) clearReverify(backend, path);
-      if (entries.length) {
-        imported = importBatchInTx(backend, entries);
+    // Adaptive batch commits (bounded transactions): the window's entries commit in batches sized
+    // from the measured transaction duration, AIMD from the historic whole-window commit. The
+    // atomic unit stays "a cursor with its rows": every batch commits exactly the entries it
+    // holds plus a cursor covering exactly those bytes, so a kill between batches resumes at the
+    // cursor and re-imports nothing (line-hash dedup) and loses nothing. The window's notes
+    // (coverage, tail) commit with the FIRST batch — they describe the whole window this pass
+    // parsed — and the last batch's cursor and boundary equal the single-transaction values.
+    const sizer = importBatchSizerFor(agentDir);
+    const windowHash = prefix.copy();
+    let folded = 0;
+    for (let first = 0; ; ) {
+      const limit = sizer.size();
+      const last = Math.min(entries.length, first + limit);
+      const batch = entries.slice(first, last);
+      const batchEnd = last === entries.length ? consumedEnd : entryEnds[last - 1];
+      windowHash.update(data.subarray(folded, batchEnd - decision.offset));
+      folded = batchEnd - decision.offset;
+      const boundary = windowHash.copy().digest("hex");
+      // A batch whose work lost its head (a version bump, a crash mid-rebuild) is rebuilt in
+      // bounded slices BEFORE the batch transaction, so the batch itself stays small; the
+      // in-transaction check below remains as the fallback for the rare case where another
+      // process's rebuild cleared the head between this and the commit.
+      for (const workId of new Set(batch.map((entry) => entry.record.workId))) {
+        if (!backend.getHead(workId) && backend.recordCount(workId) > 0)
+          rebuildWorkSliced(backend, agentDir, workId);
       }
-      backend.putJournalCursor({
-        path,
-        dev,
-        ino,
-        generation: decision.generation,
-        offset: consumedEnd,
-        boundaryHash,
-        updatedAt: Date.now(),
+      backend.tx(() => {
+        if (first === 0) {
+          // A read from the start, or a continuing re-verification, that reached the end without a
+          // problem retires problems saved against older content; every other window keeps the
+          // clean marker fresh as before.
+          if (
+            !problems.length &&
+            savedProblems.length > 0 &&
+            endReached &&
+            (decision.offset === 0 || reverifying)
+          )
+            putProblems(backend, path, COVERAGE_NOTES, []);
+          else saveCoverage(backend, path, problems);
+          putProblems(backend, path, TAIL_NOTES, tail);
+        }
+        // Progress of the from-start re-verification persists across windows and passes, now at
+        // each committed batch boundary. Damage found along the way ends it: the note then
+        // describes the current file again.
+        if (savedProblems.length > 0 && (recheck || reverifying)) {
+          if (!endReached && !problems.length) saveReverify(backend, path, batchEnd, boundary);
+          else clearReverify(backend, path);
+        } else if (first === 0 && reverify !== undefined && !recheck && !reverifying)
+          clearReverify(backend, path);
+        if (batch.length) {
+          imported += importBatchInTx(backend, batch);
+        }
+        backend.putJournalCursor({
+          path,
+          dev,
+          ino,
+          generation: decision.generation,
+          offset: batchEnd,
+          boundaryHash: boundary,
+          updatedAt: Date.now(),
+        });
       });
-    });
+      const measured = backend.txDurations?.().lastMs;
+      if (measured !== undefined) sizer.observe(measured);
+      if (last === entries.length) break;
+      first = last;
+    }
+    const hash = windowHash.copy();
+    const boundaryHash = windowHash.copy().digest("hex");
     // The memo survives a completed append now: the running hash, line count and stat identity
     // let the next append's preflight (and any later stat-identical window) skip the re-read.
     rememberContinued(path, {
@@ -805,6 +890,18 @@ interface ImportOptions {
 /** How long one import slice may hold the event loop before yielding. */
 export const IMPORT_SLICE_MS = 50;
 
+/** Import batch sizing per agent directory: AIMD on measured transaction durations, starting at
+ * a bounded cold-start size (the first window after a process restart is already split) and
+ * growing toward the historic whole-window commit as its ceiling. */
+const importBatchSizers = new Map<string, TxChunkSizer>();
+const IMPORT_BATCH_START = 512;
+const IMPORT_BATCH_MAX = 100_000;
+function importBatchSizerFor(agentDir: string): TxChunkSizer {
+  return rememberSizer(importBatchSizers, agentDir, () =>
+    createTxChunkSizer(IMPORT_BATCH_START, 1, IMPORT_BATCH_MAX),
+  );
+}
+
 export async function importJournals(
   agentDir: string,
   options: ImportOptions = {},
@@ -863,6 +960,146 @@ export async function importJournals(
 export function importJournalSlice(agentDir: string, checkBudget?: () => void): boolean {
   const options = { checkBudget, until: Date.now() + IMPORT_SLICE_MS };
   return importJournalFiles(agentDir, syncWorkJournals(agentDir), options, true).pending === true;
+}
+
+/** The capture spool's session files, rotation leftovers included. */
+export function spoolFiles(agentDir: string): string[] {
+  const directory = spoolDirectory(agentDir);
+  const paths: string[] = [];
+  try {
+    for (const file of readdirSync(directory, { withFileTypes: true }))
+      if (file.isFile() && file.name.endsWith(".jsonl")) paths.push(join(directory, file.name));
+  } catch (error) {
+    if (!object(error) || error.code !== "ENOENT") throw error;
+  }
+  return paths;
+}
+
+/** Where spool files with lines this reader could not parse (corrupt bytes, or a record type a
+ * newer release wrote) are moved instead of deleted: the bytes stay on disk, recoverable by a
+ * newer release or a manual repair, and the diagnostics table counts each quarantine. */
+export function spoolQuarantineDirectory(agentDir: string): string {
+  return join(spoolDirectory(agentDir), "quarantine");
+}
+
+/** Deletes a spool file whose committed cursor reached its end — but only after claiming it by
+ * an atomic rename to a unique name and verifying the claimed file's identity (dev and inode),
+ * and that it has not grown past the committed cursor, against the stat the cursor validation
+ * used. Two importers can validate the same old file; the first renames it away, and a capture
+ * can create a same-length replacement at the original path before the second renames. The
+ * second importer's rename then claims the replacement, and the identity check fails: the claim
+ * is left in the spool directory (still scanned and imported as its own file), never deleted. A
+ * capture that appended through a still-open descriptor after the validation lands in the
+ * claim's growth, and the size check keeps that claim too. The claim itself is re-validated
+ * through an O_NOFOLLOW descriptor immediately before any deletion: an inode that is not this
+ * user's private single-link regular file — a hardlink added after the pre-claim check, whose
+ * raw record stays reachable at the external name — is never unlinked or quarantined, only
+ * reported and left in place as a scannable spool file (line-hash dedup keeps its re-imports
+ * exactly-once). A residual window remains where a link is added between that fstat and the
+ * unlink itself; it cannot lose data for the same reason — the claim's bytes stay on disk at
+ * every name that holds them. A file whose cursor covers the whole file but whose saved
+ * problems are non-empty (a corrupt or unknown-type line, never a pending incomplete tail)
+ * moves to quarantine instead of being unlinked. */
+function retireImportedSpool(agentDir: string, files: string[], checkBudget?: () => void): void {
+  const backend = backendFor(agentDir);
+  for (const path of files) {
+    checkBudget?.();
+    try {
+      const cursor = backend.getJournalCursor(path);
+      if (!cursor) continue;
+      const stat = statSync(path);
+      if (cursor.offset !== stat.size || cursor.dev !== stat.dev || cursor.ino !== stat.ino)
+        continue;
+      // The inode must be this user's private, single-link regular file before it may be
+      // unlinked. A hardlink planted at the spool path matches dev/ino while its raw record
+      // stays reachable at the external name, so retirement refuses (the file stays a scannable
+      // spool file; re-imports are deduped) and reports the unsafe inode instead of deleting it.
+      const uid = process.getuid?.();
+      const link = lstatSync(path);
+      if (!link.isFile() || link.nlink !== 1 || (uid !== undefined && link.uid !== uid)) {
+        diagnostic(agentDir, "spool-unsafe-inode");
+        continue;
+      }
+      // The epoch/writable fence covers this destructive file step, like every pass write.
+      assertLedgerWritable(agentDir);
+      const claim = join(dirname(path), `claim-${randomUUID()}-${basename(path)}`);
+      renameSync(path, claim);
+      // The claim is inspected through a non-following descriptor immediately before anything is
+      // deleted: a hardlink added after the pre-claim check above leaves the claim reachable at
+      // the unscanned external name, so retiring it would report the spool drained while the
+      // raw record survives there.
+      let fd: number;
+      try {
+        fd = openSync(claim, constants.O_RDONLY | O_NOFOLLOW);
+      } catch {
+        // The claim stays in the spool directory; the next pass imports it as its own file
+        // (line-hash dedup keeps it exactly-once) and retries the retirement.
+        continue;
+      }
+      try {
+        const claimed = fstatSync(fd);
+        if (
+          claimed.dev !== stat.dev ||
+          claimed.ino !== stat.ino ||
+          // A capture appended through its still-open descriptor after the validation above: the
+          // claim now holds a line no importer has committed, so it is never unlinked. It stays a
+          // scannable spool file and the next pass imports it as its own file (line-hash dedup
+          // keeps the re-scanned lines exactly-once), retiring it once its own cursor reaches its
+          // end.
+          claimed.size !== cursor.offset
+        ) {
+          // A replacement a capture created after this validation, or a growth inside the claim:
+          // leave the claim in the spool directory; the next pass imports it as its own file
+          // (line-hash dedup keeps it exactly-once) and retires it when its own cursor reaches its
+          // end.
+          continue;
+        }
+        if (
+          !claimed.isFile() ||
+          claimed.nlink !== 1 ||
+          (uid !== undefined && claimed.uid !== uid)
+        ) {
+          // A hardlink planted after the pre-claim check (or a foreign owner): never unlink.
+          // Removing the claim's directory entry cannot remove the external name's copy
+          // anyway, and keeping the claim leaves the bytes in a scannable spool file while the
+          // diagnostic reports the unsafe inode.
+          diagnostic(agentDir, "spool-unsafe-inode");
+          continue;
+        }
+      } finally {
+        closeSync(fd);
+      }
+      const problems =
+        coverageProblems(backend, path).length + coverageProblems(backend, path, TAIL_NOTES).length;
+      backend.tx(() => backend.deleteJournalCursor(path));
+      if (problems === 0) {
+        unlinkSync(claim);
+      } else {
+        const quarantine = spoolQuarantineDirectory(agentDir);
+        mkdirSync(quarantine, { recursive: true, mode: 0o700 });
+        const kept = join(quarantine, `${randomUUID()}-${basename(path)}`);
+        renameSync(claim, kept);
+        fsyncDirectoryDurable(quarantine);
+        diagnostic(agentDir, "spool-quarantined");
+      }
+      fsyncDirectoryDurable(dirname(path));
+    } catch {
+      // A failed rename or unlink (an open handle, permissions) retries next pass; a re-import
+      // is deduped, so nothing is lost or duplicated either way.
+    }
+  }
+}
+
+/** The reconciliation files channel's spool step: imports every spool file through the cursor
+ * importer (line-hash dedup makes each record exactly-once, against native capture too), then
+ * retires the files whose every line was committed — deleted only when clean, quarantined when
+ * any line this reader could not parse, and left in place while an incomplete tail remains. */
+export function importSpool(agentDir: string, checkBudget?: () => void): ImportResult {
+  checkBudget?.();
+  const files = spoolFiles(agentDir);
+  const result = importJournalFiles(agentDir, files, { checkBudget }, true);
+  retireImportedSpool(agentDir, files, checkBudget);
+  return result;
 }
 
 /**

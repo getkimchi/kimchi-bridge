@@ -47,7 +47,7 @@ import {
   readAttributedFileStates,
   reconcileFileTransitions,
   reconcileRepositoryTransitions,
-  RECONCILIATION_BUDGET_MS,
+  reconciliationBudgetMs,
   reflog,
   referenceTips,
   repositoryFile,
@@ -61,6 +61,7 @@ import {
   readWorkRecords,
   type WorkRecord,
 } from "../../../src/reconcile/work-attribution/summary.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /**
  * Ported from Kimchi's src/extensions/work-attribution/file-transitions.test.ts. The
@@ -123,6 +124,13 @@ const realExecFile = childProcess.execFile;
 
 let root: string;
 let repo: string;
+// Load tolerance lives at this boundary, not in production: the direct-call budget and the
+// per-command git timeout widen to the values the loaded-runner fix (59b154e) needed, while
+// the production constants stay at the pre-B4 3 s / 2 s the plan's unchanged-budget constraint
+// and K1 inline equivalence require. Read at call time, so setting them here (before any test
+// runs) covers every reconcile below.
+process.env.KIMCHI_FILE_TRANSITIONS_TEST_BUDGET_MS = "10000";
+process.env.KIMCHI_FILE_TRANSITIONS_TEST_GIT_TIMEOUT_MS = "5000";
 const host: HostPorts = {
   get agentDir() {
     return join(root, "agent");
@@ -414,7 +422,7 @@ function baseline() {
 }
 beforeEach(() => {
   useBackendFactory(() => createMemoryRecords());
-  root = mkdtempSync(join(tmpdir(), "kimchi-file-work-"));
+  root = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-file-work-")));
   repo = join(root, "repo");
   mkdirSync(repo);
   setDefaultHostPorts(host);
@@ -650,7 +658,7 @@ describe("manual commit reconciliation", () => {
     vi.spyOn(Date, "now").mockImplementation(() => clock);
     // One command costs a twelfth of the budget, as before the budget grew: a bounded launch
     // still stops after the same number of commands and later launches finish the rest.
-    const perCommand = RECONCILIATION_BUDGET_MS / 12;
+    const perCommand = reconciliationBudgetMs() / 12;
     vi.spyOn(childProcess, "execFile").mockImplementation(((
       ...args: Parameters<typeof realExecFile>
     ) => {
@@ -1013,7 +1021,7 @@ describe("manual commit reconciliation", () => {
       vi.spyOn(Date, "now").mockImplementation(() => clock);
       // One command costs a twelfth of the budget, as before the budget grew: a bounded launch
       // still stops after the same number of commands and later launches finish the rest.
-      const perCommand = RECONCILIATION_BUDGET_MS / 12;
+      const perCommand = reconciliationBudgetMs() / 12;
       vi.spyOn(childProcess, "execFile").mockImplementation(((
         ...args: Parameters<typeof realExecFile>
       ) => {
@@ -1045,7 +1053,7 @@ describe("manual commit reconciliation", () => {
     ) => {
       const command = args[1];
       if (Array.isArray(command) && command.includes("ls-tree") && command.includes("second.txt"))
-        clock += RECONCILIATION_BUDGET_MS + 1000;
+        clock += reconciliationBudgetMs() + 1000;
       return realExecFile(...args);
     }) as typeof realExecFile);
     vi.spyOn(console, "warn").mockImplementation(() => {});

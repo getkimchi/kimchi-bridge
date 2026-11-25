@@ -36,6 +36,10 @@ it("exports the public ledger API through the package barrel", () => {
     "importJournals",
     "importJournalSlice",
     "importSessionJournal",
+    "importSpool",
+    "spoolFiles",
+    "spoolDirectory",
+    "spoolFilePath",
     "workJournals",
     // outbox delivery
     "readOutboxStatus",
@@ -50,6 +54,21 @@ it("exports the public ledger API through the package barrel", () => {
     "ledgerDbPath",
     "LedgerUnavailableError",
     "LedgerSchemaError",
+    "LedgerFencedError",
+    "acquireWriterEpoch",
+    "readWriterEpoch",
+    "withLedgerWriteFence",
+    "currentLedgerWriteFence",
+    "assertLedgerWritable",
+    "ledgerTxDurations",
+    "resetLedgerTxDurations",
+    "txDurations",
+    "resetTxDurations",
+    "useTxClock",
+    "TX_DURATION_EDGES",
+    "TX_TARGET_MS",
+    "TX_CEILING_MS",
+    "createTxChunkSizer",
     "classifyUserVersion",
     "retryOnBusy",
     "createMemoryRecords",
@@ -74,8 +93,6 @@ it("resolves the package specifier to the source barrel it exports", () => {
 });
 
 it("typechecks a consumer importing through the package specifier", () => {
-  const dbPath: string = ledger.ledgerDbPath(
-    join(tmpdir(), "kimchi-bridge-ledger-export-consumer"),
-  );
+  const dbPath: string = ledger.ledgerDbPath(tmpdir());
   expect(dbPath.endsWith("ledger.db")).toBe(true);
 });
