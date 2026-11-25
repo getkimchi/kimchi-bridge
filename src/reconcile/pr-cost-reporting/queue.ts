@@ -222,14 +222,42 @@ export function snapshotMarkers(content: SnapshotContent): string[] {
   return [...markers].sort();
 }
 
+/** The user's PR-reporting consent, read live from the host port: "on"/"off" decide enabled
+ *  outright, "follow-telemetry" defers to telemetry consent, and a host without the port (or
+ *  an undefined answer) leaves the choice to state.json exactly as before. Never cached: a
+ *  mid-session change must be honored by the next consent read. */
+export function hostReportingConsent(): "on" | "off" | "follow-telemetry" | undefined {
+  return hostPorts().reportingConsent?.();
+}
+
+/** Applies the port's answer to a state's enabled/followsTelemetry mirror. The port wins over
+ *  state.json whenever the host owns the choice, so a pass suspended past its queue lock's stale
+ *  window cannot rename a stale consent value back into effect — the resumed rename only flips
+ *  the MIRROR state.json carries for old readers, and the next read re-derives the real answer
+ *  from the port (and the next pass that rewrites the file repairs the mirror). A host without
+ *  the port keeps the legacy semantics untouched: the callers' own followsTelemetry re-clamp
+ *  below still runs. */
+function applyHostConsent(state: ReportingState): void {
+  const consent = hostPorts().reportingConsent?.();
+  if (consent === "on" || consent === "off") {
+    state.enabled = consent === "on";
+    state.followsTelemetry = undefined;
+  } else if (consent === "follow-telemetry") {
+    state.followsTelemetry = true;
+    state.enabled = hostPorts().telemetryConsent();
+  }
+}
+
 function empty(): ReportingState {
-  return {
+  const state: ReportingState = {
     version: 1,
     enabled: hostPorts().telemetryConsent(),
     followsTelemetry: true,
     producerId: randomUUID(),
     entries: {},
   };
+  applyHostConsent(state);
+  return state;
 }
 
 export async function readReportingState(agentDir: string): Promise<ReportingState> {
@@ -295,7 +323,9 @@ export async function readReportingStateFresh(
     signature.size === cached.signature.size &&
     signature.ino === cached.signature.ino
   ) {
-    // Telemetry config lives outside state.json; re-derive the toggle on a cache hit.
+    // Consent is derived live on every cache hit: the port owns the choice when present, and
+    // telemetry config lives outside state.json either way.
+    applyHostConsent(cached.state);
     if (cached.state.followsTelemetry) cached.state.enabled = hostPorts().telemetryConsent();
     return { state: cached.state, signature: cached.signature };
   }
@@ -479,6 +509,7 @@ async function loadReportingState(
         ))
     )
       throw new Error("Invalid PR reporting state");
+    applyHostConsent(value);
     if (value.followsTelemetry) value.enabled = hostPorts().telemetryConsent();
     hostPorts().metric({
       kind: "queueDepth",
@@ -1381,6 +1412,9 @@ export async function withReportingConsent(
       if (state.followsTelemetry && !hostPorts().telemetryConsent()) return;
       const consent = () => {
         check();
+        // The port is read live here too: a choice flipped to "off" while the action runs
+        // must stop it, not just the one read under the load the state came from.
+        if (hostReportingConsent() === "off") throw new Error("PR reporting is disabled");
         if (state.followsTelemetry && !hostPorts().telemetryConsent())
           throw new Error("PR reporting is disabled");
       };

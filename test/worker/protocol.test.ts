@@ -9,6 +9,7 @@ import {
   parseHostEndpoints,
   parseParentLine,
   parsePolicyReply,
+  parseReportingConsentReply,
   parseWorkerLine,
   PROTOCOL_VERSION,
   redactTokens,
@@ -93,6 +94,7 @@ function workerMessages(): WorkerMessage[] {
     { type: "request", rid: 1, kind: "credentials", cwd: "/project" },
     { type: "request", rid: 2, kind: "policy" },
     { type: "request", rid: 3, kind: "consent" },
+    { type: "request", rid: 6, kind: "reportingConsent" },
     { type: "request", rid: 4, kind: "endpoints", cwd: "/project" },
     { type: "request", rid: 5, kind: "gitToken", host: "github.com" },
     { type: "metric", metric: { kind: "reconciliation" } },
@@ -268,6 +270,17 @@ describe("reply payload validation", () => {
     expect(parseConsentReply({ consent: false }).ok).toBe(true);
     expect(parseConsentReply({ consent: "no" }).ok).toBe(false);
     expect(parseConsentReply({}).ok).toBe(false);
+    // The PR-reporting consent reply round-trips like the consent reply: an explicit choice
+    // (on/off/follow-telemetry) or an empty object when the host does not govern the choice.
+    expect(parseReportingConsentReply({ reportingConsent: "off" })).toEqual({
+      ok: true,
+      value: { reportingConsent: "off" },
+    });
+    expect(parseReportingConsentReply({ reportingConsent: "follow-telemetry" }).ok).toBe(true);
+    expect(parseReportingConsentReply({}).ok).toBe(true);
+    expect(parseReportingConsentReply({ reportingConsent: "maybe" }).ok).toBe(false);
+    expect(parseReportingConsentReply({ reportingConsent: 1 }).ok).toBe(false);
+    expect(parseReportingConsentReply({ consent: true }).ok).toBe(false);
     // The saved git host token, or no token at all when none is saved.
     expect(parseGitTokenReply({ token: "ghp_saved" })).toEqual({
       ok: true,

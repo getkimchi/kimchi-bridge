@@ -317,6 +317,7 @@ function main(): void {
       endpoints: (cwd: string) => guarded(() => base.endpoints(cwd)),
       orgPolicy: () => guarded(() => base.orgPolicy()),
       telemetryConsent: () => guarded(() => base.telemetryConsent()),
+      reportingConsent: () => guarded(() => base.reportingConsent()),
     };
   };
 

@@ -32,7 +32,13 @@ export const PROTOCOL_VERSION = 1;
 export const HEARTBEAT_TIMEOUT_MS = 2000;
 
 /** The host services the worker cannot resolve itself and must ask the parent for. */
-export type HostRequestKind = "credentials" | "endpoints" | "policy" | "consent" | "gitToken";
+export type HostRequestKind =
+  | "credentials"
+  | "endpoints"
+  | "policy"
+  | "consent"
+  | "reportingConsent"
+  | "gitToken";
 
 /** The channels one pass runs; the supervisor's channel set, on the wire. */
 export interface PassChannels {
@@ -542,6 +548,7 @@ function parseWorkerValue(value: unknown): Parsed<WorkerMessage> {
               "endpoints",
               "policy",
               "consent",
+              "reportingConsent",
               "gitToken",
             ] as const)
           : undefined;
@@ -747,6 +754,29 @@ export function parseConsentReply(value: unknown): Parsed<ConsentReply> {
   const consent = fieldBoolean(object.value, "consent");
   if (!consent.ok) return consent;
   return accept({ consent: consent.value });
+}
+
+/** The PR-reporting consent reply: the host's explicit choice for the reporting queue, or
+ *  nothing at all when the host leaves the choice to the queue's legacy state.json semantics
+ *  (an older embedding release, or a user choice the host does not govern). Like the consent
+ *  reply, this is read live at every consent site — never cached — and an answer this reader
+ *  cannot validate is an error, never a guessed value. */
+export interface ReportingConsentReply {
+  reportingConsent?: "on" | "off" | "follow-telemetry";
+}
+
+export function parseReportingConsentReply(value: unknown): Parsed<ReportingConsentReply> {
+  const object = asObject(value, "reportingConsent reply");
+  if (!object.ok) return object;
+  const shape = exactKeys(object.value, [], ["reportingConsent"]);
+  if (!shape.ok) return shape;
+  const consent = optionalFieldString(object.value, "reportingConsent");
+  if (!consent.ok) return consent;
+  if (consent.value === undefined) return accept({});
+  const choice = oneOf(consent.value, ["on", "off", "follow-telemetry"] as const);
+  if (choice === undefined)
+    return reject("reportingConsent reply is not one of on|off|follow-telemetry");
+  return accept({ reportingConsent: choice });
 }
 
 /** The gitToken reply: the saved Git host token, or no token at all when none is saved. */

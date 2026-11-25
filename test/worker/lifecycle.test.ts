@@ -77,6 +77,8 @@ const REPLIES: Record<HostRequestKind, unknown> = {
   },
   policy: { resources: { "extensions.cost-per-pr": true } },
   consent: { consent: false },
+  // No host-governed PR-reporting choice: the queue keeps its legacy state.json semantics.
+  reportingConsent: {},
 };
 
 interface WorkerHandle {
