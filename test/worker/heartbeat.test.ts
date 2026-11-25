@@ -377,32 +377,30 @@ it("a post-wake deschedule across the fence window never reads the silence as fr
   // descheduled right after the old lazy re-sync woke up, the estimated cross-thread offset
   // absorbed the whole pause, and a stale heartbeat read as fresh — the probe reported
   // refused:false at an age of 0.046 ms after 5,861 ms of silence. The anchored fence never
-  // converts between the two threads' clocks: the construction hook below stretches the
-  // transport's construction past the fence window while the parent keeps heartbeating; the
-  // parent's final heartbeat (sent once the child reports "drain") is the last arrival, and
-  // the child's wait then spans the window on the main thread's own clock. The check after
-  // it must refuse with the age covering the whole silence since that arrival.
+  // converts between the two threads' clocks: the helper-start hook below delays the reader
+  // thread's first action past the old design's handshake bound while the parent keeps
+  // heartbeating; the parent then goes silent, and the child's wait spans the window on the
+  // main thread's own clock. The check after it must refuse with the age covering the whole
+  // silence since the last arrival.
   const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "post-wake"], {
     cwd: ROOT,
     env: {
       ...process.env,
-      KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS: "600",
+      KIMCHI_WORKER_TEST_HELPER_START_DELAY_MS: "600",
       HEARTBEAT_WINDOW_MS: "500",
-      HEARTBEAT_WAIT_MS: "2200",
+      HEARTBEAT_WAIT_MS: "2000",
     },
     stdio: ["pipe", "ignore", "pipe"],
   });
   const lines: string[] = [];
   createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
-  const saw = (phase: string) => lines.some((line) => line.includes(`"phase":"${phase}"`));
-  // The parent heartbeats every 100 ms until the child reports the drain marker, then
-  // sends exactly one final heartbeat and goes silent for the rest of the run.
-  for (let round = 0; round < 100 && !saw("drain"); round++) {
+  // The parent heartbeats every 100 ms for the first ~1.2 s of the run — past the helper's
+  // delayed start — and then goes silent: the last arrival is ~900 ms before the child's
+  // check, well past the 500 ms window.
+  for (let round = 0; round < 12; round++) {
     child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  expect(saw("drain")).toBe(true);
-  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
   const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
   expect(code).toBe(0);
   const summary = lines
@@ -415,11 +413,11 @@ it("a post-wake deschedule across the fence window never reads the silence as fr
     })
     .find((note) => note.phase === "summary");
   expect(summary).toBeDefined();
-  // The silence since the final heartbeat is well past the 500 ms window; the age the fence
+  // The silence since the last heartbeat is well past the 500 ms window; the age the fence
   // computes must cover it (never the ~0 ms a post-wake-calibrated offset would report).
   expect(summary?.refused).toBe(true);
-  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(1_500);
-  expect(summary?.ageMs ?? Infinity).toBeLessThan(6_000);
+  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(600);
+  expect(summary?.ageMs ?? Infinity).toBeLessThan(5_000);
 }, 20_000);
 
 it("a live parent is never refused across a thousand samples under concurrent CPU load", async () => {

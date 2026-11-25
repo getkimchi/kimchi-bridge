@@ -20,12 +20,13 @@
  *    while the parent delivers one more heartbeat, then goes silent for
  *    KIMCHI_WORKER_TEST_SILENCE_MS before the child checks the fence.
  *  - "post-wake": the round-7 deschedule reproduction (failure-012 / security-006). The
- *    transport's construction is stretched past the fence window (the construction hook)
- *    while the parent heartbeats; the parent sends one final heartbeat when the child
- *    reports "drain" and then goes silent. The child waits out the window and checks: the
- *    write must be refused with the age covering the whole silence. (On the pre-fix code,
- *    the same shape with a deterministic delay in the old resync's post-wake gap reported
- *    ageMs 0.046 / refused:false after 5,861 ms of silence.)
+ *    helper thread's first action is delayed past the old design's handshake bound (the
+ *    helper-start hook); the parent heartbeats at the required cadence for the first part
+ *    of the run and then goes silent, and the child checks the fence once its wait expires.
+ *    The write must be refused with the age covering the silence since the last arrival.
+ *    (On the pre-fix code, the same shape with a deterministic delay in the old resync's
+ *    post-wake gap — the unobservable deschedule the round-7 reviewers instrumented —
+ *    reported ageMs 0.046 / refused:false after 5,861 ms of silence.)
  *  - "live-load": the no-lockout bound. The child takes KIMCHI_WORKER_SAMPLES fence samples
  *    ~5 ms apart under concurrent CPU load (spin worker threads that self-terminate on a
  *    shared stop flag and after a hard 30 s cap), with the parent heartbeating at the
@@ -86,14 +87,13 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
   transport.close();
   report({ mode, phase: "summary", ageMs, refused });
 } else if (mode === "post-wake") {
-  // The deschedule reproduction: the construction hook stretched the transport's
-  // construction past the fence window while the parent kept heartbeating; the parent's
-  // final heartbeat (sent once this child reports "drain") is the last one before the
-  // silence. The child waits out the window: the fence must refuse with the age covering
-  // the whole silence since that final arrival.
-  report({ mode, phase: "drain" });
+  // The deschedule reproduction: the helper-start hook delayed the reader thread's first
+  // action past the old design's handshake bound, so the pre-fix offset calibration rested
+  // entirely on what happened after the queued notes drained. The child's single wait
+  // expires while the (instrumented) deschedule still holds the main thread, so the fence
+  // is sampled the moment the thread wakes — the first sample the round-7 probe took.
   await new Promise((resolve) =>
-    setTimeout(resolve, Number(process.env.HEARTBEAT_WAIT_MS ?? 2200)),
+    setTimeout(resolve, Number(process.env.HEARTBEAT_WAIT_MS ?? 2000)),
   );
   let refused = false;
   try {
