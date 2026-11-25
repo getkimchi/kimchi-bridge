@@ -27,6 +27,7 @@ import type {
   WorkRecord,
   WorkRecordProblem,
 } from "../../../src/reconcile/work-attribution/summary.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /**
  * Ported from Kimchi's src/extensions/work-attribution/summary-reader.test.ts. The journal
@@ -49,7 +50,7 @@ const WORK = "11111111-1111-4111-8111-111111111111";
 const directories: string[] = [];
 
 function journal(lines: unknown[]) {
-  const agentDir = mkdtempSync(join(tmpdir(), "kimchi-history-reader-"));
+  const agentDir = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-history-reader-")));
   directories.push(agentDir);
   const directory = join(agentDir, "work-attribution");
   mkdirSync(directory);
@@ -454,7 +455,7 @@ it("cancels inside native SQLite reading and preserves same-connection and reope
   // reopen contract as stored-read-regressions.test.ts, but through readWorkRecordsAsync — the
   // moved wrapper that imports journals (none here: the store holds native captures only)
   // before paging the store and parsing each committed body.
-  const agentDir = mkdtempSync(join(tmpdir(), "kimchi-native-async-reader-"));
+  const agentDir = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-native-async-reader-")));
   directories.push(agentDir);
   const base: WorkRecord = { ...work, sessionId: "native-reader" };
   const native: WorkRecord[] = [

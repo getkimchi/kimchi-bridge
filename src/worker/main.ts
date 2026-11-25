@@ -16,6 +16,7 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { HostPorts } from "../reconcile/host.js";
+import { pinAgentDir } from "../ledger/store.js";
 import { runReconciliationPass, type PassRun } from "../reconcile/pass.js";
 import { setDiagnosticsRedactor } from "../reconcile/work-attribution/diagnostics.js";
 import type { ContinuationProgress } from "../reconcile/work-attribution/links.js";
@@ -292,9 +293,12 @@ function main(): void {
    * Wraps the host client's blocking reads so a request that died from the
    * pass's own cancellation or deadline marks the pass state before the
    * error is swallowed by a channel handler. No channel outcome is inferred
-   * here: the pass result alone decides what the wire reports.
+   * here: the pass result alone decides what the wire reports. `agentDir` overrides the
+   * hello's agent directory with the parent's already-resolved (pinned) path from the pass
+   * message, so the pass runs on the same real tree the parent pinned even when an agentDir
+   * link moved between the two processes' starts.
    */
-  const guardHostReads = (base: StdioHostClient): HostPorts => {
+  const guardHostReads = (base: StdioHostClient, agentDir?: string): HostPorts => {
     const guarded = <T>(read: () => T): T => {
       try {
         return read();
@@ -307,7 +311,7 @@ function main(): void {
       }
     };
     return {
-      agentDir: base.agentDir,
+      agentDir: agentDir ?? base.agentDir,
       e2eSeam: (name: string) => base.e2eSeam(name),
       now: () => base.now(),
       metric: base.metric.bind(base),
@@ -333,9 +337,14 @@ function main(): void {
     transport.deadlineAt = deadlineAt;
     const deadline = setTimeout(() => abortActive("deadline"), deadlineAt - Date.now());
     const base = host as StdioHostClient;
+    // The parent resolved the agent directory before sending the pass; pinning that real
+    // path here is idempotent with this worker's own resolution of the same tree, and keeps a
+    // repointed agentDir link from splitting one ledger across two trees mid-session. A pass
+    // without the field keeps the hello's agent directory, pinned on first use.
+    const passAgentDir = message.agentDir === undefined ? agentDir : pinAgentDir(message.agentDir);
     // The once-a-day integrity gate: a failed quick_check stops every write of this pass and
     // leaves the ledger untouched, reported as ledger_integrity_failed on every channel.
-    const integrity = integrityCheckGate(agentDir);
+    const integrity = integrityCheckGate(passAgentDir);
     let run: PassRun | undefined;
     let passError: unknown;
     if (!integrity.ok) {
@@ -360,7 +369,7 @@ function main(): void {
             epoch: message.epoch,
             assertWritable: () => base.assertHeartbeatFresh(),
           },
-          guardHostReads(base),
+          guardHostReads(base, passAgentDir),
           {
             signal: state.controller.signal,
             assertLease: () => {

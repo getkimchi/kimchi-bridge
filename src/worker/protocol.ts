@@ -126,6 +126,11 @@ export interface PassMessage {
   deadlineMs: number;
   /** The lease fencing epoch; chunk B4 checks it inside every write transaction. */
   epoch: number;
+  /** The agent directory the parent already resolved (pinned to its real path) before sending
+   *  the pass. The worker pins the same real path — idempotently — so a symlink in the path
+   *  repointed between the two processes' starts cannot split one ledger across two trees.
+   *  Optional: a parent that does not send it keeps the hello's agent directory. */
+  agentDir?: string;
 }
 
 /** Cancels a running pass; the parent sends this on lease loss or shutdown. */
@@ -467,7 +472,7 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       const shape = exactKeys(
         object.value,
         ["type", "id", "channels", "deadlineMs", "epoch"],
-        ["nextRepository", "reportingCwd"],
+        ["nextRepository", "reportingCwd", "agentDir"],
       );
       if (!shape.ok) return shape;
       const id = fieldInteger(object.value, "id", 1);
@@ -482,6 +487,8 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       if (!nextRepository.ok) return nextRepository;
       const reportingCwd = optionalFieldString(object.value, "reportingCwd");
       if (!reportingCwd.ok) return reportingCwd;
+      const agentDir = optionalFieldString(object.value, "agentDir");
+      if (!agentDir.ok) return agentDir;
       return accept({
         type: "pass",
         id: id.value,
@@ -490,6 +497,7 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
         epoch: epoch.value,
         ...(nextRepository.value === undefined ? {} : { nextRepository: nextRepository.value }),
         ...(reportingCwd.value === undefined ? {} : { reportingCwd: reportingCwd.value }),
+        ...(agentDir.value === undefined ? {} : { agentDir: agentDir.value }),
       });
     }
     case "cancel": {

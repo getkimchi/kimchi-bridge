@@ -18,7 +18,7 @@
  */
 import type * as Sqlite from "bun:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { closeSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import {
@@ -131,11 +131,54 @@ function assertFencedWritable(db: Sqlite.Database, agentDir: string): void {
   fence.assertWritable();
 }
 
+/** The real path every input agent directory has pinned to, for this process's lifetime. */
+const pinnedAgentDirs = new Map<string, string>();
+
+/** Pins an agent directory to its real path, memoized per input path for the process lifetime.
+ *
+ * Whoever controls a symlink in the agentDir path can repoint it mid-session — after capture's
+ * spool live-check but before capture returns — leaving an acknowledged record in a tree the
+ * importer, now resolving through the moved link, never scans (security-006, agentDir variant).
+ * Every path the ledger and the reporting queue build from an agentDir therefore routes through
+ * here, so the whole process reads and writes one real tree: the tree the link pointed at when
+ * it was first pinned. Intended behavior: a repointed agentDir takes effect at the next process
+ * start; records acknowledged before the repoint stay in the tree they were written to. Nothing
+ * follows a link mid-session.
+ *
+ * A realpathSync failure (ENOENT) propagates: the directory must exist for any ledger operation
+ * anyway, and a missing agentDir must fail loudly rather than silently create a second tree. */
+export function pinAgentDir(agentDir: string): string {
+  const pinned = pinnedAgentDirs.get(agentDir);
+  if (pinned !== undefined) return pinned;
+  const real = realpathSync(agentDir);
+  pinnedAgentDirs.set(agentDir, real);
+  return real;
+}
+
+/** The pinned real path, or undefined when the agent directory does not exist. Only the
+ *  journal scanners' read path may use this: a missing directory has no journals to import —
+ *  the same answer their own readdir ENOENT handling always gave. Every write path takes the
+ *  strict {@link pinAgentDir} instead, so a missing agentDir still fails loudly. */
+export function pinnedAgentDirIfPresent(agentDir: string): string | undefined {
+  try {
+    return pinAgentDir(agentDir);
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { code?: unknown }).code === "ENOENT"
+    )
+      return undefined;
+    throw error;
+  }
+}
+
 /** The ledger lives beside the legacy state.json queue, inheriting its directory's lock discipline. */
 export function ledgerDbPath(agentDir: string): string {
   // Mirrors Kimchi's queue.reportingDirectory (agentDir/pr-cost-reporting); kept local so the
-  // ledger library needs no Kimchi imports.
-  return join(agentDir, "pr-cost-reporting", "ledger.db");
+  // ledger library needs no Kimchi imports. Pinned so a repointed agentDir link cannot move
+  // the database out from under an open process.
+  return join(pinAgentDir(agentDir), "pr-cost-reporting", "ledger.db");
 }
 
 /** Pure version decision, unit-tested without a database. */

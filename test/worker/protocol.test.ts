@@ -71,6 +71,7 @@ function parentMessages(): ParentMessage[] {
     reportingCwd: "/project",
     deadlineMs: 3000,
     epoch: 0,
+    agentDir: "/tmp/agent",
   };
   return [
     HELLO,

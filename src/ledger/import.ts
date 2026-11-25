@@ -33,6 +33,7 @@ import {
   rebuildWorkSliced,
   spoolDirectory,
 } from "./records.js";
+import { pinAgentDir, pinnedAgentDirIfPresent } from "./store.js";
 import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "./tx-budget.js";
 
 /** Immutable legacy import: authority, projection, coverage and cursor commit together. */
@@ -516,10 +517,14 @@ function prepareJournal(
 }
 
 function syncWorkJournals(agentDir: string): string[] {
+  // Pinned: the scan stays on the real tree the agentDir link pointed at when first used. A
+  // missing agent directory has no journals — the same read as the ENOENT handling below.
+  const pinned = pinnedAgentDirIfPresent(agentDir);
+  if (pinned === undefined) return [];
   const paths: string[] = [];
   for (const source of [
-    join(agentDir, "work-attribution"),
-    join(agentDir, "work-attribution", "transitions"),
+    join(pinned, "work-attribution"),
+    join(pinned, "work-attribution", "transitions"),
   ]) {
     try {
       for (const file of readdirSync(source, { withFileTypes: true }))

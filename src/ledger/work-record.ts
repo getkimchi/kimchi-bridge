@@ -9,6 +9,7 @@
  */
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { pinnedAgentDirIfPresent } from "./store.js";
 import { isWorkId } from "./work-id.js";
 
 interface SummaryEntry {
@@ -176,9 +177,13 @@ export function journalParser(
       );
   };
 }
-/** The legacy journals the C3 importer scans, session ledgers and transitions, in a stable order. */
+/** The legacy journals the C3 importer scans, session ledgers and transitions, in a stable order.
+ *  Pinned to the real agentDir tree, so a repointed link cannot move the scan mid-session; a
+ *  missing agent directory has no journals, the same read as the ENOENT handling below. */
 export async function workJournals(agentDir: string): Promise<string[]> {
-  const directory = join(agentDir, "work-attribution");
+  const pinned = pinnedAgentDirIfPresent(agentDir);
+  if (pinned === undefined) return [];
+  const directory = join(pinned, "work-attribution");
   const paths: string[] = [];
   for (const source of [directory, join(directory, "transitions")]) {
     try {

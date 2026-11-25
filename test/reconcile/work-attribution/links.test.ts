@@ -38,6 +38,7 @@ import {
   type WorkRecord,
 } from "../../../src/reconcile/work-attribution/summary.js";
 import { createWorkScopeSnapshot } from "../mocks/work-scope.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /**
  * Ported from Kimchi's src/extensions/work-attribution/links.test.ts. The continuation
@@ -172,7 +173,7 @@ function savePlanMarkdown(opts: { cwd: string; name: string; planText: string; w
 }
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "kimchi-work-link-"));
+  dir = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-work-link-")));
   workIds.clear();
   setDefaultHostPorts(host);
   closeBackends();

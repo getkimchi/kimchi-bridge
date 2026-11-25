@@ -11,6 +11,7 @@ import { hostPorts } from "../host-ports.js";
 import { isWorkAccount, type WorkAccount } from "../work-attribution/scope.js";
 import { object, SHA256_HEX } from "../work-attribution/summary.js";
 import { assertLedgerWritable, backendFor, diagnostic } from "../../ledger/records.js";
+import { pinAgentDir } from "../../ledger/store.js";
 import { machineFingerprint } from "./machine.js";
 import {
   accountKey,
@@ -147,7 +148,9 @@ export interface ReportingState {
 }
 
 export function reportingDirectory(agentDir: string): string {
-  return join(agentDir, "pr-cost-reporting");
+  // Pinned: the reporting queue's state stays in the real tree the agentDir link pointed at
+  // when the process first used it, so a repointed link cannot split the queue mid-session.
+  return join(pinAgentDir(agentDir), "pr-cost-reporting");
 }
 
 export function reportingStatePath(agentDir: string): string {
