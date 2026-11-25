@@ -198,9 +198,9 @@ it("an isolated warm capture under a 6 s writer meets the 260 ms acceptance boun
   // Dedicated acceptance coverage, isolated from the load-tolerant stress cases above: the
   // plan's 260 ms bound sits just 10 ms over the 250 ms busy window the capture itself owes, so
   // the measurement runs in its own child process (nothing else executes there) and reports
-  // three captures inside one writer hold. The best sample carries the criterion — a scheduler
-  // spike on one capture cannot mask it — while a path that actually stalls (the blocking
-  // fallback's full-writer wait, or a slow spool append) exceeds the bound on every sample.
+  // three captures inside one writer hold. The bound is asserted for EVERY measured capture —
+  // a per-capture criterion, not a best sample — while a path that actually stalls (the
+  // blocking fallback's full-writer wait, or a slow spool append) exceeds it on every sample.
   const holder = await holdWriter(dir, 6000);
   let warm: { elapsedMs?: number[] } | undefined;
   try {
@@ -231,9 +231,14 @@ console.log(JSON.stringify({ elapsedMs }));`)) as { elapsedMs?: number[] };
   const elapsed = warm?.elapsedMs ?? [];
   expect(elapsed).toHaveLength(3);
   // Every measured capture paid the contended busy window (the writer never released), and
-  // the best one still returned inside the plan's 260 ms acceptance bound.
-  for (const ms of elapsed) expect(ms).toBeGreaterThanOrEqual(150);
-  expect(Math.min(...elapsed)).toBeLessThan(260);
+  // EVERY one returned inside the plan's 260 ms acceptance bound — the criterion is
+  // per-capture, not best-of-three: a scheduler spike on one capture cannot mask another
+  // capture's violation, and a path that actually stalls (the blocking fallback's
+  // full-writer wait, or a slow spool append) exceeds the bound on every sample.
+  for (const ms of elapsed) {
+    expect(ms).toBeGreaterThanOrEqual(150);
+    expect(ms).toBeLessThan(260);
+  }
   // The bounded path is the one that returned: the records sit in the spool and the ledger
   // holds nothing — neither the blocking fallback nor a direct SQLite write ran.
   const spool = spoolFilePath(dir, "session");
@@ -251,7 +256,8 @@ it("an isolated cold capture under a 6 s writer meets the 260 ms acceptance boun
   const dir = agentDir();
   // The cold shape of the same acceptance bound: three fresh processes, each whose first-ever
   // backend open rides the capture busy window itself. Each child reports one capture's
-  // elapsed time; the best sample carries the criterion and every sample proves contention.
+  // elapsed time; the 260 ms bound is asserted for EVERY sample, and every sample proves
+  // contention.
   const holder = await holdWriter(dir, 6000);
   const samples: number[] = [];
   try {
@@ -273,8 +279,12 @@ console.log(JSON.stringify({ elapsedMs: Date.now() - start }));`)) as {
     await holder.done;
   }
   expect(samples).toHaveLength(3);
-  for (const ms of samples) expect(ms).toBeGreaterThanOrEqual(150);
-  expect(Math.min(...samples)).toBeLessThan(260);
+  // Every cold capture paid the contended busy window and EVERY one returned inside the
+  // 260 ms acceptance bound — per-capture, not best-of-three.
+  for (const ms of samples) {
+    expect(ms).toBeGreaterThanOrEqual(150);
+    expect(ms).toBeLessThan(260);
+  }
   const spool = spoolFilePath(dir, "session");
   expect(existsSync(spool)).toBe(true);
   expect(readRecords(dir)).toHaveLength(0);
