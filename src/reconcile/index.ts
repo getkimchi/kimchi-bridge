@@ -77,7 +77,10 @@ export {
   type ServerLimit,
 } from "./pr-cost-reporting/queue.js";
 export { queueSnapshots } from "./pr-cost-reporting/queue.js";
-export { calculatePullRequestCosts } from "./work-attribution/costs.js";
+export {
+  calculatePullRequestCosts,
+  calculatePullRequestCostsAsync,
+} from "./work-attribution/costs.js";
 export type { ReportingRepository } from "./pr-cost-reporting/snapshot.js";
 export { accountKey, buildSnapshots } from "./pr-cost-reporting/snapshot.js";
 export {
