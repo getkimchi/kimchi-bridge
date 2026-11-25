@@ -186,6 +186,67 @@ it("a slow helper construction stops rejecting live heartbeats once a prompt one
   }
 }, 20_000);
 
+it("a late handshake never locks a live heartbeating parent out for the transport's lifetime", async () => {
+  // The round-6 reproduced defect (failure-011): the transport's construction is stretched
+  // 2.1 s past the fence window while the parent keeps heartbeating every 100 ms, and the
+  // handshake observation then exceeds its 50 ms bound — the helper started, but the main
+  // thread was descheduled through the construction-to-observation gap. The construction
+  // handshake leaves the sync offset uncalibrated forever, the note fold's delivery guard
+  // depends on it, and the conservative fallback understates the true offset by the whole
+  // construction delay: every heartbeat read ~2189 ms old against the production 2 s fence,
+  // 12/12 samples refused, for the transport's lifetime — a live parent permanently locked
+  // out of worker writes. Safe refusal of the observation must not become a lifetime
+  // lockout: a later, independently bounded shared-memory observation re-establishes the
+  // offset, prompt notes converge it, and the live parent's writes are allowed again.
+  const child = Bun.spawn({
+    cmd: [process.execPath, join(ROOT, "test/worker/heartbeat-child.ts"), "lockout"],
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS: "2100",
+      KIMCHI_WORKER_TEST_HANDSHAKE_GAP_MS: "500",
+      HEARTBEAT_WINDOW_MS: "2000",
+      HEARTBEAT_SAMPLES: "12",
+    },
+    stdin: "pipe",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const stderrText = new Response(child.stderr).text();
+  // The parent heartbeats every 100 ms for the child's whole run, including the delayed
+  // construction: the lines queue in the pipe and the helper reads them once it starts.
+  const feeder = (async () => {
+    for (let index = 0; index < 60; index++) {
+      try {
+        await sendHeartbeat(child.stdin);
+      } catch {
+        // The child has exited; the pipe is gone. Its summary is already complete.
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  })();
+  const [code] = await Promise.all([child.exited, feeder]);
+  const lines = (await stderrText).split("\n").filter((line) => line.trim() !== "");
+  expect(code).toBe(0);
+  const summary = JSON.parse(lines[lines.length - 1] ?? "{}") as {
+    samples?: { ageMs: number; refused: boolean }[];
+  };
+  const samples = summary.samples ?? [];
+  expect(samples).toHaveLength(12);
+  // The lockout is not permanent: the transport recovers while the parent keeps
+  // heartbeating — the samples converge onto the 100 ms cadence (never the ~2.1 s
+  // construction delay the pre-fix fallback baked into every age), and once recovered the
+  // acceptance stays (a fluke boundary sample cannot satisfy this).
+  const firstAccepted = samples.findIndex((sample) => !sample.refused);
+  expect(firstAccepted).toBeGreaterThanOrEqual(0);
+  for (const sample of samples.slice(firstAccepted)) {
+    expect(sample.refused).toBe(false);
+    expect(sample.ageMs).toBeLessThan(500);
+  }
+  expect(samples.length - firstAccepted).toBeGreaterThanOrEqual(8);
+}, 25_000);
+
 it("a late-delivered heartbeat never makes a stale worker writable", async () => {
   // The offset is the running MINIMUM of per-heartbeat estimates, each an upper bound (the
   // true offset plus that note's delivery latency). A heartbeat whose note is queued behind

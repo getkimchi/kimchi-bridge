@@ -35,6 +35,15 @@
  *    heartbeat as fresh (the round-5 probe reported 31.8 ms with refused:false on this exact
  *    shape).
  *
+ *  - "lockout": the transport's construction is delayed past the fence window AND the
+ *    handshake observation exceeds its bound (the two test-only hooks), while the parent
+ *    keeps heartbeating at the required cadence for the child's whole run. The handshake
+ *    never calibrates the sync offset, so availability rests entirely on whether a later
+ *    bounded observation can: the child samples the fence every 100 ms and reports each
+ *    sample's age and refusal — a transport that never recovers refuses every sample for
+ *    its lifetime (the round-6 failure-011 probe: 12/12 refusals at ~2189 ms ages against a
+ *    2 s fence with a live, heartbeating parent).
+ *
  * The summary goes to stderr as one JSON line; stdout carries only the transport's own
  * request lines (none in these scenarios).
  */
@@ -64,7 +73,7 @@ async function sampleFence(rounds: number): Promise<{ ageMs: number; refused: bo
   return samples;
 }
 
-if (mode === "slow-construction" || mode === "slow-helper") {
+if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout") {
   const samples = await sampleFence(Number(process.env.HEARTBEAT_SAMPLES ?? 14));
   transport.close();
   report({ mode, samples });

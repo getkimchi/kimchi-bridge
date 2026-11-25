@@ -300,14 +300,14 @@ export function backendFor(agentDir: string): RecordBackend {
 /** Capture's backend lookup: a warm cache returns as usual, but a COLD process — no cached
  *  backend yet — opens the ledger inside capture's own bounded busy window, so a writer held
  *  by another process fails the open (or its construction writes) with SQLITE_BUSY inside the
- *  250 ms window instead of stalling the session's event loop for the reconciliation timeout
- *  and escaping the spool path entirely. The opened connection is handed back with the normal
- *  busy timeout restored, exactly as tryCaptureTx leaves it. */
-function captureBackendFor(agentDir: string): RecordBackend {
+ *  remaining capture budget instead of stalling the session's event loop for the
+ *  reconciliation timeout and escaping the spool path entirely. The opened connection is
+ *  handed back with the normal busy timeout restored, exactly as tryCaptureTx leaves it. */
+function captureBackendFor(agentDir: string, busyMs: number): RecordBackend {
   const found = backends.get(agentDir);
   if (found) return found;
   // The test factory (the in-memory double) cannot be busy; only the SQLite open is bounded.
-  const created = factory ? factory(agentDir) : captureSqliteBackend(agentDir);
+  const created = factory ? factory(agentDir) : captureSqliteBackend(agentDir, busyMs);
   backends.set(agentDir, created);
   return created;
 }
@@ -603,6 +603,12 @@ function spoolCaptureLine(agentDir: string, sessionId: string, line: string): bo
  */
 /** How often a blocked capture reports that it is still waiting. */
 const BLOCKED_NOTE_MS = 5000;
+/** The spool append's reserve inside the total capture budget: the busy window — and a cold
+ *  process's bounded open before it — leaves this much of the 250 ms budget for the fsynced
+ *  spool write, so the whole contended return stays inside the 260 ms acceptance bound even
+ *  when the append or the open's teardown costs a few extra milliseconds (the round-6 strict
+ *  run measured one 266 ms cold sample against the unreserved window). */
+const SPOOL_RESERVE_MS = 15;
 
 /** The spool could not be written, so capture blocks on the SQLite writer without a time limit:
  * the record commits once the holder releases the lock and is never dropped. A diagnostic line
@@ -640,6 +646,13 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
   // busy window below is whatever of the 250 ms budget remains after everything capture
   // did before it, so the whole path stays inside the window however large the plan was.
   const startedAtMs = performance.now();
+  // Whatever of the total budget (the busy window minus the spool reserve) remains after
+  // everything capture did so far is the window the next bounded step may wait.
+  const remainingBudgetMs = (): number =>
+    Math.max(
+      0,
+      CAPTURE_BUSY_TIMEOUT_MS - SPOOL_RESERVE_MS - Math.ceil(performance.now() - startedAtMs),
+    );
   const line = JSON.stringify(record);
   const stored: StoredRecord = {
     recordHash: recordHashOf(record),
@@ -717,7 +730,7 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
   // would, and on a failed spool blocks on the open and the commit without a time limit.
   let backend: RecordBackend;
   try {
-    backend = captureBackendFor(agentDir);
+    backend = captureBackendFor(agentDir, remainingBudgetMs());
   } catch (error) {
     if (!isBusyError(error)) throw error;
     if (spoolCaptureLine(agentDir, record.sessionId, line)) return;
@@ -736,7 +749,7 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
   // contended return past the acceptance window.
   const planned = planCaptureFold(backend, record);
   const commit = () => commitPlanned(backend, planned);
-  const busyMs = Math.max(0, CAPTURE_BUSY_TIMEOUT_MS - Math.ceil(performance.now() - startedAtMs));
+  const busyMs = remainingBudgetMs();
   if (busyMs > 0 && backend.tryCaptureTx(commit, busyMs)) return;
   if (spoolCaptureLine(agentDir, record.sessionId, line)) return;
   blockingCaptureCommit(() => commitInto(backendFor(agentDir)));
@@ -1694,9 +1707,9 @@ function sqliteBackend(agentDir: string): RecordBackend {
  *  lookup fits inside the window tryCaptureTx commits within. The connection's normal busy
  *  timeout is restored once construction succeeded — a cached backend is a general ledger
  *  connection, not a capture-only one. */
-function captureSqliteBackend(agentDir: string): RecordBackend {
+function captureSqliteBackend(agentDir: string, busyMs: number): RecordBackend {
   const store: LedgerStore = openStore(agentDir, {
-    busyTimeoutMs: CAPTURE_BUSY_TIMEOUT_MS,
+    busyTimeoutMs: Math.max(0, Math.min(busyMs, CAPTURE_BUSY_TIMEOUT_MS)),
     openRetryBudgetMs: 0,
     deferAdditiveSchema: true,
   });
