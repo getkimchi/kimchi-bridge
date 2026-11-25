@@ -813,6 +813,12 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
   }
   for (const workId of touched) {
     const records = insertedByWork.get(workId);
+    // A duplicate-only batch inserted nothing for this head: there is no new row to fold,
+    // and nothing this batch did can have invalidated the head — the importer's own preflight
+    // repaired a missing one before the transaction — so the head is left exactly as it is.
+    // Marking it dirty anyway (the pre-fix behavior) forced every clean oversized head touched
+    // by a duplicate re-import into a full deferred rebuild (design-008).
+    if (!records?.length) continue;
     // A projection lost to a version bump, a bug or another process's head removal (the
     // round-5 probe removed it between the importer's preflight rebuild and this batch's
     // commit) is NOT rebuilt here: this whole-work fallback ran the complete authority merge
@@ -835,7 +841,7 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
       backend.markDirty(workId);
       continue;
     }
-    if (records?.length) foldWork(backend, workId, records);
+    foldWork(backend, workId, records);
   }
   return inserted;
 }
