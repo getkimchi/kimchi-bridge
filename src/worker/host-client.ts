@@ -229,6 +229,7 @@ function cancel(parsed) {
   Atomics.notify(ia, ${COMBINED});
 }
 function heartbeat(parsed) {
+  // A malformed stamp cannot refresh liveness; a valid stamp's value is not read by the fence.
   if (parsed.type !== "heartbeat" || typeof parsed.at !== "number") return;
   Atomics.add(seq, 0, 1);
   Atomics.notify(seq, 0);
@@ -370,7 +371,9 @@ export class StdioTransport {
 
   /** Throws LeaseHeartbeatLost when the newest heartbeat's conservative silence bound exceeds
    *  the window. Delayed helper/pipe/main-thread observation and wall-clock steps cannot lower
-   *  this bound. A long main-thread hold may overstate it; later punctual observations recover. */
+   *  this bound. A long main-thread hold may overstate it; later punctual observations recover.
+   *  On platforms whose monotonic clock pauses during OS suspend, suspended time is outside
+   *  this arrival bound; the host lease and post-resume heartbeat cadence remain the backstop. */
   assertHeartbeatFresh(timeoutMs: number = heartbeatTimeoutMs()): void {
     const age = this.heartbeatAgeMs();
     if (age > timeoutMs) throw new LeaseHeartbeatLost(age);

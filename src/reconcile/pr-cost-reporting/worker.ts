@@ -1419,7 +1419,10 @@ function truncatedHeadPullRequests(
  * Works that share a PR or a work link change each other's events: a PR's state and issue keys and a link's target
  * come from all of them. Each group holding a changed work translates together.
  */
-export function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>): string[][] {
+export function changedWorkGroups(
+  backend: RecordBackend,
+  changed: ReadonlySet<string>,
+): string[][] {
   const parent = new Map<string, string>();
   const root = (node: string) => {
     let top = node;

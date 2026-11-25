@@ -150,7 +150,8 @@ export interface CancelMessage {
 export interface HeartbeatMessage {
   type: "heartbeat";
   /** When the parent sent it: its own Date.now() at send, retained for wire diagnostics and
-   *  compatibility. Freshness uses arrival order on the worker's monotonic clock, never this stamp. */
+   *  compatibility. Freshness never reads its value; numeric presence remains required so
+   *  malformed heartbeats cannot refresh liveness. */
   at: number;
 }
 

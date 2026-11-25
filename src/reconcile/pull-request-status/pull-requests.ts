@@ -150,7 +150,8 @@ function readLookupChecks(agentDir: string): LookupChecks {
   try {
     // The note is authoritative, including an empty cache; legacy files are read only before migration.
     value = JSON.parse(
-      checks.saved ?? readFileSync(join(pinAgentDir(agentDir), "work-attribution", LOOKUP_CHECKS), "utf8"),
+      checks.saved ??
+        readFileSync(join(pinAgentDir(agentDir), "work-attribution", LOOKUP_CHECKS), "utf8"),
     );
   } catch {
     // A missing or damaged cache only costs one more check per commit.
