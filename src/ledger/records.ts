@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
+import { mergePullRequestLinks } from "./links.js";
 import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
   COLLECTIONS,
@@ -637,21 +638,50 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
     sourceOffset: null,
     importedAt: Date.now(),
   };
-  const commitInto = (backend: RecordBackend) => {
-    // A projection lost to a version bump or a bug is not rebuilt here: this commit must stay
-    // one small transaction, and a rebuild that ran inside it would hold the write lock across
-    // every slice (an outer tryCaptureTx transaction cannot see the slice boundaries). The work
-    // is marked dirty instead; the next read of it (the lazy head repair) or the reconciliation
-    // pass's recovery rebuilds it in bounded slices, folding this record with the rest of the
-    // authority.
+  // The commit's transaction: the insert, the marker and — when the planned fold is still
+  // current — the precomputed projection publication. A plan that went stale (another writer
+  // committed between the plan and this transaction) is never trusted: the fold re-derives
+  // from fresh reads inside the lock, exactly as capture always did, or — when the projection
+  // is missing — the work is marked dirty instead. A projection lost to a version bump or a
+  // bug is not rebuilt here either way: this commit must stay one small transaction, and a
+  // rebuild that ran inside it would hold the write lock across every slice (an outer
+  // tryCaptureTx transaction cannot see the slice boundaries). The dirty marker hands the
+  // work to the next read's lazy repair or the reconciliation pass's recovery, which rebuild
+  // in bounded slices, folding this record with the rest of the authority.
+  const commitPlanned = (backend: RecordBackend, planned: PlannedCaptureFold): void => {
     backend.tx(() => {
-      const projection =
-        backend.getHead(record.workId) !== undefined || backend.recordCount(record.workId) === 0;
-      if (!projection) backend.markDirty(record.workId);
+      // The currency check runs before any write of this transaction: the SQLite backend's
+      // dataVersion cannot move for the writes the still-open transaction itself is about to
+      // make (the write lock is held and own commits are counted after the transaction ends),
+      // so checking first keeps the window exactly the plan's.
+      if (backend.dataVersion() !== planned.version) {
+        // Something committed between the plan and this transaction (a same-work capture, an
+        // importer's batch, another process's rebuild): the planned rows, counters and
+        // serialized body are stale, so they are never replayed. The fold re-derives from the
+        // fresh head inside the lock — the bounded incremental fold, never an authority
+        // rescan — or the work is marked dirty when its projection is gone.
+        const projection =
+          backend.getHead(record.workId) !== undefined || backend.recordCount(record.workId) === 0;
+        backend.insertRecord(stored);
+        backend.upsertMarker(stored.recordHash, record.workId, record.type);
+        if (projection) foldWork(backend, record.workId, [record]);
+        else backend.markDirty(record.workId);
+        return;
+      }
       backend.insertRecord(stored);
       backend.upsertMarker(stored.recordHash, record.workId, record.type);
-      if (projection) foldWork(backend, record.workId, [record]);
+      if (planned.dirty) {
+        backend.markDirty(record.workId);
+        return;
+      }
+      replayPlannedRows(backend, record.workId, planned.writes);
+      backend.putHead(planned.head, planned.body);
     });
+  };
+  const commitInto = (backend: RecordBackend): void => {
+    // The plan runs OUTSIDE every transaction (see planCaptureFold); the transaction above only
+    // re-checks and writes.
+    commitPlanned(backend, planCaptureFold(backend, record));
   };
   // The backend lookup itself is inside the bounded capture path: a cold process whose ledger
   // open (or its construction writes) hits the held writer spools the record like a busy commit
@@ -669,10 +699,15 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
     commitInto(backend);
     return;
   }
-  const commit = () => commitInto(backend);
+  // The plan is hoisted out of the commit closure so it never runs inside tryCaptureTx's
+  // transaction: the whole head merge and serialization stay outside the write lock, and the
+  // transaction the closure opens only writes. A busy tryCaptureTx discards the plan with the
+  // attempt; the spool and blocking paths re-plan on every retry.
+  const planned = planCaptureFold(backend, record);
+  const commit = () => commitPlanned(backend, planned);
   if (backend.tryCaptureTx(commit)) return;
   if (spoolCaptureLine(agentDir, record.sessionId, line)) return;
-  blockingCaptureCommit(commit);
+  blockingCaptureCommit(() => commitInto(backendFor(agentDir)));
 }
 
 /** One journal line handed to the importer; the line bytes are the dedup key (sha256 of the exact line). */
@@ -689,11 +724,21 @@ export interface ImportEntry {
  * C3 importer wraps rows and the cursor advance in the same transaction, so a kill mid-pass resumes at the cursor.
  * Duplicate lines (same hash) are skipped; the translation marker is upserted only for genuinely new rows. Only
  * NEWLY inserted rows fold into the projection, so a duplicate line re-imported after a file anomaly can never
- * overwrite newer captured state; a missing projection is still rebuilt from the whole authority.
+ * overwrite newer captured state; a missing projection is marked dirty for the bounded sliced repair instead of
+ *  being rebuilt inside this transaction.
  */
 export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]): number {
   const insertedByWork = new Map<string, WorkRecord[]>();
   const touched = new Set<string>();
+  /** The works that already had records BEFORE this batch: a head missing for one of them was
+   *  lost (a version bump, a bug, another process's rebuild between the importer's preflight
+   *  and this commit), so the work is marked dirty for the bounded sliced repair — never
+   *  rebuilt whole inside this transaction. A work without earlier records is brand new: its
+   *  batch rows are its whole authority so far, so folding them creates the same projection
+   *  the whole-work rebuild would. */
+  const preexisting = new Set<string>();
+  for (const workId of new Set(entries.map((entry) => entry.record.workId)))
+    if (backend.recordCount(workId) > 0) preexisting.add(workId);
   let inserted = 0;
   for (const entry of entries) {
     touched.add(entry.record.workId);
@@ -723,10 +768,17 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
   }
   for (const workId of touched) {
     const records = insertedByWork.get(workId);
-    // A projection lost to a version bump or a bug is rebuilt from the whole authority even when this
-    // pass only saw duplicates; otherwise fold exactly the newly inserted rows.
-    if (!backend.getHead(workId) && backend.recordCount(workId) > 0) {
-      rebuildWorkInTx(backend, workId);
+    // A projection lost to a version bump, a bug or another process's head removal (the
+    // round-5 probe removed it between the importer's preflight rebuild and this batch's
+    // commit) is NOT rebuilt here: this whole-work fallback ran the complete authority merge
+    // and the head publication inside the caller's transaction — one 969.795 ms transaction
+    // on the probe's 1,000-commit/500-links-each shape. The work is marked dirty instead,
+    // exactly as capture does: the next read of it (the lazy head repair), the next batch's
+    // preflight or the reconciliation pass's recovery rebuilds it in bounded slices, folding
+    // these records with the rest of the authority; otherwise fold exactly the newly
+    // inserted rows.
+    if (!backend.getHead(workId) && backend.recordCount(workId) > 0 && preexisting.has(workId)) {
+      backend.markDirty(workId);
       continue;
     }
     if (records?.length) foldWork(backend, workId, records);
@@ -1311,27 +1363,117 @@ function rebuildWorkInTx(backend: RecordBackend, workId: string): void {
   backend.clearDirty(workId);
 }
 
+/** One row write a planned fold recorded outside the write lock, for replay inside the
+ *  transaction that publishes it. */
+interface PlannedRowWrite {
+  log: LogName;
+  key: string;
+  row: Row;
+  pos: number;
+}
+
+/** A capture's planned fold: the merged head and its serialized publication body, computed
+ *  OUTSIDE the write lock, plus the row writes the transaction replays once the plan is
+ *  confirmed current. `dirty` marks the missing-projection case, which never folds. */
+type PlannedCaptureFold =
+  | { dirty: true; version: number; head?: undefined; body?: undefined; writes?: undefined }
+  | {
+      dirty: false;
+      /** The database version the plan was made against; the transaction replays it only when
+       *  nothing committed in between (any commit — a same-work capture, an importer's batch,
+       *  another process's rebuild — could have moved the rows, counters or head the plan
+       *  derived from). */
+      version: number;
+      head: WorkHead;
+      body: string;
+      writes: PlannedRowWrite[];
+    };
+
+/** The capture fold's plan, computed OUTSIDE every transaction: the head's merge (counters,
+ *  `latest`, the incrementally merged PR summary) and the publication body — the expensive
+ *  parts on a large head — never run under the write lock, so the capture's transaction stays
+ *  one small write even on a work whose head is a multi-megabyte reduced publication (the
+ *  round-5 probe measured an 898 ms capture transaction when the fold rescanned every commit
+ *  row and serialized the whole head inside it). */
+function planCaptureFold(backend: RecordBackend, record: WorkRecord): PlannedCaptureFold {
+  const saved = backend.getHead(record.workId);
+  if (!saved && backend.recordCount(record.workId) > 0) return { dirty: true, version: 0 };
+  const plan = planFold(backend, saved ?? emptyHead(record.workId), [record]);
+  return {
+    dirty: false,
+    version: backend.dataVersion(),
+    head: plan.head,
+    body: plan.body,
+    writes: plan.writes,
+  };
+}
+
+/** Replays a planned fold's row writes inside the transaction that publishes it. */
+function replayPlannedRows(
+  backend: RecordBackend,
+  workId: string,
+  writes: PlannedRowWrite[],
+): void {
+  for (const write of writes) backend.putRow(workId, write.log, write.key, write.row, write.pos);
+}
+
+/** Folds records into a COPY of the head without writing anything: the row writes are
+ *  recorded for replay inside a transaction, `latest` is observed on the copy, and the merged
+ *  PR summary is maintained INCREMENTALLY — the touched commit rows' final links merge into
+ *  the head's existing summary — so the fold never rescans every commit row of a large work
+ *  (a capture on a 2,000 × 250-link work paid a 76 MB row rescan inside its transaction). The
+ *  incremental merge equals the full rescan the rebuild performs: every commit row only ever
+ *  accumulates links (an empty or failed lookup never removes one), so the union of the head's
+ *  summary and the touched rows' merged links is the same merged set `commitPullRequests`
+ *  derives from every row. The serialized publication body is computed here too, so the caller
+ *  can keep the whole derivation outside the write lock. */
+function planFold(
+  backend: RecordBackend,
+  head: WorkHead,
+  records: WorkRecord[],
+): { head: WorkHead; body: string; writes: PlannedRowWrite[] } {
+  const merged: WorkHead = {
+    ...head,
+    logs: Object.fromEntries(Object.entries(head.logs).map(([name, log]) => [name, { ...log }])),
+    latest: { ...head.latest },
+  };
+  const writes: PlannedRowWrite[] = [];
+  const commits = new Map<string, Row>();
+  mergeRecordsInto(
+    projectionRows(
+      backend,
+      merged,
+      (collection, row) => {
+        observeLatest(merged.latest, collection, row);
+        if (collection === "commits") commits.set(ROW_KEYS.commits(row), row);
+      },
+      (log, key, row, pos) => writes.push({ log, key, row, pos }),
+    ),
+    records,
+  );
+  if (commits.size)
+    merged.pullRequests = mergePullRequestLinks(
+      merged.pullRequests,
+      ...[...commits.values()].map((row) =>
+        Array.isArray(row.pullRequests) ? row.pullRequests.filter(object) : [],
+      ),
+    );
+  const { head: publishable, body } = headForPublication({
+    ...merged,
+    updatedAt: new Date().toISOString(),
+  });
+  return { head: publishable, body, writes };
+}
+
 /** Folds records into the saved head like the journal-era summary writer: only the rows they touch are read. */
 function foldWork(backend: RecordBackend, workId: string, records: WorkRecord[]): void {
   const head = backend.getHead(workId) ?? emptyHead(workId);
-  let commits = false;
-  mergeRecordsInto(
-    projectionRows(backend, head, (collection, row) => {
-      observeLatest(head.latest, collection, row);
-      commits ||= collection === "commits";
-    }),
-    records,
-  );
-  if (commits) head.pullRequests = commitPullRequests(backend.readLog(workId, "commits"));
+  const plan = planFold(backend, head, records);
+  replayPlannedRows(backend, workId, plan.writes);
   // The publication is capped like every other head write: a capture folding onto an already
-  // reduced head re-derives the full merged set from the rows, and a body above the budget
-  // publishes reduced again (the `truncated` marker) instead of one unbounded put inside the
-  // capture transaction.
-  const { head: publishable, body } = headForPublication({
-    ...head,
-    updatedAt: new Date().toISOString(),
-  });
-  backend.putHead(publishable, body);
+  // reduced head merges incrementally, and a body above the budget publishes reduced again
+  // (the `truncated` marker) instead of one unbounded put inside the capture transaction.
+  backend.putHead(plan.head, plan.body);
 }
 
 function emptyHead(workId: string): WorkHead {
@@ -1353,6 +1495,8 @@ function projectionRows(
   backend: RecordBackend,
   head: WorkHead,
   onSet?: (collection: Collection, row: Row) => void,
+  write: (log: LogName, key: string, row: Row, pos: number) => void = (log, key, row, pos) =>
+    backend.putRow(head.workId, log, key, row, pos),
 ): SummaryRows {
   const { workId, logs } = head;
   /** Stored size of each row this fold has seen; undefined while the key is new. */
@@ -1373,7 +1517,7 @@ function projectionRows(
       meta.rows++;
       meta.bytes += bytes + 1;
     } else meta.bytes += bytes - previous;
-    backend.putRow(workId, log, key, row, meta.rows);
+    write(log, key, row, meta.rows);
     sizes.set(id, bytes);
   };
   const sessions = {

@@ -13,6 +13,7 @@ import {
   backendFor,
   capture,
   closeBackends,
+  importBatchInTx,
   ledgerTxDurations,
   listWorks,
   readRecords,
@@ -1181,7 +1182,107 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   expect(head?.pullRequests.length ?? 0).toBeGreaterThan(0);
   expect(readWorkSummary(dir, WORK)?.commits).toHaveLength(commits);
   expect(backend.dirtyWorks()).toEqual([]);
-}, 120_000);
+  // A capture on this reduced head (the round-5 design-006 probe: one ordinary one-link
+  // commit after the reduced rebuild held the write lock for 898.196 ms while the fold
+  // rescanned every commit row and serialized the whole head inside the capture
+  // transaction). The capture's fold must merge the head INCREMENTALLY outside the write
+  // lock: the structural proof counts the commit-row rescans (readLog) the capture runs at
+  // all, and whether any ran inside a transaction — the pre-fix capture read the work's
+  // whole 2,000-row commit log inside its own transaction.
+  // The captured link is stamped LATER than every seeded link, so the reduced publication's
+  // newest-first ranking keeps it: the budget drops only the oldest links.
+  const laterAt = new Date(Date.parse(at) + 60_000).toISOString();
+  const oneLinkCommit: WorkRecord = {
+    version: 1,
+    type: "commit",
+    workId: WORK,
+    sessionId: "session",
+    sha: "c".repeat(40),
+    repository: "github.com/o/r",
+    worktree: "/w",
+    recordedAt: laterAt,
+    pullRequests: [
+      {
+        provider: "github",
+        host: "github.com",
+        id: String(900_000),
+        url: "https://github.com/o/r/pull/900000",
+        checkedAt: laterAt,
+        state: "open",
+      },
+    ],
+  } as WorkRecord;
+  const realReadLog = backend.readLog;
+  let inCaptureTx = 0;
+  let captureReadLogs = 0;
+  let captureReadLogsInTx = 0;
+  const realCaptureTx = backend.tx;
+  backend.tx = ((run: () => void) => {
+    inCaptureTx++;
+    try {
+      return realCaptureTx(run);
+    } finally {
+      inCaptureTx--;
+    }
+  }) as typeof realCaptureTx;
+  backend.readLog = (...args: Parameters<typeof realReadLog>) => {
+    captureReadLogs++;
+    if (inCaptureTx > 0) captureReadLogsInTx++;
+    return realReadLog(...args);
+  };
+  try {
+    resetLedgerTxDurations(dir);
+    capture(dir, oneLinkCommit, "summary-native");
+  } finally {
+    backend.readLog = realReadLog;
+    backend.tx = realCaptureTx;
+  }
+  // The capture's fold never rescanned the commit rows — inside the transaction or out: the
+  // head's merged summary is maintained incrementally from the touched rows, and its
+  // serialization is precomputed outside the write lock (the pre-fix capture's single
+  // readLog call ran inside its transaction and the whole capture measured 898.196 ms).
+  expect(captureReadLogs).toBe(0);
+  expect(captureReadLogsInTx).toBe(0);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(1000);
+  // The reduced head stays readable and now carries the new link, and the authority keeps
+  // every commit row — the fold lost nothing.
+  const capturedHead = readWorkHead(dir, WORK);
+  expect(capturedHead?.truncated).toBe(true);
+  expect(capturedHead?.pullRequests.some((link) => link.id === String(900_000))).toBe(true);
+  expect(backend.readLog(WORK, "commits")).toHaveLength(commits + 1);
+  // The between-preflight-and-commit head-loss shape (the round-5 design-005 probe): another
+  // process removes the head after the importer's preflight rebuild, and one touch record
+  // imports inside the importer's transaction. The whole-work fallback that rebuilt the head
+  // there committed one 969.795 ms transaction on this exact shape; the work is marked dirty
+  // instead and the reader's lazy repair rebuilds it in bounded slices.
+  backend.clearProjectionHead(WORK);
+  resetLedgerTxDurations(dir);
+  backend.tx(() => {
+    importBatchInTx(backend, [
+      {
+        line: JSON.stringify(record("req-head-loss")),
+        record: record("req-head-loss"),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: commits + 1,
+      },
+    ]);
+  });
+  // The import committed the record and marked the work dirty — it never rebuilt the whole
+  // authority inside its own transaction (the pre-fix code published the head right here and
+  // cleared the marker, leaving dirtyWorks empty).
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(1000);
+  // The headless-dirty state is exactly what every reader repairs: the lazy read rebuilds in
+  // bounded slices and the work is readable again, reduced, with the touch record folded.
+  const repairedHead = readWorkHead(dir, WORK);
+  expect(repairedHead?.truncated).toBe(true);
+  expect(backend.dirtyWorks()).toEqual([]);
+  expect(readWorkSummary(dir, WORK)?.requests.map((row) => row.requestId)).toContain(
+    "req-head-loss",
+  );
+  expect(backend.readLog(WORK, "commits")).toHaveLength(commits + 1);
+}, 180_000);
 
 it("retry exhaustion abandons publication in bounded transactions instead of one convergence fold", () => {
   const dir = agentDir();
