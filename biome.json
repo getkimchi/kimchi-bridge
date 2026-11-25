@@ -1,0 +1,8 @@
+{
+  "files": {
+    "includes": [
+      "**",
+      "!test/ledger/protocol-golden.json"
+    ]
+  }
+}
