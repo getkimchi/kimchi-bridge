@@ -63,6 +63,14 @@ afterEach(() => {
 
 const WORK = "00000000-0000-4000-8000-000000000001";
 
+/** The plan's transaction ceiling for the loaded-path timing gates. The ISOLATED strict
+ *  acceptance run (KIMCHI_TX_BUDGET_STRICT=1 — one file, no concurrent suite load, the CI
+ *  strict-acceptance step) asserts the specified 250 ms maximum itself; under the loaded full
+ *  suite the same bounded transactions measure up to ~2x from scheduling and fsync contention,
+ *  so the in-suite allowance stays at the documented 1000 ms. The structural assertions beside
+ *  each gate (transaction counts, merge placement) are load-independent either way. */
+const TX_CEILING_MS = process.env.KIMCHI_TX_BUDGET_STRICT ? 250 : 1000;
+
 function record(requestId: string): WorkRecord {
   return {
     version: 1,
@@ -946,12 +954,13 @@ it("a many-distinct-commit work publishes its merged PR summary outside the writ
   const histogram = ledgerTxDurations(dir);
   // The plan's 250 ms ceiling holds in isolation; under the loaded full suite the
   // same bounded transactions measure up to ~2× from scheduling and fsync
-  // contention, so the in-suite allowance is 1000 ms. The structural merge
-  // assertions above are load-independent; the pre-fix shape measured 323 ms
-  // for the merge ALONE inside the publication transaction — far past either
-  // bound.
-  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(1000);
-  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(1000);
+  // contention, so the in-suite allowance is TX_CEILING_MS (1000 ms; the
+  // isolated strict acceptance run pins the plan's 250 ms itself — see
+  // TX_CEILING_MS above). The structural merge assertions above are
+  // load-independent; the pre-fix shape measured 323 ms for the merge ALONE
+  // inside the publication transaction — far past either bound.
+  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
   const head = readWorkHead(dir, WORK);
   expect(backend.readLog(WORK, "commits")).toHaveLength(commits);
   expect(head?.pullRequests).toHaveLength(commits * linksPerCommit);
@@ -1095,10 +1104,11 @@ it("an oversized publication head publishes reduced, so the work stays readable 
   // A repair rebuild of the same oversized shape is equally bounded and stays
   // readable. The 250 ms ceiling holds in isolation; the loaded full suite
   // measures the bounded transactions up to ~2× (see the sibling ceiling
-  // allowances above), so the in-suite bound is 1000 ms.
+  // allowances above and TX_CEILING_MS), so the in-suite bound stays at the
+  // documented 1000 ms while the isolated strict run pins 250 ms.
   resetLedgerTxDurations(dir);
   rebuildWork(dir, WORK);
-  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(1000);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
   expect(readWorkHead(dir, WORK)?.truncated).toBe(true);
   expect(backend.readLog(WORK, "commits")).toHaveLength(commits);
 }, 120_000);
@@ -1161,12 +1171,14 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   rebuildWork(dir, WORK);
   // The plan's 250 ms ceiling holds in isolation; under the loaded full suite
   // the same byte-batched folds measure up to ~2× from scheduling and fsync
-  // contention, so the in-suite allowance is 1000 ms. The transaction-count
-  // assertion below is the load-independent structural guarantee; the
-  // pre-fix whole-work transaction measured 1,638.992 ms on this exact shape.
+  // contention, so the in-suite allowance is TX_CEILING_MS (1000 ms; the
+  // isolated strict acceptance run pins the plan's 250 ms itself — see
+  // TX_CEILING_MS above). The transaction-count assertion below is the
+  // load-independent structural guarantee; the pre-fix whole-work transaction
+  // measured 1,638.992 ms on this exact shape.
   const histogram = ledgerTxDurations(dir);
-  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(1000);
-  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(1000);
+  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
   // The routing itself is structural, not a timing coincidence: the rebuild ran as MANY
   // bounded transactions (the clear, the drain and ~38 byte-batched folds of ~2 MiB each,
   // then the capped publication) — the pre-fix whole-work branch ran this same shape as
@@ -1243,7 +1255,7 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   // readLog call ran inside its transaction and the whole capture measured 898.196 ms).
   expect(captureReadLogs).toBe(0);
   expect(captureReadLogsInTx).toBe(0);
-  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(1000);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
   // The reduced head stays readable and now carries the new link, and the authority keeps
   // every commit row — the fold lost nothing.
   const capturedHead = readWorkHead(dir, WORK);
@@ -1272,7 +1284,7 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   // authority inside its own transaction (the pre-fix code published the head right here and
   // cleared the marker, leaving dirtyWorks empty).
   expect(backend.dirtyWorks()).toEqual([WORK]);
-  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(1000);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
   // The headless-dirty state is exactly what every reader repairs: the lazy read rebuilds in
   // bounded slices and the work is readable again, reduced, with the touch record folded.
   const repairedHead = readWorkHead(dir, WORK);
