@@ -987,13 +987,14 @@ const REBUILD_PUBLISH_RETRY_LIMIT = 8;
  * repair) rather than spinning forever against an equally determined other writer. */
 const REBUILD_RESTART_LIMIT = 8;
 /** The largest head body the publication transaction may write: the SQLite put of a body at
- *  this bound measures well under the 250 ms ceiling (~1.5 ms/MB; the 200,000-link acceptance
- *  shape is ~29 MB and writes in ~90 ms), while the reproduced 500,000-distinct-commit head
- *  (~73 MB) measured 493-778 ms inside the lock. A merged head above the bound is PUBLISHED
+ *  this bound measures ~100 ms idle and ~180 ms under the loaded full-suite runner on the
+ *  CI-pinned Bun 1.4.0 — both inside the 250 ms ceiling (a first calibration at 48 MiB put
+ *  ~150 ms idle and measured 272 ms loaded) — while the 200,000-link acceptance shape
+ *  (~29 MB) stays below it and publishes whole. A merged head above the bound is PUBLISHED
  *  REDUCED — the newest PR links up to the bound, with an explicit `truncated` marker in the
  *  head object — never deferred: a recorded work must never become unreadable, and the full
  *  link set stays in the authority rows every rebuild refolds. */
-const HEAD_PUBLISH_MAX_BYTES = 48 * 1024 * 1024;
+const HEAD_PUBLISH_MAX_BYTES = 32 * 1024 * 1024;
 /** Record body bytes the whole-work rebuild's single atomic transaction may cover. The
  *  branch is otherwise chosen by record count alone, and a count-sized work can still merge
  *  to an arbitrarily large projection (the reviewed probe: 1,000 commit records carrying

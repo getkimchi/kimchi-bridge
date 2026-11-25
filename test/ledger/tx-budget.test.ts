@@ -1081,7 +1081,7 @@ it("an oversized publication head publishes reduced, so the work stays readable 
     expect(parsed.logs.commits.rows).toBe(commits);
     expect(parsed.pullRequests).toHaveLength(head?.pullRequests.length ?? 0);
     expect(parsed.truncated).toBe(true);
-    expect(Buffer.byteLength(raw.body)).toBeLessThanOrEqual(48 * 1024 * 1024);
+    expect(Buffer.byteLength(raw.body)).toBeLessThanOrEqual(32 * 1024 * 1024);
   } finally {
     store.close();
   }
