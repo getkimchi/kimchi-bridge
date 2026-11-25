@@ -231,3 +231,46 @@ it("a late-delivered heartbeat never makes a stale worker writable", async () =>
   expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(250);
   expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
 }, 20_000);
+
+it("a first heartbeat delivered late never calibrates the offset to itself", async () => {
+  // The round-3 reproduced defect: with NO earlier heartbeat to converge the minimum, the
+  // first note's estimate becomes the offset wholesale. When that note sat queued behind a
+  // blocked main thread (delivered 50 ms into a 500 ms block), its estimate folds in ~450 ms
+  // of delivery latency and heartbeatAgeMs subtracts that latency from the heartbeat's real
+  // age — the pre-fix child reported ~31 ms and refused:false although ~480 ms had elapsed
+  // since the arrival. The first note must therefore never calibrate the offset unless its
+  // own delivery is bounded (the construction-time handshake offset is the yardstick), so
+  // the conservative conversion stays and the fence refuses the stale write.
+  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "first-late"], {
+    cwd: ROOT,
+    env: { ...process.env, HEARTBEAT_WINDOW_MS: "100" },
+    stdio: ["pipe", "ignore", "pipe"],
+  });
+  const lines: string[] = [];
+  createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
+  const saw = (phase: string) => lines.some((line) => line.includes(`"phase":"${phase}"`));
+  for (let round = 0; round < 100 && !saw("block"); round++)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(saw("block")).toBe(true);
+  // The parent delivers exactly one heartbeat 50 ms into the child's 500 ms block and then
+  // goes silent: its note can only drain after the block, ~450 ms after its true arrival.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+  expect(code).toBe(0);
+  const summary = lines
+    .map((line) => {
+      try {
+        return JSON.parse(line) as { phase?: string; ageMs?: number; refused?: boolean };
+      } catch {
+        return {} as { phase?: string; ageMs?: number; refused?: boolean };
+      }
+    })
+    .find((note) => note.phase === "summary");
+  expect(summary).toBeDefined();
+  // The drained note's delivery latency is never erased from the age: the age covers the
+  // true silent span since the heartbeat's arrival, so the fence refuses the write.
+  expect(summary?.refused).toBe(true);
+  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(250);
+  expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
+}, 20_000);
