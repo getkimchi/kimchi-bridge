@@ -190,7 +190,9 @@ export interface RecordBackend {
    *  rebuild drains the old rows in bounded transactions instead of one whole-work delete. */
   deleteProjectionRows(workId: string, limit: number): number;
   getHead(workId: string): WorkHead | undefined;
-  putHead(head: WorkHead): void;
+  /** `body` is the head's precomputed serialization, for callers that stringified outside the
+   *  write lock (the sliced publication); omitted, the store serializes the head itself. */
+  putHead(head: WorkHead, body?: string): void;
   allHeads(): WorkHead[];
   readRecords(
     opts: { workId?: string; sessionId?: string; modifiedSince?: number; type?: string },
@@ -961,6 +963,13 @@ const REBUILD_PUBLISH_RETRY_LIMIT = 8;
  * publishes nothing (no head, dirty marker intact — the state every reader and the next pass
  * repair) rather than spinning forever against an equally determined other writer. */
 const REBUILD_RESTART_LIMIT = 8;
+/** The largest head body the publication transaction may write: the SQLite put of a body at
+ *  this bound measures well under the 250 ms ceiling (~1.5 ms/MB; the 200,000-link acceptance
+ *  shape is ~29 MB and writes in ~90 ms), while the reproduced 500,000-distinct-commit head
+ *  (~73 MB) measured 493-778 ms inside the lock. A head whose body exceeds the bound defers
+ *  publication — the work keeps the headless-dirty state every reader and the next pass repair
+ *  in bounded slices — exactly like retry exhaustion, rather than paying one unbounded write. */
+const HEAD_PUBLISH_MAX_BYTES = 48 * 1024 * 1024;
 
 /** Folds every record page in (after, through] into `rows`, parsing damaged bodies away. */
 function foldWorkRecordPages(
@@ -1098,6 +1107,23 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
       // transaction (the reviewed probe measured 323 ms for 200k distinct commit rows). A
       // failed attempt re-folds the delta first, so the next attempt's merge sees every row.
       const pullRequests = commitPullRequests(commits.values());
+      // The head's serialization is also precomputed OUTSIDE the write lock, so the
+      // publication transaction only writes — and the body's size is the bound on that write:
+      // a head too large to publish inside the transaction budget defers publication to the
+      // repairable headless-dirty state (the same convergence retry exhaustion takes) instead
+      // of holding the write lock across one unbounded put.
+      const publishedHead = {
+        ...head,
+        updatedAt: new Date().toISOString(),
+        pullRequests,
+      };
+      const body = JSON.stringify(publishedHead);
+      if (Buffer.byteLength(body) > HEAD_PUBLISH_MAX_BYTES) {
+        writeDiagnosticNote(
+          "kimchi: a work's projection head exceeds the publication budget; publication is deferred to the repairable dirty state\n",
+        );
+        return;
+      }
       backend.tx(() => {
         if (backend.getNote(workId, REBUILD_OWNERSHIP_NOTE) !== generation) {
           foreign = true;
@@ -1108,11 +1134,7 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
         // write lock is held for the whole transaction, so nothing can move while it runs, and
         // the transaction itself stays one small write — it never folds records.
         if (backend.recordCount(workId) !== expected) return;
-        backend.putHead({
-          ...head,
-          updatedAt: new Date().toISOString(),
-          pullRequests,
-        });
+        backend.putHead(publishedHead, body);
         backend.clearDirty(workId);
         backend.deleteNote(workId, REBUILD_OWNERSHIP_NOTE);
         published = true;
@@ -1732,7 +1754,7 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
       const found = getHead.get(workId);
       return found ? (JSON.parse(found.body) as WorkHead) : undefined;
     },
-    putHead: (head) => putHead.run(head.workId, JSON.stringify(head), Date.now()),
+    putHead: (head, body) => putHead.run(head.workId, body ?? JSON.stringify(head), Date.now()),
     allHeads: () => allHeads.all().map((row) => JSON.parse(row.body) as WorkHead),
     readRecords: (opts, checkBudget) => {
       checkBudget?.();

@@ -943,6 +943,100 @@ it("a many-distinct-commit work publishes its merged PR summary outside the writ
   expect(head?.pullRequests).toEqual(commitPullRequests(backend.readLog(WORK, "commits")));
 }, 60_000);
 
+it("an oversized publication head defers to the repairable dirty state instead of one unbounded write", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  const OTHER = "00000000-0000-4000-8000-000000000002";
+  // Warm this directory's rebuild sizer down first (small request records under a slow clock),
+  // so the commit-heavy fold below runs in small slices and every transaction is measurable
+  // against the plan's ceiling.
+  for (let index = 0; index < 60; index++)
+    backend.tx(() => {
+      backend.insertRecord({
+        recordHash: `warm-${index}`,
+        type: "request",
+        workId: OTHER,
+        sessionId: "session",
+        body: JSON.stringify({ ...record(`warm-${index}`), workId: OTHER }),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: index,
+        importedAt: index,
+      });
+    });
+  slowClock(300);
+  for (let round = 0; round < 16; round++) rebuildWork(dir, OTHER);
+  useTxClock(null);
+  // The round-3 reproduction's shape, scaled past the publication bound: 500,000 merged PR
+  // links (2,000 distinct commits × 250 links each), a head body of ~73 MB whose single
+  // unbounded put inside the write lock measured 493-778 ms on the pre-fix code. The
+  // publication must stay a bounded write: an oversized head defers to the same repairable
+  // headless-dirty state retry exhaustion takes, and no transaction crosses the ceiling.
+  const commits = 2_000;
+  const linksPerCommit = 250;
+  const at = new Date().toISOString();
+  let seeded = 0;
+  for (let round = 0; seeded < commits; round++) {
+    const from = seeded;
+    backend.tx(() => {
+      for (let index = from; index < from + 200 && index < commits; index++) {
+        const links = Array.from({ length: linksPerCommit }, (_, k) => ({
+          provider: "github",
+          host: "github.com",
+          id: String(100_000 + index * linksPerCommit + k),
+          url: `https://github.com/o/r/pull/${100_000 + index * linksPerCommit + k}`,
+          checkedAt: at,
+          state: "open",
+        }));
+        backend.insertRecord({
+          recordHash: `commit-${index}`,
+          type: "commit",
+          workId: WORK,
+          sessionId: "session",
+          body: JSON.stringify({
+            version: 1,
+            type: "commit",
+            workId: WORK,
+            sessionId: "session",
+            sha: `sha${index.toString(16).padStart(6, "0")}`,
+            repository: "github.com/o/r",
+            worktree: "/w",
+            recordedAt: at,
+            pullRequests: links,
+          }),
+          sourcePath: "/journal",
+          sourceGeneration: 0,
+          sourceOffset: index,
+          importedAt: index,
+        });
+        backend.upsertMarker(`commit-${index}`, WORK, "commit");
+        seeded = index + 1;
+      }
+    });
+  }
+  expect(backend.recordCount(WORK)).toBe(commits);
+  resetLedgerTxDurations(dir);
+  rebuildWork(dir, WORK);
+  // Every transaction of the rebuild — folds, drains and publication attempt — stayed inside
+  // the plan's ceiling: the oversized head was never written inside the lock.
+  const histogram = ledgerTxDurations(dir);
+  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(250);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  // The work keeps the repairable state instead of a published head: no head, the dirty
+  // marker intact — every reader's lazy repair and the next pass rebuild it in bounded
+  // slices, exactly like retry exhaustion's convergence.
+  expect(backend.getHead(WORK)).toBeUndefined();
+  expect(backend.dirtyWorks()).toContain(WORK);
+  expect(backend.readLog(WORK, "commits")).toHaveLength(commits);
+  // A repair attempt is bounded too: the deferred shape reproduces without any transaction
+  // crossing the ceiling.
+  resetLedgerTxDurations(dir);
+  rebuildWork(dir, WORK);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  expect(backend.getHead(WORK)).toBeUndefined();
+  expect(backend.dirtyWorks()).toContain(WORK);
+}, 120_000);
+
 it("retry exhaustion abandons publication in bounded transactions instead of one convergence fold", () => {
   const dir = agentDir();
   const backend = backendFor(dir);
