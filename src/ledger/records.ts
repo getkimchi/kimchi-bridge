@@ -2030,8 +2030,12 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
   const hasDirtyStmt = db.query<{ one: number }, [string]>(
     "SELECT 1 AS one FROM work_dirty WHERE work_id = ?",
   );
+  // The stored body's BYTE length: SQLite's length() on TEXT counts CHARACTERS, so a head
+  // holding multibyte content measured smaller here than the memory backend's
+  // Buffer.byteLength and the two backends routed the same head to different sides of the
+  // inline fold gate (contracts-003). CAST to BLOB makes length() count UTF-8 bytes.
   const headBodyBytesStmt = db.query<{ bytes: number | null }, [string]>(
-    "SELECT length(body) AS bytes FROM work_projection_head WHERE work_id = ?",
+    "SELECT length(CAST(body AS BLOB)) AS bytes FROM work_projection_head WHERE work_id = ?",
   );
   const markDirty = db.query("INSERT OR IGNORE INTO work_dirty (work_id) VALUES (?)");
   const clearDirty = db.query("DELETE FROM work_dirty WHERE work_id = ?");
