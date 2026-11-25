@@ -296,6 +296,77 @@ console.log(JSON.stringify({ elapsedMs: Date.now() - start }));`)) as {
   ).toEqual(["cold-a", "cold-b", "cold-c"]);
 }, 20_000);
 
+it("a full spool-descriptor cache revisiting its oldest path keeps spooling without EBADF", async () => {
+  const dir = agentDir();
+  // The reproduced round-4 stall: the append cache holds one descriptor per spool path with a
+  // 16-entry bound (SPOOL_APPEND_FD_CACHE_MAX in records.ts). Sixteen distinct session paths
+  // fill it; a subsequent append to the OLDEST path — the first one cached — ran the capacity
+  // check on a cache HIT, closed that same path's live descriptor, and re-cached the closed
+  // fd. The NEXT append to the path failed fstat with EBADF, spooling returned false, and the
+  // capture fell back to the unlimited blocking SQLite wait: a contended capture that
+  // normally returns in ~252 ms stalled 10,708 ms against a 15 s holder. One child process
+  // owns the whole cache (it is per-process), fills all 16 paths, then appends three more
+  // records to the oldest path under the same held writer.
+  const cacheMax = 16;
+  const sessions = Array.from({ length: cacheMax }, (_, index) => `fd-cache-${index}`);
+  const holder = await holdWriter(dir, 8000);
+  let result: { elapsedMs?: number[] } | undefined;
+  try {
+    const captures = [
+      ...sessions.map((session, index) => [session, `fill-${index}`] as const),
+      ...([
+        ["fd-cache-0", "revisit-a"],
+        ["fd-cache-0", "revisit-b"],
+        ["fd-cache-0", "revisit-c"],
+      ] as const),
+    ]
+      .map(([session, requestId]) => ({ ...record(requestId, session) }))
+      .map((rec) => JSON.stringify(rec))
+      .join(",");
+    result = (await runChild(`const { capture } = await import(${JSON.stringify(
+      `${ROOT}src/ledger/records.js`,
+    )});
+const elapsedMs = [];
+for (const rec of [${captures}]) {
+  const start = Date.now();
+  capture(${JSON.stringify(dir)}, rec, "fd-cache-test");
+  elapsedMs.push(Date.now() - start);
+}
+console.log(JSON.stringify({ elapsedMs }));`)) as { elapsedMs?: number[] };
+  } finally {
+    await holder.done;
+  }
+  const elapsed = result?.elapsedMs ?? [];
+  expect(elapsed).toHaveLength(cacheMax + 3);
+  // EVERY capture — the 16 that filled the cache and the three revisits to its oldest path —
+  // returned inside the contended busy window: none took the blocking fallback the closed
+  // descriptor would have forced (the pre-fix second revisit stalled ~8 s, until the holder
+  // released). The bound is the load-tolerant in-suite form; the invariant below proves the
+  // bounded path itself.
+  for (const ms of elapsed) {
+    expect(ms).toBeGreaterThanOrEqual(150);
+    expect(ms).toBeLessThan(1000);
+  }
+  // The bounded path is the one every capture took: every record sits in its session's
+  // spool (the oldest path carries its three revisits as one durable append each) and the
+  // ledger holds nothing — no blocking fallback, no direct write under the held writer.
+  expect(readRecords(dir)).toHaveLength(0);
+  const oldest = spoolFilePath(dir, "fd-cache-0");
+  expect(existsSync(oldest)).toBe(true);
+  // The oldest path's file carries its original fill record plus the three revisits — four
+  // durable appends, none lost to a closed descriptor.
+  expect(
+    readFileSync(oldest, "utf8")
+      .split("\n")
+      .filter((line) => line.trim()),
+  ).toHaveLength(4);
+  for (const session of sessions) expect(existsSync(spoolFilePath(dir, session))).toBe(true);
+  // The spool imports exactly once; every record lands, none is dropped.
+  expect(importSpool(dir).imported).toBe(cacheMax + 3);
+  expect(readRecords(dir)).toHaveLength(cacheMax + 3);
+  expect(readWorkSummary(dir, WORK)?.sessions.sort()).toEqual([...sessions].sort());
+}, 30_000);
+
 it("each spooled record is one self-delimiting append, so a killed writer's torn line never glues onto it", async () => {
   const dir = agentDir();
   expect(readRecords(dir)).toHaveLength(0);

@@ -536,9 +536,19 @@ function appendSpoolRecord(path: string, line: string): boolean {
     }
     if (live.dev !== stat.dev || live.ino !== stat.ino) return false;
     kept = true;
-    if (spoolAppendFds.size >= SPOOL_APPEND_FD_CACHE_MAX) {
-      const oldest = spoolAppendFds.keys().next().value;
-      if (oldest !== undefined) closeSpoolAppendFd(oldest, spoolAppendFds.get(oldest) as number);
+    // Eviction runs only for a path the cache does not already hold: this append's own
+    // descriptor is the one being re-cached below, and when its path is the oldest entry
+    // the capacity check would close THAT SAME live descriptor and immediately re-cache
+    // the closed fd — the next append to the path would then fail fstat with EBADF, abandon
+    // the spool, and stall capture on the unlimited blocking SQLite wait although the
+    // spool itself was healthy (the reproduced 10.7 s stall after a 16-path cache filled
+    // and revisited its oldest entry). A cache hit inserts nothing, so it evicts nothing.
+    if (!spoolAppendFds.has(path)) {
+      while (spoolAppendFds.size >= SPOOL_APPEND_FD_CACHE_MAX) {
+        const oldest = spoolAppendFds.keys().next().value;
+        if (oldest === undefined) break;
+        closeSpoolAppendFd(oldest, spoolAppendFds.get(oldest) as number);
+      }
     }
     spoolAppendFds.set(path, descriptor);
     return true;
