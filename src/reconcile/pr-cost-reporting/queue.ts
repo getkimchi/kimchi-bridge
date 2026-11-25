@@ -566,11 +566,7 @@ async function update(
     assertLedgerWritable(agentDir);
     if (reportingPassContext.getStore() !== agentDir) return;
     const backend = backendFor(agentDir);
-    if (
-      epoch !== undefined &&
-      backend.writerEpoch &&
-      backend.writerEpoch() !== epoch
-    )
+    if (epoch !== undefined && backend.writerEpoch && backend.writerEpoch() !== epoch)
       throw new Error("PR reporting queue state was fenced by a newer lease holder");
   };
   try {
