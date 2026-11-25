@@ -298,6 +298,7 @@ export function closeBackends(): void {
   for (const backend of backends.values()) backend.close();
   backends.clear();
   rebuildSizers.clear();
+  for (const [path, fd] of spoolAppendFds) closeSpoolAppendFd(path, fd);
 }
 
 /** Hash used for native capture; imported records retain the hash of their exact original line bytes. */
@@ -413,112 +414,84 @@ function writeDiagnosticNote(text: string): void {
  * cannot leave a torn record behind. The file must be a regular file with no other link and
  * owned by this user — anything else (a symlink or hardlink planted at the predictable path) is
  * refused so the caller falls back to the blocking SQLite wait. */
+/** Cached append descriptors per spool path: a successful append parks its descriptor here, so
+ *  the next append for the same entry writes through the very inode it verified — no name
+ *  re-resolution at all, and the held descriptor pins the inode, so no replacement can recycle
+ *  its number underneath the live-path identity check. Bounded, so a long-lived process cannot
+ *  accumulate one per session it ever captured for. */
+const spoolAppendFds = new Map<string, number>();
+const SPOOL_APPEND_FD_CACHE_MAX = 16;
+
+function closeSpoolAppendFd(path: string, fd: number): void {
+  spoolAppendFds.delete(path);
+  try {
+    closeSync(fd);
+  } catch {
+    // The descriptor is gone either way; the next append re-opens the path.
+  }
+}
+
 function appendSpoolRecord(path: string, line: string): boolean {
   const directory = dirname(path);
   const bytes = Buffer.from(`\n${line}\n`, "utf8");
-  const fsyncDirectories = ensureDirectoryChain(directory);
-  let fd: number;
-  // Creation is decided by an exclusive-create attempt, never inferred from a pre-open
-  // existsSync: a retirement or replacement between a check and the open would hide a fresh
-  // directory entry. Only an append whose own open created the entry needs the directory's
-  // fsync; an append to an existing file leaves the directory unchanged and syncs only the
-  // file, so sustained contention does not pay a blocking directory flush per capture.
-  let created = false;
-  /** Whether the exclusive attempt's EEXIST proved a name existed: whatever the fallback open
-   *  below lands on is then compared against the entry that EEXIST observed, so a replacement
-   *  is detected even though the fallback's own O_CREAT cannot report creation. */
-  let sawEntry = false;
-  /** The stat of the entry the first EEXIST observed, when the lstat could still see it: its
-   *  identity against the stat the fallback open lands on decides whether that entry is fresh.
-   *  The inode alone cannot decide — a retirement between the attempts can recycle the number
-   *  onto another creator's replacement — so the size and timestamps are compared too. */
-  let existedStat: Stats | undefined;
-  try {
-    fd = openSync(
-      path,
-      constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW,
-      0o600,
-    );
-    created = true;
-  } catch (error) {
-    if (!object(error) || error.code !== "EEXIST") return false;
-    // The entry the EEXIST observed: an importer can retire it (rename to a claim, then
-    // unlink) before the opens below, or another creator can replace it, so its full stat
-    // is remembered rather than the mere fact that the name existed — whatever the fallback
-    // lands on is compared against it. A missing entry here (already retired) leaves the
-    // fallback's creation undeniably fresh.
-    sawEntry = true;
-    try {
-      existedStat = lstatSync(path);
-    } catch {
-      // Retired between the EEXIST and here: the exclusive retry below creates fresh.
-    }
-    // Retry the exclusive create: a retirement since the first EEXIST makes it succeed, so a
-    // replacement entry this append itself creates is detected by the same contract as the
-    // primary path instead of being opened as if it pre-existed.
+  let fd = spoolAppendFds.get(path);
+  // The first landing on an entry this process has not appended to yet: the open dance below
+  // decides it exactly (an exclusive create made the entry, or the non-creating open observed
+  // it) — never by comparing metadata, which a recycled inode with equal size and coarse
+  // timestamps can defeat. The landing persists the directory record BEFORE any byte is
+  // written, so whichever entry the append lands on — its own creation, another writer's
+  // replacement, a concurrent creator's mid-flight entry — is durable at the pathname before
+  // the append is acknowledged. Later appends through the cached descriptor sync only the
+  // file: the directory is unchanged and its entry was already made durable by the landing.
+  let firstLanding = fd === undefined;
+  if (firstLanding) {
+    const fsyncDirectories = ensureDirectoryChain(directory);
     try {
       fd = openSync(
         path,
         constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW,
         0o600,
       );
-      created = true;
-    } catch (again) {
-      if (!object(again) || again.code !== "EEXIST") return false;
+    } catch (error) {
+      if (!object(error) || error.code !== "EEXIST") return false;
+      // The non-creating open never creates: an entry retired between the attempts fails with
+      // ENOENT and the caller's retry restarts at the exclusive create, whose own landing
+      // fsync covers the fresh entry it makes.
       try {
-        fd = openSync(
-          path,
-          constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | O_NOFOLLOW,
-          0o600,
-        );
+        fd = openSync(path, constants.O_RDWR | constants.O_APPEND | O_NOFOLLOW, 0o600);
       } catch {
         return false;
       }
     }
-  }
-  try {
-    const stat = fstatSync(fd);
-    const uid = process.getuid?.();
-    // A fresh directory entry THIS attempt is responsible for persisting: one its own
-    // exclusive create made, or one the fallback open landed on that is not the entry the
-    // first EEXIST observed (an importer's retirement let another creator — or the fallback's
-    // own O_CREAT — replace it; a recycled inode number alone cannot prove sameness).
-    const freshEntry =
-      created ||
-      (sawEntry &&
-        (existedStat === undefined ||
-          existedStat.ino !== stat.ino ||
-          existedStat.size !== stat.size ||
-          existedStat.mtimeMs !== stat.mtimeMs ||
-          existedStat.ctimeMs !== stat.ctimeMs));
-    /** Persists every entry this attempt created — before the append is acknowledged, and
-     *  equally before a failed attempt bails out or throws: the next attempt reopens the
-     *  entry as pre-existing, so deferring this fsync to a later success would acknowledge an
-     *  append whose pathname was never directory-fsynced (the creation-durability debt is
-     *  carried across retries, never dropped). */
-    const syncCreatedEntries = () => {
-      if (freshEntry) fsyncDirectoryDurable(directory);
+    try {
       for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
-    };
+      fsyncDirectoryDurable(directory);
+    } catch {
+      // The landing's own durability step failed: nothing was written, so the attempt owes
+      // nothing but a retry — which lands again and repeats the fsync.
+      closeSpoolAppendFd(path, fd);
+      return false;
+    }
+  }
+  const descriptor = fd as number;
+  let kept = false;
+  try {
+    const stat = fstatSync(descriptor);
+    const uid = process.getuid?.();
     if (!stat.isFile() || stat.nlink !== 1 || (uid !== undefined && stat.uid !== uid)) {
-      syncCreatedEntries();
       return false;
     }
     let written = 0;
     while (written < bytes.length) {
-      const count = writeSync(fd, bytes, written, bytes.length - written);
-      if (count <= 0) {
-        syncCreatedEntries();
-        return false;
-      }
+      const count = writeSync(descriptor, bytes, written, bytes.length - written);
+      if (count <= 0) return false;
       written += count;
     }
-    fsyncSync(fd);
-    // The append is durable. The directory entries a created file (or directory chain) added
-    // need their directories' fsync too, or a kernel crash can lose the path the next import
-    // scans — an append to an existing entry syncs nothing but the file itself. Windows cannot
-    // open a directory for fsync; the file's own fsync still holds.
-    syncCreatedEntries();
+    fsyncSync(descriptor);
+    // The append is durable. A first landing already fsynced the directory (and any created
+    // directory chain) before the first byte; a cached descriptor's entry was made durable by
+    // its own landing, and the descriptor pins the inode, so no replacement can have recycled
+    // it — an append to it syncs nothing but the file itself.
     // Verify through this descriptor that the record is the file's last line, and then that
     // the live pathname is still this user's private single-link regular file at the same
     // inode, never following a symlink (a link swapped in for the path would otherwise hide
@@ -528,10 +501,10 @@ function appendSpoolRecord(path: string, line: string): boolean {
     // inode no importer can ever scan again. A missing path or a different inode reports the
     // mismatch and the caller re-appends the same line to a fresh spool file — the importer's
     // line-hash dedup keeps the record exactly-once either way.
-    const size = fstatSync(fd).size;
+    const size = fstatSync(descriptor).size;
     if (size < bytes.length) return false;
     const tail = Buffer.alloc(bytes.length);
-    readSync(fd, tail, 0, bytes.length, size - bytes.length);
+    readSync(descriptor, tail, 0, bytes.length, size - bytes.length);
     if (!tail.equals(bytes)) return false;
     let live: Stats;
     try {
@@ -543,29 +516,23 @@ function appendSpoolRecord(path: string, line: string): boolean {
     if (!live.isFile() || live.nlink !== 1 || (uid !== undefined && live.uid !== uid)) {
       // The live pathname is not this user's private single-link regular file (a symlink
       // swapped in for it, an added hardlink, or a foreign owner): the append is not
-      // acknowledged, the caller re-appends or falls back to the blocking SQLite wait, and the
-      // unsafe path is reported so it can be repaired.
+      // acknowledged, the caller re-appends or falls back to the blocking SQLite wait, and
+      // the unsafe path is reported so it can be repaired.
       writeDiagnosticNote(
         "kimchi: the capture spool path is unsafe; the record is being re-appended\n",
       );
       return false;
     }
-    return live.dev === stat.dev && live.ino === stat.ino;
-  } catch (error) {
-    // A failed attempt still owes the durability of any entry it may have created: the retry
-    // the caller performs reopens the entry as pre-existing, so the creation-debt cannot wait
-    // for a later success (the syncs already performed above are simply repeated, not owed).
-    if (created || sawEntry) {
-      try {
-        fsyncDirectoryDurable(directory);
-        for (const durable of fsyncDirectories) fsyncDirectoryDurable(durable);
-      } catch {
-        // Best-effort on an already-failing path: the caller's fallback continues regardless.
-      }
+    if (live.dev !== stat.dev || live.ino !== stat.ino) return false;
+    kept = true;
+    if (spoolAppendFds.size >= SPOOL_APPEND_FD_CACHE_MAX) {
+      const oldest = spoolAppendFds.keys().next().value;
+      if (oldest !== undefined) closeSpoolAppendFd(oldest, spoolAppendFds.get(oldest) as number);
     }
-    throw error;
+    spoolAppendFds.set(path, descriptor);
+    return true;
   } finally {
-    closeSync(fd);
+    if (!kept) closeSpoolAppendFd(path, descriptor);
   }
 }
 

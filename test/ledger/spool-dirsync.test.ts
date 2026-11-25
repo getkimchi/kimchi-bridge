@@ -44,20 +44,16 @@ mock.module("node:fs", () => ({
     // The real importer retires the checked file between the exclusive attempt's EEXIST and
     // this fallback open, so the fallback's O_CREAT creates a replacement entry the old
     // code never directory-fsynced.
-    if (
-      !injected &&
-      retireBeforeCreate &&
-      String(path) === spoolPath &&
-      (flags & realFs.constants.O_CREAT) !== 0 &&
-      (flags & realFs.constants.O_EXCL) === 0
-    ) {
+    if (!injected && retireBeforeCreate && String(path) === spoolPath) {
       injected = true;
       retireBeforeCreate();
     }
-    const fd = realOpenSync(path, flags, mode);
-    fdPaths.set(fd, String(path));
+    // Recorded before the real call: the exclusive attempt exists to fail with EEXIST when
+    // the entry is there, and the append still ran its create-deciding open.
     if (String(path) === spoolPath && (flags & realFs.constants.O_CREAT) !== 0)
       createdViaOpen = true;
+    const fd = realOpenSync(path, flags, mode);
+    fdPaths.set(fd, String(path));
     return fd;
   }) as typeof realFs.openSync,
   closeSync: ((fd: number) => {
