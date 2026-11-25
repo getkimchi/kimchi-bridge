@@ -78,6 +78,16 @@ export interface HostPorts {
   readonly orgPolicy: () => HostOrgPolicy;
   /** Whether telemetry (and telemetry-following PR reporting) is currently consented to. */
   readonly telemetryConsent: () => boolean;
+  /**
+   * The user's PR-cost reporting consent, overriding the queue's persisted `state.json` value
+   * when the host owns the choice (Kimchi stores it beside telemetry consent in its global
+   * config, written only by the user's explicit `/pr-reporting` command or its setup flow).
+   * "follow-telemetry" defers to {@link telemetryConsent}. Optional: a host that does not
+   * provide it (an older embedding release) keeps the legacy `state.json` semantics, and a
+   * return of undefined falls back the same way. A host that cannot read its consent should
+   * return "off" (fail closed), not undefined.
+   */
+  readonly reportingConsent?: () => "on" | "off" | "follow-telemetry" | undefined;
   /** Replays a PR-cost metric into the embedding process's telemetry context. */
   readonly metric: (metric: HostMetric) => void;
   /** The embedding process's fetch (instrumented, proxied) — replaces bare global fetch. */
