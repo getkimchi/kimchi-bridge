@@ -139,24 +139,18 @@ export interface CancelMessage {
   id: number;
 }
 
-/** The lease holder's heartbeat: the parent is alive and still holds the lease.
- *  The parent stamps `at` with its own Date.now() at SEND, and the worker's reader thread
- *  stores that value VERBATIM as the write fence's datum — the send time travels with the
- *  event and is never re-dated by observation, so the fence never depends on when (or
- *  whether) the worker gets around to noticing the arrival. Parent and worker are local
- *  processes on the same host, so both read the same system clock; if the worker ever runs
- *  remotely, this fence is void. The fence refuses ledger writes once no stamp has arrived
- *  within the heartbeat window — the fence that stops a stale worker an old release's lease
- *  handover never covers (it never bumps the epoch).
+/** The lease holder's heartbeat: the parent is alive and still holds the lease. The reader
+ *  increments a shared arrival counter; the worker bounds changes on its own monotonic clock,
+ *  so wall-clock corrections and delayed observation cannot make a silent parent fresh.
  *
- *  Required parent send cadence: the parent must send heartbeats at a fixed interval of at
- *  most 1 s (proper-lockfile's own lease-update interval; K2's supervisor sends every 500 ms
- *  while the worker lives), starting immediately after `ready`. A parent that only heartbeats
- *  around passes will find its worker refusing writes mid-pass once the window elapses. */
+ *  Required parent send cadence: at a fixed interval of at most 1 s (proper-lockfile's own
+ *  lease-update interval; K2's supervisor sends every 500 ms while the worker lives), starting
+ *  immediately after `ready`. A parent that only heartbeats around passes will find its worker
+ *  refusing writes mid-pass once the window elapses. */
 export interface HeartbeatMessage {
   type: "heartbeat";
-  /** When the parent sent it: its own Date.now() at send, in milliseconds since the epoch.
-   *  Stored verbatim by the worker; the fence's one load-bearing datum. */
+  /** When the parent sent it: its own Date.now() at send, retained for wire diagnostics and
+   *  compatibility. Freshness uses arrival order on the worker's monotonic clock, never this stamp. */
   at: number;
 }
 

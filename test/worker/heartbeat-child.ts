@@ -1,48 +1,13 @@
 /**
- * A child process for the heartbeat fence regressions (see heartbeat.test.ts). Its stdin is a
- * pipe the test drives: the parent writes real heartbeat lines on the wire, each stamped
- * with its own Date.now() at send exactly as the protocol requires, while the child samples
- * the transport's fence — the same shape as the parent process driving the worker over
- * stdio. No cross-thread clock conversion happens anywhere: the helper thread stores the
- * parent's stamp verbatim, and the main thread subtracts it from its monotonically
- * reconstructed wall time (a high-water mark plus a backward-regression accumulator).
+ * Real stdin-driven heartbeat-fence scenarios. The parent writes heartbeat lines while the
+ * child samples the same transport used by the worker. Freshness follows only the helper's
+ * arrival counter and the child's monotonic clock; wall offsets simulate host clock changes.
  *
- * Modes (argv[2]):
- *  - "slow-construction" / "slow-helper" / "lockout": the availability regressions. The
- *    child samples the fence every 100 ms and reports each sample's age and refusal while
- *    the parent keeps heartbeating at the required cadence (the construction hook stretches
- *    the transport's construction, or the helper-start hook delays the reader thread's
- *    first action, past the fence window). The startup stamp covers the whole stretch:
- *    ages only read older through it, and the live heartbeats re-date the fence as they
- *    arrive.
- *  - "late-heartbeat": the parent heartbeats while the child settles, the child then holds
- *    its main thread for KIMCHI_WORKER_TEST_HOLD_MS while the parent delivers one more
- *    heartbeat, then goes silent for KIMCHI_WORKER_TEST_SILENCE_MS before the child checks
- *    the fence. The hold cannot re-date the arrival: its send stamp travels with the event.
- *  - "delayed-anchor": the C4a severe (failure-013 / security-007 / correctness-016 /
- *    design-009). The parent heartbeats until the child's multi-second main-thread hold
- *    begins (KIMCHI_WORKER_TEST_HOLD_MS) and delivers one final heartbeat at the hold's
- *    START, then goes silent. The hold cannot re-date that arrival — its send stamp travels
- *    with the event — so the post-hold check must refuse with the age covering the hold.
- *  - "clock-jump": the backward wall-clock regression between a heartbeat's send and the
- *    check. The child reads its wall through an offset seam; when the
- *    KIMCHI_WORKER_TEST_JUMP_AT_BEAT-th heartbeat arrives it steps its clock back
- *    KIMCHI_WORKER_TEST_JUMP_MS and reports "jumped", and the parent stops sending. The
- *    child then waits KIMCHI_WORKER_TEST_SILENCE_MS and checks: the reconstruction must
- *    keep the computed age at the true silence (a raw wall read would compute a negative
- *    age and accept forever).
- *  - "post-wake": the round-7 deschedule reproduction (failure-012 / security-006). The
- *    helper thread's first action is delayed past the old design's handshake bound (the
- *    helper-start hook); the parent heartbeats at the required cadence for the first part
- *    of the run and then goes silent, and the child checks the fence once its wait expires.
- *    The write must be refused with the age covering the silence since the last arrival.
- *  - "live-load": the no-lockout bound. The child takes KIMCHI_WORKER_SAMPLES fence samples
- *    ~5 ms apart under concurrent CPU load (spin worker threads that self-terminate on a
- *    shared stop flag and after a hard 30 s cap), with the parent heartbeating at the
- *    required 100 ms cadence throughout: a live parent is never refused.
- *
- * The summary goes to stderr as one JSON line; stdout carries only the transport's own
- * request lines (none in these scenarios).
+ * Modes cover delayed construction/helper starts, quiet pipes, arrivals during main-thread
+ * holds, forward/backward wall steps, live-parent recovery, and sustained CPU load. The
+ * backward-hold and forward-back-hold summaries report a check immediately after the hold
+ * and another after overdue anchors. Live-hold proves the accepted false refusal recovers.
+ * Summaries are JSON on stderr; stdout is reserved for the transport's own messages.
  */
 import { Worker } from "node:worker_threads";
 import {
@@ -58,9 +23,13 @@ function report(value: unknown): void {
   process.stderr.write(`${JSON.stringify(value)}\n`);
 }
 
-/** The clock-jump mode's offset seam: the transport reads its wall through this offset,
- *  and the arrival of the jump-triggering heartbeat steps it backwards mid-run. */
+/** Wall offsets simulate host clock corrections without affecting the monotonic fence. */
+const realDateNow = Date.now;
 const clock = { offset: 0 };
+function setWallOffset(offset: number): void {
+  clock.offset = offset;
+  Date.now = () => realDateNow() + clock.offset;
+}
 let beats = 0;
 let signalJump: (() => void) | undefined;
 const jumped = new Promise<void>((resolve) => {
@@ -70,29 +39,33 @@ const jumped = new Promise<void>((resolve) => {
 function onEvent(event: TransportEvent): void {
   if (event.kind !== "message" || event.message.type !== "heartbeat") return;
   beats++;
-  if (beats < Number(process.env.KIMCHI_WORKER_TEST_JUMP_AT_BEAT ?? 8)) return;
-  clock.offset = -Number(process.env.KIMCHI_WORKER_TEST_JUMP_MS ?? 10_000);
+  if (beats < Number(process.env.KIMCHI_WORKER_TEST_JUMP_AT_BEAT ?? 8) || clock.offset !== 0)
+    return;
+  setWallOffset(-Number(process.env.KIMCHI_WORKER_TEST_JUMP_MS ?? 10_000));
   report({ mode, phase: "jumped" });
   signalJump?.();
   signalJump = undefined;
 }
 
 const transport = new StdioTransport(
-  mode === "clock-jump" ? onEvent : () => {},
-  mode === "clock-jump" ? { now: () => Date.now() + clock.offset } : undefined,
+  mode === "clock-jump" || mode === "backward-live" ? onEvent : () => {},
 );
+
+function readFence(): { ageMs: number; refused: boolean } {
+  let refused = false;
+  try {
+    transport.assertHeartbeatFresh(windowMs);
+  } catch (error) {
+    refused = error instanceof LeaseHeartbeatLost;
+  }
+  return { ageMs: transport.heartbeatAgeMs(), refused };
+}
 
 async function sampleFence(rounds: number): Promise<{ ageMs: number; refused: boolean }[]> {
   const samples: { ageMs: number; refused: boolean }[] = [];
   for (let index = 0; index < rounds; index++) {
     await new Promise((resolve) => setTimeout(resolve, 100));
-    let refused = false;
-    try {
-      transport.assertHeartbeatFresh(windowMs);
-    } catch (error) {
-      refused = error instanceof LeaseHeartbeatLost;
-    }
-    samples.push({ ageMs: transport.heartbeatAgeMs(), refused });
+    samples.push(readFence());
   }
   return samples;
 }
@@ -109,7 +82,7 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
   report({ mode, phase: "block" });
   const start = Date.now();
   while (Date.now() - start < holdMs) {
-    /* A real block: the main thread (and the wall sampler with it) is held. */
+    /* A real block: the main thread (and its arrival anchor timer) is held. */
   }
   await new Promise((resolve) => setTimeout(resolve, silenceMs));
   let refused = false;
@@ -122,20 +95,15 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
   transport.close();
   report({ mode, phase: "summary", ageMs, refused });
 } else if (mode === "delayed-anchor") {
-  // The C4a severe (failure-013 / security-007 / correctness-016 / design-009): a heartbeat
-  // arrives at the START of a multi-second main-thread hold. The held thread cannot observe
-  // the arrival until the hold ends; under the anchored design the first post-hold anchor
-  // fire sampled the current arrival counter and re-dated that old heartbeat as just-now
-  // (writes accepted after seconds of silence at ~132 ms ages). The parent-stamped design
-  // carries the heartbeat's send time with the event, so the post-hold check must refuse
-  // with the age covering the whole hold.
+  // A heartbeat arrives at the start of a multi-second main-thread hold. The overdue
+  // observation keeps the preceding fire as its lower bound, so the age covers the hold.
   report({ mode, phase: "converge" });
   await new Promise((resolve) => setTimeout(resolve, 600));
   report({ mode, phase: "block" });
   const holdMs = Number(process.env.KIMCHI_WORKER_TEST_HOLD_MS ?? 2200);
   const start = Date.now();
   while (Date.now() - start < holdMs) {
-    /* A real multi-second block: the main thread (and its wall sampler) is held. */
+    /* A real multi-second block: the main thread (and its anchor timer) is held. */
   }
   await new Promise((resolve) => setTimeout(resolve, 100));
   let refused = false;
@@ -148,13 +116,8 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
   transport.close();
   report({ mode, phase: "summary", ageMs, refused });
 } else if (mode === "clock-jump") {
-  // The backward wall-clock regression between a heartbeat's send and the check: the last
-  // heartbeat is stamped with the pre-jump clock, and the worker's wall then steps back. A
-  // raw wall read would compute a negative age (silence minus the jump) and accept the
-  // write forever; the reconstruction's high-water floors effective time at the last
-  // observed wall reading, the next sample absorbs the step, and the age keeps tracking the
-  // true silence — so the fence refuses. The 10 s cap keeps the wait self-terminating even
-  // if the jump-triggering heartbeat never arrives.
+  // The parent stops after a backward wall step. Arrival order and monotonic time still age
+  // out the fence. The cap keeps the wait self-terminating without its triggering heartbeat.
   const silenceMs = Number(process.env.KIMCHI_WORKER_TEST_SILENCE_MS ?? 1200);
   const cap = setTimeout(() => signalJump?.(), 10_000);
   await jumped;
@@ -170,11 +133,8 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
   transport.close();
   report({ mode, phase: "summary", ageMs, refused });
 } else if (mode === "post-wake") {
-  // The deschedule reproduction: the helper-start hook delayed the reader thread's first
-  // action past the old design's handshake bound, so the pre-fix offset calibration rested
-  // entirely on what happened after the queued notes drained. The child's single wait
-  // expires while the (instrumented) deschedule still holds the main thread, so the fence
-  // is sampled the moment the thread wakes — the first sample the round-7 probe took.
+  // Delay the helper's first action, queue heartbeats, and check after a silent wait.
+  // Draining notes late cannot refresh the monotonic arrival lower bound.
   await new Promise((resolve) =>
     setTimeout(resolve, Number(process.env.HEARTBEAT_WAIT_MS ?? 2000)),
   );
@@ -187,11 +147,47 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
   const ageMs = transport.heartbeatAgeMs();
   transport.close();
   report({ mode, phase: "summary", ageMs, refused });
+} else if (mode === "backward-hold" || mode === "forward-back-hold") {
+  report({ mode, phase: "converge" });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  if (mode === "forward-back-hold") setWallOffset(60_000);
+  report({ mode, phase: "block" });
+  const holdMs = Number(process.env.KIMCHI_WORKER_TEST_HOLD_MS ?? 2200);
+  const start = realDateNow();
+  let corrected = false;
+  while (realDateNow() - start < holdMs) {
+    if (!corrected && realDateNow() - start >= 500) {
+      setWallOffset(mode === "forward-back-hold" ? 0 : -10_000);
+      corrected = true;
+      report({ mode, phase: "jumped" });
+    }
+  }
+  const immediate = readFence();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const afterTimer = readFence();
+  transport.close();
+  report({ mode, phase: "summary", immediate, afterTimer });
+} else if (mode === "backward-live") {
+  const samples = await sampleFence(Number(process.env.HEARTBEAT_SAMPLES ?? 14));
+  transport.close();
+  report({ mode, phase: "summary", samples });
+} else if (mode === "live-hold") {
+  report({ mode, phase: "converge" });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  report({ mode, phase: "block" });
+  const holdMs = Number(process.env.KIMCHI_WORKER_TEST_HOLD_MS ?? 2200);
+  const start = realDateNow();
+  while (realDateNow() - start < holdMs) {
+    /* The helper keeps receiving while the main thread cannot observe anchors. */
+  }
+  const immediate = readFence();
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const recovered = readFence();
+  transport.close();
+  report({ mode, phase: "summary", immediate, recovered });
 } else if (mode === "live-load") {
-  // The no-lockout bound: a live parent heartbeating at the required cadence is never
-  // refused, even with the machine busy. The spin workers compete for the CPU with the
-  // wall sampler (and the helper thread); each stops the moment the shared flag is set and
-  // unconditionally after a hard 30 s cap, so nothing can hang.
+  // A live parent is never refused while anchors stay punctual. Spin workers compete for
+  // CPU with the anchor timer and helper, and stop on the shared flag or after 30 s.
   const samples = Number(process.env.KIMCHI_WORKER_SAMPLES ?? 1000);
   const stop = new Int32Array(new SharedArrayBuffer(4));
   const hogs: Worker[] = [];
@@ -204,7 +200,7 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
         const stop = new Int32Array(workerData);
         const deadline = performance.now() + 30000;
         while (Atomics.load(stop, 0) === 0 && performance.now() < deadline) {
-          /* Spin: concurrent CPU load for the wall sampler to compete with. */
+          /* Spin: concurrent CPU load for the arrival anchor timer to compete with. */
         }
         `,
         { eval: true, workerData: stop.buffer },

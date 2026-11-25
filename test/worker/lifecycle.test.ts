@@ -845,6 +845,10 @@ test("a late reply after a request's timeout never satisfies a later request", a
   expect(stalled).toBeDefined();
   const done1 = await drain(worker, 50);
   expect(done1.result.outcome).toBe("failed");
+  // The expired host request held the main thread for 10 s. Even though the helper kept
+  // receiving, that hold's conservative refusal ends only after later punctual anchors.
+  // Let those anchors observe the still-live parent so this pass exercises reply handling.
+  await new Promise((resolve) => setTimeout(resolve, 650));
   // Pass 2 asks again with consent granted, so its credentials request
   // really happens; only after seeing the new request does the parent
   // deliver the stale reply belonging to pass 1's timed-out request — with

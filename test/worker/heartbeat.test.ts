@@ -13,17 +13,11 @@ import { HEARTBEAT_TIMEOUT_MS as PROTOCOL_HEARTBEAT_TIMEOUT_MS } from "../../src
 const ROOT = join(import.meta.dir, "../..");
 
 /**
- * The heartbeat fence's clock (v3): the parent stamps each heartbeat's `at` with its own
- * Date.now() at SEND and the helper thread stores that value verbatim into the shared wall
- * slot on arrival, so the send time travels with the event — no scheme that observes an
- * arrival late can re-date it. The check subtracts the stamp from the main thread's
- * monotonically reconstructed wall time (a high-water mark plus a backward-regression
- * accumulator, sampled every 50 ms), so a backward clock step is floored by the high-water
- * and then absorbed, and delayed reads (a line in the pipe, or behind a busy helper) are
- * counted as age — overstatement, never understatement. The ages below are therefore exact
- * parent-stamped ages, which stay inside proper-lockfile's 5 s stale-lock interval whatever
- * the environment asks for. The check is also cheap: two loads and arithmetic, safe inside
- * the fenced transaction.
+ * Heartbeat freshness uses only the helper's arrival counter and the main thread's monotonic
+ * clock. Each changed counter is bounded by the actual preceding observation, including when
+ * that observation was delayed. Wall-clock steps, queued notes and late timer fires therefore
+ * cannot make silence fresh. A long main-thread hold can overstate age; later punctual
+ * observations recover with a live parent.
  */
 
 const transports: StdioTransport[] = [];
@@ -34,17 +28,14 @@ afterEach(() => {
 it("a backward wall-clock move cannot turn a stale heartbeat fresh", async () => {
   const transport = new StdioTransport(() => {});
   transports.push(transport);
-  // No heartbeat ever arrives; the fence window is a test-short 400 ms. The wall clock then
-  // steps 10 seconds backwards and keeps ticking at the real rate: the reconstruction must
-  // absorb the step at its next 50 ms sample, so the age keeps growing with real elapsed time
-  // and the fence refuses once the window elapses.
+  // No heartbeat arrives. A backward wall step must not pause monotonic age or prevent the
+  // no-arrival startup datum from expiring after the test-short window.
   const realNow = Date.now();
   const dateNow = Date.now;
   const started = performance.now();
   Date.now = () => realNow - 10_000 + (performance.now() - started);
   try {
-    // The step is floored by the high-water: the age right after it is small and finite,
-    // never negative — effective time cannot drop below a wall time already observed.
+    // The wall correction does not produce a negative age or any startup heartbeat credit.
     expect(transport.heartbeatAgeMs()).toBeLessThan(250);
     await new Promise((resolve) => setTimeout(resolve, 500));
     let refused: LeaseHeartbeatLost | undefined;
@@ -63,58 +54,42 @@ it("a backward wall-clock move cannot turn a stale heartbeat fresh", async () =>
   }
 });
 
-it("a backward jump between samples is absorbed at the next sample", async () => {
-  // The reconstruction's second half (see the transport's wall sampler): a regression between
-  // two samples is immediately floored by the high-water (effective time never drops below a
-  // wall time already observed), and the NEXT sample absorbs it into the accumulator so
-  // effective time resumes advancing at the pre-regression rate. Injected wall source, so the
-  // jump is deterministic.
-  const startedAt = 1_800_000_000_000;
-  let wall = startedAt;
-  const transport = new StdioTransport(() => {}, { now: () => wall });
+it("monotonic elapsed time advances without a timer sample", () => {
+  let mono = 0;
+  const transport = new StdioTransport(() => {}, { mono: () => mono });
   transports.push(transport);
-  // Before any sample fires, the clock steps 10 s back: the age is floored at the startup
-  // stamp (small, never negative).
-  wall -= 10_000;
-  expect(transport.heartbeatAgeMs()).toBeLessThan(250);
-  // Let the real 50 ms sampler take at least one fire: the step is absorbed.
-  await new Promise((resolve) => setTimeout(resolve, 120));
-  expect(transport.heartbeatAgeMs()).toBeLessThan(250);
-  // Effective time now advances at the pre-jump rate: 600 fake ms of passage is 600 ms of
-  // age, not -9,400.
-  wall += 600;
-  const age = transport.heartbeatAgeMs();
-  expect(age).toBeGreaterThanOrEqual(500);
-  expect(age).toBeLessThan(5_000);
+  expect(transport.heartbeatAgeMs()).toBe(0);
+  mono += 600;
+  expect(transport.heartbeatAgeMs()).toBe(600);
   expect(() => transport.assertHeartbeatFresh(400)).toThrow(LeaseHeartbeatLost);
 });
 
-it("a forward wall-clock jump overstates the age (refusal, safe)", () => {
-  // A forward step grows effective time, so the fence refuses even though no real silence
-  // has passed — the safe direction. Injected wall source, deterministic.
-  let wall = 1_800_000_000_000;
-  const transport = new StdioTransport(() => {}, { now: () => wall });
-  transports.push(transport);
-  wall += 60_000;
-  const age = transport.heartbeatAgeMs();
-  expect(age).toBeGreaterThanOrEqual(59_000);
-  expect(() => transport.assertHeartbeatFresh(2000)).toThrow(LeaseHeartbeatLost);
+it("a forward wall-clock jump cannot create age or heartbeat credit", () => {
+  const dateNow = Date.now;
+  Date.now = () => dateNow() + 60_000;
+  try {
+    let mono = 0;
+    const transport = new StdioTransport(() => {}, { mono: () => mono });
+    transports.push(transport);
+    expect(transport.heartbeatAgeMs()).toBe(0);
+    mono += 400;
+    expect(() => transport.assertHeartbeatFresh(2000)).not.toThrow();
+    mono += 1_700;
+    expect(() => transport.assertHeartbeatFresh(2000)).toThrow(LeaseHeartbeatLost);
+  } finally {
+    Date.now = dateNow;
+  }
 });
 
 it("a main thread held past the window with no arrivals cannot turn the fence fresh", async () => {
-  // The main thread is blocked past the fence window and no heartbeat arrives, so the wall
-  // sampler cannot fire during the block either. The startup stamp — the transport's
-  // construction-time wall reading — still anchors the age, and the wall clock itself
-  // advanced through the block, so once it ends the fence refuses with the age covering
-  // the whole silent span. (The pre-fix mechanism this replaced calibrated a cross-thread
-  // offset from notes queued behind the block; the drained calibration erased the block from
-  // every age.)
+  // With no arrivals, construction is the arrival lower bound. The main thread's monotonic
+  // clock advances through a held interval even though no anchor can fire during it.
   const transport = new StdioTransport(() => {});
   transports.push(transport);
   const start = Date.now();
   const blockedUntil = start + 350;
   while (Date.now() < blockedUntil) {
-    /* A real block: the wall sampler cannot fire until it ends. */
+    /* A real block: the arrival anchor timer cannot fire until it ends. */
   }
   const blockedFor = Date.now() - start;
   expect(blockedFor).toBeGreaterThanOrEqual(340);
@@ -144,10 +119,8 @@ it("a heartbeat's staleness tracks real elapsed time on a quiet pipe", async () 
 });
 
 it("a stuck reader thread fails closed: no arrivals, no stamp refresh", async () => {
-  // The helper thread is alive but never reads a heartbeat, so the wall slot keeps the
-  // startup stamp. The sampler keeps firing (the wait below spans far more than two
-  // periods), but no fire can refresh the stamp — only an arrival can. The age therefore
-  // grows monotonically with the wall clock, and the fence refuses after the window.
+  // Anchor fires alone never refresh the counter or the arrival lower bound. Only a real
+  // heartbeat can do that, so a stuck reader keeps aging the startup datum and refuses.
   const transport = new StdioTransport(() => {});
   transports.push(transport);
   const early = transport.heartbeatAgeMs();
@@ -160,17 +133,15 @@ it("a stuck reader thread fails closed: no arrivals, no stamp refresh", async ()
 });
 
 it("consecutive checks never report a smaller age with no new arrival", async () => {
-  // The monotonicity property the fence rests on: with no arrival to refresh the stamp,
-  // the age can only grow — effective time is monotonically non-decreasing by construction
-  // (the high-water never drops), across busy stretches (no sampler fires at all) and
-  // event-loop turns alike.
+  // With no arrival to change the lower bound, consecutive checks cannot report less silence,
+  // whether anchors were delayed by a busy stretch or fired normally between checks.
   const transport = new StdioTransport(() => {});
   transports.push(transport);
   let previous = transport.heartbeatAgeMs();
   for (let index = 0; index < 60; index++) {
     const spinUntil = performance.now() + 2;
     while (performance.now() < spinUntil) {
-      /* Busy: the wall sampler cannot fire. */
+      /* Busy: the arrival anchor timer cannot fire. */
     }
     await new Promise((resolve) => setTimeout(resolve, 5));
     const age = transport.heartbeatAgeMs();
@@ -211,6 +182,30 @@ async function sendHeartbeat(stdin: Bun.FileSink): Promise<void> {
 /** Parses the child's last stderr line as its summary. */
 function lastSummary(lines: string[]): Record<string, unknown> {
   return JSON.parse(lines[lines.length - 1] ?? "{}") as Record<string, unknown>;
+}
+
+function childScenario(mode: string, env: Record<string, string> = {}) {
+  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), mode], {
+    cwd: ROOT,
+    env: { ...process.env, HEARTBEAT_WINDOW_MS: "500", ...env },
+    stdio: ["pipe", "ignore", "pipe"],
+  });
+  const lines: string[] = [];
+  createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
+  return { child, lines };
+}
+
+function summary<T>(lines: string[]): T {
+  return lastSummary(lines.filter((line) => line.includes('"phase":"summary"'))) as T;
+}
+
+function hasPhase(lines: string[], phase: string): boolean {
+  return lines.some((line) => line.includes(`"phase":"${phase}"`));
+}
+
+interface FenceSample {
+  ageMs: number;
+  refused: boolean;
 }
 
 it("a slow helper construction stops rejecting live heartbeats once a prompt one arrives", async () => {
@@ -266,13 +261,9 @@ it("a slow helper construction stops rejecting live heartbeats once a prompt one
 }, 20_000);
 
 it("a late handshake never locks a live heartbeating parent out for the transport's lifetime", async () => {
-  // The round-6 reproduced defect (failure-011): the transport's construction is stretched
-  // 2.1 s past the fence window while the parent keeps heartbeating every 100 ms. The old
-  // design's construction handshake could miss, leaving its conservative fallback in force
-  // for the transport's lifetime — 12/12 samples refused at ~2189 ms ages against the
-  // production 2 s fence. The parent-stamped design has no handshake to miss: the startup
-  // stamp covers the stretch and the live heartbeats refresh it as they arrive, so the live
-  // parent's writes are allowed again — and stay allowed.
+  // Construction stretches 2.1 s past the production fence window while the parent keeps
+  // heartbeating every 100 ms. The startup lower bound covers that stretch, and subsequent
+  // punctual arrival observations recover instead of locking the live parent out forever.
   const child = Bun.spawn({
     cmd: [process.execPath, join(ROOT, "test/worker/heartbeat-child.ts"), "lockout"],
     cwd: ROOT,
@@ -399,9 +390,8 @@ it("a heartbeat arriving during a bounded main-thread hold still ages from its a
   }
   expect(saw("block")).toBe(true);
   // Exactly one more heartbeat lands ~40 ms into the child's 90 ms hold; the parent then
-  // goes silent, so the check happens at least the 600 ms silence after that arrival — past
-  // the 400 ms window. The hold cannot re-date the arrival: its send stamp travels with the
-  // event, and the check's age covers the silence since that send, observation timing aside.
+  // goes silent past the 400 ms window. A delayed observation cannot re-date the arrival
+  // because its lower bound stays at the preceding observation or earlier.
   await new Promise((resolve) => setTimeout(resolve, 40));
   child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
   const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
@@ -424,13 +414,9 @@ it("a heartbeat arriving during a bounded main-thread hold still ages from its a
 }, 20_000);
 
 it("a heartbeat at the start of a multi-second main-thread hold is never re-dated", async () => {
-  // The C4a reproduced severe (failure-013 / security-007 / correctness-016 / design-009):
-  // the main thread is held for 2.2 s and a heartbeat lands at the hold's START. The held
-  // thread cannot observe the arrival until the hold ends; the anchored design's late
-  // timer fire sampled the current arrival counter and re-dated the old heartbeat as
-  // just-now — the reproduction accepted writes after 2.1–5.9 s of silence, reporting ~132
-  // ms. The parent-stamped design carries the send time with the event and never re-dates
-  // it by observation, so the post-hold check must refuse with the age covering the hold.
+  // A heartbeat lands at the start of a 2.2 s main-thread hold. The overdue anchor must use
+  // the actual preceding fire as its lower bound, so the post-hold age includes the hold
+  // instead of restarting at the current fire.
   const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "delayed-anchor"], {
     cwd: ROOT,
     env: {
@@ -466,21 +452,103 @@ it("a heartbeat at the start of a multi-second main-thread hold is never re-date
     })
     .find((note) => note.phase === "summary");
   expect(summary).toBeDefined();
-  // The parent-stamped age is 2+ seconds regardless of when the main thread observes the
-  // arrival: the write is refused, never accepted at a ~132 ms re-dated age.
+  // The conservative age is at least the whole hold regardless of when the timer observes it.
   expect(summary?.refused).toBe(true);
   expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(2000);
   expect(summary?.ageMs ?? Infinity).toBeLessThan(15_000);
 }, 20_000);
 
+it("a backward wall step during a held anchor interval refuses before and after overdue timers", async () => {
+  const { child, lines } = childScenario("backward-hold", {
+    KIMCHI_WORKER_TEST_HOLD_MS: "2200",
+  });
+  for (let round = 0; round < 40 && !hasPhase(lines, "block"); round++) {
+    child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  expect(hasPhase(lines, "block")).toBe(true);
+  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+  expect(code).toBe(0);
+  const result = summary<{ immediate: FenceSample; afterTimer: FenceSample }>(lines);
+  for (const sample of [result.immediate, result.afterTimer]) {
+    expect(sample.refused).toBe(true);
+    expect(sample.ageMs).toBeGreaterThanOrEqual(2000);
+    expect(sample.ageMs).toBeLessThan(15_000);
+  }
+}, 20_000);
+
+it("a future send stamp corrected during the same hold grants no heartbeat credit", async () => {
+  const { child, lines } = childScenario("forward-back-hold", {
+    KIMCHI_WORKER_TEST_HOLD_MS: "2200",
+  });
+  for (let round = 0; round < 40 && !hasPhase(lines, "block"); round++) {
+    child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  expect(hasPhase(lines, "block")).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  child.stdin.write(`{"type":"heartbeat","at":${Date.now() + 60_000}}\n`);
+  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+  expect(code).toBe(0);
+  const result = summary<{ immediate: FenceSample; afterTimer: FenceSample }>(lines);
+  for (const sample of [result.immediate, result.afterTimer]) {
+    expect(sample.refused).toBe(true);
+    expect(sample.ageMs).toBeGreaterThanOrEqual(2000);
+    expect(sample.ageMs).toBeLessThan(15_000);
+  }
+}, 20_000);
+
+it("live heartbeats keep recovering after a backward wall step", async () => {
+  const { child, lines } = childScenario("backward-live", {
+    HEARTBEAT_WINDOW_MS: "2000",
+    KIMCHI_WORKER_TEST_JUMP_AT_BEAT: "4",
+    HEARTBEAT_SAMPLES: "14",
+  });
+  const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+  for (let round = 0; round < 30; round++) {
+    try {
+      const offset = hasPhase(lines, "jumped") ? -10_000 : 0;
+      child.stdin.write(`{"type":"heartbeat","at":${Date.now() + offset}}\n`);
+    } catch {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const code = await exited;
+  expect(code).toBe(0);
+  expect(hasPhase(lines, "jumped")).toBe(true);
+  const result = summary<{ samples: FenceSample[] }>(lines);
+  expect(result.samples).toHaveLength(14);
+  expect(result.samples.every((sample) => !sample.refused)).toBe(true);
+  expect(Math.max(...result.samples.map((sample) => sample.ageMs))).toBeLessThan(2000);
+}, 20_000);
+
+it("a long hold's false refusal recovers on later punctual live anchors", async () => {
+  const { child, lines } = childScenario("live-hold", {
+    KIMCHI_WORKER_TEST_HOLD_MS: "2200",
+  });
+  const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+  for (let round = 0; round < 40; round++) {
+    try {
+      child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+    } catch {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const code = await exited;
+  expect(code).toBe(0);
+  const result = summary<{ immediate: FenceSample; recovered: FenceSample }>(lines);
+  expect(result.immediate.refused).toBe(true);
+  expect(result.immediate.ageMs).toBeGreaterThanOrEqual(2000);
+  expect(result.recovered.refused).toBe(false);
+  expect(result.recovered.ageMs).toBeLessThan(500);
+}, 20_000);
+
 it("a wall-clock regression between a heartbeat's send and the check keeps the age at the truth", async () => {
-  // The v3 floor's regression case: the last heartbeat is stamped with the pre-jump clock
-  // and the worker's wall then steps 10 s back before the check. A raw Date.now() check
-  // would read the age as silence - 10 s (negative) and accept the write forever; the
-  // reconstruction's high-water floors effective time at the last observed wall reading and
-  // the next sample absorbs the step, so the computed age stays at the true silence and the
-  // fence refuses. The child reads its wall through the transport's injected `now` seam, so
-  // the jump is deterministic.
+  // The parent stops after a backward wall step. Since freshness uses only arrival order and
+  // monotonic time, the correction cannot create negative age or keep the worker writable.
   const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "clock-jump"], {
     cwd: ROOT,
     env: {
@@ -523,15 +591,9 @@ it("a wall-clock regression between a heartbeat's send and the check keeps the a
 }, 20_000);
 
 it("a post-wake deschedule across the fence window never reads the silence as fresh", async () => {
-  // The round-7 reproduced defect (failure-012 / security-006): the main thread was
-  // descheduled right after the old lazy re-sync woke up, the estimated cross-thread offset
-  // absorbed the whole pause, and a stale heartbeat read as fresh — the probe reported
-  // refused:false at an age of 0.046 ms after 5,861 ms of silence. The parent-stamped fence
-  // never re-dates an arrival by observation: the helper-start hook below delays the reader
-  // thread's first action past the old design's handshake bound while the parent keeps
-  // heartbeating; the parent then goes silent, and the child's wait spans the window on its
-  // own clock. The check after it must refuse with the age covering the whole silence since
-  // the last send.
+  // The helper starts late, reads queued heartbeats, and the parent then goes silent past
+  // the fence window. Draining notes or a delayed observation cannot re-date those arrivals
+  // on the main thread's monotonic clock, so the write must be refused.
   const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "post-wake"], {
     cwd: ROOT,
     env: {
@@ -571,12 +633,8 @@ it("a post-wake deschedule across the fence window never reads the silence as fr
 }, 20_000);
 
 it("a live parent is never refused across a thousand samples under concurrent CPU load", async () => {
-  // The residual assumption's empirical bound: the wall sampler keeps firing often enough
-  // that the high-water stays fresh even while the machine is busy, so a parent heartbeating
-  // at the required 100 ms cadence is never refused against the production 2 s fence (the
-  // stamps are exact; only an unabsorbed regression could understate, and the sampler's
-  // period bounds that). The child runs three spin worker threads for the whole sampling
-  // run, competing with the wall sampler and the helper thread for the CPU.
+  // Punctual anchors track the required 100 ms cadence without reaching the 2 s timeout.
+  // Three spin workers compete with the anchor timer and helper throughout the run.
   const child = Bun.spawn({
     cmd: [process.execPath, join(ROOT, "test/worker/heartbeat-child.ts"), "live-load"],
     cwd: ROOT,
