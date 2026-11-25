@@ -129,9 +129,14 @@ export interface CancelMessage {
 }
 
 /** The lease holder's heartbeat: the parent is alive and still holds the lease.
- *  The worker's reader thread records each one's arrival, and the write fence refuses
- *  ledger writes once none has arrived for the heartbeat window — the fence that stops a
- *  stale worker an old release's lease handover never covers (it never bumps the epoch).
+ *  The parent stamps `at` with its own Date.now() at SEND, and the worker's reader thread
+ *  stores that value VERBATIM as the write fence's datum — the send time travels with the
+ *  event and is never re-dated by observation, so the fence never depends on when (or
+ *  whether) the worker gets around to noticing the arrival. Parent and worker are local
+ *  processes on the same host, so both read the same system clock; if the worker ever runs
+ *  remotely, this fence is void. The fence refuses ledger writes once no stamp has arrived
+ *  within the heartbeat window — the fence that stops a stale worker an old release's lease
+ *  handover never covers (it never bumps the epoch).
  *
  *  Required parent send cadence: the parent must send heartbeats at a fixed interval of at
  *  most 1 s (proper-lockfile's own lease-update interval; K2's supervisor sends every 500 ms
@@ -139,7 +144,8 @@ export interface CancelMessage {
  *  around passes will find its worker refusing writes mid-pass once the window elapses. */
 export interface HeartbeatMessage {
   type: "heartbeat";
-  /** When the parent sent it, in milliseconds since the epoch. */
+  /** When the parent sent it: its own Date.now() at send, in milliseconds since the epoch.
+   *  Stored verbatim by the worker; the fence's one load-bearing datum. */
   at: number;
 }
 

@@ -46,19 +46,23 @@ import {
 /** The parent must answer a host request within this window. */
 export const REQUEST_TIMEOUT_MS = 10_000;
 
-/** SharedArrayBuffer header (int32 slots, then the heartbeat arrival counter) followed by
- *  the reply line's bytes. */
+/** SharedArrayBuffer header (int32 slots, the heartbeat arrival counter, and the
+ *  parent-stamped send time) followed by the reply line's bytes. */
 /** Slot 0 holds the state in its low bits and the owning request's rid above. */
 const COMBINED = 0;
 const LENGTH = 1;
 const ACTIVE_PASS = 3;
-/** Int32 slot 4 (byte 16): the heartbeat ARRIVAL COUNTER. The helper thread increments it
- *  once per heartbeat line it reads. No arrival TIME is stored anywhere: the two threads'
- *  monotonic clocks are never converted into each other (see ANCHOR_PERIOD_MS below), so the
- *  fence only ever needs to know THAT an arrival happened, anchored against the main
- *  thread's own clock. */
+/** Int32 slot 4 (byte 16): the heartbeat ARRIVAL COUNTER, diagnostics only. The helper
+ *  thread increments it once per heartbeat line it reads; nothing load-bearing reads it
+ *  back — it exists so tests and future diagnostics can observe arrivals. */
 const HEARTBEAT_SEQ = 4;
-const HEADER_BYTES = 24;
+/** Bytes 24-31: the parent-stamped send time (`at`) of the latest heartbeat arrival,
+ *  stored VERBATIM by the helper thread the moment it reads the line — the fence's one
+ *  load-bearing datum, never re-dated by observation (the defect every estimator design
+ *  had). A BigInt64 slot because a wall-clock milliseconds count does not fit an int32, and
+ *  the store must not tear. */
+const HEARTBEAT_AT_OFFSET = 24;
+const HEADER_BYTES = 32;
 /** The longest reply line (a credentials or policy answer is a few hundred bytes). */
 const REPLY_BYTES = 64 * 1024;
 
@@ -73,13 +77,9 @@ const STATE_MASK = 0b111;
 const RID_SHIFT = 3;
 /** The rid's bits of the combined word; the mask keeps the word a positive int32. */
 const RID_MASK = 0x0fffffff;
-/** How often the main thread's anchor timer samples the heartbeat arrival counter. */
+/** How often the main thread's sampler reads the wall clock to absorb a backward step
+ *  (see the reconstruction inside StdioTransport). */
 const ANCHOR_PERIOD_MS = 50;
-/** The allowance the fence adds to the time since the last anchor, turning it into an upper
- *  bound on the true heartbeat age: the anchor period plus a jitter allowance. This is the
- *  design's single tunable — if the no-lockout-under-load regression cannot hold it, raise it
- *  (it has generous room inside the 2 s fence) rather than weakening the fail-closed rule. */
-export const ANCHOR_BOUND_MS = 100;
 
 /** Packs a slot owner into one word: state in the low bits, rid above. */
 /** The next request id: cycles through 1..RID_MASK, never the zero the wire forbids. */
@@ -146,8 +146,9 @@ export class HostRequestError extends Error {
 }
 
 /** One note from the helper thread: a forwarded line, or a stdin condition. The helper's read
- *  time (`at`) is the true receipt moment; heartbeat notes carry no clock of their own — the
- *  arrival counter in shared memory is the fence's only heartbeat signal. */
+ *  time (`at`) is the true receipt moment; the fence's heartbeat datum is not in the notes at
+ *  all — it is the parent-stamped send time the helper stores verbatim into the shared wall
+ *  slot, so a note drained late can never re-date the arrival it reports. */
 interface HelperNote {
   line?: string;
   /** When the helper read the line (ms since epoch): the true receipt time. */
@@ -178,6 +179,7 @@ const { parentPort, workerData } = require("node:worker_threads");
 const { readSync } = require("node:fs");
 const ia = new Int32Array(workerData);
 const seq = new Int32Array(workerData, ${HEARTBEAT_SEQ * 4}, 1);
+const hbAt = new BigInt64Array(workerData, ${HEARTBEAT_AT_OFFSET}, 1);
 const payload = new Uint8Array(workerData, ${HEADER_BYTES});
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -186,10 +188,11 @@ const chunk = Buffer.alloc(65536);
 let pending = "";
 // This thread owns stdin through a BLOCKING readSync loop (below): it never takes an
 // event-loop turn between reads, so it cannot answer postMessages — the heartbeat fence
-// therefore never asks it anything. On each heartbeat arrival it only increments the shared
-// arrival counter (and notifies it, so a future Atomics.waitAsync main thread could observe
-// arrivals without a timer); no age is computed here, because the main thread's fence never
-// converts between the two threads' monotonic clocks.
+// therefore never asks it anything. On each heartbeat arrival it stores the message's
+// parent-stamped send time VERBATIM into the shared wall slot (and increments the
+// diagnostics-only arrival counter, notifying it for any future observer); no age is
+// computed here, because the send time already places the event in time — observing it
+// late cannot re-date it.
 // Test-only hook: a delay inserted before this thread's first action, so a test can
 // reproduce a helper whose actual start is delayed past the fence window (scheduler
 // starvation) without touching the main thread. Zero (unset) keeps it dormant.
@@ -238,13 +241,14 @@ function cancel(parsed) {
   Atomics.notify(ia, ${COMBINED});
 }
 function heartbeat(parsed) {
-  // The arrival counter: one increment per heartbeat line read on this thread's own turn.
-  // The main thread never learns WHEN this happened in this thread's clock; it anchors the
-  // count against its own clock instead (see the transport's anchor timer), so the two
-  // threads' monotonic clocks are never converted into each other.
+  // The parent stamped the "at" field with its own Date.now() at SEND; this thread stores
+  // that value VERBATIM the moment it reads the line, so a delayed read (the line sitting in
+  // the pipe, or behind this thread while it was busy) is included in the age the main
+  // thread later computes — overstatement, never understatement.
   if (parsed.type !== "heartbeat" || typeof parsed.at !== "number") return;
   Atomics.add(seq, 0, 1);
   Atomics.notify(seq, 0);
+  Atomics.store(hbAt, 0, BigInt(Math.trunc(parsed.at)));
 }
 function gone() {
   Atomics.store(ia, ${COMBINED}, ${STATE_PARENT_GONE});
@@ -309,54 +313,52 @@ export class StdioTransport {
   }
   private readonly shared = new SharedArrayBuffer(HEADER_BYTES + REPLY_BYTES);
   private readonly slots: Int32Array = new Int32Array(this.shared);
+  /** The parent-stamped send time of the latest heartbeat arrival (see HEARTBEAT_AT_OFFSET). */
+  private readonly heartbeatAt: BigInt64Array = new BigInt64Array(
+    this.shared,
+    HEARTBEAT_AT_OFFSET,
+    1,
+  );
   private readonly helper: Worker;
   private rid = 0;
   private closed = false;
   private readonly secrets = new Set<string>();
-  /** The main thread's anchor: its own monotonic clock reading at the last anchor that
-   *  observed a NEW heartbeat arrival. The startup anchor is the transport's construction
-   *  (sampled before the helper thread can exist, so every arrival lies after it) with the
-   *  counter still at its zero seed — a parent that never heartbeats therefore locks the
-   *  worker out of writes after the window, exactly the old-release fence decision 7 calls
-   *  for. Never converted to or from the helper's clock. */
-  #anchorAtMs: number;
-  /** The arrival counter value the anchor sampled: the pair advances together, and only when
-   *  the counter moved — an anchor with no new arrival would misdate the last real one as
-   *  fresh, so silence must leave the anchor untouched and the age growing. */
-  #anchoredArrivals: number;
-  /** The anchor timer; stopped by close(). */
-  #anchorTimer: ReturnType<typeof setInterval>;
+  /** The wall source the fence reads: Date.now by default, injectable so tests can simulate
+   *  backward clock jumps deterministically (see assertHeartbeatFresh's invariant). */
+  readonly #wall: () => number;
+  /** The maximum effective wall time ever observed (ms since epoch): the reconstruction's
+   *  floor. It only grows, so effective time can never drop below a wall time already seen. */
+  #highWater: number;
+  /** How much backward wall regression the reconstruction has absorbed so far: added to every
+   *  raw reading, it keeps effective time advancing at the pre-regression rate. */
+  #accum = 0;
+  /** The wall sampler; stopped by close(). */
+  #sampleTimer: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly emit: (event: TransportEvent) => void,
-    options?: { ridSeed?: number },
+    options?: { ridSeed?: number; now?: () => number },
   ) {
     this.rid = options?.ridSeed ?? 0;
-    this.#anchorAtMs = performance.now();
-    this.#anchoredArrivals = Atomics.load(this.slots, HEARTBEAT_SEQ);
-    // Test-only hook: a delay inserted between the startup anchor above and the helper
+    this.#wall = options?.now ?? (() => Date.now());
+    // First sample: effective time starts at the construction-time wall reading, which also
+    // seeds the heartbeat slot — the startup datum. A parent that never heartbeats leaves
+    // the ages growing from construction, locking the worker out after the window (decision
+    // 7): the fence never starts fresh.
+    this.#highWater = Number.NEGATIVE_INFINITY;
+    this.#sampleWall();
+    Atomics.store(this.heartbeatAt, 0, BigInt(Math.trunc(this.#effectiveNow())));
+    // Test-only hook: a delay inserted between the startup stamp above and the helper
     // thread's start, so a test can reproduce a Worker construction stretched past the fence
-    // window (scheduler pressure, a paused process). The startup anchor covers the whole
+    // window (scheduler pressure, a paused process). The startup stamp covers the whole
     // stretch — ages only read older through it, never fresher. Zero (unset) keeps it
     // dormant.
     const TEST_CONSTRUCT_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS || 0);
     if (TEST_CONSTRUCT_DELAY_MS > 0) {
-      const until = this.#anchorAtMs + TEST_CONSTRUCT_DELAY_MS;
+      const until = performance.now() + TEST_CONSTRUCT_DELAY_MS;
       while (performance.now() < until) {
         /* A real block: the helper thread cannot start until it ends. */
       }
-    }
-    // Test-only hooks whose scenarios the anchored design removed: the handshake gap and the
-    // post-wake observation delay fed the old cross-thread offset estimator, which no longer
-    // exists — the main thread never converts between the two clocks, so a deschedule around
-    // the helper's start can only leave the startup anchor in force (ages read older, never
-    // fresher). The variables stay accepted so existing environments keep working.
-    const TEST_HANDSHAKE_GAP_MS = Number(process.env.KIMCHI_WORKER_TEST_HANDSHAKE_GAP_MS || 0);
-    const TEST_HANDSHAKE_OBSERVE_DELAY_MS = Number(
-      process.env.KIMCHI_WORKER_TEST_HANDSHAKE_OBSERVE_DELAY_MS || 0,
-    );
-    if (TEST_HANDSHAKE_GAP_MS > 0 || TEST_HANDSHAKE_OBSERVE_DELAY_MS > 0) {
-      /* Nothing to delay: the scenario cannot fire under the anchored fence. */
     }
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
     this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
@@ -367,39 +369,54 @@ export class StdioTransport {
       if (!this.closed)
         this.transportError(`the stdin reader thread exited unexpectedly (${code})`);
     });
-    // The anchor timer: on each fire it samples the arrival counter and, only when the
-    // counter moved, re-anchors (D, S_D) at its own clock — the fence's upper-bound argument
-    // needs the anchored arrival to be the latest one, so fires that observe no new arrival
-    // must not move the anchor. A late fire only overstates ages; see assertHeartbeatFresh.
-    this.#anchorTimer = setInterval(() => {
-      const arrivals = Atomics.load(this.slots, HEARTBEAT_SEQ);
-      if (arrivals !== this.#anchoredArrivals) {
-        this.#anchoredArrivals = arrivals;
-        this.#anchorAtMs = performance.now();
-      }
-    }, ANCHOR_PERIOD_MS);
+    // The wall sampler: every fire absorbs any backward step into #accum, keeping effective
+    // time monotonically non-decreasing. A held main thread cannot turn this into
+    // understatement: the wall clock itself advances through the hold, and even a fire-free
+    // stretch cannot rewind effective time below the observed high-water.
+    this.#sampleTimer = setInterval(() => this.#sampleWall(), ANCHOR_PERIOD_MS);
   }
 
-  /** The upper bound on how long ago the reader thread last saw a parent heartbeat, in
-   *  milliseconds, measured on the MAIN thread's monotonic clock only (never the helper's,
-   *  never the wall clock, whose backward moves would turn a stale heartbeat fresh). Two
-   *  loads and arithmetic — cheap enough for the fence's synchronous assertWritable hook. */
+  /** One wall sample: absorbs a backward step by growing #accum, otherwise raises the
+   *  high-water mark. Between samples the high-water still floors effective time, so a
+   *  regression is caught immediately by the max() and merely made exact at the next sample. */
+  #sampleWall(): void {
+    const eff = this.#wall() + this.#accum;
+    if (eff < this.#highWater) this.#accum += this.#highWater - eff;
+    else this.#highWater = eff;
+  }
+
+  /** Effective wall time: monotonically non-decreasing by construction — it never drops
+   *  below the raw clock plus absorbed regression, nor below any wall time ever observed. */
+  #effectiveNow(): number {
+    return Math.max(this.#wall() + this.#accum, this.#highWater);
+  }
+
+  /** How long ago the parent stamped its latest heartbeat, in milliseconds, on the
+   *  reconstructed effective wall clock. The stamp travels with the event, so a delayed read
+   *  is included in the age — overstatement, never understatement — and a late observation
+   *  cannot re-date the arrival. Two loads and arithmetic — cheap inside the fence. */
   heartbeatAgeMs(): number {
-    return performance.now() - this.#anchorAtMs + ANCHOR_BOUND_MS;
+    return this.#effectiveNow() - Number(Atomics.load(this.heartbeatAt, 0));
   }
 
-  /** Throws LeaseHeartbeatLost when no heartbeat arrived within the window; the write fence's
-   *  assertWritable hook calls this inside every fenced ledger transaction.
+  /** Throws LeaseHeartbeatLost when the parent's latest heartbeat stamp is older than the
+   *  window; the write fence's assertWritable hook calls this inside every fenced ledger
+   *  transaction.
    *
-   *  Why the computed value is an UPPER bound on the true age: the anchored arrival is the
-   *  latest one, and it arrived at or after the previous anchor fire — the counter is sampled
-   *  at each fire, so any not-yet-anchored arrival lies between two fires and is fresher than
-   *  the anchor, never older. Therefore trueAge = now - arrival <= now - previousFire
-   *  = (now - anchor) + ANCHOR_PERIOD_MS <= ageUpper. A deschedule of the main thread only
-   *  makes now - anchor larger (ages look older, never fresher); a late timer fire likewise
-   *  only overstates. The one residual assumption is that the anchor timer's fire-to-fire
-   *  interval stays under ANCHOR_BOUND_MS — bounded empirically by the no-lockout-under-load
-   *  regression; raise the bound, never the fail-closed rule, if the test cannot hold it. */
+   *  DESIGN INVARIANT: parent and worker are local processes on the same host, so Date.now()
+   *  reads the same system clock on both sides — the design's foundation. The parent stamps
+   *  `at` at send, the helper stores it verbatim on arrival, and the check subtracts it from
+   *  the worker's own (monotonically reconstructed) wall time; no clock is ever converted,
+   *  and no observation timing is involved. If the worker ever runs remotely, this fence is
+   *  void.
+   *
+   *  Why the ages only ever OVERSTATE the true staleness: a heartbeat sitting in the pipe or
+   *  behind a busy helper keeps its send stamp, so the check counts that delay as age; a
+   *  backward wall step is floored by the high-water and then absorbed; a forward jump grows
+   *  effective time. The residual understating window is a regression whose absorption has
+   *  not happened yet at check time AND whose high-water is stale — bounded by the sampler's
+   *  period plus scheduler jitter, which the no-lockout-under-load regression keeps far
+   *  inside the fence window. */
   assertHeartbeatFresh(timeoutMs: number = heartbeatTimeoutMs()): void {
     const age = this.heartbeatAgeMs();
     if (age > timeoutMs) throw new LeaseHeartbeatLost(age);
@@ -591,10 +608,10 @@ export class StdioTransport {
     return parsed.value.result;
   }
 
-  /** Stops the anchor timer and the reader thread; the process is exiting anyway. */
+  /** Stops the wall sampler and the reader thread; the process is exiting anyway. */
   close(): void {
     this.closed = true;
-    clearInterval(this.#anchorTimer);
+    clearInterval(this.#sampleTimer);
     this.helper.terminate();
   }
 }

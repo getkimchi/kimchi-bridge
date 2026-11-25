@@ -224,9 +224,9 @@ function main(): void {
         break;
       }
       case "heartbeat":
-        // Counted by the reader thread in the shared arrival counter; the write fence anchors
-        // that counter against the main thread's own clock inside every fenced transaction,
-        // so no main-thread handling is needed.
+        // Stamped by the parent at send and stored verbatim by the reader thread into the
+        // shared wall slot; the write fence subtracts it from the reconstructed effective
+        // wall time inside every fenced transaction, so no main-thread handling is needed.
         break;
       case "reply":
         // A late or duplicate reply: the request it belonged to already
