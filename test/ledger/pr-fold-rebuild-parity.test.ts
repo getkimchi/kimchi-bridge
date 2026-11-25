@@ -89,7 +89,7 @@ describe("capture/rebuild parity on equal-timestamp PR observations", () => {
     expect(fromCapture).toEqual(fromRebuild);
     // The fold could not order the conflicting observations the way the rebuild does, so it
     // deferred: the work carries the dirty marker, not a head the rebuild would not reproduce.
-    expect(backendFor(dir).hasDirty(WORK)).toBe(false);
+    expect(backendFor(dir).hasDirty?.(WORK)).toBe(false);
   });
 
   it("the A-open/B-closed/A-merged sequence publishes one state from capture and rebuild (SQLite)", () => {
@@ -101,7 +101,7 @@ describe("capture/rebuild parity on equal-timestamp PR observations", () => {
     rebuildWork(dir, WORK);
     const fromRebuild = prStates(readWorkHead(dir, WORK));
     expect(fromCapture).toEqual(fromRebuild);
-    expect(backendFor(dir).hasDirty(WORK)).toBe(false);
+    expect(backendFor(dir).hasDirty?.(WORK)).toBe(false);
   });
 
   it("unambiguous observations keep folding inline: capture still publishes without a rebuild", () => {
@@ -112,7 +112,7 @@ describe("capture/rebuild parity on equal-timestamp PR observations", () => {
     useBackendFactory(() => createMemoryRecords());
     capture(dir, commit("a".repeat(40), "open", "2026-10-01T00:00:00.000Z"), "/ignored/source");
     capture(dir, commit("b".repeat(40), "closed", "2026-10-01T01:00:00.000Z"), "/ignored/source");
-    expect(backendFor(dir).hasDirty(WORK)).toBe(false);
+    expect(backendFor(dir).hasDirty?.(WORK)).toBe(false);
     const head = readWorkHead(dir, WORK);
     expect(head?.pullRequests.map((pr) => String(pr.state))).toEqual(["closed"]);
   });

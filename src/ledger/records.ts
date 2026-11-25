@@ -179,11 +179,15 @@ export interface RecordBackend {
   clearDirty(workId: string): void;
   dirtyWorks(): string[];
   /** Whether the work carries the dirty marker (its head is stale or missing and the next
-   *  read repairs it); a cheap routing read, unlike `dirtyWorks`' full scan. */
-  hasDirty(workId: string): boolean;
+   *  read repairs it); a cheap routing read, unlike `dirtyWorks`' full scan. OPTIONAL: the
+   *  member was added after round 6, and backends written against round 6 do not have it —
+   *  internal callers go through backendHasDirty, which falls back to dirtyWorks(). */
+  hasDirty?(workId: string): boolean;
   /** The stored serialization's byte length of the work's saved head (0 when there is none):
-   *  the oversize gate for the inline fold, read WITHOUT parsing the head. */
-  headBodyBytes(workId: string): number;
+   *  the oversize gate for the inline fold, read WITHOUT parsing the head. OPTIONAL for the
+   *  same reason: backendHeadBodyBytes falls back to Buffer.byteLength(JSON.stringify(
+   *  getHead())) when the backend predates the member. */
+  headBodyBytes?(workId: string): number;
   getRow(workId: string, log: LogName, key: string): Row | undefined;
   /** A new key takes position `pos`; a later write of the same key replaces the body and keeps its position. */
   putRow(workId: string, log: LogName, key: string, body: Row, pos: number): void;
@@ -266,6 +270,23 @@ export interface RecordBackend {
 
 const backends = new Map<string, RecordBackend>();
 let factory: ((agentDir: string) => RecordBackend) | undefined;
+
+/** RecordBackend.hasDirty for internal callers: the member is optional (backends written
+ *  against round 6 do not have it), so a backend without it falls back to the full
+ *  dirtyWorks() scan — correct, only slower — instead of breaking at runtime. */
+function backendHasDirty(backend: RecordBackend, workId: string): boolean {
+  return backend.hasDirty?.(workId) ?? backend.dirtyWorks().includes(workId);
+}
+
+/** RecordBackend.headBodyBytes for internal callers: the member is optional, so a backend
+ *  without it falls back to reading and reserializing the head — the same stored body the
+ *  member would have measured, at the cost of the parse the member exists to avoid. */
+function backendHeadBodyBytes(backend: RecordBackend, workId: string): number {
+  const measured = backend.headBodyBytes?.(workId);
+  if (measured !== undefined) return measured;
+  const head = backend.getHead(workId);
+  return head ? Buffer.byteLength(JSON.stringify(head)) : 0;
+}
 
 /** Tests register the in-memory backend; production always resolves the SQLite one. */
 export function useBackendFactory(next: ((agentDir: string) => RecordBackend) | null): void {
@@ -698,8 +719,8 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
         // instead, and a work already marked dirty keeps its marker rather than folding onto
         // a stale head the next read must repair anyway.
         if (
-          backend.headBodyBytes(record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
-          backend.hasDirty(record.workId)
+          backendHeadBodyBytes(backend, record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+          backendHasDirty(backend, record.workId)
         ) {
           backend.markDirty(record.workId);
           return;
@@ -834,9 +855,9 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
     // inserted rows.
     if (
       backend.recordCount(workId) > 0 &&
-      (backend.hasDirty(workId) ||
-        backend.headBodyBytes(workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
-        (backend.headBodyBytes(workId) === 0 && preexisting.has(workId)))
+      (backendHasDirty(backend, workId) ||
+        backendHeadBodyBytes(backend, workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+        (backendHeadBodyBytes(backend, workId) === 0 && preexisting.has(workId)))
     ) {
       backend.markDirty(workId);
       continue;
@@ -1020,7 +1041,7 @@ export function fingerprint(agentDir: string): string {
 export function readWorkHead(agentDir: string, workId: string): WorkHead | undefined {
   const backend = backendFor(agentDir);
   const head = backend.getHead(workId);
-  if (head && !backend.hasDirty(workId)) return head;
+  if (head && !backendHasDirty(backend, workId)) return head;
   if (backend.recordCount(workId) === 0) return head;
   rebuildWorkSliced(backend, agentDir, workId);
   return backend.getHead(workId);
@@ -1492,8 +1513,8 @@ function planCaptureFold(backend: RecordBackend, record: WorkRecord): PlannedCap
   // The oversize/dirty gate reads only the stored body's byte length and the dirty marker:
   // neither parses the head, so even a 30 MB head costs microseconds to route around.
   if (
-    backend.headBodyBytes(record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
-    backend.hasDirty(record.workId)
+    backendHeadBodyBytes(backend, record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+    backendHasDirty(backend, record.workId)
   )
     return { dirty: true, version };
   const saved = backend.getHead(record.workId);

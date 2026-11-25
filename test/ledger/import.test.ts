@@ -267,9 +267,9 @@ describe("import loop over the memory backend", () => {
       latest: {},
       pullRequests: filler,
     };
-    expect(backend.headBodyBytes(WORK)).toBeGreaterThan(0);
+    expect(backend.headBodyBytes?.(WORK) ?? 0).toBeGreaterThan(0);
     backend.putHead(oversized);
-    expect(backend.headBodyBytes(WORK)).toBeGreaterThan(4 * 1024 * 1024);
+    expect(backend.headBodyBytes?.(WORK) ?? 0).toBeGreaterThan(4 * 1024 * 1024);
     expect(backend.dirtyWorks()).toEqual([]);
     // A replaced journal (new inode, same lines): the file mutated, so the whole file is
     // re-imported — but every line hash already exists, so the batch inserts NOTHING.
