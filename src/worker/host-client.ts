@@ -352,8 +352,7 @@ export class StdioTransport {
   #observeArrivalAnchors(): void {
     const fireAt = this.#mono();
     const observedSeq = Atomics.load(this.slots, HEARTBEAT_SEQ) >>> 0;
-    if (observedSeq !== this.#previousObservedSeq)
-      this.#arrivalLowerBound = this.#previousFireAt;
+    if (observedSeq !== this.#previousObservedSeq) this.#arrivalLowerBound = this.#previousFireAt;
     this.#previousObservedSeq = observedSeq;
     this.#previousFireAt = fireAt;
   }
