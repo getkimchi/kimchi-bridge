@@ -32,7 +32,13 @@ export const PROTOCOL_VERSION = 1;
 export const HEARTBEAT_TIMEOUT_MS = 2000;
 
 /** The host services the worker cannot resolve itself and must ask the parent for. */
-export type HostRequestKind = "credentials" | "endpoints" | "policy" | "consent" | "gitToken";
+export type HostRequestKind =
+  | "credentials"
+  | "endpoints"
+  | "policy"
+  | "consent"
+  | "reportingConsent"
+  | "gitToken";
 
 /** The channels one pass runs; the supervisor's channel set, on the wire. */
 export interface PassChannels {
@@ -120,6 +126,11 @@ export interface PassMessage {
   deadlineMs: number;
   /** The lease fencing epoch; chunk B4 checks it inside every write transaction. */
   epoch: number;
+  /** The agent directory the parent already resolved (pinned to its real path) before sending
+   *  the pass. The worker pins the same real path — idempotently — so a symlink in the path
+   *  repointed between the two processes' starts cannot split one ledger across two trees.
+   *  Optional: a parent that does not send it keeps the hello's agent directory. */
+  agentDir?: string;
 }
 
 /** Cancels a running pass; the parent sends this on lease loss or shutdown. */
@@ -467,7 +478,7 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       const shape = exactKeys(
         object.value,
         ["type", "id", "channels", "deadlineMs", "epoch"],
-        ["nextRepository", "reportingCwd"],
+        ["nextRepository", "reportingCwd", "agentDir"],
       );
       if (!shape.ok) return shape;
       const id = fieldInteger(object.value, "id", 1);
@@ -482,6 +493,8 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       if (!nextRepository.ok) return nextRepository;
       const reportingCwd = optionalFieldString(object.value, "reportingCwd");
       if (!reportingCwd.ok) return reportingCwd;
+      const agentDir = optionalFieldString(object.value, "agentDir");
+      if (!agentDir.ok) return agentDir;
       return accept({
         type: "pass",
         id: id.value,
@@ -490,6 +503,7 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
         epoch: epoch.value,
         ...(nextRepository.value === undefined ? {} : { nextRepository: nextRepository.value }),
         ...(reportingCwd.value === undefined ? {} : { reportingCwd: reportingCwd.value }),
+        ...(agentDir.value === undefined ? {} : { agentDir: agentDir.value }),
       });
     }
     case "cancel": {
@@ -548,6 +562,7 @@ function parseWorkerValue(value: unknown): Parsed<WorkerMessage> {
               "endpoints",
               "policy",
               "consent",
+              "reportingConsent",
               "gitToken",
             ] as const)
           : undefined;
@@ -753,6 +768,29 @@ export function parseConsentReply(value: unknown): Parsed<ConsentReply> {
   const consent = fieldBoolean(object.value, "consent");
   if (!consent.ok) return consent;
   return accept({ consent: consent.value });
+}
+
+/** The PR-reporting consent reply: the host's explicit choice for the reporting queue, or
+ *  nothing at all when the host leaves the choice to the queue's legacy state.json semantics
+ *  (an older embedding release, or a user choice the host does not govern). Like the consent
+ *  reply, this is read live at every consent site — never cached — and an answer this reader
+ *  cannot validate is an error, never a guessed value. */
+export interface ReportingConsentReply {
+  reportingConsent?: "on" | "off" | "follow-telemetry";
+}
+
+export function parseReportingConsentReply(value: unknown): Parsed<ReportingConsentReply> {
+  const object = asObject(value, "reportingConsent reply");
+  if (!object.ok) return object;
+  const shape = exactKeys(object.value, [], ["reportingConsent"]);
+  if (!shape.ok) return shape;
+  const consent = optionalFieldString(object.value, "reportingConsent");
+  if (!consent.ok) return consent;
+  if (consent.value === undefined) return accept({});
+  const choice = oneOf(consent.value, ["on", "off", "follow-telemetry"] as const);
+  if (choice === undefined)
+    return reject("reportingConsent reply is not one of on|off|follow-telemetry");
+  return accept({ reportingConsent: choice });
 }
 
 /** The gitToken reply: the saved Git host token, or no token at all when none is saved. */

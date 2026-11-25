@@ -11,6 +11,7 @@ import {
   LedgerUnavailableError,
   ledgerDbPath,
   openStore,
+  pinAgentDir,
   retryOnBusy,
 } from "../../src/ledger/store.js";
 
@@ -133,7 +134,13 @@ describe("Node runtime", () => {
 });
 
 test("ledger path sits in the reporting directory", () => {
-  expect(ledgerDbPath("/tmp/agent-x")).toBe("/tmp/agent-x/pr-cost-reporting/ledger.db");
+  const dir = mkdtempSync(join(tmpdir(), "kimchi-ledger-path-"));
+  try {
+    // The path is built from the PINNED agent directory, so a repointed link cannot move it.
+    expect(ledgerDbPath(dir)).toBe(join(pinAgentDir(dir), "pr-cost-reporting", "ledger.db"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe("open via Bun driver", () => {

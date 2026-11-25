@@ -185,6 +185,7 @@ const {
   TranslationPreludeTimeoutError,
 } = await import("../../../src/reconcile/pr-cost-reporting/worker.js");
 import type { Batch } from "../../../src/ledger/protocol.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /** Bun's it.each types reject the vitest-style tables below (plain and object rows). */
 const each = (rows: readonly unknown[]): ((name: string, fn: (...args: any[]) => void) => void) =>
@@ -276,7 +277,7 @@ const workerHost: HostPorts = {
 // summary the test wrote, so a loaded machine can legitimately need more than the 5 s default
 // test timeout; 30 s keeps these hooks from reporting a timeout that is really contention.
 beforeEach(async () => {
-  directory = await mkdtemp(join(tmpdir(), "kimchi-reporting-http-"));
+  directory = pinAgentDir(await mkdtemp(join(tmpdir(), "kimchi-reporting-http-")));
   ssoAgentDir = undefined;
   credential = { token: "test-key", apiUrl: "https://api.example" };
   endpoint = "https://api.example";

@@ -476,10 +476,10 @@ it("each spooled record is one self-delimiting append, so a killed writer's torn
 
 it("session ids encode into safe spool filenames, Windows reserved names included", async () => {
   for (const id of ["CON", "NUL", "COM1", "LPT9", "AUX", "con", "prn", "a/b", "..", "x.", "tail "])
-    expect(basename(spoolFilePath("/agents", id))).toBe(`s-${encodeURIComponent(id)}.jsonl`);
+    expect(basename(spoolFilePath(tmpdir(), id))).toBe(`s-${encodeURIComponent(id)}.jsonl`);
   // The reserved basenames never appear with their extension, and separators never split the path.
   for (const id of ["CON", "NUL", "COM1"])
-    expect(basename(spoolFilePath("/agents", id))).not.toBe(`${id}.jsonl`);
+    expect(basename(spoolFilePath(tmpdir(), id))).not.toBe(`${id}.jsonl`);
   // A contended capture with a reserved-name session still spools: prefix and suffix always
   // surround the encoded id, so the name is legal on every platform.
   const dir = agentDir();

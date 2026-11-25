@@ -36,6 +36,7 @@ import {
   parseHostEndpoints,
   parseParentLine,
   parsePolicyReply,
+  parseReportingConsentReply,
   redactTokens,
   resourceEnabledFromPolicy,
   type HostRequestKind,
@@ -712,6 +713,20 @@ export class StdioHostClient implements HostPorts {
         "invalid-reply",
       );
     return parsed.value.consent;
+  }
+
+  /** The user's PR-reporting consent, exactly like telemetryConsent: a live blocking request
+   *  per call — never cached, so a mid-pass choice change is honored — with a timeout that
+   *  fails the channel through a typed error rather than ever guessing a value. */
+  reportingConsent(): "on" | "off" | "follow-telemetry" | undefined {
+    const parsed = parseReportingConsentReply(this.transport.request("reportingConsent"));
+    if (!parsed.ok)
+      throw new HostRequestError(
+        `the parent's reportingConsent reply was invalid: ${parsed.error}`,
+        "reportingConsent",
+        "invalid-reply",
+      );
+    return parsed.value.reportingConsent;
   }
 
   metric(metric: Parameters<HostPorts["metric"]>[0]): void {

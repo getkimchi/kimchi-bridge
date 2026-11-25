@@ -7,7 +7,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -77,6 +80,8 @@ const REPLIES: Record<HostRequestKind, unknown> = {
   },
   policy: { resources: { "extensions.cost-per-pr": true } },
   consent: { consent: false },
+  // No host-governed PR-reporting choice: the queue keeps its legacy state.json semantics.
+  reportingConsent: {},
 };
 
 interface WorkerHandle {
@@ -426,6 +431,10 @@ test("a cancel mid-pass returns a canceled done promptly and writes nothing", as
   const canceling = (async () => {
     for (;;) {
       const message = await worker.next();
+      if (message.type === "request" && message.kind === "reportingConsent") {
+        worker.send({ type: "reply", rid: message.rid, result: {} });
+        continue;
+      }
       if (message.type === "request" && message.kind === "consent") {
         worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
         continue;
@@ -522,6 +531,10 @@ async function answerRequestsUntilConsent(worker: WorkerHandle, consent: boolean
   for (;;) {
     const message = await worker.next();
     if (message.type !== "request") continue;
+    if (message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent } });
       return;
@@ -548,6 +561,10 @@ test("a cancel for a pass queued behind a blocked one drops it before it starts"
   let blocked = false;
   for (;;) {
     const message = await worker.next();
+    if (message.type === "request" && message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.type === "request" && message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
       continue;
@@ -612,6 +629,10 @@ test("a pass queued behind a blocked one is reported expired when its budget ran
   let blocked = false;
   for (;;) {
     const message = await worker.next();
+    if (message.type === "request" && message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.type === "request" && message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
       continue;
@@ -810,6 +831,10 @@ test("a late reply after a request's timeout never satisfies a later request", a
   for (;;) {
     const message = await worker.next();
     if (message.type !== "request") continue;
+    if (message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
       continue;
@@ -841,6 +866,10 @@ test("a late reply after a request's timeout never satisfies a later request", a
       break;
     }
     if (message.type !== "request") continue;
+    if (message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
       continue;
@@ -1294,3 +1323,46 @@ test("capture under a 6 s writer spools, and the next worker pass imports it exa
     await worker.exited();
   }
 }, 30000);
+
+test("the parent and the worker pin the same real path when the link moves between their starts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kimchi-worker-pin-"));
+  dirs.push(root);
+  const original = join(root, "original-agent");
+  const replacement = join(root, "replacement-agent");
+  const link = join(root, "agent-link");
+  mkdirSync(original, { recursive: true, mode: 0o700 });
+  mkdirSync(replacement, { recursive: true, mode: 0o700 });
+  symlinkSync(original, link);
+  // The parent resolves the agent directory — its pin — while the link still points at the
+  // original tree, and the link moves before the worker starts: the worker inherits the link
+  // spelling, and the pass message carries the parent's already-resolved real path.
+  const pinned = realpathSync(link);
+  unlinkSync(link);
+  symlinkSync(replacement, link);
+  const worker = spawnWorker(link);
+  try {
+    await handshake(worker, link);
+    worker.send({
+      type: "pass",
+      id: 70,
+      channels: { files: true },
+      deadlineMs: 30000,
+      epoch: 0,
+      agentDir: pinned,
+    });
+    const done = await answerRequestsUntilDone(worker, 70);
+    expect(done.result.outcome).toBe("ok");
+    expect(done.result.channels.files?.outcome).toBe("ok");
+    worker.end();
+    expect(await worker.exited()).toBe(0);
+    // The pass ran on the parent's pinned tree...
+    expect(existsSync(join(pinned, "work-attribution"))).toBe(true);
+    expect(existsSync(join(pinned, "pr-cost-reporting"))).toBe(true);
+    // ...and never touched the tree the link moved to.
+    expect(existsSync(join(replacement, "work-attribution"))).toBe(false);
+    expect(existsSync(join(replacement, "pr-cost-reporting"))).toBe(false);
+  } finally {
+    worker.kill();
+    await worker.exited();
+  }
+}, 20000);

@@ -95,6 +95,7 @@ const { isWorkAccount, sameWorkAccount } = await import(
 const { calculatePullRequestCosts, decimalNanos, roundedUsd } = costsReal;
 const { flushWorkSummaries, object, readWorkRecords } = summaryReal;
 import type { WorkRecord } from "../../../src/reconcile/work-attribution/summary.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /** Bun's it.each types reject the vitest-style tables below (plain and object rows). */
 const each = (
@@ -266,7 +267,7 @@ function savedWorkSummary(agentDir: string, workId: string) {
 
 beforeEach(() => {
   installClock(Date.parse("2026-10-01T12:00:00.000Z"));
-  dir = mkdtempSync(join(tmpdir(), "kimchi-cost-sync-"));
+  dir = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-cost-sync-")));
   currentKey = "test-only-original-key";
   notes = backendFor(dir);
   missingNotes = new Set();

@@ -37,6 +37,7 @@ import {
   LedgerFencedError,
   type LedgerStore,
   openStore,
+  pinAgentDir,
   readWriterEpoch,
   resetTxDurations,
   type TxDurations,
@@ -354,7 +355,9 @@ export function recordHashOf(record: WorkRecord): string {
  * does. Drain the spool (one pass with the files channel) before rolling back if immediate
  * visibility is required. */
 export function spoolDirectory(agentDir: string): string {
-  return join(agentDir, "work-attribution", "spool");
+  // Pinned: the spool stays in the real tree the link pointed at when the process first used
+  // it, so a repointed agentDir link cannot hide an acknowledged record from the importer.
+  return join(pinAgentDir(agentDir), "work-attribution", "spool");
 }
 
 /** Total session-id encoding for the spool filename: `encodeURIComponent` for every

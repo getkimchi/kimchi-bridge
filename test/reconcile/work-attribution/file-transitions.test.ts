@@ -61,6 +61,7 @@ import {
   readWorkRecords,
   type WorkRecord,
 } from "../../../src/reconcile/work-attribution/summary.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /**
  * Ported from Kimchi's src/extensions/work-attribution/file-transitions.test.ts. The
@@ -421,7 +422,7 @@ function baseline() {
 }
 beforeEach(() => {
   useBackendFactory(() => createMemoryRecords());
-  root = mkdtempSync(join(tmpdir(), "kimchi-file-work-"));
+  root = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-file-work-")));
   repo = join(root, "repo");
   mkdirSync(repo);
   setDefaultHostPorts(host);

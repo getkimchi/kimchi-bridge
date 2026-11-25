@@ -28,6 +28,7 @@ import {
   reconcileWorkPullRequests,
   type WorkPullRequestUpdate,
 } from "../../../src/reconcile/pull-request-status/pull-requests.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /**
  * Ported from Kimchi's src/extensions/pull-request-status/pull-requests.test.ts. The
@@ -321,7 +322,7 @@ const host: HostPorts = {
 };
 
 beforeEach(() => {
-  directory = mkdtempSync(join(tmpdir(), "kimchi-pull-requests-"));
+  directory = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-pull-requests-")));
   repository = join(directory, "repo.git");
   agentDir = join(directory, "agent");
   mkdirSync(repository);

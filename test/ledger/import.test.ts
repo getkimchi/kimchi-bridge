@@ -24,6 +24,7 @@ import {
   reportJournalProblems,
 } from "../../src/ledger/import.js";
 import { createMemoryRecords } from "../../src/ledger/memory-records.js";
+import { pinAgentDir } from "../../src/ledger/store.js";
 import {
   backendFor,
   capture,
@@ -46,7 +47,9 @@ const WORK = "11111111-1111-4111-8111-111111111111";
 const SESSION = "session-import";
 
 function agentDir(): string {
-  return mkdtempSync(join(tmpdir(), "kimchi-import-"));
+  // Pinned to its real path, so the journal paths this suite builds and asserts match the
+  // pinned spelling the importer's own scan derives from the same agent directory.
+  return pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-import-")));
 }
 
 function line(record: Record<string, unknown>): string {

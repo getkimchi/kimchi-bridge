@@ -444,6 +444,8 @@ const REPLIES = (api: string): Record<string, unknown> => ({
   },
   policy: { resources: { "extensions.cost-per-pr": true } },
   consent: { consent: true },
+  // The host does not govern the PR-reporting choice: the queue's state.json semantics apply.
+  reportingConsent: {},
 });
 
 /** Sends one pass with a freshly acquired epoch, and answers its host requests until done. */
