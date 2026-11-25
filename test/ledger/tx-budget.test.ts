@@ -1204,26 +1204,27 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   // The captured link is stamped LATER than every seeded link, so the reduced publication's
   // newest-first ranking keeps it: the budget drops only the oldest links.
   const laterAt = new Date(Date.parse(at) + 60_000).toISOString();
-  const oneLinkCommit: WorkRecord = {
-    version: 1,
-    type: "commit",
-    workId: WORK,
-    sessionId: "session",
-    sha: "c".repeat(40),
-    repository: "github.com/o/r",
-    worktree: "/w",
-    recordedAt: laterAt,
-    pullRequests: [
-      {
-        provider: "github",
-        host: "github.com",
-        id: String(900_000),
-        url: "https://github.com/o/r/pull/900000",
-        checkedAt: laterAt,
-        state: "open",
-      },
-    ],
-  } as WorkRecord;
+  const oneLinkCommit = (linkId: string, sha: string): WorkRecord =>
+    ({
+      version: 1,
+      type: "commit",
+      workId: WORK,
+      sessionId: "session",
+      sha,
+      repository: "github.com/o/r",
+      worktree: "/w",
+      recordedAt: laterAt,
+      pullRequests: [
+        {
+          provider: "github",
+          host: "github.com",
+          id: linkId,
+          url: `https://github.com/o/r/pull/${linkId}`,
+          checkedAt: laterAt,
+          state: "open",
+        },
+      ],
+    }) as WorkRecord;
   const realReadLog = backend.readLog;
   let inCaptureTx = 0;
   let captureReadLogs = 0;
@@ -1244,24 +1245,99 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   };
   try {
     resetLedgerTxDurations(dir);
-    capture(dir, oneLinkCommit, "summary-native");
+    capture(dir, oneLinkCommit(String(900_000), "c".repeat(40)), "summary-native");
   } finally {
     backend.readLog = realReadLog;
     backend.tx = realCaptureTx;
   }
-  // The capture's fold never rescanned the commit rows — inside the transaction or out: the
-  // head's merged summary is maintained incrementally from the touched rows, and its
-  // serialization is precomputed outside the write lock (the pre-fix capture's single
-  // readLog call ran inside its transaction and the whole capture measured 898.196 ms).
+  // The capture's fold never rescanned the commit rows — inside the transaction or out: an
+  // oversized saved head (this reduced publication is ~30 MB) never even reaches the fold —
+  // the inline fold gate defers it — so the capture's planning is O(new records) with no head
+  // parse, merge or serialization anywhere on its path (round-6 failure-010/correctness-014:
+  // the pre-gate plan parsed and serialized the whole head before the busy window, and its
+  // transaction put the full ~30 MB body — 316–653 ms against the 250 ms ceiling).
   expect(captureReadLogs).toBe(0);
   expect(captureReadLogsInTx).toBe(0);
   expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
-  // The reduced head stays readable and now carries the new link, and the authority keeps
-  // every commit row — the fold lost nothing.
+  // The capture committed ONLY the record, its marker and the dirty marker: the head
+  // derivation is the bounded rebuild's, exactly as the deferral design directs.
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+  // The reduced head stays readable and carries the new link once its lazy repair has
+  // rebuilt the work in bounded slices, and the authority keeps every commit row — the
+  // fold lost nothing (the captured link is stamped later than every seeded link, so the
+  // reduced publication's newest-first ranking keeps it: the budget drops only the oldest).
   const capturedHead = readWorkHead(dir, WORK);
   expect(capturedHead?.truncated).toBe(true);
   expect(capturedHead?.pullRequests.some((link) => link.id === String(900_000))).toBe(true);
+  expect(backend.dirtyWorks()).toEqual([]);
   expect(backend.readLog(WORK, "commits")).toHaveLength(commits + 1);
+  // The plan/commit gap on the SAME reduced-head shape (the round-6 design-006 probe): one
+  // unrelated record commits between the capture's plan and its transaction, so the planned
+  // fold is stale. The pre-gate code re-derived the whole fold inside the lock and measured a
+  // 441.199 ms capture transaction here; the gate must instead route the stale plan to the
+  // dirty marker with the transaction staying one small write.
+  const OTHER = "00000000-0000-4000-8000-000000000002";
+  const realTryCaptureTx = backend.tryCaptureTx!;
+  let unrelatedCommitted = false;
+  backend.tryCaptureTx = ((commit: () => void, busyMs?: number) => {
+    if (!unrelatedCommitted) {
+      unrelatedCommitted = true;
+      backend.tx(() => {
+        backend.insertRecord({
+          recordHash: "unrelated-intervening",
+          type: "request",
+          workId: OTHER,
+          sessionId: "session",
+          body: JSON.stringify(record("unrelated")),
+          sourcePath: "/journal",
+          sourceGeneration: 0,
+          sourceOffset: null,
+          importedAt: Date.now(),
+        });
+        backend.upsertMarker("unrelated-intervening", OTHER, "request");
+      });
+    }
+    return realTryCaptureTx.call(backend, commit, busyMs);
+  }) as typeof realTryCaptureTx;
+  try {
+    resetLedgerTxDurations(dir);
+    capture(dir, oneLinkCommit(String(900_001), "d".repeat(40)), "summary-native");
+  } finally {
+    backend.tryCaptureTx = realTryCaptureTx;
+  }
+  // The unrelated record is durable, the stale plan never replayed its fold, and the
+  // capture transaction stayed bounded — the oversized head routed it to the dirty marker.
+  expect(backend.readRecords({}).some((row) => row.recordHash === "unrelated-intervening")).toBe(
+    true,
+  );
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
+  const racedHead = readWorkHead(dir, WORK);
+  expect(racedHead?.pullRequests.some((link) => link.id === String(900_001))).toBe(true);
+  expect(backend.dirtyWorks()).toEqual([]);
+  expect(backend.readLog(WORK, "commits")).toHaveLength(commits + 2);
+  // The HEAD-INTACT import on the same reduced-head shape (the round-6 design-007 probe): one
+  // ordinary one-link commit imports with the reduced head present. The pre-gate import
+  // folded inline and measured a 350.518 ms transaction parsing, merging and republishing the
+  // whole head inside the importer's transaction; the gate must defer it to the bounded
+  // repair instead.
+  resetLedgerTxDurations(dir);
+  backend.tx(() => {
+    importBatchInTx(backend, [
+      {
+        line: JSON.stringify(oneLinkCommit(String(900_002), "e".repeat(40))),
+        record: oneLinkCommit(String(900_002), "e".repeat(40)),
+        sourcePath: "/journal",
+        sourceGeneration: 0,
+        sourceOffset: commits + 2,
+      },
+    ]);
+  });
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
+  const importedHead = readWorkHead(dir, WORK);
+  expect(importedHead?.pullRequests.some((link) => link.id === String(900_002))).toBe(true);
+  expect(backend.readLog(WORK, "commits")).toHaveLength(commits + 3);
   // The between-preflight-and-commit head-loss shape (the round-5 design-005 probe): another
   // process removes the head after the importer's preflight rebuild, and one touch record
   // imports inside the importer's transaction. The whole-work fallback that rebuilt the head
@@ -1293,7 +1369,7 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   expect(readWorkSummary(dir, WORK)?.requests.map((row) => row.requestId)).toContain(
     "req-head-loss",
   );
-  expect(backend.readLog(WORK, "commits")).toHaveLength(commits + 1);
+  expect(backend.readLog(WORK, "commits")).toHaveLength(commits + 3);
 }, 180_000);
 
 it("retry exhaustion abandons publication in bounded transactions instead of one convergence fold", () => {

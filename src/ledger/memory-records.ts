@@ -335,6 +335,11 @@ export function createMemoryRecords(): RecordBackend {
       dirty.delete(workId);
     },
     dirtyWorks: () => [...dirty],
+    hasDirty: (workId) => dirty.has(workId),
+    headBodyBytes: (workId) => {
+      const head = heads.get(workId);
+      return head ? Buffer.byteLength(JSON.stringify(head)) : 0;
+    },
     getRow: (workId, log, key) => workLogs(workId).get(log)?.get(key)?.body,
     putRow: (workId, log, key, body, pos) => {
       touch();

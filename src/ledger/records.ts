@@ -136,8 +136,9 @@ export interface RecordBackend {
   resetTxDurations?(): void;
   /** Capture's contended write: runs commit() under the short busy timeout and returns false when
    * the writer was busy for that whole window (the caller parks the record in the spool);
-   * absent on backends whose store cannot be busy. */
-  tryCaptureTx?(commit: () => void): boolean;
+   * absent on backends whose store cannot be busy. `busyMs` narrows the window below the
+   * capture default, so time the caller spent planning is never added on top of it. */
+  tryCaptureTx?(commit: () => void, busyMs?: number): boolean;
   /** True when a NEW row was inserted; false when the record hash already exists (import dedup). */
   insertRecord(row: StoredRecord): boolean;
   upsertMarker(recordHash: string, workId: string, type: string): void;
@@ -177,6 +178,12 @@ export interface RecordBackend {
   markDirty(workId: string): void;
   clearDirty(workId: string): void;
   dirtyWorks(): string[];
+  /** Whether the work carries the dirty marker (its head is stale or missing and the next
+   *  read repairs it); a cheap routing read, unlike `dirtyWorks`' full scan. */
+  hasDirty(workId: string): boolean;
+  /** The stored serialization's byte length of the work's saved head (0 when there is none):
+   *  the oversize gate for the inline fold, read WITHOUT parsing the head. */
+  headBodyBytes(workId: string): number;
   getRow(workId: string, log: LogName, key: string): Row | undefined;
   /** A new key takes position `pos`; a later write of the same key replaces the body and keeps its position. */
   putRow(workId: string, log: LogName, key: string, body: Row, pos: number): void;
@@ -626,6 +633,13 @@ function blockingCaptureCommit(commit: () => void): void {
 }
 
 export function capture(agentDir: string, record: WorkRecord, sourcePath: string | null): void {
+  // The total bounded-return budget: planning, the busy wait and the spool append must all
+  // fit inside the capture acceptance window (round-6 failure-010: a hoisted plan on a
+  // 30 MB head added ~50 ms of parse, merge and serialization ON TOP of the 250 ms busy
+  // window and the contended capture returned in 300.888 ms against the 260 ms bound). The
+  // busy window below is whatever of the 250 ms budget remains after everything capture
+  // did before it, so the whole path stays inside the window however large the plan was.
+  const startedAtMs = performance.now();
   const line = JSON.stringify(record);
   const stored: StoredRecord = {
     recordHash: recordHashOf(record),
@@ -640,32 +654,47 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
   };
   // The commit's transaction: the insert, the marker and — when the planned fold is still
   // current — the precomputed projection publication. A plan that went stale (another writer
-  // committed between the plan and this transaction) is never trusted: the fold re-derives
-  // from fresh reads inside the lock, exactly as capture always did, or — when the projection
-  // is missing — the work is marked dirty instead. A projection lost to a version bump or a
-  // bug is not rebuilt here either way: this commit must stay one small transaction, and a
-  // rebuild that ran inside it would hold the write lock across every slice (an outer
-  // tryCaptureTx transaction cannot see the slice boundaries). The dirty marker hands the
-  // work to the next read's lazy repair or the reconciliation pass's recovery, which rebuild
-  // in bounded slices, folding this record with the rest of the authority.
+  // committed between the plan's FIRST read and this transaction) is never trusted and never
+  // replayed: the record commits first, and the fold is then re-derived from fresh reads
+  // inside the lock — but ONLY when the head it would merge onto is itself bounded (the
+  // inline fold gate below); an oversized or already-dirty head takes the dirty marker
+  // instead, so a competing writer's multi-megabyte publication can never turn this
+  // transaction into the round-6 design-006 defect (a 441 ms capture transaction on the
+  // reduced-head probe shape). A projection lost to a version bump or a bug is not rebuilt
+  // here either way: this commit must stay one small transaction, and a rebuild that ran
+  // inside it would hold the write lock across every slice (an outer tryCaptureTx
+  // transaction cannot see the slice boundaries). The dirty marker hands the work to the
+  // next read's lazy repair or the reconciliation pass's recovery, which rebuild in
+  // bounded slices, folding this record with the rest of the authority.
   const commitPlanned = (backend: RecordBackend, planned: PlannedCaptureFold): void => {
     backend.tx(() => {
       // The currency check runs before any write of this transaction: the SQLite backend's
       // dataVersion cannot move for the writes the still-open transaction itself is about to
       // make (the write lock is held and own commits are counted after the transaction ends),
-      // so checking first keeps the window exactly the plan's.
-      if (backend.dataVersion() !== planned.version) {
-        // Something committed between the plan and this transaction (a same-work capture, an
-        // importer's batch, another process's rebuild): the planned rows, counters and
-        // serialized body are stale, so they are never replayed. The fold re-derives from the
-        // fresh head inside the lock — the bounded incremental fold, never an authority
-        // rescan — or the work is marked dirty when its projection is gone.
-        const projection =
-          backend.getHead(record.workId) !== undefined || backend.recordCount(record.workId) === 0;
+      // so checking first keeps the window exactly the plan's. The version the plan carries is
+      // the one sampled BEFORE its first read (planCaptureFold), so any commit inside the
+      // plan's read window — a same-work capture, an importer's batch, another process's
+      // rebuild — moves the current version off it and the stale plan is never replayed.
+      if (!planned.dirty && backend.dataVersion() !== planned.version) {
         backend.insertRecord(stored);
         backend.upsertMarker(stored.recordHash, record.workId, record.type);
-        if (projection) foldWork(backend, record.workId, [record]);
-        else backend.markDirty(record.workId);
+        // Re-derive inside the lock ONLY when the head the fold would merge onto is itself
+        // bounded: the gate reads the stored body's length without parsing it, so a head a
+        // competing writer installed since the plan (a multi-megabyte reduced publication —
+        // the round-6 design-006 probe's 441 ms transaction) routes to the dirty marker
+        // instead, and a work already marked dirty keeps its marker rather than folding onto
+        // a stale head the next read must repair anyway.
+        if (
+          backend.headBodyBytes(record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+          backend.hasDirty(record.workId)
+        ) {
+          backend.markDirty(record.workId);
+          return;
+        }
+        // The bounded re-derivation: parse, merge and republish a head at most
+        // INLINE_FOLD_MAX_HEAD_BYTES, reading only the rows this record touches — the same
+        // fold capture always ran inside its transaction before the plan was hoisted out.
+        foldWork(backend, record.workId, [record]);
         return;
       }
       backend.insertRecord(stored);
@@ -702,10 +731,13 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
   // The plan is hoisted out of the commit closure so it never runs inside tryCaptureTx's
   // transaction: the whole head merge and serialization stay outside the write lock, and the
   // transaction the closure opens only writes. A busy tryCaptureTx discards the plan with the
-  // attempt; the spool and blocking paths re-plan on every retry.
+  // attempt; the spool and blocking paths re-plan on every retry. The busy wait is bounded by
+  // what remains of the total capture budget above, so planning time never pushes the
+  // contended return past the acceptance window.
   const planned = planCaptureFold(backend, record);
   const commit = () => commitPlanned(backend, planned);
-  if (backend.tryCaptureTx(commit)) return;
+  const busyMs = Math.max(0, CAPTURE_BUSY_TIMEOUT_MS - Math.ceil(performance.now() - startedAtMs));
+  if (busyMs > 0 && backend.tryCaptureTx(commit, busyMs)) return;
   if (spoolCaptureLine(agentDir, record.sessionId, line)) return;
   blockingCaptureCommit(() => commitInto(backendFor(agentDir)));
 }
@@ -772,12 +804,21 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
     // round-5 probe removed it between the importer's preflight rebuild and this batch's
     // commit) is NOT rebuilt here: this whole-work fallback ran the complete authority merge
     // and the head publication inside the caller's transaction — one 969.795 ms transaction
-    // on the probe's 1,000-commit/500-links-each shape. The work is marked dirty instead,
-    // exactly as capture does: the next read of it (the lazy head repair), the next batch's
-    // preflight or the reconciliation pass's recovery rebuilds it in bounded slices, folding
-    // these records with the rest of the authority; otherwise fold exactly the newly
+    // on the probe's 1,000-commit/500-links-each shape. A work whose saved head is OVER the
+    // inline fold bound — or already dirty, so its head is stale by construction — is never
+    // folded inline either (round-6 design-007: a head-intact one-link import on the same
+    // probe shape measured a 350 ms transaction parsing, merging and republishing the whole
+    // reduced head inside the importer's transaction). All of these mark the work dirty
+    // instead, exactly as capture does: the next read of it (the lazy head repair), the next
+    // batch's preflight or the reconciliation pass's recovery rebuilds it in bounded slices,
+    // folding these records with the rest of the authority; otherwise fold exactly the newly
     // inserted rows.
-    if (!backend.getHead(workId) && backend.recordCount(workId) > 0 && preexisting.has(workId)) {
+    if (
+      backend.recordCount(workId) > 0 &&
+      (backend.hasDirty(workId) ||
+        backend.headBodyBytes(workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+        (backend.headBodyBytes(workId) === 0 && preexisting.has(workId)))
+    ) {
       backend.markDirty(workId);
       continue;
     }
@@ -950,13 +991,18 @@ export function fingerprint(agentDir: string): string {
   return String(backendFor(agentDir).recordCount());
 }
 
-/** The work's manifest, rebuilt from its records when the projection is missing — in bounded
- * slices, so a large work's lazy repair never runs as one unbounded transaction. */
+/** The work's manifest, rebuilt from its records when the projection is missing or marked
+ * dirty — in bounded slices, so a large work's lazy repair never runs as one unbounded
+ * transaction. The dirty case is the round-6 lesson of correctness-012: a present head whose
+ * work carries the dirty marker is STALE by construction (a deferred or invalidated fold
+ * landed after it), and serving it silently would leave readers disagreeing with the
+ * authority until some unrelated rebuild — so the marker, not the head's presence, decides
+ * whether a read repairs. */
 export function readWorkHead(agentDir: string, workId: string): WorkHead | undefined {
   const backend = backendFor(agentDir);
   const head = backend.getHead(workId);
-  if (head) return head;
-  if (backend.recordCount(workId) === 0) return undefined;
+  if (head && !backend.hasDirty(workId)) return head;
+  if (backend.recordCount(workId) === 0) return head;
   rebuildWorkSliced(backend, agentDir, workId);
   return backend.getHead(workId);
 }
@@ -1047,6 +1093,17 @@ const REBUILD_RESTART_LIMIT = 8;
  *  head object — never deferred: a recorded work must never become unreadable, and the full
  *  link set stays in the authority rows every rebuild refolds. */
 const HEAD_PUBLISH_MAX_BYTES = 32 * 1024 * 1024;
+/** The largest saved-head body a capture or import transaction may parse, merge and republish
+ *  INLINE. A head over this bound is not touched by the incremental fold at all: the fold's
+ *  merge and serialization are O(head) even when its row reads are O(new records), so a
+ *  multi-megabyte head turns the fold's transaction into a multi-hundred-millisecond head put
+ *  (the round-6 probes: a 441 ms capture transaction and a 350 ms import batch on the
+ *  reduced-head shape). Oversized works defer instead — the record, its marker and the dirty
+ *  marker commit alone, and the bounded rebuild (the lazy repair or the pass's recovery)
+ *  owns the head derivation with its capped publication — while every ordinary work (heads in
+ *  the kilobytes) keeps today's immediate fold. Reads stay correct because a dirty work is
+ *  repaired by its next read (readWorkHead), never served its stale head silently. */
+const INLINE_FOLD_MAX_HEAD_BYTES = 4 * 1024 * 1024;
 /** Record body bytes the whole-work rebuild's single atomic transaction may cover. The
  *  branch is otherwise chosen by record count alone, and a count-sized work can still merge
  *  to an arbitrarily large projection (the reviewed probe: 1,000 commit records carrying
@@ -1372,9 +1429,12 @@ interface PlannedRowWrite {
   pos: number;
 }
 
-/** A capture's planned fold: the merged head and its serialized publication body, computed
- *  OUTSIDE the write lock, plus the row writes the transaction replays once the plan is
- *  confirmed current. `dirty` marks the missing-projection case, which never folds. */
+/** A capture's planned fold: either a full fold (the merged head, its serialized publication
+ *  body and the row writes the transaction replays once the plan is confirmed current) or the
+ *  deferred shape, which never touches the head at all — the record, its marker and the
+ *  dirty marker commit alone and the bounded rebuild owns the head derivation. `dirty` marks
+ *  every deferred case: a missing projection, an oversized saved head, or a work already
+ *  carrying the dirty marker. */
 type PlannedCaptureFold =
   | { dirty: true; version: number; head?: undefined; body?: undefined; writes?: undefined }
   | {
@@ -1394,14 +1454,35 @@ type PlannedCaptureFold =
  *  parts on a large head — never run under the write lock, so the capture's transaction stays
  *  one small write even on a work whose head is a multi-megabyte reduced publication (the
  *  round-5 probe measured an 898 ms capture transaction when the fold rescanned every commit
- *  row and serialized the whole head inside it). */
+ *  row and serialized the whole head inside it). The plan's version stamp is sampled BEFORE
+ *  its first read, so the plan can never carry a version newer than the reads it derived
+ *  from (round-6 correctness-012/failure-009: a version sampled after the reads absorbed a
+ *  competing capture into the stamp without its rows, and the publication check accepted
+ *  the stale plan). A work whose saved head is OVER the inline fold bound — or already dirty,
+ *  so its head is stale by construction — never plans a fold at all: capture commits only the
+ *  record, its marker and the dirty marker (O(new records), no head parse, merge or
+ *  serialization anywhere on the path), and the head derivation stays with the bounded
+ *  rebuild (the lazy repair or the pass's recovery), whose publication is capped exactly as
+ *  every head publication is (round-6 design-006/failure-010/correctness-014: a 30 MB head
+ *  made the plan itself ~50 ms and its transaction a 316–653 ms put). */
 function planCaptureFold(backend: RecordBackend, record: WorkRecord): PlannedCaptureFold {
+  // The version stamp precedes every read the plan derives from. Anything committing after
+  // this sample — but before the transaction — moves the current version off the stamp and
+  // the transaction takes the stale path instead of replaying the plan.
+  const version = backend.dataVersion();
+  // The oversize/dirty gate reads only the stored body's byte length and the dirty marker:
+  // neither parses the head, so even a 30 MB head costs microseconds to route around.
+  if (
+    backend.headBodyBytes(record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+    backend.hasDirty(record.workId)
+  )
+    return { dirty: true, version };
   const saved = backend.getHead(record.workId);
-  if (!saved && backend.recordCount(record.workId) > 0) return { dirty: true, version: 0 };
+  if (!saved && backend.recordCount(record.workId) > 0) return { dirty: true, version };
   const plan = planFold(backend, saved ?? emptyHead(record.workId), [record]);
   return {
     dirty: false,
-    version: backend.dataVersion(),
+    version,
     head: plan.head,
     body: plan.body,
     writes: plan.writes,
@@ -1884,6 +1965,12 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
     "SELECT sum(length(body)) AS bytes FROM work_records WHERE work_id = ?",
   );
   const dirty = db.query<{ work_id: string }, []>("SELECT work_id FROM work_dirty");
+  const hasDirtyStmt = db.query<{ one: number }, [string]>(
+    "SELECT 1 AS one FROM work_dirty WHERE work_id = ?",
+  );
+  const headBodyBytesStmt = db.query<{ bytes: number | null }, [string]>(
+    "SELECT length(body) AS bytes FROM work_projection_head WHERE work_id = ?",
+  );
   const markDirty = db.query("INSERT OR IGNORE INTO work_dirty (work_id) VALUES (?)");
   const clearDirty = db.query("DELETE FROM work_dirty WHERE work_id = ?");
   const hasNote = db.query<{ one: number }, [string, string]>(
@@ -1939,10 +2026,16 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
     writerEpoch: () => readWriterEpoch(db),
     txDurations: () => txDurations(store),
     resetTxDurations: () => resetTxDurations(store),
-    tryCaptureTx: (commit: () => void): boolean => {
+    tryCaptureTx: (commit: () => void, busyMs?: number): boolean => {
       // The short wait runs on this connection only, and the original timeout is restored before
-      // the caller can fall back to the blocking wait.
-      db.exec(`PRAGMA busy_timeout=${CAPTURE_BUSY_TIMEOUT_MS}`);
+      // the caller can fall back to the blocking wait. A caller that already spent part of the
+      // capture budget planning narrows the window by what it consumed (never below zero —
+      // a zero window fails the attempt immediately and takes the spool path).
+      const window = Math.max(
+        0,
+        Math.min(busyMs ?? CAPTURE_BUSY_TIMEOUT_MS, CAPTURE_BUSY_TIMEOUT_MS),
+      );
+      db.exec(`PRAGMA busy_timeout=${window}`);
       try {
         runTx(commit);
         return true;
@@ -2023,6 +2116,8 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
     markDirty: (workId) => markDirty.run(workId),
     clearDirty: (workId) => clearDirty.run(workId),
     dirtyWorks: () => dirty.all().map((row) => row.work_id),
+    hasDirty: (workId) => hasDirtyStmt.get(workId) != null,
+    headBodyBytes: (workId) => headBodyBytesStmt.get(workId)?.bytes ?? 0,
     getRow: (workId, log, key) => {
       const found = getRow.get(workId, log, key);
       return found ? (JSON.parse(found.body) as Row) : undefined;

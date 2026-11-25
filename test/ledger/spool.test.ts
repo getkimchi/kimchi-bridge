@@ -266,6 +266,65 @@ console.log(JSON.stringify({ elapsedMs }));`)) as { elapsedMs?: number[] };
   ).toEqual(["warm-0", "warm-a", "warm-b", "warm-c"]);
 }, 20_000);
 
+it("a warm contended capture on an oversized head meets the 260 ms acceptance bound", async () => {
+  const dir = agentDir();
+  // The round-6 failure-010 shape: the hoisted plan parsed, merged and serialized the work's
+  // whole saved head BEFORE the busy window started, so a warm capture on a large valid head
+  // under a held writer returned only after planning PLUS the 250 ms busy wait (a real
+  // cross-process probe on a 30,377,919-byte head measured 300.888 ms against the 260 ms
+  // bound; an 18 MB head measured 282 ms). The inline fold gate now keeps planning O(new
+  // records) on such a head — no parse, merge or serialization at all — and the busy window
+  // is narrowed by whatever planning did spend, so the whole path fits the bound.
+  // The work's head is a real ~16 MB publication: 100,000 valid links over one seeded commit.
+  const backend = backendFor(dir);
+  capture(dir, record("seed"), "summary-native");
+  const bigHead = {
+    version: 2,
+    workId: WORK,
+    updatedAt: new Date().toISOString(),
+    logs: { requests: { generation: 1, bytes: 200, rows: 1 } },
+    latest: {},
+    pullRequests: Array.from({ length: 100_000 }, (_, index) => ({
+      provider: "github",
+      host: "github.com",
+      id: String(200_000 + index),
+      url: `https://github.com/o/r/pull/${200_000 + index}`,
+      checkedAt: new Date().toISOString(),
+      state: "open",
+    })),
+  };
+  const body = JSON.stringify(bigHead);
+  expect(Buffer.byteLength(body)).toBeGreaterThan(8 * 1024 * 1024);
+  backend.putHead(bigHead as never, body);
+  expect(backend.headBodyBytes(WORK)).toBeGreaterThan(8 * 1024 * 1024);
+  const holder = await holdWriter(dir, 4000);
+  let big: { elapsedMs?: number } | undefined;
+  try {
+    const rec = { ...record("big-head"), sessionId: "session" };
+    big = (await runChild(`const { capture } = await import(${JSON.stringify(
+      `${ROOT}src/ledger/records.js`,
+    )});
+const start = Date.now();
+capture(${JSON.stringify(dir)}, ${JSON.stringify(rec)}, "big-head-accept");
+console.log(JSON.stringify({ elapsedMs: Date.now() - start }));`)) as {
+      elapsedMs?: number;
+    };
+  } finally {
+    await holder.done;
+  }
+  // The contended capture paid its busy window (the writer never released) and STILL
+  // returned inside the acceptance bound — the head itself contributed no planning time.
+  expect(big?.elapsedMs ?? Infinity).toBeGreaterThanOrEqual(150);
+  expect(big?.elapsedMs ?? Infinity).toBeLessThan(ACCEPTANCE_BOUND_MS);
+  // The bounded path is the one that returned: the record sits in the spool and the ledger
+  // holds nothing beyond the seeded work — neither the blocking fallback nor a direct
+  // SQLite write under the held writer ran.
+  const spool = spoolFilePath(dir, "session");
+  expect(existsSync(spool)).toBe(true);
+  expect(readRecords(dir)).toHaveLength(1);
+  expect(importSpool(dir).imported).toBe(1);
+}, 20_000);
+
 it("an isolated cold capture under a 6 s writer meets the 260 ms acceptance bound", async () => {
   const dir = agentDir();
   // The cold shape of the same acceptance bound: three fresh processes, each whose first-ever
