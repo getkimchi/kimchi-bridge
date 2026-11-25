@@ -232,6 +232,119 @@ it("a late-delivered heartbeat never makes a stale worker writable", async () =>
   expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
 }, 20_000);
 
+it("a delayed handshake observation never calibrates a late first heartbeat to itself", async () => {
+  // The round-4 reproduced defect (failure-007): the main thread was descheduled between
+  // the handshake futex wake and its post-wait clock read, so the sync offset absorbed the
+  // whole pause; the delivery guard then measured a note delivered 50 ms into a 500 ms
+  // block as prompt, folded its estimate, and heartbeatAgeMs erased the pause — the probe
+  // reported ~30 ms with refused:false although ~480 ms had elapsed since the arrival. The
+  // whole wait-and-read observation is now bounded by monotonic timestamps, and the offset
+  // it yields is trusted only when that observation stayed inside the delivery bound: a
+  // descheduled observation leaves the offset uncalibrated, no note is ever folded, and the
+  // conservative fallback — pinned to the pre-construction sample — keeps the age honest.
+  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "first-late"], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      HEARTBEAT_WINDOW_MS: "100",
+      KIMCHI_WORKER_TEST_HANDSHAKE_OBSERVE_DELAY_MS: "500",
+    },
+    stdio: ["pipe", "ignore", "pipe"],
+  });
+  const lines: string[] = [];
+  createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
+  const saw = (phase: string) => lines.some((line) => line.includes(`"phase":"${phase}"`));
+  for (let round = 0; round < 100 && !saw("block"); round++)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(saw("block")).toBe(true);
+  // The parent delivers exactly one heartbeat 50 ms into the child's 500 ms block and then
+  // goes silent: its note can only drain after the block, ~450 ms after its true arrival.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+  expect(code).toBe(0);
+  const summary = lines
+    .map((line) => {
+      try {
+        return JSON.parse(line) as { phase?: string; ageMs?: number; refused?: boolean };
+      } catch {
+        return {} as { phase?: string; ageMs?: number; refused?: boolean };
+      }
+    })
+    .find((note) => note.phase === "summary");
+  expect(summary).toBeDefined();
+  // The descheduled observation never calibrates anything: the drained note's delivery
+  // latency is never erased from the age, the fence refuses the stale write, and the age
+  // covers the true silent span since the heartbeat's arrival (the pre-fix child reported
+  // ~30 ms and refused:false on this exact shape).
+  expect(summary?.refused).toBe(true);
+  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(250);
+  expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
+}, 20_000);
+
+it("a helper whose first action is delayed past the window keeps accepting live heartbeats", async () => {
+  // The missed-handshake availability consequence (correctness-p02 / design-p10): the helper
+  // thread's ACTUAL first action is delayed past the 250 ms handshake bound and the fence
+  // window (scheduler starvation at worker startup) while the parent keeps heartbeating at
+  // the required cadence; the queued lines are read once the helper starts. The handshake
+  // never calibrates and no heartbeat note is ever folded (both the safe directions), so
+  // availability rests on the conservative fallback alone: it is pinned to the main thread's
+  // pre-construction sample, which understates the true offset by at most the construction's
+  // own duration — never by the helper's startup delay. The fence must therefore accept the
+  // live heartbeats once they arrive instead of refusing them for the transport's lifetime
+  // (the pre-fix fallback subtracted the helper's whole startup delay from the offset and
+  // rejected every live heartbeat: permanent false staleness).
+  const child = Bun.spawn({
+    cmd: [process.execPath, join(ROOT, "test/worker/heartbeat-child.ts"), "slow-helper"],
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KIMCHI_WORKER_TEST_HELPER_START_DELAY_MS: "2000",
+      HEARTBEAT_WINDOW_MS: "250",
+      HEARTBEAT_SAMPLES: "40",
+    },
+    stdin: "pipe",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const stderrText = new Response(child.stderr).text();
+  // The parent heartbeats every 100 ms for the child's whole run, including the delayed
+  // helper start: the lines queue in the pipe and the helper reads them once it starts.
+  const feeder = (async () => {
+    for (let index = 0; index < 50; index++) {
+      try {
+        await sendHeartbeat(child.stdin);
+      } catch {
+        // The child has exited; the pipe is gone. Its summary is already complete.
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  })();
+  const [code] = await Promise.all([child.exited, feeder]);
+  const lines = (await stderrText).split("\n").filter((line) => line.trim() !== "");
+  expect(code).toBe(0);
+  const summary = JSON.parse(lines[lines.length - 1] ?? "{}") as {
+    samples?: { ageMs: number; refused: boolean }[];
+  };
+  const samples = summary.samples ?? [];
+  expect(samples).toHaveLength(40);
+  // Before the helper's first action the heartbeat slot is empty, so the fence refuses
+  // (ages read as infinitely stale — the safe direction); the delayed start itself is
+  // covered by that. Once the helper reads the queued heartbeats, the live parent's writes
+  // are allowed again and STAY allowed: every sample from the first acceptance on tracks
+  // the 100 ms heartbeat cadence (never the 2 s startup delay the pre-fix fallback baked
+  // into every age — on the pre-fix code no sample is accepted at all), and the recovery
+  // leaves at least a quarter of the run's samples accepted, not a fluke at the boundary.
+  const firstAccepted = samples.findIndex((sample) => !sample.refused);
+  expect(firstAccepted).toBeGreaterThanOrEqual(0);
+  for (const sample of samples.slice(firstAccepted)) {
+    expect(sample.refused).toBe(false);
+    expect(sample.ageMs).toBeLessThan(250);
+  }
+  expect(samples.length - firstAccepted).toBeGreaterThanOrEqual(10);
+}, 20_000);
+
 it("a first heartbeat delivered late never calibrates the offset to itself", async () => {
   // The round-3 reproduced defect: with NO earlier heartbeat to converge the minimum, the
   // first note's estimate becomes the offset wholesale. When that note sat queued behind a

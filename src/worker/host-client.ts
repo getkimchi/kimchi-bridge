@@ -213,6 +213,17 @@ let pending = "";
 // seed itself with, and one reading both seeds the shared slot and rides the startup note,
 // so the main thread's fallback calibration and the slot's baseline are the very same
 // instant.
+// Test-only hook: a delay inserted before this thread's first action, so a test can
+// reproduce a helper whose actual start is delayed past the handshake bound and the fence
+// window (scheduler starvation) without touching the main thread's clock samples. Zero
+// (unset) keeps it dormant.
+const TEST_HELPER_START_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_HELPER_START_DELAY_MS || 0);
+if (TEST_HELPER_START_DELAY_MS > 0) {
+  const until = performance.now() + TEST_HELPER_START_DELAY_MS;
+  while (performance.now() < until) {
+    /* A real block: no first action, no store, no wake until it ends. */
+  }
+}
 const startupClock = performance.now();
 Atomics.store(hb, 0, BigInt(Math.round(startupClock)));
 // The start handshake: the same startup clock reading also goes into shared memory and flips
@@ -356,13 +367,15 @@ export class StdioTransport {
   private readonly secrets = new Set<string>();
   /** The conservative fallback offset between the main thread's and the helper thread's monotonic
    *  clocks (both performance.now; their origins differ by the helper's startup): derived once from
-   *  the main thread's time BEFORE it constructed the helper — a value guaranteed to precede the
-   *  helper's start — so it understates the true offset by the whole construction-to-startup
-   *  latency and therefore only ever overstates a heartbeat's age (refuse early, the safe
-   *  direction). Seeded earlier by the construction-time handshake below when the helper started
-   *  inside the handshake's bound; the startup note's own derivation then replaces it with that
-   *  conservative value. Undefined until one of them lands, which reads as infinitely stale,
-   *  the safe direction. */
+   *  the main thread's time BEFORE it constructed the helper. The helper thread's own clock cannot
+   *  have started before the Worker's construction began, so this sample always precedes the
+   *  helper's clock origin — it understates the true offset by at most the construction's own
+   *  duration, and therefore only ever overstates a heartbeat's age (refuse early, the safe
+   *  direction). It is NEVER replaced: the startup note's clock includes the helper's whole
+   *  in-thread startup delay, and subtracting that delay (as an earlier revision did) understates
+   *  the true offset by the whole delay — a helper whose first action was delayed past the fence
+   *  window would then refuse every live heartbeat for the transport's lifetime. A delivery-delayed
+   *  startup note moves nothing here, so no note can shrink an age through it either. */
   #monoOffsetMs: number | undefined;
   /** The running MINIMUM of the per-heartbeat offset estimates: each estimate is the helper's
    *  send-time clock subtracted from the main thread's time when it handled that heartbeat's
@@ -379,9 +392,17 @@ export class StdioTransport {
    *  stores its startup clock in shared memory and wakes this thread's bounded wait through the
    *  futex path, so no postMessage queue — and no blocked event loop — can delay the reading.
    *  The wake follows the helper's store, so this is an upper bound on the true offset whose
-   *  error is the futex wake latency (microseconds), not a message-delivery latency: it is the
-   *  only conversion against which a note's delivery can be soundly bounded. Undefined when the
-   *  helper did not start inside the handshake's bound. */
+   *  error is the futex wake latency (microseconds), not a message-delivery latency — PROVIDED the
+   *  whole wait-and-read observation completed promptly: the main thread can be descheduled
+   *  between the futex wake and the clock read, and that unbounded delay would fold itself into
+   *  the offset (the reproduced defect calibrated a late first heartbeat to itself through it).
+   *  The observation is therefore measured with monotonic timestamps around the entire wait, one
+   *  post-wait reading is reused for the offset itself, and the offset is trusted only when that
+   *  whole observation stayed inside the delivery bound — the wait's own window for the helper to
+   *  start plus the bound would hide a deschedule inside it, and a slower (but healthy) start is
+   *  still covered by the conservative fallback above, which only overstates ages by the
+   *  construction's duration. Undefined when the helper did not start inside the handshake's
+   *  bound, or the observation exceeded it. */
   #syncOffsetMs: number | undefined;
   /** The main thread's monotonic clock immediately before the helper thread was constructed. */
   readonly #constructedAtMs: number;
@@ -409,18 +430,38 @@ export class StdioTransport {
       }
     }
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
+    // The conservative fallback is pinned the moment the pre-construction sample exists: the
+    // helper's clock cannot have started before it, and no later note — however delivered — can
+    // move it (the startup note used to replace it with a value biased by the helper's whole
+    // startup delay, locking a slow-started helper out of writes for the transport's lifetime).
+    this.#monoOffsetMs = this.#constructedAtMs;
     // The construction-time start handshake: the helper's first action puts its startup clock
     // in SHARED MEMORY and wakes this bounded wait through the futex path, so the reading
     // carries no postMessage delivery latency — no blocked event loop can stretch it. The
-    // resulting offset is the only sound yardstick for bounding later notes' delivery (a
-    // queued note's own estimate would erase exactly its queuing delay from every heartbeat
-    // age); when the helper does not start within the bound, the offset stays undefined and
-    // the conservative fallback below keeps refusing early.
+    // whole wait-and-read is bounded by monotonic timestamps (and one test-only hook can
+    // deschedule exactly the post-wake read, reproducing the delayed observation); the
+    // resulting offset is the only sound yardstick for bounding later notes' delivery, and it
+    // is trusted only when the whole observation stayed inside the delivery bound — an
+    // observation descheduled past it leaves the offset uncalibrated and the conservative
+    // fallback above in force (which never folds a note, the safe direction).
+    const handshakeStartedAt = performance.now();
     Atomics.wait(this.syncState, 0, 0, STARTUP_HANDSHAKE_MS);
-    if (Atomics.load(this.syncState, 0) === 1) {
+    const TEST_OBSERVE_DELAY_MS = Number(
+      process.env.KIMCHI_WORKER_TEST_HANDSHAKE_OBSERVE_DELAY_MS || 0,
+    );
+    if (TEST_OBSERVE_DELAY_MS > 0) {
+      const until = performance.now() + TEST_OBSERVE_DELAY_MS;
+      while (performance.now() < until) {
+        /* A real deschedule-shaped block between the futex wake and the clock read. */
+      }
+    }
+    const observedAt = performance.now();
+    if (
+      Atomics.load(this.syncState, 0) === 1 &&
+      observedAt - handshakeStartedAt <= HEARTBEAT_NOTE_DELIVERY_BOUND_MS
+    ) {
       const helperClock = Number(Atomics.load(this.syncClock, 0));
-      this.#syncOffsetMs = performance.now() - helperClock;
-      if (this.#monoOffsetMs === undefined) this.#monoOffsetMs = this.#syncOffsetMs;
+      this.#syncOffsetMs = observedAt - helperClock;
     }
     this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
     this.helper.on("error", (error) => {
@@ -463,18 +504,15 @@ export class StdioTransport {
 
   private onHelperNote(note: HelperNote): void {
     if (note.clock !== undefined && note.line === undefined) {
-      // The helper's startup clock report: derive the conservative fallback offset between
-      // the two threads' monotonic clocks from the main thread's time BEFORE it constructed
-      // the helper. The helper cannot have started before that call, so this calibration
-      // can only place the helper's clock origin too early — ages can only come out older
-      // than the truth, never fresher. Message delivery latency therefore never enters it:
-      // a startup note queued for seconds behind a blocked main thread cannot shrink any
-      // heartbeat's age the way an arrival-calibrated offset would. It replaces the handshake
-      // offset that may have seeded the fallback earlier (the handshake's reading is the
-      // tighter bound, but this one can only overstate ages — the direction a stale-heartbeat
-      // decision must err toward); its construction-time understatement is dropped by the
-      // first bounded heartbeat estimate below.
-      this.#monoOffsetMs = this.#constructedAtMs - note.clock;
+      // The helper's startup clock report. The conservative fallback is already pinned to the
+      // main thread's pre-construction sample — a lower bound no delivery delay and no helper
+      // startup delay can move below the truth — so this note changes nothing: its own clock
+      // reading includes the helper's whole in-thread startup delay, and an earlier revision
+      // replaced the fallback with (pre-construction sample - that delay), understating the true
+      // offset by the whole delay. A helper whose first action was delayed past the fence
+      // window then refused every live heartbeat for the transport's lifetime; with the pinned
+      // bound its ages overstate by at most the construction's own duration, so live
+      // heartbeats pass the fence without any calibration at all.
       return;
     }
     if (note.line !== undefined) {

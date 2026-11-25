@@ -10,6 +10,10 @@
  *    hook in the constructor, via KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS) past the fence
  *    window while the parent keeps heartbeating. The child samples the fence every 100 ms
  *    and reports each sample's age and refusal.
+ *  - "slow-helper": the HELPER THREAD's actual first action is delayed (the test-only hook in
+ *    its source, via KIMCHI_WORKER_TEST_HELPER_START_DELAY_MS) past the handshake bound and
+ *    the fence window while the parent keeps heartbeating; the queued heartbeats are read
+ *    once it starts. The child samples the fence exactly as in slow-construction.
  *  - "late-heartbeat": the parent heartbeats while the child converges the offset, the
  *    child then blocks its own event loop past the window while the parent delivers one
  *    more heartbeat whose note can only drain after the block. The child reports that
@@ -35,9 +39,8 @@ function report(value: unknown): void {
 
 const transport = new StdioTransport(() => {});
 
-if (mode === "slow-construction") {
+async function sampleFence(rounds: number): Promise<{ ageMs: number; refused: boolean }[]> {
   const samples: { ageMs: number; refused: boolean }[] = [];
-  const rounds = Number(process.env.HEARTBEAT_SAMPLES ?? 14);
   for (let index = 0; index < rounds; index++) {
     await new Promise((resolve) => setTimeout(resolve, 100));
     let refused = false;
@@ -48,6 +51,11 @@ if (mode === "slow-construction") {
     }
     samples.push({ ageMs: transport.heartbeatAgeMs(), refused });
   }
+  return samples;
+}
+
+if (mode === "slow-construction" || mode === "slow-helper") {
+  const samples = await sampleFence(Number(process.env.HEARTBEAT_SAMPLES ?? 14));
   transport.close();
   report({ mode, samples });
 } else if (mode === "first-late") {
