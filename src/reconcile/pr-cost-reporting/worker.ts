@@ -1095,6 +1095,10 @@ export { preludeStretch } from "./prelude.js";
 const CHUNK_RESERVE_MS = 500;
 /** Ceiling for building one group's translation plan; the prelude yields throughout and runs once per round. */
 const PRELUDE_MS = 60_000;
+const PRELUDE_TIMEOUT_MESSAGE = "PR reporting translation time limit exceeded";
+/** Only this timeout rests the stalled window: parent cancellation, lease failures and unrelated
+ * errors with the same message must keep their existing handling. */
+export class TranslationPreludeTimeoutError extends Error {}
 /** The group translation in progress: units committed under the plan its group and plan digest name. Records
  * captured after that plan was built leave the count valid; they wait for the next round. */
 const PROGRESS_NOTE = "translation-progress";
@@ -1340,22 +1344,32 @@ async function captureEvents(
       continue;
     }
     const changed = new Map(works.flatMap((workId) => [...(marked.get(workId) ?? [])]));
-    const translated = await translateGroup(
-      agentDir,
-      works,
-      changed,
-      producer,
-      deadline,
-      check,
-      signal,
-      assertLease,
-    );
+    let translated: { waiting: boolean; addedMarkers: boolean } | undefined;
+    try {
+      translated = await translateGroup(
+        agentDir,
+        works,
+        changed,
+        producer,
+        deadline,
+        check,
+        signal,
+        assertLease,
+      );
+    } catch (error) {
+      // An unfinished prelude saves no plan; bound how often identical inputs pay for another full build.
+      if (error instanceof TranslationPreludeTimeoutError && !signal.aborted) {
+        stalled[signature] = { at: Date.now() };
+        backend.tx(() => backend.putNote("agent", STALLED_NOTE, JSON.stringify(stalled)));
+      }
+      throw error;
+    }
     if (translated === undefined) return;
-    waiting ||= translated;
-    // Every retry that still leaves the group unresolved rests the window from now; a group that invoked every
-    // attempt and still waits for evidence otherwise re-runs on every pass once its first window elapsed.
-    const stamped = translated || signature in stalled;
-    if (translated) stalled[signature] = { at: Date.now() };
+    waiting ||= translated.waiting;
+    // A resumed plan did not translate markers added while suspended: do not rest the signature containing them.
+    const rests = translated.waiting && !translated.addedMarkers;
+    const stamped = rests || signature in stalled;
+    if (rests) stalled[signature] = { at: Date.now() };
     else delete stalled[signature];
     if (stamped) backend.tx(() => backend.putNote("agent", STALLED_NOTE, JSON.stringify(stalled)));
   }
@@ -1431,8 +1445,8 @@ function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>)
 
 /**
  * Rebuilds one group from all of its records and observes the units its changed records touch, in bounded
- * transactions. Returns whether the group still waits for evidence or for a repository identity, or undefined when
- * time ran out.
+ * transactions. Returns its unresolved state and whether a resumed plan left newer markers for the next round,
+ * or undefined when time ran out.
  */
 async function translateGroup(
   agentDir: string,
@@ -1443,7 +1457,7 @@ async function translateGroup(
   check: () => void,
   signal: AbortSignal,
   assertLease: () => void,
-): Promise<boolean | undefined> {
+): Promise<{ waiting: boolean; addedMarkers: boolean } | undefined> {
   const backend = backendFor(agentDir);
   // Lease and cancellation only: the pass deadline bounds the chunk loop, not the plan's construction.
   const checkLease = () => {
@@ -1492,13 +1506,14 @@ async function translateGroup(
     // The prelude runs under its own limit, not the pass deadline: a large group's read, report and event build
     // take longer than one pass, and only a finished prelude saves a plan. It yields on its stretch cadence
     // throughout and runs once per round; later passes commit the saved plan's chunks under the pass deadline.
-    const preludeSignal = AbortSignal.any([signal, AbortSignal.timeout(PRELUDE_MS)]);
+    const preludeTimeout = AbortSignal.timeout(PRELUDE_MS);
+    const preludeSignal = AbortSignal.any([signal, preludeTimeout]);
     const preludeDeadline = Date.now() + PRELUDE_MS;
     const preludeCheck = () => {
       assertLease();
-      preludeSignal.throwIfAborted();
-      if (Date.now() >= preludeDeadline)
-        throw new Error("PR reporting translation time limit exceeded");
+      signal.throwIfAborted();
+      if (preludeTimeout.aborted || Date.now() >= preludeDeadline)
+        throw new TranslationPreludeTimeoutError(PRELUDE_TIMEOUT_MESSAGE);
     };
     // Reads page through each work's records — at most 128 rows materialize between
     // stretches, so a single work with a huge history cannot own the UI loop for its
@@ -1640,7 +1655,10 @@ async function translateGroup(
     backend.deleteNote("agent", PLAN_NOTE);
   });
   // Unresolved requests and unsettled repository identities both keep the group waiting for external state.
-  return unresolved > 0 || !settled;
+  return {
+    waiting: unresolved > 0 || !settled,
+    addedMarkers: !!existingPlan && changed.size > markers.length,
+  };
 }
 
 /**

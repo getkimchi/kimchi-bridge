@@ -182,6 +182,7 @@ const {
   reconcileReporting,
   resetReportingPassGates,
   serverLimit,
+  TranslationPreludeTimeoutError,
 } = await import("../../../src/reconcile/pr-cost-reporting/worker.js");
 import type { Batch } from "../../../src/ledger/protocol.js";
 
@@ -3017,6 +3018,69 @@ describe("incremental translation", () => {
     );
     await run();
     expect(buildEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off a group whose translation prelude exceeds its time limit", async () => {
+    await seedLinked();
+    const backend = backendFor(directory);
+    buildEvents.mockRejectedValueOnce(
+      new TranslationPreludeTimeoutError("PR reporting translation time limit exceeded"),
+    );
+    const run = () =>
+      reconcileReporting(directory, "/project", new AbortController().signal, () => {});
+    await run();
+    expect(
+      Object.keys(JSON.parse(backend.getNote("agent", "translation-stalled") ?? "{}")),
+    ).toHaveLength(1);
+    expect(backend.getNote("agent", "translation-plan")).toBeUndefined();
+    expect(backend.getNote("agent", "translation-progress")).toBeUndefined();
+    expect(backend.markedRecords()).not.toEqual([]);
+    // The identical group does not pay for another prelude until its retry window expires.
+    await run();
+    expect(buildEvents).toHaveBeenCalledTimes(1);
+    expect((await readReportingState(directory)).error).toBe(
+      "Some PR cost events are waiting for complete original evidence or a repository identity",
+    );
+    const clock = spyOn(Date, "now");
+    try {
+      clock.mockReturnValue(Date.now() + 5 * 60_000 + 1_000);
+      await run();
+      expect(buildEvents).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not stall a group when its parent capture is cancelled", async () => {
+    await seedLinked();
+    const backend = backendFor(directory);
+    const controller = new AbortController();
+    buildEvents.mockImplementationOnce(() => {
+      controller.abort();
+      return Promise.reject(controller.signal.reason);
+    });
+    await reconcileReporting(directory, "/project", controller.signal, () => {});
+    expect(backend.getNote("agent", "translation-stalled")).toBeUndefined();
+    expect(backend.getNote("agent", "translation-plan")).toBeUndefined();
+    expect(backend.markedRecords()).not.toEqual([]);
+    expect((await readReportingState(directory)).error).toBeUndefined();
+  });
+
+  it("does not stall on an unrelated error with the prelude timeout message", async () => {
+    await seedLinked();
+    buildEvents.mockRejectedValueOnce(new Error("PR reporting translation time limit exceeded"));
+    await reconcileReporting(directory, "/project", new AbortController().signal, () => {});
+    expect(backendFor(directory).getNote("agent", "translation-stalled")).toBeUndefined();
+  });
+
+  it("does not stall on a reconciliation lease failure", async () => {
+    await seedLinked();
+    await expect(
+      reconcileReporting(directory, "/project", new AbortController().signal, () => {
+        throw new Error("lease lost");
+      }),
+    ).rejects.toThrow("lease lost");
+    expect(backendFor(directory).getNote("agent", "translation-stalled")).toBeUndefined();
   });
 
   it("a persistently unsettled group retries only after the stalled window passes", async () => {
