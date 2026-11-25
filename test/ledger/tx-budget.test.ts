@@ -1155,6 +1155,12 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   const histogram = ledgerTxDurations(dir);
   expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(250);
   expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  // The routing itself is structural, not a timing coincidence: the rebuild ran as MANY
+  // bounded transactions (the clear, the drain and ~38 byte-batched folds of ~2 MiB each,
+  // then the capped publication) — the pre-fix whole-work branch ran this same shape as
+  // ONE transaction (count 1). No load on the host can make the bounded route look like the
+  // unbounded one.
+  expect(histogram?.count ?? 0).toBeGreaterThanOrEqual(30);
   // The same capped publication as the sliced acceptance shape: a readable, explicitly
   // reduced head over the full authority rows.
   const head = readWorkHead(dir, WORK);
