@@ -1,8 +1,6 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { join } from "node:path";
 import { afterEach, expect, it } from "bun:test";
 import {
   heartbeatTimeoutMs,
@@ -15,10 +13,13 @@ import { HEARTBEAT_TIMEOUT_MS as PROTOCOL_HEARTBEAT_TIMEOUT_MS } from "../../src
 const ROOT = join(import.meta.dir, "../..");
 
 /**
- * The heartbeat fence's clock: heartbeat ages are measured on the monotonic clocks the reader
- * thread and the main thread share, so a backward wall-clock move (an NTP step) after the last
- * heartbeat cannot keep a stale worker writable beyond the window — and the window itself stays
- * inside proper-lockfile's 5 s stale-lock interval whatever the environment asks for.
+ * The heartbeat fence's clock: the helper thread counts heartbeat ARRIVALS in shared memory
+ * and the main thread anchors that count against its own monotonic clock, so no age is ever
+ * converted between the two threads' clocks (the estimator that seven review rounds each
+ * found a new race in). The ages below are therefore upper bounds — the time since the last
+ * anchor plus the anchor bound (100 ms) — which a backward wall-clock move cannot shrink, and
+ * which stay inside proper-lockfile's 5 s stale-lock interval whatever the environment asks
+ * for. The check is also cheap: two loads and arithmetic, safe inside the fenced transaction.
  */
 
 const transports: StdioTransport[] = [];
@@ -26,67 +27,56 @@ afterEach(() => {
   while (transports.length) transports.pop()?.close();
 });
 
-/** A transport whose helper thread has reported its startup clock, so ages are measurable. */
-async function startedTransport(): Promise<StdioTransport> {
+it("a backward wall-clock move cannot turn a stale heartbeat fresh", async () => {
   const transport = new StdioTransport(() => {});
   transports.push(transport);
-  for (let round = 0; round < 100; round++) {
-    if (transport.heartbeatAgeMs() !== Number.POSITIVE_INFINITY) break;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  expect(transport.heartbeatAgeMs()).not.toBe(Number.POSITIVE_INFINITY);
-  return transport;
-}
-
-it("a backward wall-clock move cannot turn a stale heartbeat fresh", async () => {
-  const transport = await startedTransport();
-  // No heartbeat ever arrives; the fence window is a test-short 100 ms. The wall clock then
+  // No heartbeat ever arrives; the fence window is a test-short 400 ms. The wall clock then
   // jumps 10 seconds backwards: the age must still be measured against real elapsed monotonic
   // time, so the fence refuses once the window elapses.
   const realNow = Date.now();
   const dateNow = Date.now;
   Date.now = () => realNow - 10_000;
   try {
-    expect(transport.heartbeatAgeMs()).toBeLessThan(100);
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    // The startup anchor bounds the age by the time since construction plus the anchor
+    // bound: small right after construction, and finite from the start.
+    expect(transport.heartbeatAgeMs()).toBeLessThan(250);
+    await new Promise((resolve) => setTimeout(resolve, 500));
     let refused: LeaseHeartbeatLost | undefined;
     try {
-      transport.assertHeartbeatFresh(100);
+      transport.assertHeartbeatFresh(400);
     } catch (error) {
       refused = error instanceof LeaseHeartbeatLost ? error : undefined;
     }
     expect(refused).toBeInstanceOf(LeaseHeartbeatLost);
-    // The age the refusal reports is real elapsed time, not the moved-back wall clock.
-    expect(refused?.ageMs).toBeGreaterThanOrEqual(100);
+    // The age the refusal reports is real elapsed time plus the anchor bound, not the
+    // moved-back wall clock.
+    expect(refused?.ageMs).toBeGreaterThanOrEqual(400);
     expect(refused?.ageMs).toBeLessThan(5_000);
   } finally {
     Date.now = dateNow;
   }
 });
 
-it("a startup clock note delivered late cannot turn a stale heartbeat fresh", async () => {
-  // The helper posts its startup clock while the main thread is blocked past the heartbeat
-  // window and no heartbeat arrives; the note sits queued until the main thread yields. The
-  // offset must be calibrated from the main thread's time BEFORE it constructed the helper
-  // — a bound no delivery delay can move — so the age after the note finally drains still
-  // covers the whole silent span. (An offset calibrated at note handling would subtract the
-  // queuing delay from every age: ~350 ms silent read as ~20 ms fresh.)
+it("a main thread held past the window with no arrivals cannot turn the fence fresh", async () => {
+  // The main thread is blocked past the fence window and no heartbeat arrives, so the
+  // anchor timer cannot fire during the block either. The startup anchor — the transport's
+  // construction on the main thread's own clock — still bounds the age, so once the block
+  // ends the fence refuses with the age covering the whole silent span. (The pre-fix
+  // mechanism this replaced calibrated a cross-thread offset from notes queued behind the
+  // block; the drained calibration erased the block from every age.)
   const transport = new StdioTransport(() => {});
   transports.push(transport);
   const start = Date.now();
   const blockedUntil = start + 350;
   while (Date.now() < blockedUntil) {
-    /* A real block: the event loop cannot drain the queued startup note. */
+    /* A real block: the anchor timer cannot fire until it ends. */
   }
   const blockedFor = Date.now() - start;
   expect(blockedFor).toBeGreaterThanOrEqual(340);
-  // The note drains only now — after the fence window has long passed.
   await new Promise((resolve) => setTimeout(resolve, 5));
-  expect(transport.heartbeatAgeMs()).not.toBe(Number.POSITIVE_INFINITY);
-  await new Promise((resolve) => setTimeout(resolve, 25));
   const age = transport.heartbeatAgeMs();
   // The age covers the whole silent span since the transport's construction, not just the
-  // time since the queued note was handled.
+  // time since the block ended.
   expect(age).toBeGreaterThanOrEqual(350);
   expect(age).toBeLessThan(5_000);
   let refused: LeaseHeartbeatLost | undefined;
@@ -99,12 +89,50 @@ it("a startup clock note delivered late cannot turn a stale heartbeat fresh", as
 });
 
 it("a heartbeat's staleness tracks real elapsed time on a quiet pipe", async () => {
-  const transport = await startedTransport();
+  const transport = new StdioTransport(() => {});
+  transports.push(transport);
   expect(transport.heartbeatAgeMs()).toBeLessThan(250);
   await new Promise((resolve) => setTimeout(resolve, 300));
   // With no heartbeat arriving, the age grew with real time and passes the short window.
   expect(transport.heartbeatAgeMs()).toBeGreaterThanOrEqual(250);
   expect(() => transport.assertHeartbeatFresh(100)).toThrow(LeaseHeartbeatLost);
+});
+
+it("a stuck reader thread fails closed: no arrivals, no anchor advances", async () => {
+  // The helper thread is alive but never reads a heartbeat. Although the anchor timer keeps
+  // firing (the wait below spans far more than two periods), no fire may move the anchor
+  // without a new arrival — an anchor that advanced on silence would misdate the last real
+  // arrival as fresh. now - anchor therefore grows monotonically on the main thread's own
+  // clock, and the fence refuses after the window.
+  const transport = new StdioTransport(() => {});
+  transports.push(transport);
+  const early = transport.heartbeatAgeMs();
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const late = transport.heartbeatAgeMs();
+  // The fires did not re-anchor: the age grew by (at least) the real elapsed time.
+  expect(late).toBeGreaterThanOrEqual(early + 200);
+  expect(late).toBeLessThan(5_000);
+  expect(() => transport.assertHeartbeatFresh(200)).toThrow(LeaseHeartbeatLost);
+});
+
+it("consecutive checks never report a smaller age with no new arrival anchored", async () => {
+  // The monotonicity property the upper-bound argument rests on: with no arrival to anchor,
+  // the anchor cannot move, so the reported age can only grow with the main thread's own
+  // clock — across busy stretches (no timer fires at all) and event-loop turns alike.
+  const transport = new StdioTransport(() => {});
+  transports.push(transport);
+  let previous = transport.heartbeatAgeMs();
+  for (let index = 0; index < 60; index++) {
+    const spinUntil = performance.now() + 2;
+    while (performance.now() < spinUntil) {
+      /* Busy: the anchor timer cannot fire. */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const age = transport.heartbeatAgeMs();
+    expect(age).toBeGreaterThanOrEqual(previous);
+    previous = age;
+  }
+  expect(previous).toBeGreaterThan(300);
 });
 
 it("the heartbeat window clamps above the proper-lockfile stale interval and keeps test-short values", () => {
@@ -135,20 +163,24 @@ async function sendHeartbeat(stdin: Bun.FileSink): Promise<void> {
   await stdin.flush();
 }
 
+/** Parses the child's last stderr line as its summary. */
+function lastSummary(lines: string[]): Record<string, unknown> {
+  return JSON.parse(lines[lines.length - 1] ?? "{}") as Record<string, unknown>;
+}
+
 it("a slow helper construction stops rejecting live heartbeats once a prompt one arrives", async () => {
   // The helper thread's construction is stretched 600 ms past the fence window (scheduler
   // pressure, a paused process) while the parent keeps heartbeating at the required cadence.
-  // The construction-derived fallback offset understates the true offset by that whole
-  // interval, so it must not stay in force: the first heartbeat's own send-time estimate
-  // replaces it (each estimate is an upper bound), and the ages then track the fresh
-  // arrivals instead of the construction delay.
+  // The startup anchor is sampled before the stretch, so it only overstates ages through
+  // it; the anchor timer re-anchors on the queued heartbeats the helper reads once it
+  // starts, and the ages then track the fresh arrivals instead of the construction delay.
   const child = Bun.spawn({
     cmd: [process.execPath, join(ROOT, "test/worker/heartbeat-child.ts"), "slow-construction"],
     cwd: ROOT,
     env: {
       ...process.env,
       KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS: "600",
-      HEARTBEAT_WINDOW_MS: "250",
+      HEARTBEAT_WINDOW_MS: "500",
       HEARTBEAT_SAMPLES: "12",
     },
     stdin: "pipe",
@@ -172,39 +204,36 @@ it("a slow helper construction stops rejecting live heartbeats once a prompt one
   const [code] = await Promise.all([child.exited, feeder]);
   const lines = (await stderrText).split("\n").filter((line) => line.trim() !== "");
   expect(code).toBe(0);
-  const summary = JSON.parse(lines[lines.length - 1] ?? "{}") as {
-    samples?: { ageMs: number; refused: boolean }[];
-  };
+  const summary = lastSummary(lines) as { samples?: { ageMs: number; refused: boolean }[] };
   const samples = summary.samples ?? [];
   expect(samples).toHaveLength(12);
-  // The fallback sample never survives the first heartbeat: every sampled age tracks the
-  // 100 ms heartbeat cadence (never the 600 ms construction delay), so a live parent's
-  // writes are allowed again instead of being refused for the transport's lifetime.
-  for (const sample of samples.slice(1)) {
+  // The startup anchor never outlives the first queued heartbeat: within the first couple
+  // of samples the ages track the 100 ms heartbeat cadence (never the 600 ms construction
+  // delay), and once accepted the live parent's writes STAY allowed instead of being refused
+  // for the transport's lifetime.
+  const lastRefused = samples.map((sample) => sample.refused).lastIndexOf(true);
+  expect(lastRefused).toBeLessThan(3);
+  for (const sample of samples.slice(lastRefused + 1)) {
     expect(sample.refused).toBe(false);
-    expect(sample.ageMs).toBeLessThan(250);
+    expect(sample.ageMs).toBeLessThan(500);
   }
+  expect(samples.length - lastRefused - 1).toBeGreaterThanOrEqual(10);
 }, 20_000);
 
 it("a late handshake never locks a live heartbeating parent out for the transport's lifetime", async () => {
   // The round-6 reproduced defect (failure-011): the transport's construction is stretched
-  // 2.1 s past the fence window while the parent keeps heartbeating every 100 ms, and the
-  // handshake observation then exceeds its 50 ms bound — the helper started, but the main
-  // thread was descheduled through the construction-to-observation gap. The construction
-  // handshake leaves the sync offset uncalibrated forever, the note fold's delivery guard
-  // depends on it, and the conservative fallback understates the true offset by the whole
-  // construction delay: every heartbeat read ~2189 ms old against the production 2 s fence,
-  // 12/12 samples refused, for the transport's lifetime — a live parent permanently locked
-  // out of worker writes. Safe refusal of the observation must not become a lifetime
-  // lockout: a later, independently bounded shared-memory observation re-establishes the
-  // offset, prompt notes converge it, and the live parent's writes are allowed again.
+  // 2.1 s past the fence window while the parent keeps heartbeating every 100 ms. The old
+  // design's construction handshake could miss, leaving its conservative fallback in force
+  // for the transport's lifetime — 12/12 samples refused at ~2189 ms ages against the
+  // production 2 s fence. The anchored design has no handshake to miss: the startup anchor
+  // covers the stretch and the live heartbeats re-anchor as they arrive, so the live
+  // parent's writes are allowed again — and stay allowed.
   const child = Bun.spawn({
     cmd: [process.execPath, join(ROOT, "test/worker/heartbeat-child.ts"), "lockout"],
     cwd: ROOT,
     env: {
       ...process.env,
       KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS: "2100",
-      KIMCHI_WORKER_TEST_HANDSHAKE_GAP_MS: "500",
       HEARTBEAT_WINDOW_MS: "2000",
       HEARTBEAT_SAMPLES: "12",
     },
@@ -213,8 +242,6 @@ it("a late handshake never locks a live heartbeating parent out for the transpor
     stderr: "pipe",
   });
   const stderrText = new Response(child.stderr).text();
-  // The parent heartbeats every 100 ms for the child's whole run, including the delayed
-  // construction: the lines queue in the pipe and the helper reads them once it starts.
   const feeder = (async () => {
     for (let index = 0; index < 60; index++) {
       try {
@@ -229,189 +256,36 @@ it("a late handshake never locks a live heartbeating parent out for the transpor
   const [code] = await Promise.all([child.exited, feeder]);
   const lines = (await stderrText).split("\n").filter((line) => line.trim() !== "");
   expect(code).toBe(0);
-  const summary = JSON.parse(lines[lines.length - 1] ?? "{}") as {
-    samples?: { ageMs: number; refused: boolean }[];
-  };
+  const summary = lastSummary(lines) as { samples?: { ageMs: number; refused: boolean }[] };
   const samples = summary.samples ?? [];
   expect(samples).toHaveLength(12);
-  // The lockout is not permanent: the transport recovers while the parent keeps
-  // heartbeating — the samples converge onto the 100 ms cadence (never the ~2.1 s
-  // construction delay the pre-fix fallback baked into every age), and once recovered the
-  // acceptance stays (a fluke boundary sample cannot satisfy this).
-  const firstAccepted = samples.findIndex((sample) => !sample.refused);
-  expect(firstAccepted).toBeGreaterThanOrEqual(0);
-  for (const sample of samples.slice(firstAccepted)) {
+  // The lockout is not permanent: once the construction ends, the queued heartbeats anchor
+  // and every sample tracks the 100 ms cadence (never the ~2.1 s construction delay the
+  // pre-fix fallback baked into every age).
+  const lastRefused = samples.map((sample) => sample.refused).lastIndexOf(true);
+  expect(lastRefused).toBeLessThan(3);
+  for (const sample of samples.slice(lastRefused + 1)) {
     expect(sample.refused).toBe(false);
     expect(sample.ageMs).toBeLessThan(500);
   }
-  expect(samples.length - firstAccepted).toBeGreaterThanOrEqual(8);
+  expect(samples.length - lastRefused - 1).toBeGreaterThanOrEqual(8);
 }, 25_000);
 
-it("a late-delivered heartbeat never makes a stale worker writable", async () => {
-  // The offset is the running MINIMUM of per-heartbeat estimates, each an upper bound (the
-  // true offset plus that note's delivery latency). A heartbeat whose note is queued behind
-  // a blocked main thread therefore cannot calibrate the offset to itself: an already
-  // converged offset stays, and the heartbeat's age keeps counting from its true arrival,
-  // so a parent silent past the window is still refused. (An offset calibrated from the
-  // latest note would instead read that stale heartbeat as fresh.)
-  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "late-heartbeat"], {
-    cwd: ROOT,
-    env: { ...process.env, HEARTBEAT_WINDOW_MS: "100" },
-    stdio: ["pipe", "ignore", "pipe"],
-  });
-  const lines: string[] = [];
-  createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
-  const saw = (phase: string) => lines.some((line) => line.includes(`"phase":"${phase}"`));
-  // Converge on prompt heartbeats until the child blocks (a bounded wait: the phase lines
-  // arrive on the child's stderr as they are written).
-  for (let round = 0; round < 30 && !saw("block"); round++) {
-    child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  expect(saw("block")).toBe(true);
-  // No more converge heartbeats: the parent goes silent, then delivers exactly one more
-  // heartbeat ~50 ms into the child's 500 ms block. Its note can only drain after the
-  // block, hundreds of ms after its true arrival — well past the 100 ms window.
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
-  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
-  expect(code).toBe(0);
-  const summary = lines
-    .map((line) => {
-      try {
-        return JSON.parse(line) as { phase?: string; ageMs?: number; refused?: boolean };
-      } catch {
-        return {} as { phase?: string; ageMs?: number; refused?: boolean };
-      }
-    })
-    .find((note) => note.phase === "summary");
-  expect(summary).toBeDefined();
-  // The drained note is late by the whole block: its age still covers the true silent span
-  // (never the zero a latest-note-calibrated offset would report), so the fence refuses.
-  expect(summary?.refused).toBe(true);
-  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(250);
-  expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
-}, 20_000);
-
-it("a delayed handshake observation never calibrates a late first heartbeat to itself", async () => {
-  // The round-4 reproduced defect (failure-007): the main thread was descheduled between
-  // the handshake futex wake and its post-wait clock read, so the sync offset absorbed the
-  // whole pause; the delivery guard then measured a note delivered 50 ms into a 500 ms
-  // block as prompt, folded its estimate, and heartbeatAgeMs erased the pause — the probe
-  // reported ~30 ms with refused:false although ~480 ms had elapsed since the arrival. The
-  // whole wait-and-read observation is now bounded by monotonic timestamps, and the offset
-  // it yields is trusted only when that observation stayed inside the delivery bound: a
-  // descheduled observation leaves the offset uncalibrated, no note is ever folded, and the
-  // conservative fallback — pinned to the pre-construction sample — keeps the age honest.
-  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "first-late"], {
-    cwd: ROOT,
-    env: {
-      ...process.env,
-      HEARTBEAT_WINDOW_MS: "100",
-      KIMCHI_WORKER_TEST_HANDSHAKE_OBSERVE_DELAY_MS: "500",
-    },
-    stdio: ["pipe", "ignore", "pipe"],
-  });
-  const lines: string[] = [];
-  createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
-  const saw = (phase: string) => lines.some((line) => line.includes(`"phase":"${phase}"`));
-  for (let round = 0; round < 100 && !saw("block"); round++)
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  expect(saw("block")).toBe(true);
-  // The parent delivers exactly one heartbeat 50 ms into the child's 500 ms block and then
-  // goes silent: its note can only drain after the block, ~450 ms after its true arrival.
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
-  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
-  expect(code).toBe(0);
-  const summary = lines
-    .map((line) => {
-      try {
-        return JSON.parse(line) as { phase?: string; ageMs?: number; refused?: boolean };
-      } catch {
-        return {} as { phase?: string; ageMs?: number; refused?: boolean };
-      }
-    })
-    .find((note) => note.phase === "summary");
-  expect(summary).toBeDefined();
-  // The descheduled observation never calibrates anything: the drained note's delivery
-  // latency is never erased from the age, the fence refuses the stale write, and the age
-  // covers the true silent span since the heartbeat's arrival (the pre-fix child reported
-  // ~30 ms and refused:false on this exact shape).
-  expect(summary?.refused).toBe(true);
-  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(250);
-  expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
-}, 20_000);
-
-it("a deschedule in the handshake's pre-sample gap never calibrates a stale first heartbeat", async () => {
-  // The round-5 reproduced defect (security-005): the handshake observation's start was
-  // sampled only AFTER the helper thread's construction returned, but the helper can publish
-  // its startup clock — and read the parent's first heartbeat — as soon as the Worker starts.
-  // A deschedule in that unmeasured gap then inflated #syncOffsetMs while the observation
-  // itself looked prompt: the delivery guard subtracted the inflated offset, the first
-  // heartbeat's equally inflated estimate folded, and its ~450 ms-old arrival read ~30 ms
-  // fresh (the reviewer's real-helper probe: ageMs 31.8, refused:false, against a 100 ms
-  // fence). The observation's start is now sampled BEFORE the helper is constructed, so the
-  // measured window covers the construction, the helper's start and any pause between: an
-  // observation descheduled past the delivery bound is rejected outright, no note is ever
-  // folded, and the pre-construction fallback keeps the age honest.
-  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "sample-gap"], {
-    cwd: ROOT,
-    env: {
-      ...process.env,
-      HEARTBEAT_WINDOW_MS: "100",
-      KIMCHI_WORKER_TEST_HANDSHAKE_GAP_MS: "500",
-    },
-    stdio: ["pipe", "ignore", "pipe"],
-  });
-  const lines: string[] = [];
-  createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
-  // The parent delivers exactly one heartbeat 50 ms after the spawn and then goes silent:
-  // the line reaches the pipe before the child's transport is constructed, the already-
-  // started helper reads it early in the constructor's 500 ms gap, and its note can only
-  // drain once the constructor returns — hundreds of ms after its true arrival.
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
-  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
-  expect(code).toBe(0);
-  const summary = lines
-    .map((line) => {
-      try {
-        return JSON.parse(line) as { phase?: string; ageMs?: number; refused?: boolean };
-      } catch {
-        return {} as { phase?: string; ageMs?: number; refused?: boolean };
-      }
-    })
-    .find((note) => note.phase === "summary");
-  expect(summary).toBeDefined();
-  // The descheduled observation never calibrates anything: the drained note's delivery
-  // latency is never erased from the age, the fence refuses the stale write, and the age
-  // covers the true silent span since the heartbeat's arrival (the pre-fix child reported
-  // ~30 ms and refused:false on this exact shape).
-  expect(summary?.refused).toBe(true);
-  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(250);
-  expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
-}, 20_000);
-
 it("a helper whose first action is delayed past the window keeps accepting live heartbeats", async () => {
-  // The missed-handshake availability consequence (correctness-p02 / design-p10): the helper
-  // thread's ACTUAL first action is delayed past the 250 ms handshake bound and the fence
-  // window (scheduler starvation at worker startup) while the parent keeps heartbeating at
-  // the required cadence; the queued lines are read once the helper starts. The handshake
-  // never calibrates and no heartbeat note is ever folded (both the safe directions), so
-  // availability rests on the conservative fallback alone: it is pinned to the main thread's
-  // pre-construction sample, which understates the true offset by at most the construction's
-  // own duration — never by the helper's startup delay. The fence must therefore accept the
-  // live heartbeats once they arrive instead of refusing them for the transport's lifetime
-  // (the pre-fix fallback subtracted the helper's whole startup delay from the offset and
-  // rejected every live heartbeat: permanent false staleness).
+  // The helper thread's ACTUAL first action is delayed past the fence window (scheduler
+  // starvation at worker startup) while the parent keeps heartbeating at the required
+  // cadence; the queued lines are read once the helper starts. Before that first action no
+  // arrival has been counted, so the fence refuses (the startup anchor keeps the ages
+  // growing — the safe direction, the delayed start itself covered by it). Once the helper
+  // reads the queued heartbeats, the live parent's writes are allowed again and STAY
+  // allowed: every sample from the first acceptance on tracks the 100 ms heartbeat cadence.
   const child = Bun.spawn({
     cmd: [process.execPath, join(ROOT, "test/worker/heartbeat-child.ts"), "slow-helper"],
     cwd: ROOT,
     env: {
       ...process.env,
       KIMCHI_WORKER_TEST_HELPER_START_DELAY_MS: "2000",
-      HEARTBEAT_WINDOW_MS: "250",
+      HEARTBEAT_WINDOW_MS: "500",
       HEARTBEAT_SAMPLES: "40",
     },
     stdin: "pipe",
@@ -419,8 +293,6 @@ it("a helper whose first action is delayed past the window keeps accepting live 
     stderr: "pipe",
   });
   const stderrText = new Response(child.stderr).text();
-  // The parent heartbeats every 100 ms for the child's whole run, including the delayed
-  // helper start: the lines queue in the pipe and the helper reads them once it starts.
   const feeder = (async () => {
     for (let index = 0; index < 50; index++) {
       try {
@@ -435,50 +307,53 @@ it("a helper whose first action is delayed past the window keeps accepting live 
   const [code] = await Promise.all([child.exited, feeder]);
   const lines = (await stderrText).split("\n").filter((line) => line.trim() !== "");
   expect(code).toBe(0);
-  const summary = JSON.parse(lines[lines.length - 1] ?? "{}") as {
-    samples?: { ageMs: number; refused: boolean }[];
-  };
+  const summary = lastSummary(lines) as { samples?: { ageMs: number; refused: boolean }[] };
   const samples = summary.samples ?? [];
   expect(samples).toHaveLength(40);
-  // Before the helper's first action the heartbeat slot is empty, so the fence refuses
-  // (ages read as infinitely stale — the safe direction); the delayed start itself is
-  // covered by that. Once the helper reads the queued heartbeats, the live parent's writes
-  // are allowed again and STAY allowed: every sample from the first acceptance on tracks
-  // the 100 ms heartbeat cadence (never the 2 s startup delay the pre-fix fallback baked
-  // into every age — on the pre-fix code no sample is accepted at all), and the recovery
-  // leaves at least a quarter of the run's samples accepted, not a fluke at the boundary.
-  const firstAccepted = samples.findIndex((sample) => !sample.refused);
-  expect(firstAccepted).toBeGreaterThanOrEqual(0);
-  for (const sample of samples.slice(firstAccepted)) {
+  // During the helper's delayed start the fence refuses (the startup anchor keeps the ages
+  // growing past the window — the safe direction, the delayed start itself covered by it):
+  // the last refusal sits well into the 2 s delay, proving the hook's silence was real.
+  const lastRefused = samples.map((sample) => sample.refused).lastIndexOf(true);
+  expect(lastRefused).toBeGreaterThanOrEqual(15);
+  // Once the helper reads the queued heartbeats, the live parent's writes are allowed again
+  // and STAY allowed: every sample after the last refusal tracks the 100 ms heartbeat
+  // cadence, never the 2 s startup delay, and the recovery leaves at least a quarter of the
+  // run's samples accepted, not a fluke at the boundary.
+  for (const sample of samples.slice(lastRefused + 1)) {
     expect(sample.refused).toBe(false);
-    expect(sample.ageMs).toBeLessThan(250);
+    expect(sample.ageMs).toBeLessThan(500);
   }
-  expect(samples.length - firstAccepted).toBeGreaterThanOrEqual(10);
+  expect(samples.length - lastRefused - 1).toBeGreaterThanOrEqual(10);
 }, 20_000);
 
-it("a first heartbeat delivered late never calibrates the offset to itself", async () => {
-  // The round-3 reproduced defect: with NO earlier heartbeat to converge the minimum, the
-  // first note's estimate becomes the offset wholesale. When that note sat queued behind a
-  // blocked main thread (delivered 50 ms into a 500 ms block), its estimate folds in ~450 ms
-  // of delivery latency and heartbeatAgeMs subtracts that latency from the heartbeat's real
-  // age — the pre-fix child reported ~31 ms and refused:false although ~480 ms had elapsed
-  // since the arrival. The first note must therefore never calibrate the offset unless its
-  // own delivery is bounded (the construction-time handshake offset is the yardstick), so
-  // the conservative conversion stays and the fence refuses the stale write.
-  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "first-late"], {
+it("a heartbeat arriving during a bounded main-thread hold still ages from its arrival", async () => {
+  // A heartbeat can land while the main thread is held (a scheduler pause bounded by the
+  // anchor bound — the fence's one residual assumption, which this 90 ms hold respects).
+  // The hold only delays the anchor that observes the arrival, so once the parent then
+  // goes silent past the window the fence still refuses with the age covering the silence
+  // since that arrival. (The pre-fix mechanism calibrated its cross-thread offset from the
+  // heartbeat's late-delivered note, erasing the hold from every age instead.)
+  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "late-heartbeat"], {
     cwd: ROOT,
-    env: { ...process.env, HEARTBEAT_WINDOW_MS: "100" },
+    env: {
+      ...process.env,
+      HEARTBEAT_WINDOW_MS: "400",
+      KIMCHI_WORKER_TEST_HOLD_MS: "90",
+      KIMCHI_WORKER_TEST_SILENCE_MS: "600",
+    },
     stdio: ["pipe", "ignore", "pipe"],
   });
   const lines: string[] = [];
   createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
   const saw = (phase: string) => lines.some((line) => line.includes(`"phase":"${phase}"`));
-  for (let round = 0; round < 100 && !saw("block"); round++)
-    await new Promise((resolve) => setTimeout(resolve, 10));
+  for (let round = 0; round < 30 && !saw("block"); round++) {
+    child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
   expect(saw("block")).toBe(true);
-  // The parent delivers exactly one heartbeat 50 ms into the child's 500 ms block and then
-  // goes silent: its note can only drain after the block, ~450 ms after its true arrival.
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // Exactly one more heartbeat lands ~40 ms into the child's 90 ms hold; the parent then
+  // goes silent, so the write happens ~640 ms after that arrival — past the 400 ms window.
+  await new Promise((resolve) => setTimeout(resolve, 40));
   child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
   const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
   expect(code).toBe(0);
@@ -492,9 +367,102 @@ it("a first heartbeat delivered late never calibrates the offset to itself", asy
     })
     .find((note) => note.phase === "summary");
   expect(summary).toBeDefined();
-  // The drained note's delivery latency is never erased from the age: the age covers the
-  // true silent span since the heartbeat's arrival, so the fence refuses the write.
   expect(summary?.refused).toBe(true);
-  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(250);
+  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(600);
   expect(summary?.ageMs ?? Infinity).toBeLessThan(2_000);
 }, 20_000);
+
+it("a post-wake deschedule across the fence window never reads the silence as fresh", async () => {
+  // The round-7 reproduced defect (failure-012 / security-006): the main thread was
+  // descheduled right after the old lazy re-sync woke up, the estimated cross-thread offset
+  // absorbed the whole pause, and a stale heartbeat read as fresh — the probe reported
+  // refused:false at an age of 0.046 ms after 5,861 ms of silence. The anchored fence never
+  // converts between the two threads' clocks: the construction hook below stretches the
+  // transport's construction past the fence window while the parent keeps heartbeating; the
+  // parent's final heartbeat (sent once the child reports "drain") is the last arrival, and
+  // the child's wait then spans the window on the main thread's own clock. The check after
+  // it must refuse with the age covering the whole silence since that arrival.
+  const child = spawn("bun", [join(ROOT, "test/worker/heartbeat-child.ts"), "post-wake"], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS: "600",
+      HEARTBEAT_WINDOW_MS: "500",
+      HEARTBEAT_WAIT_MS: "2200",
+    },
+    stdio: ["pipe", "ignore", "pipe"],
+  });
+  const lines: string[] = [];
+  createInterface({ input: child.stderr }).on("line", (line) => lines.push(String(line)));
+  const saw = (phase: string) => lines.some((line) => line.includes(`"phase":"${phase}"`));
+  // The parent heartbeats every 100 ms until the child reports the drain marker, then
+  // sends exactly one final heartbeat and goes silent for the rest of the run.
+  for (let round = 0; round < 100 && !saw("drain"); round++) {
+    child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  expect(saw("drain")).toBe(true);
+  child.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+  const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+  expect(code).toBe(0);
+  const summary = lines
+    .map((line) => {
+      try {
+        return JSON.parse(line) as { phase?: string; ageMs?: number; refused?: boolean };
+      } catch {
+        return {} as { phase?: string; ageMs?: number; refused?: boolean };
+      }
+    })
+    .find((note) => note.phase === "summary");
+  expect(summary).toBeDefined();
+  // The silence since the final heartbeat is well past the 500 ms window; the age the fence
+  // computes must cover it (never the ~0 ms a post-wake-calibrated offset would report).
+  expect(summary?.refused).toBe(true);
+  expect(summary?.ageMs ?? 0).toBeGreaterThanOrEqual(1_500);
+  expect(summary?.ageMs ?? Infinity).toBeLessThan(6_000);
+}, 20_000);
+
+it("a live parent is never refused across a thousand samples under concurrent CPU load", async () => {
+  // The residual assumption's empirical bound: the anchor timer's fire-to-fire interval
+  // stays under the anchor bound even while the machine is busy, so a parent heartbeating
+  // at the required 100 ms cadence is never refused against the production 2 s fence. The
+  // child runs three spin worker threads for the whole sampling run, competing with the
+  // anchor timer and the helper thread for the CPU.
+  const child = Bun.spawn({
+    cmd: [process.execPath, join(ROOT, "test/worker/heartbeat-child.ts"), "live-load"],
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      HEARTBEAT_WINDOW_MS: "2000",
+      KIMCHI_WORKER_SAMPLES: "1000",
+    },
+    stdin: "pipe",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const stderrText = new Response(child.stderr).text();
+  const feeder = (async () => {
+    for (let index = 0; index < 120; index++) {
+      try {
+        await sendHeartbeat(child.stdin);
+      } catch {
+        // The child has exited; the pipe is gone. Its summary is already complete.
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  })();
+  const [code] = await Promise.all([child.exited, feeder]);
+  const lines = (await stderrText).split("\n").filter((line) => line.trim() !== "");
+  expect(code).toBe(0);
+  const summary = lastSummary(lines) as {
+    samples?: number;
+    refused?: number;
+    maxAgeMs?: number;
+  };
+  // Not one of the thousand samples is refused, and the ages stay far inside the window:
+  // the anchor bound (100 ms) plus the heartbeat cadence (100 ms) plus scheduling jitter.
+  expect(summary.samples).toBe(1000);
+  expect(summary.refused).toBe(0);
+  expect(summary.maxAgeMs ?? Number.POSITIVE_INFINITY).toBeLessThan(1_500);
+}, 40_000);

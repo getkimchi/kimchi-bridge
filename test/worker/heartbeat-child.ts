@@ -1,52 +1,40 @@
 /**
- * A child process for the heartbeat fence's clock-calibration regressions (see
- * heartbeat.test.ts). Its stdin is a pipe the test drives: the parent writes real heartbeat
- * lines on the wire while the child samples the transport's fence, so every age the child
- * reports covers a real arrival read by the real helper thread — the same shape as the
- * parent process driving the worker over stdio.
+ * A child process for the heartbeat fence regressions (see heartbeat.test.ts). Its stdin is a
+ * pipe the test drives: the parent writes real heartbeat lines on the wire while the child
+ * samples the transport's fence, so every age the child reports covers a real arrival read
+ * by the real helper thread — the same shape as the parent process driving the worker over
+ * stdio. Under the anchored fence no cross-thread clock conversion happens anywhere: the
+ * helper counts arrivals, the main thread anchors them against its own clock, and the ages
+ * below are the fence's upper bounds (elapsed-since-anchor plus the anchor bound).
  *
  * Modes (argv[2]):
- *  - "slow-construction": the transport's Worker construction is delayed (the test-only
- *    hook in the constructor, via KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS) past the fence
- *    window while the parent keeps heartbeating. The child samples the fence every 100 ms
- *    and reports each sample's age and refusal.
- *  - "slow-helper": the HELPER THREAD's actual first action is delayed (the test-only hook in
- *    its source, via KIMCHI_WORKER_TEST_HELPER_START_DELAY_MS) past the handshake bound and
- *    the fence window while the parent keeps heartbeating; the queued heartbeats are read
- *    once it starts. The child samples the fence exactly as in slow-construction.
- *  - "late-heartbeat": the parent heartbeats while the child converges the offset, the
- *    child then blocks its own event loop past the window while the parent delivers one
- *    more heartbeat whose note can only drain after the block. The child reports that
- *    heartbeat's age once the note has drained.
- *  - "first-late": no heartbeat precedes the child's 500 ms block; the parent delivers
- *    exactly one heartbeat 50 ms into the block, so its note — and the startup note — can
- *    only drain after the block, hundreds of ms after the heartbeat's true arrival. The
- *    child reports that first heartbeat's age once its note has drained: the FIRST note
- *    must not calibrate the offset to itself, or its delivery latency is erased from the
- *    age and a stale parent's write passes the fence.
- *  - "sample-gap": the transport's constructor (the top-level one above) inserts a 500 ms
- *    deschedule (the test-only hook in the constructor, via KIMCHI_WORKER_TEST_HANDSHAKE_GAP_MS)
- *    in the gap between the helper thread's construction and the handshake observation. The
- *    helper has already started there: it publishes its startup clock and reads the parent's
- *    first heartbeat early in the gap, so the queued note can only drain once the constructor
- *    returns, hundreds of ms after its true arrival. The child reports that heartbeat's age
- *    once the constructor has returned: a handshake observation whose window does not cover
- *    that whole gap would accept an offset inflated by it and authenticate the stale
- *    heartbeat as fresh (the round-5 probe reported 31.8 ms with refused:false on this exact
- *    shape).
- *
- *  - "lockout": the transport's construction is delayed past the fence window AND the
- *    handshake observation exceeds its bound (the two test-only hooks), while the parent
- *    keeps heartbeating at the required cadence for the child's whole run. The handshake
- *    never calibrates the sync offset, so availability rests entirely on whether a later
- *    bounded observation can: the child samples the fence every 100 ms and reports each
- *    sample's age and refusal — a transport that never recovers refuses every sample for
- *    its lifetime (the round-6 failure-011 probe: 12/12 refusals at ~2189 ms ages against a
- *    2 s fence with a live, heartbeating parent).
+ *  - "slow-construction" / "slow-helper" / "lockout": the availability regressions. The
+ *    child samples the fence every 100 ms and reports each sample's age and refusal while
+ *    the parent keeps heartbeating at the required cadence (the construction hook stretches
+ *    the transport's construction, or the helper-start hook delays the reader thread's
+ *    first action, past the fence window). The startup anchor covers the whole stretch:
+ *    ages only read older through it, and the live heartbeats re-anchor as they arrive.
+ *  - "late-heartbeat": the parent heartbeats while the child settles, the child then holds
+ *    its main thread for KIMCHI_WORKER_TEST_HOLD_MS (kept inside the anchor bound, so the
+ *    fence's upper-bound property still covers an arrival that lands during the hold)
+ *    while the parent delivers one more heartbeat, then goes silent for
+ *    KIMCHI_WORKER_TEST_SILENCE_MS before the child checks the fence.
+ *  - "post-wake": the round-7 deschedule reproduction (failure-012 / security-006). The
+ *    transport's construction is stretched past the fence window (the construction hook)
+ *    while the parent heartbeats; the parent sends one final heartbeat when the child
+ *    reports "drain" and then goes silent. The child waits out the window and checks: the
+ *    write must be refused with the age covering the whole silence. (On the pre-fix code,
+ *    the same shape with a deterministic delay in the old resync's post-wake gap reported
+ *    ageMs 0.046 / refused:false after 5,861 ms of silence.)
+ *  - "live-load": the no-lockout bound. The child takes KIMCHI_WORKER_SAMPLES fence samples
+ *    ~5 ms apart under concurrent CPU load (spin worker threads that self-terminate on a
+ *    shared stop flag and after a hard 30 s cap), with the parent heartbeating at the
+ *    required 100 ms cadence throughout: a live parent is never refused.
  *
  * The summary goes to stderr as one JSON line; stdout carries only the transport's own
  * request lines (none in these scenarios).
  */
+import { Worker } from "node:worker_threads";
 import { LeaseHeartbeatLost, StdioTransport } from "../../src/worker/host-client.js";
 
 const mode = process.argv[2] ?? "";
@@ -77,54 +65,17 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
   const samples = await sampleFence(Number(process.env.HEARTBEAT_SAMPLES ?? 14));
   transport.close();
   report({ mode, samples });
-} else if (mode === "first-late") {
-  // No converge phase: the very first heartbeat is the late one. The block starts before
-  // any note can drain, so the startup note and the heartbeat's note both queue behind it.
-  report({ mode, phase: "block" });
-  const start = Date.now();
-  while (Date.now() - start < 500) {
-    /* A real block: neither note can drain until it ends. */
-  }
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  let refused = false;
-  try {
-    transport.assertHeartbeatFresh(windowMs);
-  } catch (error) {
-    refused = error instanceof LeaseHeartbeatLost;
-  }
-  const ageMs = transport.heartbeatAgeMs();
-  transport.close();
-  report({ mode, phase: "summary", ageMs, refused });
-} else if (mode === "sample-gap") {
-  // The handshake-gap shape: the 500 ms block lived INSIDE the top-level transport's
-  // constructor above, between the helper's construction and the handshake observation — the
-  // helper was already running and read the parent's single heartbeat early in it, so its
-  // note could only drain once the constructor returned. The constructor has returned by
-  // now; the fence is sampled immediately after one event-loop turn so the queued note has
-  // drained.
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  let refused = false;
-  try {
-    transport.assertHeartbeatFresh(windowMs);
-  } catch (error) {
-    refused = error instanceof LeaseHeartbeatLost;
-  }
-  const ageMs = transport.heartbeatAgeMs();
-  transport.close();
-  report({ mode, phase: "summary", ageMs, refused });
 } else if (mode === "late-heartbeat") {
-  // Converge: the parent heartbeats every 100 ms while the offset's running minimum settles.
+  const holdMs = Number(process.env.KIMCHI_WORKER_TEST_HOLD_MS ?? 500);
+  const silenceMs = Number(process.env.KIMCHI_WORKER_TEST_SILENCE_MS ?? 30);
   report({ mode, phase: "converge" });
   await new Promise((resolve) => setTimeout(resolve, 500));
-  // Block: the main thread cannot drain anything while it spins, so the one heartbeat the
-  // parent delivers during the block has its note queued behind it.
   report({ mode, phase: "block" });
   const start = Date.now();
-  while (Date.now() - start < 500) {
-    /* A real block: the heartbeat's note cannot drain until it ends. */
+  while (Date.now() - start < holdMs) {
+    /* A real block: the main thread (and the anchor timer with it) is held. */
   }
-  // The block ends; the queued note drains on the next tick.
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  await new Promise((resolve) => setTimeout(resolve, silenceMs));
   let refused = false;
   try {
     transport.assertHeartbeatFresh(windowMs);
@@ -134,5 +85,64 @@ if (mode === "slow-construction" || mode === "slow-helper" || mode === "lockout"
   const ageMs = transport.heartbeatAgeMs();
   transport.close();
   report({ mode, phase: "summary", ageMs, refused });
+} else if (mode === "post-wake") {
+  // The deschedule reproduction: the construction hook stretched the transport's
+  // construction past the fence window while the parent kept heartbeating; the parent's
+  // final heartbeat (sent once this child reports "drain") is the last one before the
+  // silence. The child waits out the window: the fence must refuse with the age covering
+  // the whole silence since that final arrival.
+  report({ mode, phase: "drain" });
+  await new Promise((resolve) =>
+    setTimeout(resolve, Number(process.env.HEARTBEAT_WAIT_MS ?? 2200)),
+  );
+  let refused = false;
+  try {
+    transport.assertHeartbeatFresh(windowMs);
+  } catch (error) {
+    refused = error instanceof LeaseHeartbeatLost;
+  }
+  const ageMs = transport.heartbeatAgeMs();
+  transport.close();
+  report({ mode, phase: "summary", ageMs, refused });
+} else if (mode === "live-load") {
+  // The no-lockout bound: a live parent heartbeating at the required cadence is never
+  // refused, even with the machine busy. The spin workers compete for the CPU with the
+  // anchor timer (and the helper thread); each stops the moment the shared flag is set and
+  // unconditionally after a hard 30 s cap, so nothing can hang.
+  const samples = Number(process.env.KIMCHI_WORKER_SAMPLES ?? 1000);
+  const stop = new Int32Array(new SharedArrayBuffer(4));
+  const hogs: Worker[] = [];
+  for (let index = 0; index < 3; index++) {
+    hogs.push(
+      new Worker(
+        `
+        "use strict";
+        const { workerData } = require("node:worker_threads");
+        const stop = new Int32Array(workerData);
+        const deadline = performance.now() + 30000;
+        while (Atomics.load(stop, 0) === 0 && performance.now() < deadline) {
+          /* Spin: concurrent CPU load for the anchor timer to compete with. */
+        }
+        `,
+        { eval: true, workerData: stop.buffer },
+      ),
+    );
+  }
+  let refused = 0;
+  let maxAgeMs = 0;
+  for (let index = 0; index < samples; index++) {
+    try {
+      transport.assertHeartbeatFresh(windowMs);
+    } catch (error) {
+      if (error instanceof LeaseHeartbeatLost) refused++;
+      else throw error;
+    }
+    maxAgeMs = Math.max(maxAgeMs, transport.heartbeatAgeMs());
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  Atomics.store(stop, 0, 1);
+  for (const hog of hogs) await hog.terminate();
+  transport.close();
+  report({ mode, samples, refused, maxAgeMs });
 }
 process.exit(0);

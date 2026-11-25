@@ -224,8 +224,9 @@ function main(): void {
         break;
       }
       case "heartbeat":
-        // Tracked by the reader thread in the shared heartbeat slot at arrival; the write fence
-        // reads that slot inside every fenced transaction, so no main-thread handling is needed.
+        // Counted by the reader thread in the shared arrival counter; the write fence anchors
+        // that counter against the main thread's own clock inside every fenced transaction,
+        // so no main-thread handling is needed.
         break;
       case "reply":
         // A late or duplicate reply: the request it belonged to already
