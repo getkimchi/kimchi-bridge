@@ -755,7 +755,7 @@ it("same-work captures never drive a rebuild into a whole-work transaction", () 
   const projection = readWorkSummary(dir, WORK);
   expect(projection?.requests).toHaveLength(backend.recordCount(WORK));
   expect(backend.dirtyWorks()).toEqual([]);
-  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  expect(ledgerTxDurations(dir)?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
 }, 30_000);
 
 /** A commit record for one SHA, each observation carrying its own distinct valid PR link. */
@@ -834,8 +834,8 @@ it("a commit-heavy work publishes its PR summary without rescanning row versions
   // maintained from each commit key's final row while the records fold, never rebuilt by
   // rescanning the row's version history inside the publication transaction.
   const histogram = ledgerTxDurations(dir);
-  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(250);
-  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
   const head = readWorkHead(dir, WORK);
   expect(backend.readLog(WORK, "commits")).toHaveLength(1);
   expect(head?.pullRequests).toHaveLength(observations);
@@ -1052,8 +1052,8 @@ it("an oversized publication head publishes reduced, so the work stays readable 
   // inside the plan's ceiling: the reduced head's put is the only large write, and it fits
   // the publication budget.
   const histogram = ledgerTxDurations(dir);
-  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(250);
-  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  expect(histogram?.lastMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
   // The work is READABLE, not stranded: a head exists, the dirty marker is cleared, the
   // reader's summary view returns the work with its full commit rows, and /work discovery
   // lists it — the pre-fix code left this exact shape permanently headless.
@@ -1372,7 +1372,7 @@ it("retry exhaustion abandons publication in bounded transactions instead of one
   expect(backend.dirtyWorks()).toEqual([WORK]);
   expect(injections).toBeGreaterThanOrEqual(10);
   const histogram = ledgerTxDurations(dir);
-  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(250);
+  expect(histogram?.maxMs ?? 0).toBeLessThanOrEqual(TX_CEILING_MS);
   // The abandoned state is repairable: with the captures stopped, the next rebuild folds
   // everything that landed and publishes the complete projection.
   useTxClock(null);

@@ -1368,6 +1368,19 @@ async function captureEvents(
 }
 
 /**
+ * Every PR-link observation of a work's commit rows: the complete connectivity index a
+ * REDUCED (truncated) head cannot carry, taken from the rows every rebuild refolds. Only
+ * the keys and urls matter here, so the rows' links are read without merging them.
+ */
+function commitRowPullRequests(backend: RecordBackend, workId: string): Record<string, unknown>[] {
+  const links: Record<string, unknown>[] = [];
+  for (const row of backend.readLog(workId, "commits"))
+    if (Array.isArray(row.pullRequests))
+      for (const link of row.pullRequests) if (object(link)) links.push(link);
+  return links;
+}
+
+/**
  * Works that share a PR or a work link change each other's events: a PR's state and issue keys and a link's target
  * come from all of them. Each group holding a changed work translates together.
  */
@@ -1386,7 +1399,14 @@ function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>)
   const works = new Set(changed);
   for (const head of backend.allHeads()) {
     works.add(head.workId);
-    for (const link of head.pullRequests) {
+    // A REDUCED head (the `truncated` marker) keeps only the newest links that fit the
+    // publication budget — its pullRequests array is NOT the work's complete PR index, so a
+    // shared PR the reduction dropped would split two works that must translate together
+    // although its link lives on in the authority's commit rows. A truncated head therefore
+    // derives its connectivity from its commit rows — the complete per-row link set every
+    // rebuild refolds — instead of the head's reduced summary.
+    const links = head.truncated ? commitRowPullRequests(backend, head.workId) : head.pullRequests;
+    for (const link of links) {
       join(head.workId, `pr:${pullRequestKey(link)}`);
       if (typeof link.url === "string") join(head.workId, `url:${link.url}`);
     }
