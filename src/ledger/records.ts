@@ -206,6 +206,8 @@ export interface RecordBackend {
   /** `body` is the head's precomputed serialization, for callers that stringified outside the
    *  write lock (the sliced publication); omitted, the store serializes the head itself. */
   putHead(head: WorkHead, body?: string): void;
+  /** Optional WAL preparation before a timed, large-head publication. */
+  prepareHeadPublication?(bodyBytes: number): void;
   allHeads(): WorkHead[];
   readRecords(
     opts: {
@@ -1311,6 +1313,7 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
       backend.recordCount(workId) <= limit &&
       backend.recordBytes(workId) <= WHOLE_WORK_REBUILD_MAX_BYTES
     ) {
+      backend.prepareHeadPublication?.(backend.recordBytes(workId));
       backend.tx(() => rebuildWorkInTx(backend, workId));
       observe();
       return;
@@ -1383,6 +1386,7 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
         updatedAt: new Date().toISOString(),
         pullRequests,
       });
+      backend.prepareHeadPublication?.(Buffer.byteLength(body));
       backend.tx(() => {
         if (backend.getNote(workId, REBUILD_OWNERSHIP_NOTE) !== generation) {
           foreign = true;
@@ -2106,6 +2110,21 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
   return {
     tx: runTx,
     writerEpoch: () => readWriterEpoch(db),
+    prepareHeadPublication: (bodyBytes) => {
+      if (bodyBytes < 4 * 1024 * 1024) return;
+      // Flush before the timed write lock, without waiting on a competing writer. The
+      // publication itself keeps the existing WAL, ACID and synchronous=FULL guarantees.
+      db.exec("PRAGMA busy_timeout=0");
+      try {
+        db.exec("PRAGMA wal_checkpoint(PASSIVE)");
+      } catch (error) {
+        console.error(
+          `kimchi: publication checkpoint preparation failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
+      }
+    },
     txDurations: () => txDurations(store),
     resetTxDurations: () => resetTxDurations(store),
     tryCaptureTx: (commit: () => void, busyMs?: number): boolean => {

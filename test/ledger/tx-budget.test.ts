@@ -1046,6 +1046,13 @@ it("an oversized publication head publishes reduced, so the work stays readable 
     });
   }
   expect(backend.recordCount(WORK)).toBe(commits);
+  const preparePublication = vi.fn();
+  const putHead = backend.putHead;
+  backend.prepareHeadPublication = preparePublication;
+  backend.putHead = vi.fn((head, body) => {
+    expect(preparePublication).toHaveBeenCalled();
+    putHead(head, body);
+  });
   resetLedgerTxDurations(dir);
   rebuildWork(dir, WORK);
   // Every transaction of the rebuild — folds, drains and the publication itself — stayed
