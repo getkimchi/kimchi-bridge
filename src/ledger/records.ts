@@ -862,6 +862,7 @@ export function importBatchInTx(backend: RecordBackend, entries: ImportEntry[]):
       backend.recordCount(workId) > 0 &&
       (backendHasDirty(backend, workId) ||
         backendHeadBodyBytes(backend, workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+        backend.getHead(workId)?.truncated === true ||
         (backendHeadBodyBytes(backend, workId) === 0 && preexisting.has(workId)))
     ) {
       backend.markDirty(workId);
@@ -1151,6 +1152,9 @@ const HEAD_PUBLISH_MAX_BYTES = 32 * 1024 * 1024;
  *  the kilobytes) keeps today's immediate fold. Reads stay correct because a dirty work is
  *  repaired by its next read (readWorkHead), never served its stale head silently. */
 const INLINE_FOLD_MAX_HEAD_BYTES = 4 * 1024 * 1024;
+/** Once a full head exceeds HEAD_PUBLISH_MAX_BYTES and must be reduced, cap its reduced
+ *  write as well. Only the derived head loses links; authority rows keep all of them. */
+const REDUCED_PUBLICATION_MAX_BYTES = INLINE_FOLD_MAX_HEAD_BYTES;
 /** Record body bytes the whole-work rebuild's single atomic transaction may cover. The
  *  branch is otherwise chosen by record count alone, and a count-sized work can still merge
  *  to an arbitrarily large projection (the reviewed probe: 1,000 commit records carrying
@@ -1192,7 +1196,7 @@ function headForPublication(head: WorkHead): { head: WorkHead; body: string } {
   const base = JSON.stringify({ ...head, truncated: true, pullRequests: [] });
   // The base carries every other field; the budget is what remains for the links themselves
   // (the separators and the marker's few bytes stay inside the slack).
-  const budget = HEAD_PUBLISH_MAX_BYTES - Buffer.byteLength(base) - 64;
+  const budget = REDUCED_PUBLICATION_MAX_BYTES - Buffer.byteLength(base) - 64;
   const taken: number[] = [];
   let bytes = 0;
   for (const item of ranked) {
@@ -1521,12 +1525,15 @@ function planCaptureFold(backend: RecordBackend, record: WorkRecord): PlannedCap
   const version = backend.dataVersion();
   // The oversize/dirty gate reads only the stored body's byte length and the dirty marker:
   // neither parses the head, so even a 30 MB head costs microseconds to route around.
+  const saved = backend.getHead(record.workId);
+  // A truncated projection is partial: future captures must converge through the bounded
+  // rebuild, not treat its compact encoding as complete authority.
   if (
+    saved?.truncated === true ||
     backendHeadBodyBytes(backend, record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
     backendHasDirty(backend, record.workId)
   )
     return { dirty: true, version };
-  const saved = backend.getHead(record.workId);
   if (!saved && backend.recordCount(record.workId) > 0) return { dirty: true, version };
   const plan = planFold(backend, saved ?? emptyHead(record.workId), [record]);
   // A fold that cannot order its PR observations the way the rebuild would never publishes:
@@ -2114,8 +2121,8 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
       if (bodyBytes < 4 * 1024 * 1024) return;
       // Flush before the timed write lock, without waiting on a competing writer. The
       // publication itself keeps the existing WAL, ACID and synchronous=FULL guarantees.
-      db.exec("PRAGMA busy_timeout=0");
       try {
+        db.exec("PRAGMA busy_timeout=0");
         db.exec("PRAGMA wal_checkpoint(PASSIVE)");
       } catch (error) {
         console.error(

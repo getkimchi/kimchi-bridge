@@ -127,9 +127,9 @@ export interface PassMessage {
   /** The lease fencing epoch; chunk B4 checks it inside every write transaction. */
   epoch: number;
   /** The agent directory the parent already resolved (pinned to its real path) before sending
-   *  the pass. The worker pins the same real path — idempotently — so a symlink in the path
-   *  repointed between the two processes' starts cannot split one ledger across two trees.
-   *  Optional: a parent that does not send it keeps the hello's agent directory. */
+   *  the pass. The worker requires this to resolve to the hello's real agent directory,
+   *  so an alias cannot redirect writes into a different tree. Optional: a parent that
+   *  does not send it keeps the hello's agent directory. */
   agentDir?: string;
 }
 

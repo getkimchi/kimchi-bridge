@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -96,6 +104,35 @@ test("a passing check writes the marker and later gates skip the check", () => {
   expect(childIntegrity(dir).ok).toBe(true);
 });
 
+test("a brief exclusive writer waits instead of being reported as corruption", async () => {
+  const dir = agentDir();
+  seedLedger(dir);
+  closeBackends();
+  const child = Bun.spawn({
+    cmd: [process.execPath, join(ROOT, "test/worker/integrity-held-writer.ts"), dir],
+    cwd: ROOT,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  let held = "";
+  try {
+    while (!held.endsWith("\n")) {
+      const step = await reader.read();
+      if (step.done) break;
+      held += decoder.decode(step.value, { stream: true });
+    }
+    expect(held.trim()).toBe("held");
+    expect(integrityCheckGate(dir).ok).toBe(true);
+  } finally {
+    child.stdin.end();
+    await child.exited;
+    await reader.cancel();
+  }
+});
+
 test("a stale marker re-runs the check; a damaged marker counts as absent", () => {
   const dir = agentDir();
   seedLedger(dir);
@@ -114,6 +151,18 @@ test("a ledger with no database yet checks nothing and writes the marker", () =>
   const dir = agentDir();
   expect(integrityCheckGate(dir).ok).toBe(true);
   expect(existsSync(integrityMarkerPath(dir))).toBe(true);
+});
+
+test("a pre-placed marker temp symlink is not followed", () => {
+  const dir = agentDir();
+  const target = join(dir, "protected.txt");
+  writeFileSync(target, "must-not-overwrite");
+  const attribution = join(dir, "work-attribution");
+  mkdirSync(attribution, { recursive: true, mode: 0o700 });
+  symlinkSync(target, join(attribution, `.integrity-check.${process.pid}.tmp`), "file");
+  expect(integrityCheckGate(dir).ok).toBe(true);
+  expect(readFileSync(target, "utf8")).toBe("must-not-overwrite");
+  expect(JSON.parse(readFileSync(integrityMarkerPath(dir), "utf8")).version).toBe(1);
 });
 
 test("a deliberately corrupted ledger fails the gate and keeps failing", () => {

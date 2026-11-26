@@ -13,11 +13,18 @@
  * a recoverable ledger as failed. The gate's failure path never writes; the pass it was
  * gating never runs.
  */
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { mkdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmdirSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
-import { ledgerDbPath, SQLITE_OPEN_READWRITE } from "../ledger/store.js";
+import { BUSY_TIMEOUT_MS, ledgerDbPath, SQLITE_OPEN_READWRITE } from "../ledger/store.js";
 
 /** The marker's validity window: one check per agent directory per day. */
 export const INTEGRITY_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -60,17 +67,23 @@ function markerAgeMs(path: string, now: number): number | undefined {
 function writeMarker(path: string, checkedAt: number): void {
   try {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const temp = join(dirname(path), `.integrity-check.${process.pid}.tmp`);
+    const directory = mkdtempSync(join(dirname(path), ".integrity-check-"));
+    const temp = join(directory, "marker.json");
     writeFileSync(
       temp,
       `${JSON.stringify({ version: 1, checkedAt } satisfies IntegrityMarker)}\n`,
       {
         mode: 0o600,
+        flag: "wx",
       },
     );
     renameSync(temp, path);
-  } catch {
-    // The marker is an optimization; the check it caches is what matters.
+    rmdirSync(directory);
+  } catch (error) {
+    // The marker is a best-effort optimization, but a filesystem failure must be visible.
+    console.error(
+      `kimchi: could not persist integrity-check marker: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
@@ -80,6 +93,9 @@ function writeMarker(path: string, checkedAt: number): void {
 function quickCheckRows(agentDir: string): string[] {
   const database = new Database(ledgerDbPath(agentDir), SQLITE_OPEN_READWRITE);
   try {
+    // A brief competing writer is transient contention, not corruption. Stay within the
+    // existing bounded-wait policy; a longer held lock still fails closed and retries later.
+    database.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
     return (
       database.query<{ quick_check: string }, []>("PRAGMA quick_check").all() as {
         quick_check: string;

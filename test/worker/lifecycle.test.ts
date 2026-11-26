@@ -267,6 +267,31 @@ function seedRecord(dir: string): void {
   closeBackends();
 }
 
+test("a pass for a different agent directory fails without creating that directory", async () => {
+  const trusted = agentDir();
+  const other = agentDir();
+  const worker = spawnWorker(trusted);
+  await handshake(worker, trusted);
+  worker.send({
+    type: "pass",
+    id: 99,
+    channels: { files: true, pullRequests: true, costs: true, reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 5_000,
+    epoch: 0,
+    agentDir: other,
+  });
+  const done = await answerRequestsUntilDone(worker, 99);
+  expect(done.result?.outcome).toBe("failed");
+  expect(done.result?.channels.files?.outcome).toBe("failed");
+  expect(done.result?.channels.pullRequests?.outcome).toBe("failed");
+  expect(done.result?.channels.reporting?.outcome).toBe("failed");
+  expect(done.result?.channels.files?.error).toContain("agent_directory_mismatch");
+  expect(existsSync(join(other, "work-attribution"))).toBe(false);
+  worker.end();
+  await worker.exited();
+});
+
 test("hello is answered with ready, and idle stdin EOF exits within 2 s", async () => {
   const dir = agentDir();
   const worker = spawnWorker(dir);

@@ -225,9 +225,8 @@ function main(): void {
         break;
       }
       case "heartbeat":
-        // Stamped by the parent at send and stored verbatim by the reader thread into the
-        // shared wall slot; the write fence subtracts it from the reconstructed effective
-        // wall time inside every fenced transaction, so no main-thread handling is needed.
+        // The reader increments only the arrival counter. The coordinator anchors each
+        // arrival to a monotonic observation on the main thread; wire stamps are not freshness.
         break;
       case "reply":
         // A late or duplicate reply: the request it belonged to already
@@ -338,14 +337,16 @@ function main(): void {
     transport.deadlineAt = deadlineAt;
     const deadline = setTimeout(() => abortActive("deadline"), deadlineAt - Date.now());
     const base = host as StdioHostClient;
-    // The parent resolved the agent directory before sending the pass; pinning that real
-    // path here is idempotent with this worker's own resolution of the same tree, and keeps a
-    // repointed agentDir link from splitting one ledger across two trees mid-session. A pass
-    // without the field keeps the hello's agent directory, pinned on first use.
+    // A pass may name an alias of its pinned agent directory, never a different tree.
+    // Without the field, the hello's pinned directory remains authoritative.
     const passAgentDir = message.agentDir === undefined ? agentDir : pinAgentDir(message.agentDir);
+    const directoryMismatch =
+      message.agentDir !== undefined && pinAgentDir(message.agentDir) !== pinAgentDir(agentDir);
     // The once-a-day integrity gate: a failed quick_check stops every write of this pass and
     // leaves the ledger untouched, reported as ledger_integrity_failed on every channel.
-    const integrity = integrityCheckGate(passAgentDir);
+    const integrity = directoryMismatch
+      ? { ok: false as const, error: "agent_directory_mismatch: pass names a different agent tree" }
+      : integrityCheckGate(passAgentDir);
     let run: PassRun | undefined;
     let passError: unknown;
     if (!integrity.ok) {
