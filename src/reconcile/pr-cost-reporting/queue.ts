@@ -535,6 +535,7 @@ async function update(
   agentDir: string,
   mutate: (state: ReportingState, check: () => void) => void | Promise<void>,
   assertCurrent: () => void = () => {},
+  createIfMissing = false,
 ): Promise<ReportingState> {
   const directory = reportingDirectory(agentDir);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -582,7 +583,7 @@ async function update(
     check();
     await mutate(state, check);
     check();
-    if (text === undefined && JSON.stringify(state) === before) return state;
+    if (!createIfMissing && text === undefined && JSON.stringify(state) === before) return state;
     state.machine ??= await machineFingerprint();
     check();
     const body = `${JSON.stringify(state)}\n`;
@@ -620,7 +621,7 @@ async function update(
   }
 }
 
-/** An explicit choice also restarts delivery: the next snapshot of every repository goes out at once. */
+/** An explicit choice also restarts delivery and creates a missing mirror, even when its enabled value is unchanged. */
 export function setReportingEnabled(agentDir: string, enabled: boolean): Promise<ReportingState> {
   return update(agentDir, (state) => {
     state.enabled = enabled;
@@ -635,7 +636,7 @@ export function setReportingEnabled(agentDir: string, enabled: boolean): Promise
       entry.retryAt = 0;
     }
     if (enabled) backendFor(agentDir).putNote("agent", "legacy-snapshot-resume", randomUUID());
-  });
+  }, () => {}, true);
 }
 
 /** Claim the installation notice under the queue lock so concurrent sessions show it once. */
