@@ -1,7 +1,13 @@
 /** Discovers the PRs and MRs of recorded commits: lookup scheduling, the check cache and the journal updates. */
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { backendFor, getNote, readRecords, setNote } from "../../ledger/records.js";
+import {
+  backendFor,
+  encodeSpoolSessionId,
+  getNote,
+  readRecords,
+  setNote,
+} from "../../ledger/records.js";
 import { pinAgentDir } from "../../ledger/store.js";
 import {
   importWorkRecordsAsync,
@@ -433,7 +439,7 @@ async function scan(
             prLookup,
           },
           commit.workId,
-          join(agentDir, "work-attribution", `${encodeURIComponent(commit.sessionId)}.jsonl`),
+          join(agentDir, "work-attribution", `${encodeSpoolSessionId(commit.sessionId)}.jsonl`),
         );
       state.commits.set(commitKey(commit), update);
       onUpdate?.(update);

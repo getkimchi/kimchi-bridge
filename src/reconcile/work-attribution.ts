@@ -16,7 +16,7 @@
  * already passes it explicitly.
  */
 import { join } from "node:path";
-import { capture } from "../ledger/records.js";
+import { capture, encodeSpoolSessionId } from "../ledger/records.js";
 import { hostPorts } from "./host-ports.js";
 import { debugWorkAttribution } from "./work-attribution/diagnostics.js";
 import { COST_PER_PR_RESOURCE_ID } from "./work-attribution/resource.js";
@@ -78,7 +78,7 @@ export function workLedgerPath(ctx: WorkContext): string {
   return join(
     getAgentDir(),
     "work-attribution",
-    `${encodeURIComponent(ctx.sessionManager.getSessionId())}.jsonl`,
+    `${encodeSpoolSessionId(ctx.sessionManager.getSessionId())}.jsonl`,
   );
 }
 

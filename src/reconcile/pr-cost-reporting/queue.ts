@@ -1416,15 +1416,22 @@ export async function withReportingConsent(
     agentDir,
     (state, check) => {
       if (!state.enabled) return;
+      const prohibited = () => {
+        const choice = hostReportingConsent();
+        return (
+          choice === "off" ||
+          ((choice === "follow-telemetry" || (choice === undefined && state.followsTelemetry)) &&
+            !hostPorts().telemetryConsent())
+        );
+      };
       check();
-      if (state.followsTelemetry && !hostPorts().telemetryConsent()) return;
+      // A live follow of disabled telemetry is not an explicit-on state. Only an undefined port
+      // answer falls back to the legacy state's mirror; otherwise the live answer controls.
+      if (prohibited()) return;
       const consent = () => {
         check();
-        // The port is read live here too: a choice flipped to "off" while the action runs
-        // must stop it, not just the one read under the load the state came from.
-        if (hostReportingConsent() === "off") throw new Error("PR reporting is disabled");
-        if (state.followsTelemetry && !hostPorts().telemetryConsent())
-          throw new Error("PR reporting is disabled");
+        // Re-read the complete live answer here too, before freezing, sending or acknowledging.
+        if (prohibited()) throw new Error("PR reporting is disabled");
       };
       action(consent);
       consent();

@@ -364,12 +364,12 @@ export function spoolDirectory(agentDir: string): string {
   return join(pinAgentDir(agentDir), "work-attribution", "spool");
 }
 
-/** Total session-id encoding for the spool filename: `encodeURIComponent` for every
+/** Total session-id encoding for a session-derived filename: `encodeURIComponent` for every
  * well-formed id, and an explicit `%uXXXX` escape for each unpaired UTF-16 surrogate it
  * rejects (a lone high or low half). ANY string session id therefore has a safe, collision-free
  * filename, so a contended capture can always park its record in the spool instead of throwing
  * it away — well-formed ids keep byte-for-byte the names earlier releases wrote. */
-function encodeSpoolSessionId(sessionId: string): string {
+export function encodeSpoolSessionId(sessionId: string): string {
   try {
     return encodeURIComponent(sessionId);
   } catch {

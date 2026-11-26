@@ -17,6 +17,9 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { afterEach, expect, it } from "bun:test";
+import type { HostPorts } from "../../src/reconcile/host.js";
+import { withHostPorts } from "../../src/reconcile/host-ports.js";
+import { appendWorkRecord } from "../../src/reconcile/work-attribution.js";
 import { importSpool, spoolFiles } from "../../src/ledger/import.js";
 import {
   backendFor,
@@ -533,6 +536,57 @@ it("a contended capture with a lone-surrogate session id still lands the record 
   expect(readRecords(direct)).toHaveLength(1);
 }, 30_000);
 
+it("appendWorkRecord reaches the no-drop spool for isolated surrogates", async () => {
+  for (const sessionId of ["parent-\uD83D", "parent-\uDC44"]) {
+    const dir = agentDir();
+    const host: HostPorts = {
+      get agentDir() {
+        return dir;
+      },
+      e2eSeam: () => undefined,
+      now: () => Date.now(),
+      credentials: () => ({ token: "", apiUrl: "https://account.example" }),
+      gitToken: () => undefined,
+      endpoints: () => ({
+        llmEndpoint: "https://llm.example",
+        openAiBaseUrl: "https://llm.example/openai/v1",
+        anthropicBaseUrl: "https://llm.example/anthropic",
+        experimentalOpenAiBaseUrl: "https://llm.example/experimental/openai/v1",
+        platformApiUrl: "https://account.example",
+      }),
+      orgPolicy: () => ({ resourceEnabled: () => true }),
+      telemetryConsent: () => false,
+      metric: () => {},
+      fetch: () => Promise.reject(new Error("this capture test never reaches the network")),
+    };
+    const ctx = { cwd: "/project", sessionManager: { getSessionId: () => sessionId } };
+    const holder = await holdWriter(dir, 2500);
+    try {
+      withHostPorts(host, () => {
+        appendWorkRecord(
+          ctx,
+          { type: "request", requestId: "public-surrogate", scope: null },
+          WORK,
+        );
+      });
+    } finally {
+      await holder.done;
+    }
+    const spool = spoolFilePath(dir, sessionId);
+    expect(existsSync(spool)).toBe(true);
+    expect(JSON.parse(readFileSync(spool, "utf8")).sessionId).toBe(sessionId);
+    // The public wrapper used spooling, not direct SQLite, while the writer was held.
+    expect(readRecords(dir)).toHaveLength(0);
+    expect(importSpool(dir).imported).toBe(1);
+    expect(importSpool(dir).imported).toBe(0);
+    const rows = readRecords(dir);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sessionId).toBe(sessionId);
+    expect(existsSync(spool)).toBe(false);
+    closeBackends();
+  }
+}, 30_000);
+
 it("a spool path that is a symlink is refused, so capture blocks instead of writing elsewhere", async () => {
   const dir = agentDir();
   expect(readRecords(dir)).toHaveLength(0);
@@ -700,6 +754,40 @@ it("an unknown-type spool line is quarantined, never deleted", () => {
   const quarantine = join(spoolDirectory(dir), "quarantine");
   const kept = readdirSync(quarantine);
   expect(kept).toHaveLength(1);
+  expect(readFileSync(join(quarantine, kept[0]), "utf8")).toBe(content);
+  expect(existsSync(spool)).toBe(false);
+});
+
+it("a legal maximum-size spool basename is claimed and retired", () => {
+  const dir = agentDir();
+  const sessionId = "a".repeat(247);
+  const spool = spoolFilePath(dir, sessionId);
+  expect(Buffer.byteLength(basename(spool))).toBe(255);
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  writeFileSync(spool, `\n${JSON.stringify(record("req-max", sessionId))}\n`, { mode: 0o600 });
+  expect(importSpool(dir).imported).toBe(1);
+  const rows = readRecords(dir);
+  expect(rows).toHaveLength(1);
+  expect(rows[0].sessionId).toBe(sessionId);
+  expect(existsSync(spool)).toBe(false);
+});
+
+it("a legal maximum-size spool basename is quarantined with its bytes intact", () => {
+  const dir = agentDir();
+  const sessionId = "a".repeat(247);
+  const spool = spoolFilePath(dir, sessionId);
+  expect(Buffer.byteLength(basename(spool))).toBe(255);
+  mkdirSync(dirname(spool), { recursive: true, mode: 0o700 });
+  const content = "not-json\n";
+  writeFileSync(spool, content, { mode: 0o600 });
+  const result = importSpool(dir);
+  expect(result.imported).toBe(0);
+  expect(result.problems.map((problem) => problem.kind)).toEqual(["invalid"]);
+  expect(readRecords(dir)).toHaveLength(0);
+  const quarantine = join(spoolDirectory(dir), "quarantine");
+  const kept = readdirSync(quarantine);
+  expect(kept).toHaveLength(1);
+  expect(Buffer.byteLength(kept[0])).toBeLessThanOrEqual(255);
   expect(readFileSync(join(quarantine, kept[0]), "utf8")).toBe(content);
   expect(existsSync(spool)).toBe(false);
 });
