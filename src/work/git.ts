@@ -498,25 +498,32 @@ export function issueKeys(text: string, source: string): IssueKey[] {
   const digit = (c: string) => c >= "0" && c <= "9";
   const parts = text.split("-"),
     seen = new Set<string>();
-  let matches = 0;
-  for (let i = 1; i < parts.length && matches < 20; i++) {
+  for (let i = 1; i < parts.length && seen.size < 20; i++) {
     const left = parts[i - 1]!,
       right = parts[i]!;
-    const prefix = left.slice(left.split("").findLastIndex((c) => !word(c)) + 1);
+    const extracted = left.slice(left.split("").findLastIndex((c) => !word(c)) + 1);
+    const prefix = Array.from(extracted, (c) =>
+      source === "branch" && c >= "a" && c <= "z" ? c.toUpperCase() : c,
+    ).join("");
     const end = Array.from(right).findIndex((c) => !digit(c));
     const number = end < 0 ? right : right.slice(0, end);
+    const mixedCase =
+      source === "branch" &&
+      Array.from(extracted).some((c) => c >= "a" && c <= "z") &&
+      Array.from(extracted).some((c) => c >= "A" && c <= "Z");
     if (
-      !prefix ||
+      mixedCase ||
+      prefix.length < 2 ||
       prefix.length > 32 ||
       prefix[0]! < "A" ||
       prefix[0]! > "Z" ||
       !Array.from(prefix).every((c) => (c >= "A" && c <= "Z") || digit(c)) ||
       !number ||
-      number.length > 20 ||
+      number.length > 16 ||
+      number[0] === "0" ||
       (end >= 0 && word(right[end]!))
     )
       continue;
-    matches++;
     seen.add(`${prefix}-${number}`);
   }
   return [...seen].map((key) => ({ key, source }));
