@@ -1671,7 +1671,8 @@ function projectionRows(
   const sessions = {
     add(sessionId: string) {
       const key = ROW_KEYS.sessions({ sessionId });
-      if (!get("sessions", key)) put("sessions", key, { sessionId });
+      // A repeated session in one planned batch is already queued, though not visible to get().
+      if (!sizes.has(`sessions\u0000${key}`)) put("sessions", key, { sessionId });
     },
   };
   const store = (name: Collection) => ({

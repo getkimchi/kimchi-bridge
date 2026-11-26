@@ -1372,6 +1372,23 @@ it("a cold whole-work rebuild at the default slice limit stays inside the transa
   expect(backend.readLog(WORK, "commits")).toHaveLength(commits + 3);
 }, 180_000);
 
+it("counts each session once while batch projection writes are pending", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  const entries = [record("req-1"), record("req-2")].map((request, index) => ({
+    line: JSON.stringify(request),
+    record: request,
+    sourcePath: "/journal",
+    sourceGeneration: 1,
+    sourceOffset: index,
+  }));
+  backend.tx(() => expect(importBatchInTx(backend, entries)).toBe(2));
+  const sessions = backend.readLog(WORK, "sessions");
+  expect(sessions).toEqual([{ sessionId: "session" }]);
+  const bytes = Buffer.byteLength(JSON.stringify(sessions[0])) + 1;
+  expect(backend.getHead(WORK)?.logs.sessions).toEqual({ generation: 1, bytes, rows: 1 });
+});
+
 it("retry exhaustion abandons publication in bounded transactions instead of one convergence fold", () => {
   const dir = agentDir();
   const backend = backendFor(dir);
