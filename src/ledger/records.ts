@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { setImmediate } from "node:timers/promises";
+import { prepareHeadPublication } from "./head-publication.js";
 import { mergePullRequestLinks, pullRequestFoldAmbiguous } from "./links.js";
 import { mergeRecordsInto, type SummaryRows } from "./merge.js";
 import {
@@ -206,8 +207,9 @@ export interface RecordBackend {
   /** `body` is the head's precomputed serialization, for callers that stringified outside the
    *  write lock (the sliced publication); omitted, the store serializes the head itself. */
   putHead(head: WorkHead, body?: string): void;
-  /** Optional WAL preparation before a timed, large-head publication. */
-  prepareHeadPublication?(bodyBytes: number): void;
+  /** Optional WAL preparation before a timed, large-head publication. The returned cleanup
+   * restores checkpoint scheduling after the timed transaction, including failed attempts. */
+  prepareHeadPublication?(bodyBytes: number): (() => void) | undefined;
   allHeads(): WorkHead[];
   readRecords(
     opts: {
@@ -1318,8 +1320,12 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
       backend.recordCount(workId) <= limit &&
       backend.recordBytes(workId) <= WHOLE_WORK_REBUILD_MAX_BYTES
     ) {
-      backend.prepareHeadPublication?.(backend.recordBytes(workId));
-      backend.tx(() => rebuildWorkInTx(backend, workId));
+      const finish = backend.prepareHeadPublication?.(backend.recordBytes(workId));
+      try {
+        backend.tx(() => rebuildWorkInTx(backend, workId));
+      } finally {
+        finish?.();
+      }
       observe();
       return;
     }
@@ -1391,22 +1397,26 @@ export function rebuildWorkSliced(backend: RecordBackend, agentDir: string, work
         updatedAt: new Date().toISOString(),
         pullRequests,
       });
-      backend.prepareHeadPublication?.(Buffer.byteLength(body));
-      backend.tx(() => {
-        if (backend.getNote(workId, REBUILD_OWNERSHIP_NOTE) !== generation) {
-          foreign = true;
-          return;
-        }
-        // Publication requires the work's population unchanged since it was read before the
-        // folded watermark: an unchanged count proves every record was already folded. The
-        // write lock is held for the whole transaction, so nothing can move while it runs, and
-        // the transaction itself stays one small write — it never folds records.
-        if (backend.recordCount(workId) !== expected) return;
-        backend.putHead(publishable, body);
-        backend.clearDirty(workId);
-        backend.deleteNote(workId, REBUILD_OWNERSHIP_NOTE);
-        published = true;
-      });
+      const finish = backend.prepareHeadPublication?.(Buffer.byteLength(body));
+      try {
+        backend.tx(() => {
+          if (backend.getNote(workId, REBUILD_OWNERSHIP_NOTE) !== generation) {
+            foreign = true;
+            return;
+          }
+          // Publication requires the work's population unchanged since it was read before the
+          // folded watermark: an unchanged count proves every record was already folded. The
+          // write lock is held for the whole transaction, so nothing can move while it runs, and
+          // the transaction itself stays one small write — it never folds records.
+          if (backend.recordCount(workId) !== expected) return;
+          backend.putHead(publishable, body);
+          backend.clearDirty(workId);
+          backend.deleteNote(workId, REBUILD_OWNERSHIP_NOTE);
+          published = true;
+        });
+      } finally {
+        finish?.();
+      }
       observe();
       if (published) return;
       if (foreign) break;
@@ -2118,21 +2128,7 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
   return {
     tx: runTx,
     writerEpoch: () => readWriterEpoch(db),
-    prepareHeadPublication: (bodyBytes) => {
-      if (bodyBytes < 4 * 1024 * 1024) return;
-      // Flush before the timed write lock, without waiting on a competing writer. The
-      // publication itself keeps the existing WAL, ACID and synchronous=FULL guarantees.
-      try {
-        db.exec("PRAGMA busy_timeout=0");
-        db.exec("PRAGMA wal_checkpoint(PASSIVE)");
-      } catch (error) {
-        console.error(
-          `kimchi: publication checkpoint preparation failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      } finally {
-        db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
-      }
-    },
+    prepareHeadPublication: (bodyBytes) => prepareHeadPublication(db, bodyBytes),
     txDurations: () => txDurations(store),
     resetTxDurations: () => resetTxDurations(store),
     tryCaptureTx: (commit: () => void, busyMs?: number): boolean => {
