@@ -725,6 +725,7 @@ export function capture(agentDir: string, record: WorkRecord, sourcePath: string
         // a stale head the next read must repair anyway.
         if (
           backendHeadBodyBytes(backend, record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
+          backend.getHead(record.workId)?.truncated === true ||
           backendHasDirty(backend, record.workId)
         ) {
           backend.markDirty(record.workId);
@@ -1525,15 +1526,15 @@ function planCaptureFold(backend: RecordBackend, record: WorkRecord): PlannedCap
   const version = backend.dataVersion();
   // The oversize/dirty gate reads only the stored body's byte length and the dirty marker:
   // neither parses the head, so even a 30 MB head costs microseconds to route around.
-  const saved = backend.getHead(record.workId);
-  // A truncated projection is partial: future captures must converge through the bounded
-  // rebuild, not treat its compact encoding as complete authority.
   if (
-    saved?.truncated === true ||
     backendHeadBodyBytes(backend, record.workId) > INLINE_FOLD_MAX_HEAD_BYTES ||
     backendHasDirty(backend, record.workId)
   )
     return { dirty: true, version };
+  const saved = backend.getHead(record.workId);
+  // A truncated projection is partial: future captures must converge through the bounded
+  // rebuild, not treat its compact encoding as complete authority.
+  if (saved?.truncated === true) return { dirty: true, version };
   if (!saved && backend.recordCount(record.workId) > 0) return { dirty: true, version };
   const plan = planFold(backend, saved ?? emptyHead(record.workId), [record]);
   // A fold that cannot order its PR observations the way the rebuild would never publishes:

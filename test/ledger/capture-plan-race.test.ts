@@ -6,6 +6,7 @@ import {
   backendFor,
   capture,
   closeBackends,
+  importBatchInTx,
   readRecords,
   readWorkHead,
   readWorkSummary,
@@ -142,6 +143,78 @@ it("a competing capture between the plan's row reads and its version sample cann
   const head = readWorkHead(dir, WORK);
   expect(head?.logs.commits?.rows).toBe(3);
   expect(readWorkSummary(dir, WORK)?.commits).toHaveLength(3);
+});
+
+it("a truncated projection defers capture and import until bounded re-derivation", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  capture(
+    dir,
+    commitRecord("a".repeat(40), [{ id: "100", url: "/pull/100", state: "open" }]),
+    "/ignored/source",
+  );
+  backend.putHead({ ...backend.getHead(WORK)!, truncated: true });
+
+  capture(
+    dir,
+    commitRecord("b".repeat(40), [{ id: "200", url: "/pull/200", state: "open" }]),
+    "/ignored/source",
+  );
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+  const incoming = commitRecord("c".repeat(40), [{ id: "300", url: "/pull/300", state: "open" }]);
+  backend.tx(() => {
+    const inserted = importBatchInTx(backend, [
+      {
+        line: JSON.stringify(incoming),
+        record: incoming,
+        sourcePath: "/journal",
+        sourceGeneration: 1,
+        sourceOffset: 2,
+      },
+    ]);
+    expect(inserted).toBe(1);
+  });
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+
+  const repaired = readWorkHead(dir, WORK);
+  expect(backend.dirtyWorks()).toEqual([]);
+  expect(repaired?.truncated).not.toBe(true);
+  expect(headLinkIds(dir)).toEqual(["100", "200", "300"]);
+  expect(readRecords(dir).filter((row) => row.workId === WORK)).toHaveLength(3);
+});
+
+it("a competing truncated publication cannot be folded by a stale capture plan", () => {
+  const dir = agentDir();
+  const backend = backendFor(dir);
+  capture(
+    dir,
+    commitRecord("a".repeat(40), [{ id: "100", url: "/pull/100", state: "open" }]),
+    "/ignored/source",
+  );
+  const planned = commitRecord("b".repeat(40), [{ id: "200", url: "/pull/200", state: "open" }]);
+  const realGetHead = backend.getHead;
+  let injected = false;
+  backend.getHead = ((workId: string) => {
+    const saved = realGetHead.call(backend, workId);
+    if (!injected && workId === WORK) {
+      injected = true;
+      if (saved) backend.putHead({ ...saved, truncated: true });
+      backend.tx(() => {});
+    }
+    return saved;
+  }) as typeof realGetHead;
+  try {
+    capture(dir, planned, "/ignored/source");
+  } finally {
+    backend.getHead = realGetHead;
+  }
+  expect(injected).toBe(true);
+  expect(backend.dirtyWorks()).toEqual([WORK]);
+  const repaired = readWorkHead(dir, WORK);
+  expect(backend.dirtyWorks()).toEqual([]);
+  expect(repaired?.truncated).not.toBe(true);
+  expect(headLinkIds(dir)).toEqual(expect.arrayContaining(["100", "200"]));
+  expect(readRecords(dir).filter((row) => row.workId === WORK)).toHaveLength(2);
 });
 
 it("the incremental capture fold and the rebuild agree on URL-alias ties with equal checkedAt", () => {

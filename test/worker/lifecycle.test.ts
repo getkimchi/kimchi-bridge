@@ -1353,7 +1353,7 @@ test("capture under a 6 s writer spools, and the next worker pass imports it exa
   }
 }, 30000);
 
-test("the parent and the worker pin the same real path when the link moves between their starts", async () => {
+test("a pass must name the inherited agent directory across a link move", async () => {
   const root = mkdtempSync(join(tmpdir(), "kimchi-worker-pin-"));
   dirs.push(root);
   const original = join(root, "original-agent");
@@ -1362,9 +1362,9 @@ test("the parent and the worker pin the same real path when the link moves betwe
   mkdirSync(original, { recursive: true, mode: 0o700 });
   mkdirSync(replacement, { recursive: true, mode: 0o700 });
   symlinkSync(original, link);
-  // The parent resolves the agent directory — its pin — while the link still points at the
-  // original tree, and the link moves before the worker starts: the worker inherits the link
-  // spelling, and the pass message carries the parent's already-resolved real path.
+  // A directory pinned before the link moves is a different tree from the inherited link's
+  // current target. It must be rejected before writing, while a pass naming the current target
+  // is valid and runs on that target, never on the pre-move directory.
   const pinned = realpathSync(link);
   unlinkSync(link);
   symlinkSync(replacement, link);
@@ -1379,17 +1379,31 @@ test("the parent and the worker pin the same real path when the link moves betwe
       epoch: 0,
       agentDir: pinned,
     });
-    const done = await answerRequestsUntilDone(worker, 70);
-    expect(done.result.outcome).toBe("ok");
-    expect(done.result.channels.files?.outcome).toBe("ok");
-    worker.end();
-    expect(await worker.exited()).toBe(0);
-    // The pass ran on the parent's pinned tree...
-    expect(existsSync(join(pinned, "work-attribution"))).toBe(true);
-    expect(existsSync(join(pinned, "pr-cost-reporting"))).toBe(true);
-    // ...and never touched the tree the link moved to.
+    const invalid = await answerRequestsUntilDone(worker, 70);
+    expect(invalid.result.outcome).toBe("failed");
+    expect(invalid.result.channels.files?.error).toContain("agent_directory_mismatch");
+    expect(existsSync(join(pinned, "work-attribution"))).toBe(false);
+    expect(existsSync(join(pinned, "pr-cost-reporting"))).toBe(false);
     expect(existsSync(join(replacement, "work-attribution"))).toBe(false);
     expect(existsSync(join(replacement, "pr-cost-reporting"))).toBe(false);
+    const currentPinned = realpathSync(link);
+    worker.send({
+      type: "pass",
+      id: 71,
+      channels: { files: true },
+      deadlineMs: 30000,
+      epoch: 0,
+      agentDir: currentPinned,
+    });
+    const valid = await answerRequestsUntilDone(worker, 71);
+    expect(valid.result.outcome).toBe("ok");
+    expect(valid.result.channels.files?.outcome).toBe("ok");
+    worker.end();
+    expect(await worker.exited()).toBe(0);
+    expect(existsSync(join(currentPinned, "work-attribution"))).toBe(true);
+    expect(existsSync(join(currentPinned, "pr-cost-reporting"))).toBe(true);
+    expect(existsSync(join(pinned, "work-attribution"))).toBe(false);
+    expect(existsSync(join(pinned, "pr-cost-reporting"))).toBe(false);
   } finally {
     worker.kill();
     await worker.exited();
