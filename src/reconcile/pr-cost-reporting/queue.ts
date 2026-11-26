@@ -623,20 +623,25 @@ async function update(
 
 /** An explicit choice also restarts delivery and creates a missing mirror, even when its enabled value is unchanged. */
 export function setReportingEnabled(agentDir: string, enabled: boolean): Promise<ReportingState> {
-  return update(agentDir, (state) => {
-    state.enabled = enabled;
-    state.followsTelemetry = undefined;
-    state.error = undefined;
-    state.skippedRequests = undefined;
-    state.paused = undefined;
-    for (const entry of Object.values(state.entries)) {
-      entry.uploadedAt = undefined;
-      entry.attempts = 0;
-      entry.defer404s = 0;
-      entry.retryAt = 0;
-    }
-    if (enabled) backendFor(agentDir).putNote("agent", "legacy-snapshot-resume", randomUUID());
-  }, () => {}, true);
+  return update(
+    agentDir,
+    (state) => {
+      state.enabled = enabled;
+      state.followsTelemetry = undefined;
+      state.error = undefined;
+      state.skippedRequests = undefined;
+      state.paused = undefined;
+      for (const entry of Object.values(state.entries)) {
+        entry.uploadedAt = undefined;
+        entry.attempts = 0;
+        entry.defer404s = 0;
+        entry.retryAt = 0;
+      }
+      if (enabled) backendFor(agentDir).putNote("agent", "legacy-snapshot-resume", randomUUID());
+    },
+    () => {},
+    true,
+  );
 }
 
 /** Claim the installation notice under the queue lock so concurrent sessions show it once. */
