@@ -1,5 +1,13 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +60,20 @@ describe("classifyUserVersion (pure)", () => {
     [777, "foreign"],
   ] as const)("user_version %i → %s", (version, action) => {
     expect(classifyUserVersion(version)).toBe(action);
+  });
+});
+
+describe("first-use directory creation", () => {
+  test("openStore creates the original tree through a symlink", () => {
+    const root = agentDir();
+    const link = join(root, "agent-link");
+    symlinkSync(join(root, "missing-tree"), link);
+    const store = openStore(link);
+    try {
+      expect(existsSync(ledgerDbPath(link))).toBe(true);
+    } finally {
+      store.close();
+    }
   });
 });
 
