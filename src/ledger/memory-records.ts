@@ -1,3 +1,4 @@
+import { journalCursorLookupPath } from "./records.js";
 import type {
   DeliveryAccountStatus,
   JournalCursor,
@@ -460,7 +461,7 @@ export function createMemoryRecords(): RecordBackend {
       // silence so memory-backed gate tests can catch an absorption regression.
       diagnostics.set(code, (diagnostics.get(code) ?? 0) + 1);
     },
-    getJournalCursor: (path) => cursors.get(path),
+    getJournalCursor: (path) => cursors.get(journalCursorLookupPath(path)),
     putJournalCursor: (cursor) => {
       touch();
       cursors.set(cursor.path, { ...cursor });

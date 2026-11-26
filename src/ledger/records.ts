@@ -1831,6 +1831,16 @@ export function outboxClaimsSql(entityPlaceholders: readonly string[], paged: bo
   return `SELECT ${paged ? "rowid AS position, " : ""}${OUTBOX_CLAIM_COLUMNS} FROM outbox_events INDEXED BY outbox_entity WHERE account_key = ? AND entity_id IN (${entityPlaceholders.join(",")})${paged ? " AND rowid > ? ORDER BY rowid LIMIT ?" : " ORDER BY rowid"}`;
 }
 
+/** Cursor lookup keeps raw and realpath aliases interchangeable on the pinned journal tree.
+ *  A removed path keeps its literal identity rather than losing the row to realpath failure. */
+export function journalCursorLookupPath(path: string): string {
+  try {
+    return pinAgentDir(path);
+  } catch {
+    return path;
+  }
+}
+
 function sqliteBackendFor(store: LedgerStore): RecordBackend {
   const db = store.db;
   if (ensureProjectionVersion(store)) {
@@ -2280,7 +2290,7 @@ function sqliteBackendFor(store: LedgerStore): RecordBackend {
     },
     diagnostic: (code) => runMutation(() => bumpDiagnostic.run(code, Date.now())),
     dataVersion: () => (dataVersionStmt.get()?.data_version ?? 0) + ownCommits,
-    getJournalCursor: (path) => getCursor.get(path) ?? undefined,
+    getJournalCursor: (path) => getCursor.get(journalCursorLookupPath(path)) ?? undefined,
     putJournalCursor: (cursor) =>
       runMutation(() =>
         putCursor.run(
