@@ -186,6 +186,7 @@ const {
 } = await import("../../../src/reconcile/pr-cost-reporting/worker.js");
 import type { Batch } from "../../../src/ledger/protocol.js";
 import { pinAgentDir } from "../../../src/ledger/store.js";
+import { TX_TARGET_MS } from "../../../src/ledger/tx-budget.js";
 
 /** Bun's it.each types reject the vitest-style tables below (plain and object rows). */
 const each = (rows: readonly unknown[]): ((name: string, fn: (...args: any[]) => void) => void) =>
@@ -764,13 +765,46 @@ describe("account-fenced reporting delivery", () => {
     ).toBe(true);
   });
 
-  it("delivers canonical-equivalent legacy account keys and drains beyond the old attempt cap", async () => {
+  async function drainCanonicalLegacyEvents(
+    durationMs: number,
+    expectedSizes?: readonly number[],
+  ): Promise<number[]> {
     const legacyKey = accountKey({ ...content.account, apiUrl: "https://app.kimchi.dev/api" });
     endpoint = "https://api.cast.ai";
     await seedCoverageEvents(legacyKey, 400);
-    acceptEventBatches();
+    const backend = backendFor(directory);
+    // Keep adaptive feedback explicit so incidental fsync latency cannot change a
+    // fixed-size delivery assertion.
+    spyOn(backend, "txDurations").mockReturnValue({
+      count: 0,
+      totalMs: 0,
+      maxMs: durationMs,
+      lastMs: durationMs,
+      buckets: [],
+    });
+    const expectedIds = new Set(
+      backend.pendingOutboxEvents(legacyKey, 400).map((event) => event.id),
+    );
+    const uploadedIds = new Set<string>();
+    const sizes: number[] = [];
+    acceptEventBatches((_attempt, batch) => {
+      sizes.push(batch.events.length);
+      for (const event of batch.events) {
+        if (uploadedIds.has(event.id)) throw new Error("duplicate event upload");
+        uploadedIds.add(event.id);
+      }
+      return undefined;
+    });
     await deliverEvents(directory, "/project", new AbortController().signal, () => {});
-    expect(eventUploads()).toHaveLength(4);
+    if (expectedSizes) {
+      expect(eventUploads()).toHaveLength(expectedSizes.length);
+      expect(sizes).toEqual([...expectedSizes]);
+    } else {
+      expect(sizes.length).toBeGreaterThan(4);
+      for (let index = 1; index < sizes.length; index++)
+        expect(sizes[index]).toBeLessThan(sizes[index - 1]);
+    }
+    expect([...uploadedIds].sort()).toEqual([...expectedIds].sort());
     expect(outboxDeliveryStatus).toHaveBeenCalledTimes(1);
     expect(http.mock.calls.filter(([url]) => String(url).endsWith("api-keys:verify"))).toHaveLength(
       1,
@@ -787,6 +821,15 @@ describe("account-fenced reporting delivery", () => {
         .readOutboxStatus(directory)
         .find((status) => status.accountKey === accountKey(content.account)),
     ).toBeUndefined();
+    return sizes;
+  }
+
+  it("delivers canonical-equivalent legacy account keys and drains beyond the old attempt cap", async () => {
+    await drainCanonicalLegacyEvents(1, [100, 100, 100, 100]);
+  });
+
+  it("shrinks canonical-equivalent event batches above the transaction target without losing events", async () => {
+    await drainCanonicalLegacyEvents(TX_TARGET_MS + 1);
   });
 
   it("does not treat a legacy URL belonging to another organization as the credential", async () => {
