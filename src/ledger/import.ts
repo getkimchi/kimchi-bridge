@@ -1022,7 +1022,9 @@ function retireImportedSpool(agentDir: string, files: string[], checkBudget?: ()
       }
       // The epoch/writable fence covers this destructive file step, like every pass write.
       assertLedgerWritable(agentDir);
-      const claim = join(dirname(path), `claim-${randomUUID()}-${basename(path)}`);
+      // Keep retirement names bounded independently of the source session filename: a legal
+      // 255-byte spool basename leaves no room for a generated claim prefix.
+      const claim = join(dirname(path), `claim-${randomUUID()}.jsonl`);
       renameSync(path, claim);
       // The claim is inspected through a non-following descriptor immediately before anything is
       // deleted: a hardlink added after the pre-claim check above leaves the claim reachable at
@@ -1077,7 +1079,7 @@ function retireImportedSpool(agentDir: string, files: string[], checkBudget?: ()
       } else {
         const quarantine = spoolQuarantineDirectory(agentDir);
         mkdirSync(quarantine, { recursive: true, mode: 0o700 });
-        const kept = join(quarantine, `${randomUUID()}-${basename(path)}`);
+        const kept = join(quarantine, `${randomUUID()}.jsonl`);
         renameSync(claim, kept);
         fsyncDirectoryDurable(quarantine);
         diagnostic(agentDir, "spool-quarantined");

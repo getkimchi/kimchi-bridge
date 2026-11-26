@@ -495,6 +495,43 @@ describe("durable reporting queue", () => {
     expect(action).toHaveBeenCalledTimes(3);
   });
 
+  it("honors a live transition from explicit-on to disabled telemetry", async () => {
+    await setReportingEnabled(directory, true);
+    let choice: "on" | "off" | "follow-telemetry" = "on";
+    const action = mock(() => {
+      choice = "follow-telemetry";
+    });
+    setDefaultHostPorts({
+      ...queueHost,
+      reportingConsent: () => choice,
+      telemetryConsent: () => false,
+    });
+    await expect(withReportingConsent(directory, action, () => {})).rejects.toThrow(
+      "PR reporting is disabled",
+    );
+    expect(action).toHaveBeenCalledTimes(1);
+    setDefaultHostPorts({ ...queueHost, telemetryConsent: () => false });
+    expect(
+      await withReportingConsent(
+        directory,
+        () => {},
+        () => {},
+      ),
+    ).toBe(true);
+    setDefaultHostPorts({
+      ...queueHost,
+      reportingConsent: () => "follow-telemetry",
+      telemetryConsent: () => true,
+    });
+    expect(
+      await withReportingConsent(
+        directory,
+        () => {},
+        () => {},
+      ),
+    ).toBe(true);
+  });
+
   it("holds the state lock during an event step, so an opt-out saves before or after it", async () => {
     await setReportingEnabled(directory, true);
     let locked = false;
