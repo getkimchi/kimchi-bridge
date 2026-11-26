@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   unlinkSync,
   utimesSync,
@@ -276,9 +277,11 @@ describe("import loop over the memory backend", () => {
     expect(backend.dirtyWorks()).toEqual([]);
     // A replaced journal (new inode, same lines): the file mutated, so the whole file is
     // re-imported — but every line hash already exists, so the batch inserts NOTHING.
+    // Create the replacement before renaming so no filesystem can reuse the original inode.
     // Age the timestamp explicitly to avoid file-granularity races on metadata-stable filesystems.
-    rmSync(file);
-    writeFileSync(file, line(work()) + line(request("req-1")));
+    const replacement = `${file}.replacement`;
+    writeFileSync(replacement, line(work()) + line(request("req-1")));
+    renameSync(replacement, file);
     utimesSync(file, new Date(0), new Date(0));
     const result = await importJournals(dir);
     expect(result.imported).toBe(0);
