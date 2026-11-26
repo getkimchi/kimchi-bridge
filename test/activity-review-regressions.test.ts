@@ -188,9 +188,14 @@ test("an exact duplicate without duration preserves the first event and accepted
   observeFull(value, before("replay"), "claude-code");
   const after = classicAfter("replay");
   delete after.event.duration_ms;
-  observeFull(value, after, "claude-code");
-  const first = value.allEvents()[1];
   const now = Date.now;
+  Date.now = () => now() + 60_000;
+  try {
+    observeFull(value, after, "claude-code");
+  } finally {
+    Date.now = now;
+  }
+  const first = value.allEvents()[1];
   Date.now = () => now() + 100;
   try {
     observeFull(value, after, "claude-code");
