@@ -18,9 +18,9 @@
  */
 import type * as Sqlite from "bun:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { closeSync, mkdirSync, openSync, realpathSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, openSync, readlinkSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   LEDGER_ADDITIVE_SCHEMA,
   LEDGER_REQUIRED_SCHEMA,
@@ -422,6 +422,15 @@ export interface OpenStoreOptions {
 export function openStore(agentDir: string, options: OpenStoreOptions = {}): LedgerStore {
   const busyTimeoutMs = options.busyTimeoutMs ?? BUSY_TIMEOUT_MS;
   const { Database } = bunSqlite();
+  // First-use creation happens before pinning: a missing real path is the original tree,
+  // not a second one to reject. This is the same directory the store has always created.
+  const existing = lstatSync(agentDir, { throwIfNoEntry: false });
+  if (existing?.isSymbolicLink()) {
+    // The link may dangle until first use; lstat sees it even when realpathSync cannot yet run.
+    mkdirSync(resolve(dirname(agentDir), readlinkSync(agentDir)), { recursive: true, mode: 0o700 });
+  } else {
+    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  }
   const path = ledgerDbPath(agentDir);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   closeSync(openSync(path, "a", 0o600));
