@@ -276,8 +276,10 @@ describe("import loop over the memory backend", () => {
     expect(backend.dirtyWorks()).toEqual([]);
     // A replaced journal (new inode, same lines): the file mutated, so the whole file is
     // re-imported — but every line hash already exists, so the batch inserts NOTHING.
+    // Age the timestamp explicitly to avoid file-granularity races on metadata-stable filesystems.
     rmSync(file);
     writeFileSync(file, line(work()) + line(request("req-1")));
+    utimesSync(file, new Date(0), new Date(0));
     const result = await importJournals(dir);
     expect(result.imported).toBe(0);
     expect(result.skipped).toBe(2);

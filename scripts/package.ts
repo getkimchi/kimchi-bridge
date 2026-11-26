@@ -69,12 +69,20 @@ export function writeWorkerBuild(build: string, outfile: string) {
   writeFileSync(outfile, `${build}\n`);
 }
 
+/** A full lowercase hexadecimal Git commit, checked without a parser dependency. */
+function isCommit(value: string): boolean {
+  if (value.length !== 40) return false;
+  for (const char of value)
+    if (!(char >= "0" && char <= "9") && !(char >= "a" && char <= "f")) return false;
+  return true;
+}
+
 /** The commit being packaged; the release and its worker bundle must agree on it. An installed
  *  package supplies it explicitly because the package is no longer its own Git checkout. */
 function checkoutCommit(root: string): string {
   const configured = process.env.KIMCHI_BRIDGE_COMMIT?.trim();
   if (configured !== undefined && configured !== "") {
-    if (!/^[0-9a-f]{40}$/.test(configured)) throw new Error("Invalid packaged bridge commit");
+    if (!isCommit(configured)) throw new Error("Invalid packaged bridge commit");
     return configured;
   }
   const commit = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
