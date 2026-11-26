@@ -495,6 +495,23 @@ describe("durable reporting queue", () => {
     expect(action).toHaveBeenCalledTimes(3);
   });
 
+  it.each([true, false])("creates a missing explicit mirror when enabled=%s", async (enabled) => {
+    const mirror = join(directory, "pr-cost-reporting", "state.json");
+    setDefaultHostPorts({
+      ...queueHost,
+      reportingConsent: () => (enabled ? "on" : "off"),
+      telemetryConsent: () => false,
+    });
+    expect(existsSync(mirror)).toBe(false);
+    await setReportingEnabled(directory, enabled);
+    expect(existsSync(mirror)).toBe(true);
+    const raw = JSON.parse(await readFile(mirror, "utf8")) as Record<string, unknown>;
+    expect(raw.version).toBe(1);
+    expect(raw.enabled).toBe(enabled);
+    expect(raw.followsTelemetry).toBeUndefined();
+    expect(typeof raw.producerId).toBe("string");
+  });
+
   it("honors a live transition from explicit-on to disabled telemetry", async () => {
     await setReportingEnabled(directory, true);
     let choice: "on" | "off" | "follow-telemetry" = "on";
