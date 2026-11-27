@@ -24,6 +24,7 @@ import {
   integer,
   numberText,
   parseJson,
+  protocolVersion,
   stableId,
   stringifyJson,
   validateBatch,
@@ -258,6 +259,84 @@ describe("legacy persistence and delivery", () => {
     expect(() => s.put({ ...e, coverage: { code: "test", count: "99" } })).toThrow(
       "identity conflicts",
     );
+  });
+});
+
+describe("delivery failure bookkeeping", () => {
+  test("failed attempts persist across reopen until the batch is parked", () => {
+    const dir = temp();
+    let s = new Store(dir);
+    s.put({ ...event("persisted"), id: randomUUID(), revision: "1" });
+    const b = s.pendingBatch()!;
+    expect(s.recordBatchFailure(b)).toBe(1);
+    expect(s.recordBatchFailure(b)).toBe(2);
+    s.close();
+    s = new Store(dir);
+    stores.push(s);
+    expect((s.db.query("SELECT attempts FROM batches WHERE id=?").get(b.id) as any).attempts).toBe(
+      2,
+    );
+    expect(encodeBatch(s.pendingBatch()!)).toBe(encodeBatch(b));
+    expect(s.recordBatchFailure(b)).toBe(3);
+  });
+  test("deadLetter parks events out of the pipeline but keeps them in the ledger", () => {
+    const s = store();
+    for (const entityId of ["one", "two"])
+      s.put({ ...event(entityId), id: randomUUID(), revision: "1" });
+    const b = s.pendingBatch()!;
+    s.deadLetter(b);
+    expect(s.pendingBatch()).toBeNull();
+    expect(s.status()).toMatchObject({ pending: 2, blocked: 2 });
+    expect(s.status().diagnostics).toMatchObject({ upload_deadletter: 1 });
+    expect(s.events()).toHaveLength(2);
+    expect(s.recordBatchFailure(b)).toBe(0);
+  });
+  test("blockOversize parks a lone record immediately", () => {
+    const s = store();
+    s.put({ ...event("huge"), id: randomUUID(), revision: "1" });
+    s.blockOversize(s.pendingBatch()!);
+    expect(s.pendingBatch()).toBeNull();
+    expect(s.status()).toMatchObject({ pending: 1, blocked: 1 });
+    expect(s.status().diagnostics).toMatchObject({ upload_oversize_blocked: 1 });
+  });
+  test("a version 0x4b570002 ledger gains the attempts column without losing data", () => {
+    const dir = temp(),
+      db = new Database(join(dir, "ledger.sqlite"));
+    const e = { ...event("migrated"), id: randomUUID(), revision: "1" };
+    db.exec(
+      "CREATE TABLE events(id TEXT PRIMARY KEY,entity_id TEXT NOT NULL,kind TEXT NOT NULL,body BLOB NOT NULL,hash TEXT NOT NULL,created_at INTEGER NOT NULL,acked_at INTEGER,blocked TEXT NOT NULL DEFAULT '')",
+    );
+    db.exec(
+      "CREATE TABLE batches(id TEXT PRIMARY KEY,body BLOB NOT NULL,event_ids BLOB NOT NULL,created_at INTEGER NOT NULL)",
+    );
+    db.query("INSERT INTO events(id,entity_id,kind,body,hash,created_at) VALUES(?,?,?,?,?,?)").run(
+      e.id,
+      e.entityId,
+      "coverage",
+      Buffer.from(encodeEvent(e)),
+      canonicalHash(e),
+      1,
+    );
+    const b: Batch = { version: protocolVersion, id: randomUUID(), events: [e] };
+    db.query("INSERT INTO batches(id,body,event_ids,created_at) VALUES(?,?,?,?)").run(
+      b.id,
+      Buffer.from(encodeBatch(b)),
+      Buffer.from(JSON.stringify([e.id])),
+      1,
+    );
+    db.exec("PRAGMA user_version=0x4b570002");
+    db.close();
+    const s = new Store(dir);
+    stores.push(s);
+    const columns = s.db.query("SELECT name FROM pragma_table_info('batches')").all() as any[];
+    expect(columns.some((c) => c.name === "attempts")).toBe(true);
+    expect((s.db.query("SELECT attempts FROM batches WHERE id=?").get(b.id) as any).attempts).toBe(
+      0,
+    );
+    expect((s.db.query("PRAGMA user_version").get() as any).user_version).toBe(0x4b570003);
+    expect((s.db.query("SELECT event_id FROM export_failures").all() as any[]).length).toBe(0);
+    expect(s.events().map((migrated) => migrated.id)).toEqual([e.id]);
+    expect(s.recordBatchFailure(s.pendingBatch()!)).toBe(1);
   });
 });
 
