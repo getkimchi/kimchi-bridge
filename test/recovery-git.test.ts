@@ -353,6 +353,241 @@ test("GitHub PRs carry Kimchi's lowercase repository path; GitLab keeps its case
   ]);
 });
 
+function githubPrFixture(title: string, branch?: string): string {
+  return JSON.stringify({
+    id: 11,
+    number: 34,
+    html_url: "https://github.com/target/repo/pull/34",
+    state: "open",
+    title,
+    ...(branch === undefined ? {} : { head: { ref: branch } }),
+    base: { repo: { id: 12, full_name: "target/repo" } },
+  });
+}
+
+test("branch issue keys accept uniform ASCII letter case and normalize prefixes", () => {
+  for (const [branch, key] of [
+    ["feature/lin-123", "LIN-123"],
+    ["feature/LIN-123", "LIN-123"],
+  ]) {
+    expect(issueKeys(branch, "branch")).toEqual([{ key, source: "branch" }]);
+  }
+
+  const source = { provider: "github", host: "github.com", id: "name:fixture" };
+  const raw = parseJson(githubPrFixture("t", "feature/lin-123"));
+  const [, pr] = pullRequest(source, raw);
+  expect(pr.issueKeys).toEqual([{ key: "LIN-123", source: "branch" }]);
+});
+
+test("PR branch keys take priority when title keys fill the reporting limit", () => {
+  const titleKeys = Array.from({ length: 20 }, (_, i) => `ABC-${i + 1}`);
+  const raw = parseJson(githubPrFixture(titleKeys.join(" "), "feature/lin-123"));
+  const [, pr] = pullRequest({ provider: "github", host: "github.com", id: "name:x" }, raw);
+  expect(pr.issueKeys).toEqual([
+    { key: "LIN-123", source: "branch" },
+    ...titleKeys.slice(0, 19).map((key) => ({ key, source: "title" })),
+  ]);
+
+  const duplicate = parseJson(githubPrFixture("LIN-123 fix", "feature/lin-123"));
+  const [, duplicatePr] = pullRequest(
+    { provider: "github", host: "github.com", id: "name:x" },
+    duplicate,
+  );
+  expect(duplicatePr.issueKeys).toEqual([{ key: "LIN-123", source: "title" }]);
+});
+
+test("malformed branch issue keys remain ignored", () => {
+  for (const branch of [
+    "feature/_lin-123",
+    "feature/123lin-123",
+    "feature/lin-",
+    "feature/lin-123abc",
+    "feature/lin-123_",
+    "feature/Eng-123",
+    "feature/ABc-123",
+    "feature/eNG-123",
+    `feature/${"l".repeat(256)}-123`,
+    "feature/lin-123456789012345678901",
+  ]) {
+    expect(issueKeys(branch, "branch")).toEqual([]);
+  }
+});
+
+test("non-branch issue key extraction remains uppercase-only", () => {
+  for (const source of ["title", "work"]) {
+    expect(issueKeys("feature/lin-123", source)).toEqual([]);
+    expect(issueKeys("feature/LiNeAr-456", source)).toEqual([]);
+    expect(issueKeys("feature/LIN-123", source)).toEqual([{ key: "LIN-123", source }]);
+  }
+});
+
+function conformanceKeys(input: string, source: string): string[] {
+  if (source === "work") {
+    const { root, store, r } = fixture();
+    r.record({
+      stage: "UserPromptSubmit",
+      event: { session_id: "s", turn_id: "t", cwd: root, prompt: `New work: ${input}` },
+    });
+    const keys = latest(store, "work").work.issueKeys ?? [];
+    return keys.map(({ key }: { key: string }) => key);
+  }
+  const raw = parseJson(
+    githubPrFixture(source === "branch" ? "t" : input, source === "branch" ? input : undefined),
+  );
+  const [, pr] = pullRequest({ provider: "github", host: "github.com", id: "name:x" }, raw);
+  return (pr.issueKeys ?? []).map(({ key }) => key);
+}
+
+const P = (n: number) => `A${"B".repeat(n - 1)}`;
+
+type IssueKeyPersistenceSurface = "work" | "pull-request";
+
+function persistedIssueKeyCase(
+  branch: string,
+  surface: IssueKeyPersistenceSurface,
+  workTitle = branch,
+) {
+  const { root, store, r, scope } = fixture();
+  if (surface === "work") {
+    r.record({
+      stage: "UserPromptSubmit",
+      event: { session_id: "s", turn_id: "t", cwd: root, prompt: `New work: ${workTitle}` },
+    });
+    return latest(store, "work").work;
+  }
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "gh"),
+    '#!/bin/sh\ncase "$*" in\n *repos/fork/repo/commits/*) /bin/cat "$SCM_FIXTURE_ROOT/pulls.json" ;;\n *repos/fork/repo) /bin/cat "$SCM_FIXTURE_ROOT/repo.json" ;;\n *) exit 1 ;;\nesac\n',
+    { mode: 0o700 },
+  );
+  const priorPath = process.env.PATH,
+    priorFixture = process.env.SCM_FIXTURE_ROOT;
+  process.env.PATH = `${bin}:${priorPath}`;
+  process.env.SCM_FIXTURE_ROOT = root;
+  cleanups.push(() => {
+    process.env.PATH = priorPath;
+    if (priorFixture === undefined) delete process.env.SCM_FIXTURE_ROOT;
+    else process.env.SCM_FIXTURE_ROOT = priorFixture;
+  });
+  writeFileSync(
+    join(root, "repo.json"),
+    JSON.stringify({ id: 55, full_name: "fork/repo", html_url: "https://github.com/fork/repo" }),
+  );
+  scope.Repository = {
+    provider: "github",
+    host: "github.com",
+    id: "name:provisional",
+    name: "fork/repo",
+  };
+  writeFileSync(join(root, "pulls.json"), `[${githubPrFixture("t", branch)}]`);
+  const sha = "a".repeat(40);
+  saveMeta(r, `tracked-commit:${stableId(scope.Repo, sha)}`, {
+    Scope: scope,
+    Source: r.source,
+    SHA: sha,
+    CreatedAt: new Date().toISOString(),
+  });
+  reconcileGit(r);
+  return latest(store, "pull_request").pullRequest;
+}
+
+const twentyFiveKeys = Array.from({ length: 25 }, (_, i) => `ABC-${i + 1}`);
+
+test("wire-excluded K11 and K21 shapes consume cap slots without being emitted", () => {
+  for (const source of ["branch", "title", "work"]) {
+    const excluded =
+      source === "branch"
+        ? ["my_proj2-10", `${P(33).toLowerCase()}-1`]
+        : ["MY_PROJ2-10", `${P(33)}-1`];
+    for (const key of excluded) {
+      expect(conformanceKeys(`${key} ${twentyFiveKeys.join(" ")}`, source)).toEqual(
+        twentyFiveKeys.slice(0, 19),
+      );
+    }
+  }
+});
+
+test("K19 valid sixteen-digit issue keys persist in work and pull-request events", () => {
+  const input = `ABC-${"9".repeat(16)}`;
+  for (const surface of ["work", "pull-request"] as const) {
+    const body = persistedIssueKeyCase(input, surface);
+    expect(body.title).toBe(surface === "work" ? input : "t");
+    expect(body.issueKeys).toEqual([
+      { key: input, source: surface === "work" ? "work" : "branch" },
+    ]);
+  }
+});
+
+test("K11 and K21 wire exceptions retain work and pull-request events without keys", () => {
+  const prefix255 = P(255);
+  for (const [id, input, workTitle] of [
+    ["K11", "my_proj2-10", "MY_PROJ2-10"],
+    ["K21", `${prefix255}-1`, `${prefix255}-1`],
+  ]) {
+    for (const surface of ["work", "pull-request"] as const) {
+      const body = persistedIssueKeyCase(input, surface, workTitle);
+      expect([id, surface, body.title, body.issueKeys ?? []]).toEqual([
+        id,
+        surface,
+        surface === "work" ? workTitle : "t",
+        [],
+      ]);
+    }
+  }
+});
+
+test("issue-key conformance accepts K01, K07-K10, K15-K16, K19 and K23-K29", () => {
+  const number16 = "9".repeat(16),
+    cases: [string, string, string, string[]][] = [
+      ["K01", "feat/eng-123-x", "branch", ["ENG-123"]],
+      ["K07", "feature/ENG-123-add-jira", "branch", ["ENG-123"]],
+      ["K08", "release/ABC-12/DEF-3", "branch", ["ABC-12", "DEF-3"]],
+      ["K09", "ENG-123: fix login", "title", ["ENG-123"]],
+      ["K10", "ENG-123: fix login", "work", ["ENG-123"]],
+      ["K15", "AB-CD-1", "branch", ["CD-1"]],
+      ["K16", "ABC-1-ABC-2", "branch", ["ABC-1", "ABC-2"]],
+      ["K19", `ABC-${number16}`, "branch", [`ABC-${number16}`]],
+      ["K23", "éeng-12é", "branch", ["ENG-12"]],
+      ["K24", "feature/abc-123/ABC-123/abc-123", "branch", ["ABC-123"]],
+      ["K25", twentyFiveKeys.join(" "), "branch", twentyFiveKeys.slice(0, 20)],
+      ["K26", twentyFiveKeys.join(" "), "title", twentyFiveKeys.slice(0, 20)],
+      ["K27", twentyFiveKeys.join(" "), "work", twentyFiveKeys.slice(0, 20)],
+      ["K28", "WID-1 then WID-1, WID-2 and WID-3", "title", ["WID-1", "WID-2", "WID-3"]],
+      ["K29", "WID-2 WID-1 WID-2 WID-1", "work", ["WID-2", "WID-1"]],
+    ];
+  for (const [id, input, source, expected] of cases)
+    expect([id, conformanceKeys(input, source)]).toEqual([id, expected]);
+});
+
+test("issue-key conformance rejects K02-K06, K11-K14, K17-K18, K20-K22 and K30-K33", () => {
+  // K11 and K21 are matrix exceptions: the existing wire validator forbids underscores and
+  // prefixes longer than 32 characters, so emitting those keys would reject their whole events.
+  const cases = [
+    ["K02", "eng-123", "title"],
+    ["K03", "eng-123", "work"],
+    ["K04", "feat/a-123-x", "branch"],
+    ["K05", "ENG-123abc", "branch"],
+    ["K06", "ENG-123abc", "title"],
+    ["K11", "my_proj2-10", "branch"],
+    ["K12", "xENG-123", "branch"],
+    ["K13", "_ENG-123", "branch"],
+    ["K14", "ENG-123_fix", "branch"],
+    ["K17", "ABC-0", "branch"],
+    ["K18", "ABC-012", "branch"],
+    ["K20", `ABC-${"9".repeat(17)}`, "branch"],
+    ["K21", `${P(255)}-1`, "branch"],
+    ["K22", `${P(256)}-1`, "branch"],
+    ["K30", "main", "branch"],
+    ["K31", "Eng-123", "branch"],
+    ["K32", "ABc-123", "branch"],
+    ["K33", "eNG-123", "branch"],
+  ];
+  for (const [id, input, source] of cases)
+    expect([id, conformanceKeys(input, source)]).toEqual([id, []]);
+});
+
 test("SCM IDs remain exact, target repository owns fork PRs and credentials stay host-bound", () => {
   const source = { provider: "github", host: "github.com", name: "fork/repo", id: "name:fixture" };
   const raw = parseJson(
@@ -378,7 +613,7 @@ test("SCM IDs remain exact, target repository owns fork PRs and credentials stay
     expect(issueKeys(text, "title")).toEqual([{ key: "ABC-123", source: "title" }]);
   for (const text of ["_ABC-123", "ABC-123_", "ABC-123abc", "123ABC-1"])
     expect(issueKeys(text, "title")).toEqual([]);
-  expect(issueKeys("A-1", "title")).toEqual([{ key: "A-1", source: "title" }]);
+  expect(issueKeys("A-1", "title")).toEqual([]);
 });
 
 test.if(process.platform === "darwin")(

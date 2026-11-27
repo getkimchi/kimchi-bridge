@@ -7,6 +7,10 @@ import {
   canonicalTime,
   gitId,
   integer,
+  MAX_ISSUE_KEYS,
+  MAX_ISSUE_NUMBER_DIGITS,
+  MAX_ISSUE_PREFIX_LENGTH,
+  MIN_ISSUE_PREFIX_LENGTH,
   numberText,
   obj,
   parseJson,
@@ -492,34 +496,51 @@ export function providerId(v: unknown): string {
     return "";
   }
 }
+// The parser grammar accepts up to 255 project characters, although the event wire limit is lower.
+const MAX_PARSED_ISSUE_PREFIX_LENGTH = 255;
 export function issueKeys(text: string, source: string): IssueKey[] {
   const word = (c: string) =>
     c === "_" || (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || (c >= "0" && c <= "9");
   const digit = (c: string) => c >= "0" && c <= "9";
   const parts = text.split("-"),
-    seen = new Set<string>();
-  let matches = 0;
-  for (let i = 1; i < parts.length && matches < 20; i++) {
+    matched = new Set<string>(),
+    keys: IssueKey[] = [];
+  for (let i = 1; i < parts.length && matched.size < MAX_ISSUE_KEYS; i++) {
     const left = parts[i - 1]!,
       right = parts[i]!;
-    const prefix = left.slice(left.split("").findLastIndex((c) => !word(c)) + 1);
+    const extracted = left.slice(left.split("").findLastIndex((c) => !word(c)) + 1);
+    const prefix = Array.from(extracted, (c) =>
+      source === "branch" && c >= "a" && c <= "z" ? c.toUpperCase() : c,
+    ).join("");
     const end = Array.from(right).findIndex((c) => !digit(c));
     const number = end < 0 ? right : right.slice(0, end);
+    const mixedCase =
+      source === "branch" &&
+      Array.from(extracted).some((c) => c >= "a" && c <= "z") &&
+      Array.from(extracted).some((c) => c >= "A" && c <= "Z");
     if (
-      !prefix ||
-      prefix.length > 32 ||
+      mixedCase ||
+      prefix.length < MIN_ISSUE_PREFIX_LENGTH ||
+      prefix.length > MAX_PARSED_ISSUE_PREFIX_LENGTH ||
       prefix[0]! < "A" ||
       prefix[0]! > "Z" ||
-      !Array.from(prefix).every((c) => (c >= "A" && c <= "Z") || digit(c)) ||
+      !Array.from(prefix).every(
+        (c, i) => (c >= "A" && c <= "Z") || digit(c) || (i > 0 && c === "_"),
+      ) ||
       !number ||
-      number.length > 20 ||
+      number.length > MAX_ISSUE_NUMBER_DIGITS ||
+      number[0] === "0" ||
       (end >= 0 && word(right[end]!))
     )
       continue;
-    matches++;
-    seen.add(`${prefix}-${number}`);
+    const key = `${prefix}-${number}`;
+    if (matched.has(key)) continue;
+    // Wire-excluded matches still occupy their parser slots, so they cannot admit a later key.
+    matched.add(key);
+    if (prefix.length > MAX_ISSUE_PREFIX_LENGTH || prefix.includes("_")) continue;
+    keys.push({ key, source });
   }
-  return [...seen].map((key) => ({ key, source }));
+  return keys;
 }
 function time(v: unknown): string | undefined {
   if (typeof v !== "string") return;
@@ -617,10 +638,14 @@ export function pullRequest(source: Repository, v: JsonObject): [Repository, Pul
     p.uri = `https://${source.host}/${repo.name}/pull/${number}`;
   }
   p.title = metadataTitle(p.title || "");
-  p.issueKeys = issueKeys(p.title, "title");
+  const titleKeys = issueKeys(p.title, "title");
   const branch = source.provider === "gitlab" ? str(v, "source_branch") : str(obj(v.head), "ref");
-  for (const key of issueKeys(branch, "branch")) {
-    if (p.issueKeys.length >= 20) break;
+  p.issueKeys = issueKeys(branch, "branch").map(
+    (key) => titleKeys.find((old) => old.key === key.key) ?? key,
+  );
+  // Branch-only keys take the available slots first; keys known from both sources retain their title source.
+  for (const key of titleKeys) {
+    if (p.issueKeys.length >= MAX_ISSUE_KEYS) break;
     if (!p.issueKeys.some((old) => old.key === key.key)) p.issueKeys.push(key);
   }
   return [repo, p];

@@ -37,6 +37,10 @@ interface CacheWrite {
   ttlSeconds: number;
   tokens: string;
 }
+export const MAX_ISSUE_KEYS = 20; // Parser cap and event wire limit.
+export const MIN_ISSUE_PREFIX_LENGTH = 2; // Minimum accepted by the backend grammar.
+export const MAX_ISSUE_PREFIX_LENGTH = 32; // Maximum accepted by the existing event wire format.
+export const MAX_ISSUE_NUMBER_DIGITS = 16; // Maximum accepted by the backend grammar.
 export interface IssueKey {
   key: string;
   source: string;
@@ -575,17 +579,17 @@ function rawValid(raw: RawUsage = {}): boolean {
 }
 function issueValid(keys: IssueKey[] = []): boolean {
   return (
-    keys.length <= 20 &&
+    keys.length <= MAX_ISSUE_KEYS &&
     keys.every((v) => {
       const parts = v.key.split("-"),
         prefix = parts[0] ?? "",
         suffix = parts[1] ?? "";
       return (
         parts.length === 2 &&
-        prefix.length >= 1 &&
-        prefix.length <= 32 &&
+        prefix.length >= MIN_ISSUE_PREFIX_LENGTH &&
+        prefix.length <= MAX_ISSUE_PREFIX_LENGTH &&
         suffix.length >= 1 &&
-        suffix.length <= 20 &&
+        suffix.length <= MAX_ISSUE_NUMBER_DIGITS &&
         Array.from(prefix).every((c, i) => (c >= "A" && c <= "Z") || (i > 0 && digit(c))) &&
         Array.from(suffix).every(digit) &&
         ["work", "branch", "title", "commit", "explicit"].includes(v.source) &&
