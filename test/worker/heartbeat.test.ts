@@ -322,7 +322,7 @@ it("a helper whose first action is delayed past the window keeps accepting live 
       ...process.env,
       KIMCHI_WORKER_TEST_HELPER_START_DELAY_MS: "2000",
       HEARTBEAT_WINDOW_MS: "500",
-      HEARTBEAT_SAMPLES: "40",
+      HEARTBEAT_SAMPLES: "60",
     },
     stdin: "pipe",
     stdout: "ignore",
@@ -330,7 +330,7 @@ it("a helper whose first action is delayed past the window keeps accepting live 
   });
   const stderrText = new Response(child.stderr).text();
   const feeder = (async () => {
-    for (let index = 0; index < 50; index++) {
+    for (let index = 0; index < 60; index++) {
       try {
         await sendHeartbeat(child.stdin);
       } catch {
@@ -345,7 +345,7 @@ it("a helper whose first action is delayed past the window keeps accepting live 
   expect(code).toBe(0);
   const summary = lastSummary(lines) as { samples?: { ageMs: number; refused: boolean }[] };
   const samples = summary.samples ?? [];
-  expect(samples).toHaveLength(40);
+  expect(samples).toHaveLength(60);
   // During the helper's delayed start the fence refuses (the startup stamp keeps the ages
   // growing past the window — the safe direction, the delayed start itself covered by it):
   // the last refusal sits well into the 2 s delay, proving the hook's silence was real.
