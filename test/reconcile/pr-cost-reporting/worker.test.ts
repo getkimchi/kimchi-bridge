@@ -3474,6 +3474,65 @@ describe("incremental translation", () => {
     expect(backend.markedRecords()).toEqual([]);
   });
 
+  it("an unsettled resumed plan leaves new markers ready for the next round", async () => {
+    await seedLinked();
+    lookupRepositoryIdentity.mockRejectedValue(new LookupError("offline", "retry"));
+    const account = accountKey(content.account);
+    const entities = Array.from({ length: 250 }, (_, index) => `entity-${index}`);
+    const facts = entities.map((entityId) => ({
+      entityId,
+      source: "kimchi",
+      sourceVersion: "test",
+      deviceId: requestId,
+      observeTime: "2026-10-04T12:00:00Z",
+      coverage: { code: "fixture", count: "1" },
+    }));
+    buildEvents.mockResolvedValue({
+      accounts: [{ account: content.account, facts, recordHashes: [] }],
+      units: entities.map((entity) => ({ account, entities: [entity], recordHashes: [] })),
+      unresolved: [],
+    });
+    const clock = spyOn(Date, "now");
+    const start = Date.now();
+    observeEvents.mockImplementationOnce(() => {
+      clock.mockReturnValue(start + 4_800);
+    });
+    const run = () =>
+      reconcileReporting(directory, "/project", new AbortController().signal, () => {});
+    await run();
+    clock.mockRestore();
+    const backend = backendFor(directory);
+    expect(backend.getNote("agent", "translation-plan")).toBeDefined();
+
+    await appendFile(
+      join(directory, "work-attribution", "source.jsonl"),
+      `${JSON.stringify({
+        version: 1,
+        type: "request",
+        workId: "55555555-5555-4555-8555-555555555555",
+        sessionId: "private-session",
+        recordedAt: "2026-10-04T12:05:00.000Z",
+        requestId: "66666666-6666-4666-8666-666666666666",
+        startedAt: "2026-10-04T12:05:00.000Z",
+        scope: { account: content.account, repository: "/private/repo/.git" },
+      })}\n`,
+    );
+    await run();
+    // The old plan resumes without another prelude, but its added marker does not rest with the old result.
+    expect(buildEvents).toHaveBeenCalledTimes(1);
+    expect(
+      Object.keys(JSON.parse(backend.getNote("agent", "translation-stalled") ?? "{}")),
+    ).toHaveLength(0);
+    await run();
+    expect(buildEvents).toHaveBeenCalledTimes(2);
+    expect(
+      Object.keys(JSON.parse(backend.getNote("agent", "translation-stalled") ?? "{}")),
+    ).toHaveLength(1);
+    await run();
+    expect(buildEvents).toHaveBeenCalledTimes(2);
+    expect(backend.markedRecords()).not.toEqual([]);
+  });
+
   it("a suspended plan is rebuilt when a marker it covers is no longer pending", async () => {
     await seedLinked();
     const account = accountKey(content.account);
