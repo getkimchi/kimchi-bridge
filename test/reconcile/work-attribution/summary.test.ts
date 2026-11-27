@@ -6,7 +6,11 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { HostPorts } from "../../../src/reconcile/host.js";
 import { setDefaultHostPorts } from "../../../src/reconcile/host-ports.js";
-import { appendWorkRecord, type WorkContext } from "../../../src/reconcile/work-attribution.js";
+import {
+  appendWorkRecord,
+  workLedgerPath,
+  type WorkContext,
+} from "../../../src/reconcile/work-attribution.js";
 import {
   flushWorkSummaries,
   journalParser,
@@ -15,6 +19,7 @@ import {
   type WorkRecord,
   type WorkRecordProblem,
 } from "../../../src/reconcile/work-attribution/summary.js";
+import { pinAgentDir } from "../../../src/ledger/store.js";
 
 /**
  * Ported from Kimchi's src/extensions/work-attribution/summary.test.ts, keeping only the
@@ -59,7 +64,7 @@ const each = (
 
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "kimchi-work-summary-"));
+  dir = pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-work-summary-")));
   setDefaultHostPorts(host);
 });
 afterEach(async () => {
@@ -289,6 +294,27 @@ describe("readable work summaries", () => {
       expect({ end, invalid: invalid.length }).toEqual({ end, invalid: 0 });
     }
   }, 120_000);
+
+  it("preserves well-formed provenance names and captures isolated surrogates", () => {
+    const ordinary = "session/emoji-🦀";
+    expect(workLedgerPath(context(ordinary))).toBe(
+      join(dir, "work-attribution", `${encodeURIComponent(ordinary)}.jsonl`),
+    );
+    for (const [sessionId, encoded] of [
+      ["before-\uD83D-after", "%ud83d"],
+      ["before-\uDC44-after", "%udc44"],
+    ] as const) {
+      const ctx = context(sessionId);
+      const workId = randomUUID();
+      expect(workLedgerPath(ctx)).toBe(
+        join(dir, "work-attribution", `before-${encoded}-after.jsonl`),
+      );
+      appendWorkRecord(ctx, { type: "request", requestId: randomUUID(), scope: null }, workId);
+      const records = readWorkRecords(dir).filter((record) => record.workId === workId);
+      expect(records).toHaveLength(1);
+      expect(records[0].sessionId).toBe(sessionId);
+    }
+  });
 
   it("reads large journals in the background without blocking the event loop", async () => {
     const ledgers = join(dir, "work-attribution");

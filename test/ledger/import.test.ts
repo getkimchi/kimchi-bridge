@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   unlinkSync,
   utimesSync,
@@ -24,6 +25,7 @@ import {
   reportJournalProblems,
 } from "../../src/ledger/import.js";
 import { createMemoryRecords } from "../../src/ledger/memory-records.js";
+import { pinAgentDir } from "../../src/ledger/store.js";
 import {
   backendFor,
   capture,
@@ -46,7 +48,9 @@ const WORK = "11111111-1111-4111-8111-111111111111";
 const SESSION = "session-import";
 
 function agentDir(): string {
-  return mkdtempSync(join(tmpdir(), "kimchi-import-"));
+  // Pinned to its real path, so the journal paths this suite builds and asserts match the
+  // pinned spelling the importer's own scan derives from the same agent directory.
+  return pinAgentDir(mkdtempSync(join(tmpdir(), "kimchi-import-")));
 }
 
 function line(record: Record<string, unknown>): string {
@@ -236,6 +240,62 @@ describe("import loop over the memory backend", () => {
     const records = readRecords(dir);
     expect(records).toHaveLength(2);
     expect(records.map((record) => record.type).sort()).toEqual(["request", "work"]);
+  });
+
+  it("a duplicate-only import leaves a clean oversized head alone instead of forcing a rebuild", async () => {
+    const dir = agentDir();
+    dirs.push(dir);
+    const backend = createMemoryRecords();
+    useBackendFactory(() => backend);
+    const folder = journal(dir);
+    const file = join(folder, "parent.jsonl");
+    writeFileSync(file, line(work()) + line(request("req-1")));
+    expect((await importJournals(dir)).imported).toBe(2);
+    // A saved head OVER the inline fold bound: the oversize gate's target. It is clean — no
+    // dirty marker — so only a batch that actually inserted a row for the work may defer it.
+    const filler = Array.from({ length: 5_000 }, (_, index) => ({
+      provider: "github",
+      host: "github.com",
+      id: `PR_filler_${index}`,
+      url: `https://github.com/example/repo/pull/${index}`,
+      number: index,
+      state: "open",
+      checkedAt: "2026-10-01T00:00:00.000Z",
+      pad: "x".repeat(900),
+    }));
+    const oversized = {
+      version: 2 as const,
+      workId: WORK,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      logs: {},
+      latest: {},
+      pullRequests: filler,
+    };
+    expect(backend.headBodyBytes?.(WORK) ?? 0).toBeGreaterThan(0);
+    backend.putHead(oversized);
+    expect(backend.headBodyBytes?.(WORK) ?? 0).toBeGreaterThan(4 * 1024 * 1024);
+    expect(backend.dirtyWorks()).toEqual([]);
+    // A replaced journal (new inode, same lines): the file mutated, so the whole file is
+    // re-imported — but every line hash already exists, so the batch inserts NOTHING.
+    // Create the replacement before renaming so no filesystem can reuse the original inode.
+    // Age the timestamp explicitly to avoid file-granularity races on metadata-stable filesystems.
+    const replacement = `${file}.replacement`;
+    writeFileSync(replacement, line(work()) + line(request("req-1")));
+    renameSync(replacement, file);
+    utimesSync(file, new Date(0), new Date(0));
+    const result = await importJournals(dir);
+    expect(result.imported).toBe(0);
+    expect(result.skipped).toBe(2);
+    // The all-duplicate batch must not mark the oversized head dirty (design-008): a clean
+    // oversized head keeps its head and its projection until a batch with new rows — or a
+    // read, or the pass — actually owes it a rebuild.
+    expect(backend.dirtyWorks()).toEqual([]);
+    expect(backend.getHead(WORK)?.pullRequests).toHaveLength(filler.length);
+    // Positive control: the same oversized head with a batch that DOES insert a row still
+    // defers to the bounded rebuild instead of folding a multi-megabyte head inline.
+    appendFileSync(file, line(request("req-2")));
+    expect((await importJournals(dir)).imported).toBe(1);
+    expect(backend.dirtyWorks()).toEqual([WORK]);
   });
 
   it("re-imports over unchanged journals insert nothing and skip the known rows", async () => {
@@ -898,6 +958,96 @@ describe("capture prefix verification (memory backend)", () => {
       reads.mockRestore();
       update.mockRestore();
     }
+  });
+
+  it("keeps importing while the session appends during the capture prefix read", async () => {
+    const dir = agentDir();
+    dirs.push(dir);
+    const backend = createMemoryRecords();
+    useBackendFactory(() => backend);
+    const file = join(journal(dir), "parent.jsonl");
+    writeFileSync(file, `${" ".repeat(2 * 1024 * 1024)}\n`);
+    while ((await importJournals(dir)).pending) {}
+    const before = backend.getJournalCursor(file)?.offset ?? 0;
+    appendFileSync(file, line(request("req-1")));
+    const realRead: typeof fs.readSync = fs.readSync;
+    let reads = 0;
+    const read = vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
+      if (++reads % 8 === 0) appendFileSync(file, " \n");
+      return realRead(...(args as Parameters<typeof fs.readSync>));
+    }) as typeof fs.readSync);
+    try {
+      let result = await importJournals(dir, { verifyCapturePrefix: true });
+      for (let slice = 0; result.pending && slice < 20; slice++)
+        result = await importJournals(dir, { verifyCapturePrefix: true });
+    } finally {
+      read.mockRestore();
+    }
+    expect(backend.getJournalCursor(file)?.offset).toBeGreaterThan(before);
+    expect(readRecords(dir).map((row) => row.requestId)).toEqual(["req-1"]);
+  });
+
+  it("rejects a prefix rewrite hidden by growth during the capture prefix read", async () => {
+    const dir = agentDir();
+    dirs.push(dir);
+    useBackendFactory(() => createMemoryRecords());
+    const file = join(journal(dir), "parent.jsonl");
+    const original = `${" ".repeat(2 * 1024 * 1024)}\n${line(request("req-1"))}`;
+    writeFileSync(file, original);
+    while ((await importJournals(dir)).pending) {}
+    appendFileSync(file, line(request("req-2")));
+    const realRead: typeof fs.readSync = fs.readSync;
+    const read = vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
+      writeFileSync(file, readFileSync(file, "utf8").replace("req-1", "req-X"));
+      appendFileSync(file, " \n");
+      return realRead(...(args as Parameters<typeof fs.readSync>));
+    }) as typeof fs.readSync);
+    let result: Awaited<ReturnType<typeof importJournals>>;
+    try {
+      result = await importJournals(dir, { verifyCapturePrefix: true });
+    } finally {
+      read.mockRestore();
+    }
+    expect(result.anomalies).toEqual([{ path: file, code: "journal-mutation" }]);
+    while (result.pending) result = await importJournals(dir, { verifyCapturePrefix: true });
+    expect(readRecords(dir).map((row) => row.requestId)).toEqual(["req-1", "req-X", "req-2"]);
+  });
+
+  it("rejects a rewrite landing between the final prefix read and the post-read fstat", async () => {
+    const dir = agentDir();
+    dirs.push(dir);
+    const backend = createMemoryRecords();
+    useBackendFactory(() => backend);
+    const file = join(journal(dir), "parent.jsonl");
+    const original = line(request("req-1"));
+    writeFileSync(file, original);
+    expect((await importJournals(dir, { verifyCapturePrefix: true })).imported).toBe(1);
+    const generation = backend.getJournalCursor(file)?.generation ?? 0;
+    appendFileSync(file, line(request("req-2")));
+    // The preflight's post-read fstatSync is this import's second fstat call (the first is its
+    // own pre-read stat), so firing on the second call lands a same-length rewrite of the
+    // consumed req-1 plus a small append exactly between the final prefix readSync and the
+    // fstatSync whose growth the memo then accepts: the memo's hash still describes req-1
+    // while its stat describes the rewritten, grown file.
+    const realFstat: typeof fs.fstatSync = fs.fstatSync;
+    let stats = 0;
+    const fstat = vi.spyOn(fs, "fstatSync").mockImplementation(((...args: unknown[]) => {
+      if (++stats === 2) {
+        writeFileSync(file, readFileSync(file, "utf8").replace("req-1", "req-X"));
+        appendFileSync(file, " \n");
+      }
+      return realFstat(...(args as Parameters<typeof fs.fstatSync>));
+    }) as typeof fs.fstatSync);
+    let result: Awaited<ReturnType<typeof importJournals>>;
+    try {
+      result = await importJournals(dir, { verifyCapturePrefix: true });
+    } finally {
+      fstat.mockRestore();
+    }
+    expect(result.anomalies).toEqual([{ path: file, code: "journal-mutation" }]);
+    while (result.pending) result = await importJournals(dir, { verifyCapturePrefix: true });
+    expect(backend.getJournalCursor(file)?.generation).toBe(generation + 1);
+    expect(readRecords(dir).map((row) => row.requestId)).toEqual(["req-1", "req-X", "req-2"]);
   });
 
   it("verifies capture-only appends with serial SHA-256 and rejects same-inode prefix rewrites", async () => {

@@ -1,7 +1,14 @@
 /** Discovers the PRs and MRs of recorded commits: lookup scheduling, the check cache and the journal updates. */
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { backendFor, getNote, readRecords, setNote } from "../../ledger/records.js";
+import {
+  backendFor,
+  encodeSpoolSessionId,
+  getNote,
+  readRecords,
+  setNote,
+} from "../../ledger/records.js";
+import { pinAgentDir } from "../../ledger/store.js";
 import {
   importWorkRecordsAsync,
   object,
@@ -149,7 +156,8 @@ function readLookupChecks(agentDir: string): LookupChecks {
   try {
     // The note is authoritative, including an empty cache; legacy files are read only before migration.
     value = JSON.parse(
-      checks.saved ?? readFileSync(join(agentDir, "work-attribution", LOOKUP_CHECKS), "utf8"),
+      checks.saved ??
+        readFileSync(join(pinAgentDir(agentDir), "work-attribution", LOOKUP_CHECKS), "utf8"),
     );
   } catch {
     // A missing or damaged cache only costs one more check per commit.
@@ -352,9 +360,10 @@ async function scan(
             : `commits/${first.sha}/pulls`,
         );
         url.searchParams.set("per_page", "100");
-        request = pages(remote, url, signal, deadline).then((values) =>
-          values.map((value) => pullRequest(value, remote, new Date().toISOString())),
-        );
+        request = pages(remote, url, signal, deadline).then((values) => {
+          const checkedAt = new Date().toISOString();
+          return values.map((value) => pullRequest(value, remote, checkedAt));
+        });
         associations.set(requestKey, request);
       }
       found = await request;
@@ -430,7 +439,7 @@ async function scan(
             prLookup,
           },
           commit.workId,
-          join(agentDir, "work-attribution", `${encodeURIComponent(commit.sessionId)}.jsonl`),
+          join(agentDir, "work-attribution", `${encodeSpoolSessionId(commit.sessionId)}.jsonl`),
         );
       state.commits.set(commitKey(commit), update);
       onUpdate?.(update);

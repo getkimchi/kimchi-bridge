@@ -495,6 +495,60 @@ describe("durable reporting queue", () => {
     expect(action).toHaveBeenCalledTimes(3);
   });
 
+  it.each([true, false])("creates a missing explicit mirror when enabled=%s", async (enabled) => {
+    const mirror = join(directory, "pr-cost-reporting", "state.json");
+    setDefaultHostPorts({
+      ...queueHost,
+      reportingConsent: () => (enabled ? "on" : "off"),
+      telemetryConsent: () => false,
+    });
+    expect(existsSync(mirror)).toBe(false);
+    await setReportingEnabled(directory, enabled);
+    expect(existsSync(mirror)).toBe(true);
+    const raw = JSON.parse(await readFile(mirror, "utf8")) as Record<string, unknown>;
+    expect(raw.version).toBe(1);
+    expect(raw.enabled).toBe(enabled);
+    expect(raw.followsTelemetry).toBeUndefined();
+    expect(typeof raw.producerId).toBe("string");
+  });
+
+  it("honors a live transition from explicit-on to disabled telemetry", async () => {
+    await setReportingEnabled(directory, true);
+    let choice: "on" | "off" | "follow-telemetry" = "on";
+    const action = mock(() => {
+      choice = "follow-telemetry";
+    });
+    setDefaultHostPorts({
+      ...queueHost,
+      reportingConsent: () => choice,
+      telemetryConsent: () => false,
+    });
+    await expect(withReportingConsent(directory, action, () => {})).rejects.toThrow(
+      "PR reporting is disabled",
+    );
+    expect(action).toHaveBeenCalledTimes(1);
+    setDefaultHostPorts({ ...queueHost, telemetryConsent: () => false });
+    expect(
+      await withReportingConsent(
+        directory,
+        () => {},
+        () => {},
+      ),
+    ).toBe(true);
+    setDefaultHostPorts({
+      ...queueHost,
+      reportingConsent: () => "follow-telemetry",
+      telemetryConsent: () => true,
+    });
+    expect(
+      await withReportingConsent(
+        directory,
+        () => {},
+        () => {},
+      ),
+    ).toBe(true);
+  });
+
   it("holds the state lock during an event step, so an opt-out saves before or after it", async () => {
     await setReportingEnabled(directory, true);
     let locked = false;
@@ -1938,5 +1992,17 @@ describe("server limits", () => {
     const state = JSON.parse(await readFile(path, "utf8"));
     expect(state.entries[key].held).toBeUndefined();
     expect(state.entries[key].heldAt).toBeUndefined();
+  });
+});
+
+describe("queue lock lifecycle", () => {
+  it("releases the queue lock when the ledger backend fails to open", async () => {
+    // A ledger.db that cannot be opened (a directory in its place) fails the epoch read after
+    // the queue lock is taken; the release in the finally must still run, or the lock file
+    // outlives the failed update and blocks every later one.
+    await files.mkdir(join(directory, "pr-cost-reporting"), { recursive: true, mode: 0o700 });
+    await files.mkdir(join(directory, "pr-cost-reporting", "ledger.db"));
+    await expect(setReportingEnabled(directory, true)).rejects.toThrow();
+    expect(existsSync(join(directory, "pr-cost-reporting.lock"))).toBe(false);
   });
 });

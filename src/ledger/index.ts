@@ -20,6 +20,7 @@ export * from "./links.js";
 export * from "./row-log.js";
 export * from "./merge.js";
 export * from "./store.js";
+export * from "./tx-budget.js";
 export * from "./records.js";
 export * from "./import.js";
 export * from "./outbox.js";

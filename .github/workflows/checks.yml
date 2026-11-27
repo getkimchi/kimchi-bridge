@@ -28,6 +28,16 @@ jobs:
       # Second full pass in a random file/test order (a fresh seed each run), so a suite that
       # only passes in the checked-in order fails here instead of slipping through silently.
       - run: bun test --randomize
+      # B4 strict acceptance bounds, ISOLATED from the loaded full suites above: the plan's
+      # per-capture 260 ms spool bound and 250 ms transaction ceiling run in their own
+      # invocations with no concurrent suite load, where the specified bounds hold as written.
+      # The full-suite runs above keep their documented load allowances (400 ms per capture
+      # sample, 1000 ms per transaction) for stress coverage; nothing else runs here, so the
+      # strict bounds cannot flake on suite load.
+      - name: Strict spool capture acceptance (isolated)
+        run: KIMCHI_SPOOL_ACCEPTANCE_STRICT=1 bun test test/ledger/spool.test.ts
+      - name: Strict transaction ceiling acceptance (isolated)
+        run: KIMCHI_TX_BUDGET_STRICT=1 bun test test/ledger/tx-budget.test.ts
       # B3 acceptance: the worker bundle must complete hello and one pass
       # under a released kimchi binary (BUN_BE_BUN=1 kimchi --no-env-file),
       # not just under plain bun. The asset layout follows Kimchi's own

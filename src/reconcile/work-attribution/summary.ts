@@ -16,6 +16,7 @@ import {
   fingerprint as recordsFingerprint,
   type WindowedRecord,
 } from "../../ledger/records.js";
+import { pinnedAgentDirIfPresent } from "../../ledger/store.js";
 import { debugWorkAttribution } from "./diagnostics.js";
 
 interface SummaryEntry {
@@ -187,7 +188,9 @@ export function journalParser(
 }
 /** The legacy journals the C3 importer scans, session ledgers and transitions, in a stable order. */
 export async function workJournals(agentDir: string): Promise<string[]> {
-  const directory = join(agentDir, "work-attribution");
+  const pinned = pinnedAgentDirIfPresent(agentDir);
+  if (pinned === undefined) return [];
+  const directory = join(pinned, "work-attribution");
   const paths: string[] = [];
   for (const source of [directory, join(directory, "transitions")]) {
     try {

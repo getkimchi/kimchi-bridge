@@ -37,6 +37,7 @@ import {
   type RecordBackend,
   type StoredRecord,
 } from "../../ledger/records.js";
+import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "../../ledger/tx-budget.js";
 import { preludeStretch } from "./prelude.js";
 import type { Acknowledgement } from "../../ledger/protocol.js";
 import {
@@ -1080,12 +1081,24 @@ export async function reconcileReporting(
 /** At most this many requests or auxiliary records commit their events in one transaction. */
 const CHUNK_UNITS = 100;
 
+/** Translation-chunk sizing per agent directory: AIMD on the measured transaction duration, from
+ * the historic fixed chunk size. An observation is only possible on a measuring backend; the
+ * in-memory double keeps the fixed size. */
+const translationChunkSizers = new Map<string, TxChunkSizer>();
+function translationChunkSizerFor(agentDir: string): TxChunkSizer {
+  return rememberSizer(translationChunkSizers, agentDir, () => createTxChunkSizer(CHUNK_UNITS));
+}
+
 export { preludeStretch } from "./prelude.js";
 
 /** Time a pass keeps for committing one more chunk and delivering what it captured. */
 const CHUNK_RESERVE_MS = 500;
 /** Ceiling for building one group's translation plan; the prelude yields throughout and runs once per round. */
 const PRELUDE_MS = 60_000;
+const PRELUDE_TIMEOUT_MESSAGE = "PR reporting translation time limit exceeded";
+/** Only this timeout rests the stalled window: parent cancellation, lease failures and unrelated
+ * errors with the same message must keep their existing handling. */
+export class TranslationPreludeTimeoutError extends Error {}
 /** The group translation in progress: units committed under the plan its group and plan digest name. Records
  * captured after that plan was built leave the count valid; they wait for the next round. */
 const PROGRESS_NOTE = "translation-progress";
@@ -1331,22 +1344,32 @@ async function captureEvents(
       continue;
     }
     const changed = new Map(works.flatMap((workId) => [...(marked.get(workId) ?? [])]));
-    const translated = await translateGroup(
-      agentDir,
-      works,
-      changed,
-      producer,
-      deadline,
-      check,
-      signal,
-      assertLease,
-    );
+    let translated: { waiting: boolean; addedMarkers: boolean } | undefined;
+    try {
+      translated = await translateGroup(
+        agentDir,
+        works,
+        changed,
+        producer,
+        deadline,
+        check,
+        signal,
+        assertLease,
+      );
+    } catch (error) {
+      // An unfinished prelude saves no plan; bound how often identical inputs pay for another full build.
+      if (error instanceof TranslationPreludeTimeoutError && !signal.aborted) {
+        stalled[signature] = { at: Date.now() };
+        backend.tx(() => backend.putNote("agent", STALLED_NOTE, JSON.stringify(stalled)));
+      }
+      throw error;
+    }
     if (translated === undefined) return;
-    waiting ||= translated;
-    // Every retry that still leaves the group unresolved rests the window from now; a group that invoked every
-    // attempt and still waits for evidence otherwise re-runs on every pass once its first window elapsed.
-    const stamped = translated || signature in stalled;
-    if (translated) stalled[signature] = { at: Date.now() };
+    waiting ||= translated.waiting;
+    // A resumed plan did not translate markers added while suspended: do not rest the signature containing them.
+    const rests = translated.waiting && !translated.addedMarkers;
+    const stamped = rests || signature in stalled;
+    if (rests) stalled[signature] = { at: Date.now() };
     else delete stalled[signature];
     if (stamped) backend.tx(() => backend.putNote("agent", STALLED_NOTE, JSON.stringify(stalled)));
   }
@@ -1359,10 +1382,47 @@ async function captureEvents(
 }
 
 /**
+ * Every PR-link observation of a work's commit rows: the complete connectivity index a
+ * REDUCED (truncated) head cannot carry, taken from the rows every rebuild refolds. Only
+ * the keys and urls matter here, so the rows' links are read without merging them.
+ */
+function commitRowPullRequests(backend: RecordBackend, workId: string): Record<string, unknown>[] {
+  const links: Record<string, unknown>[] = [];
+  for (const row of backend.readLog(workId, "commits"))
+    if (Array.isArray(row.pullRequests))
+      for (const link of row.pullRequests) if (object(link)) links.push(link);
+  return links;
+}
+
+/** One complete-link index per backend/work, refreshed only when that work's head or
+ * authority count changes. Unrelated active works therefore never rescan a stable large head. */
+const truncatedHeadIndexes = new WeakMap<
+  RecordBackend,
+  Map<string, { updatedAt: string; records: number; links: Record<string, unknown>[] }>
+>();
+
+function truncatedHeadPullRequests(
+  backend: RecordBackend,
+  head: { workId: string; updatedAt: string },
+): Record<string, unknown>[] {
+  const indexes = truncatedHeadIndexes.get(backend) ?? new Map();
+  truncatedHeadIndexes.set(backend, indexes);
+  const records = backend.recordCount(head.workId);
+  const cached = indexes.get(head.workId);
+  if (cached?.updatedAt === head.updatedAt && cached.records === records) return cached.links;
+  const links = commitRowPullRequests(backend, head.workId);
+  indexes.set(head.workId, { updatedAt: head.updatedAt, records, links });
+  return links;
+}
+
+/**
  * Works that share a PR or a work link change each other's events: a PR's state and issue keys and a link's target
  * come from all of them. Each group holding a changed work translates together.
  */
-function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>): string[][] {
+export function changedWorkGroups(
+  backend: RecordBackend,
+  changed: ReadonlySet<string>,
+): string[][] {
   const parent = new Map<string, string>();
   const root = (node: string) => {
     let top = node;
@@ -1377,7 +1437,14 @@ function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>)
   const works = new Set(changed);
   for (const head of backend.allHeads()) {
     works.add(head.workId);
-    for (const link of head.pullRequests) {
+    // A REDUCED head (the `truncated` marker) keeps only the newest links that fit the
+    // publication budget — its pullRequests array is NOT the work's complete PR index, so a
+    // shared PR the reduction dropped would split two works that must translate together
+    // although its link lives on in the authority's commit rows. A truncated head therefore
+    // derives its connectivity from its commit rows — the complete per-row link set every
+    // rebuild refolds — instead of the head's reduced summary.
+    const links = head.truncated ? truncatedHeadPullRequests(backend, head) : head.pullRequests;
+    for (const link of links) {
       join(head.workId, `pr:${pullRequestKey(link)}`);
       if (typeof link.url === "string") join(head.workId, `url:${link.url}`);
     }
@@ -1402,8 +1469,8 @@ function changedWorkGroups(backend: RecordBackend, changed: ReadonlySet<string>)
 
 /**
  * Rebuilds one group from all of its records and observes the units its changed records touch, in bounded
- * transactions. Returns whether the group still waits for evidence or for a repository identity, or undefined when
- * time ran out.
+ * transactions. Returns its unresolved state and whether a resumed plan left newer markers for the next round,
+ * or undefined when time ran out.
  */
 async function translateGroup(
   agentDir: string,
@@ -1414,7 +1481,7 @@ async function translateGroup(
   check: () => void,
   signal: AbortSignal,
   assertLease: () => void,
-): Promise<boolean | undefined> {
+): Promise<{ waiting: boolean; addedMarkers: boolean } | undefined> {
   const backend = backendFor(agentDir);
   // Lease and cancellation only: the pass deadline bounds the chunk loop, not the plan's construction.
   const checkLease = () => {
@@ -1463,13 +1530,14 @@ async function translateGroup(
     // The prelude runs under its own limit, not the pass deadline: a large group's read, report and event build
     // take longer than one pass, and only a finished prelude saves a plan. It yields on its stretch cadence
     // throughout and runs once per round; later passes commit the saved plan's chunks under the pass deadline.
-    const preludeSignal = AbortSignal.any([signal, AbortSignal.timeout(PRELUDE_MS)]);
+    const preludeTimeout = AbortSignal.timeout(PRELUDE_MS);
+    const preludeSignal = AbortSignal.any([signal, preludeTimeout]);
     const preludeDeadline = Date.now() + PRELUDE_MS;
     const preludeCheck = () => {
       assertLease();
-      preludeSignal.throwIfAborted();
-      if (Date.now() >= preludeDeadline)
-        throw new Error("PR reporting translation time limit exceeded");
+      signal.throwIfAborted();
+      if (preludeTimeout.aborted || Date.now() >= preludeDeadline)
+        throw new TranslationPreludeTimeoutError(PRELUDE_TIMEOUT_MESSAGE);
     };
     // Reads page through each work's records — at most 128 rows materialize between
     // stretches, so a single work with a huge history cannot own the UI loop for its
@@ -1579,9 +1647,10 @@ async function translateGroup(
     });
   }
   const observed = new Set<string>();
+  const sizer = translationChunkSizerFor(agentDir);
   while (done < builtUnits.length) {
     if (Date.now() >= deadline - CHUNK_RESERVE_MS) return undefined;
-    const chunk = builtUnits.slice(done, done + CHUNK_UNITS);
+    const chunk = builtUnits.slice(done, done + sizer.size());
     const byAccount = new Map<string, Fact[]>();
     for (const unit of chunk)
       for (const entity of unit.entities) {
@@ -1598,6 +1667,8 @@ async function translateGroup(
       for (const [account, list] of byAccount) observeEvents(agentDir, account, list, [], check);
       backend.putNote("agent", PROGRESS_NOTE, JSON.stringify({ ...progress, units: done }));
     });
+    const measured = backend.txDurations?.().lastMs;
+    if (measured !== undefined) sizer.observe(measured);
     await setImmediate();
   }
   backend.tx(() => {
@@ -1608,7 +1679,10 @@ async function translateGroup(
     backend.deleteNote("agent", PLAN_NOTE);
   });
   // Unresolved requests and unsettled repository identities both keep the group waiting for external state.
-  return unresolved > 0 || !settled;
+  return {
+    waiting: unresolved > 0 || !settled,
+    addedMarkers: !!existingPlan && changed.size > markers.length,
+  };
 }
 
 /**

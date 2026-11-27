@@ -24,9 +24,18 @@ import {
   type OutboxEvent,
   type RecordBackend,
 } from "./records.js";
+import { createTxChunkSizer, rememberSizer, type TxChunkSizer } from "./tx-budget.js";
 
 const BATCH_EVENTS = 100;
 const BATCH_BYTES = 1 << 20;
+
+/** ACK-batch sizing per agent directory: AIMD on measured transaction durations, starting at the
+ * historic fixed batch size. The atomic unit stays whole — one batch's acknowledgement with its
+ * receipt state commits in one transaction — so only how many events share one batch adapts. */
+const batchEventSizers = new Map<string, TxChunkSizer>();
+function batchSizerFor(agentDir: string): TxChunkSizer {
+  return rememberSizer(batchEventSizers, agentDir, () => createTxChunkSizer(BATCH_EVENTS));
+}
 export type Fact = Omit<Event, "id" | "revision" | "baseRevision" | "baseEventId">;
 
 export interface DeliveryRetry {
@@ -375,7 +384,9 @@ export function pendingBatch(
 ): OutboxBatch | undefined {
   if (!accountKey) throw new Error("Missing outbox account");
   const backend = backendFor(agentDir);
-  return backend.tx(() => {
+  const sizer = batchSizerFor(agentDir);
+  const limit = sizer.size();
+  const frozen = backend.tx(() => {
     assertCurrent();
     const existing = backend.getOutboxBatch(accountKey);
     if (existing) {
@@ -384,7 +395,7 @@ export function pendingBatch(
     }
     const batch: Batch = { version: Version, id: randomUUID(), events: [] };
     const bodies: Uint8Array[] = [];
-    for (const row of backend.pendingOutboxEvents(accountKey, BATCH_EVENTS)) {
+    for (const row of backend.pendingOutboxEvents(accountKey, limit)) {
       batch.events.push(unpack(row));
       bodies.push(row.body);
       if (wireBody(batch.id, bodies).length > BATCH_BYTES) {
@@ -407,6 +418,9 @@ export function pendingBatch(
     assertCurrent();
     return frozen;
   });
+  const measured = backend.txDurations?.().lastMs;
+  if (measured !== undefined) sizer.observe(measured);
+  return frozen;
 }
 
 /** Only a complete ACK of this account's persisted bytes can advance events and remove their batch. */
@@ -419,7 +433,8 @@ export function acknowledgeBatch(
 ): boolean {
   if (sent.accountKey !== accountKey) throw new Error("Outbox account changed");
   const backend = backendFor(agentDir);
-  return backend.tx(() => {
+  const sizer = batchSizerFor(agentDir);
+  const result = backend.tx(() => {
     assertCurrent();
     const current = backend.getOutboxBatch(accountKey);
     if (!current || current.id !== sent.id) return false;
@@ -457,4 +472,9 @@ export function acknowledgeBatch(
     assertCurrent();
     return true;
   });
+  // The acknowledgement's own transaction (receipt validation, event updates, batch deletion)
+  // feeds the same sizer: a fast freeze with a slow ACK must shrink the next batch too.
+  const measured = backend.txDurations?.().lastMs;
+  if (measured !== undefined) sizer.observe(measured);
+  return result;
 }

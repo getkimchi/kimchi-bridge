@@ -24,14 +24,28 @@ import {
   type WorkRecord,
 } from "./summary.js";
 
-// A responsive git answers in milliseconds; the bound only stops a hanging command, so it
-// tolerates a loaded machine's slow spawn instead of killing a live one.
-const GIT_TIMEOUT_MS = 5000;
+// A responsive git answers in milliseconds; the bound only stops a hanging command. The
+// production value is the pre-B4 2 s; a test-only override (below) widens it on a loaded
+// runner, so load tolerance lives at the test boundary, never in production.
+const GIT_TIMEOUT_MS = 2000;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_COMMITS = 512;
-// The supervisor pass supplies its own shared budget; this bounds direct callers, and stays
-// well past the per-command timeout so a loaded runner's slow commands retry, not abort.
-export const RECONCILIATION_BUDGET_MS = 10_000;
+// The supervisor pass supplies its own shared budget; this bounds direct callers. The
+// production value is the pre-B4 3 s (K1 inline behavior stays equivalent); a test-only
+// override (below) widens it on a loaded runner, so load tolerance lives at the test
+// boundary, never in the direct-call budget production and Kimchi inline pay.
+export const RECONCILIATION_BUDGET_MS = 3000;
+/** The direct-call budget in force: the production constant, or the test-only override a
+ *  loaded runner sets before running this file's suites. */
+export function reconciliationBudgetMs(): number {
+  if (process.env.NODE_ENV !== "test") return RECONCILIATION_BUDGET_MS;
+  return Number(process.env.KIMCHI_FILE_TRANSITIONS_TEST_BUDGET_MS) || RECONCILIATION_BUDGET_MS;
+}
+/** The per-command git timeout in force: the production constant, or the test-only override. */
+function gitTimeoutMs(): number {
+  if (process.env.NODE_ENV !== "test") return GIT_TIMEOUT_MS;
+  return Number(process.env.KIMCHI_FILE_TRANSITIONS_TEST_GIT_TIMEOUT_MS) || GIT_TIMEOUT_MS;
+}
 export interface FileState {
   blob: string;
   mode: string;
@@ -83,7 +97,7 @@ function gitBytes(
       ["-C", cwd, ...args],
       {
         encoding: "buffer",
-        timeout: GIT_TIMEOUT_MS,
+        timeout: gitTimeoutMs(),
         maxBuffer: MAX_FILE_BYTES,
         env,
         signal: options.signal,
@@ -464,7 +478,7 @@ interface TransitionJournal {
 // Journal filenames identify one immutable repository/worktree pair. Retain discovery progress across bounded scans.
 const journalOwners = new Map<string, FileTransition>();
 function reconciliationBudget(signal?: AbortSignal): () => void {
-  const deadline = Date.now() + RECONCILIATION_BUDGET_MS;
+  const deadline = Date.now() + reconciliationBudgetMs();
   return () => {
     signal?.throwIfAborted();
     if (Date.now() > deadline)

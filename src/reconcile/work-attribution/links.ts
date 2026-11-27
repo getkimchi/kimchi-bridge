@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { preludeStretch } from "../shared/prelude-stretch.js";
+import { encodeSpoolSessionId } from "../../ledger/records.js";
 import { isWorkId } from "../../ledger/work-id.js";
 import { appendWorkRecord, isWorkSegment, type WorkContinuation } from "../work-attribution.js";
 import {
@@ -824,7 +825,7 @@ export async function reconcileWorkContinuations(
       { cwd: String(row.cwd), sessionManager: { getSessionId: () => row.sessionId } },
       link,
       row.workId,
-      join(agentDir, "work-attribution", `${encodeURIComponent(row.sessionId)}.jsonl`),
+      join(agentDir, "work-attribution", `${encodeSpoolSessionId(row.sessionId)}.jsonl`),
     );
     wrote = true;
     done.add(keys[position]);

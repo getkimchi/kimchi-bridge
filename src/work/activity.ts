@@ -784,7 +784,7 @@ export function activityObservation(
   else if (observation.webFetchOutput) observation.webFetchOutput.callId = callId;
   else if (observation.fileOperationResult) observation.fileOperationResult.callId = callId;
   const event: WorkspaceObservationEvent = {
-    ...header(input),
+    ...header(timed),
     causality: { causationId: before.eventId },
     observation,
   };
