@@ -379,6 +379,23 @@ test("branch issue keys accept uniform ASCII letter case and normalize prefixes"
   expect(pr.issueKeys).toEqual([{ key: "LIN-123", source: "branch" }]);
 });
 
+test("PR branch keys take priority when title keys fill the reporting limit", () => {
+  const titleKeys = Array.from({ length: 20 }, (_, i) => `ABC-${i + 1}`);
+  const raw = parseJson(githubPrFixture(titleKeys.join(" "), "feature/lin-123"));
+  const [, pr] = pullRequest({ provider: "github", host: "github.com", id: "name:x" }, raw);
+  expect(pr.issueKeys).toEqual([
+    { key: "LIN-123", source: "branch" },
+    ...titleKeys.slice(0, 19).map((key) => ({ key, source: "title" })),
+  ]);
+
+  const duplicate = parseJson(githubPrFixture("LIN-123 fix", "feature/lin-123"));
+  const [, duplicatePr] = pullRequest(
+    { provider: "github", host: "github.com", id: "name:x" },
+    duplicate,
+  );
+  expect(duplicatePr.issueKeys).toEqual([{ key: "LIN-123", source: "title" }]);
+});
+
 test("malformed branch issue keys remain ignored", () => {
   for (const branch of [
     "feature/_lin-123",
@@ -477,6 +494,20 @@ function persistedIssueKeyCase(
 }
 
 const twentyFiveKeys = Array.from({ length: 25 }, (_, i) => `ABC-${i + 1}`);
+
+test("wire-excluded K11 and K21 shapes consume cap slots without being emitted", () => {
+  for (const source of ["branch", "title", "work"]) {
+    const excluded =
+      source === "branch"
+        ? ["my_proj2-10", `${P(33).toLowerCase()}-1`]
+        : ["MY_PROJ2-10", `${P(33)}-1`];
+    for (const key of excluded) {
+      expect(conformanceKeys(`${key} ${twentyFiveKeys.join(" ")}`, source)).toEqual(
+        twentyFiveKeys.slice(0, 19),
+      );
+    }
+  }
+});
 
 test("K19 valid sixteen-digit issue keys persist in work and pull-request events", () => {
   const input = `ABC-${"9".repeat(16)}`;
