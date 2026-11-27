@@ -16,9 +16,11 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { HostPorts } from "../reconcile/host.js";
+import { pinAgentDir } from "../ledger/store.js";
 import { runReconciliationPass, type PassRun } from "../reconcile/pass.js";
 import { setDiagnosticsRedactor } from "../reconcile/work-attribution/diagnostics.js";
 import type { ContinuationProgress } from "../reconcile/work-attribution/links.js";
+import { integrityCheckGate } from "./integrity.js";
 import { passResultFromRun, type AbortCause } from "./pass-result.js";
 import {
   HostRequestError,
@@ -222,6 +224,10 @@ function main(): void {
         }
         break;
       }
+      case "heartbeat":
+        // The reader increments only the arrival counter. The coordinator anchors each
+        // arrival to a monotonic observation on the main thread; wire stamps are not freshness.
+        break;
       case "reply":
         // A late or duplicate reply: the request it belonged to already
         // timed out or was answered. Never guessed from, never answered twice.
@@ -287,9 +293,12 @@ function main(): void {
    * Wraps the host client's blocking reads so a request that died from the
    * pass's own cancellation or deadline marks the pass state before the
    * error is swallowed by a channel handler. No channel outcome is inferred
-   * here: the pass result alone decides what the wire reports.
+   * here: the pass result alone decides what the wire reports. `agentDir` overrides the
+   * hello's agent directory with the parent's already-resolved (pinned) path from the pass
+   * message, so the pass runs on the same real tree the parent pinned even when an agentDir
+   * link moved between the two processes' starts.
    */
-  const guardHostReads = (base: StdioHostClient): HostPorts => {
+  const guardHostReads = (base: StdioHostClient, agentDir?: string): HostPorts => {
     const guarded = <T>(read: () => T): T => {
       try {
         return read();
@@ -302,7 +311,7 @@ function main(): void {
       }
     };
     return {
-      agentDir: base.agentDir,
+      agentDir: agentDir ?? base.agentDir,
       e2eSeam: (name: string) => base.e2eSeam(name),
       now: () => base.now(),
       metric: base.metric.bind(base),
@@ -312,6 +321,7 @@ function main(): void {
       endpoints: (cwd: string) => guarded(() => base.endpoints(cwd)),
       orgPolicy: () => guarded(() => base.orgPolicy()),
       telemetryConsent: () => guarded(() => base.telemetryConsent()),
+      reportingConsent: () => guarded(() => base.reportingConsent()),
     };
   };
 
@@ -327,37 +337,56 @@ function main(): void {
     transport.deadlineAt = deadlineAt;
     const deadline = setTimeout(() => abortActive("deadline"), deadlineAt - Date.now());
     const base = host as StdioHostClient;
+    // A pass may name an alias of its pinned agent directory, never a different tree.
+    // Without the field, the hello's pinned directory remains authoritative.
+    const passAgentDir = message.agentDir === undefined ? agentDir : pinAgentDir(message.agentDir);
+    const directoryMismatch =
+      message.agentDir !== undefined && pinAgentDir(message.agentDir) !== pinAgentDir(agentDir);
+    // The once-a-day integrity gate: a failed quick_check stops every write of this pass and
+    // leaves the ledger untouched, reported as ledger_integrity_failed on every channel.
+    const integrity = directoryMismatch
+      ? { ok: false as const, error: "agent_directory_mismatch: pass names a different agent tree" }
+      : integrityCheckGate(passAgentDir);
     let run: PassRun | undefined;
     let passError: unknown;
-    try {
-      run = await runReconciliationPass(
-        {
-          ...(message.channels.files ? { files: true } : {}),
-          ...(message.channels.pullRequests ? { pullRequests: {} } : {}),
-          ...(message.channels.costs ? { costs: true } : {}),
-          ...(message.channels.reporting
-            ? { reporting: { cwd: message.reportingCwd as string } }
-            : {}),
-          ...(message.nextRepository === undefined
-            ? {}
-            : { nextRepository: message.nextRepository }),
-          progress: continuation,
-        },
-        guardHostReads(base),
-        {
-          signal: state.controller.signal,
-          assertLease: () => {
-            if (!state.leaseValid) throw new Error("the reconciliation lease was lost");
-            state.controller.signal.throwIfAborted();
+    if (!integrity.ok) {
+      passError = new Error(`ledger_integrity_failed: ${integrity.error}`);
+    } else {
+      try {
+        run = await runReconciliationPass(
+          {
+            ...(message.channels.files ? { files: true } : {}),
+            ...(message.channels.pullRequests ? { pullRequests: {} } : {}),
+            ...(message.channels.costs ? { costs: true } : {}),
+            ...(message.channels.reporting
+              ? { reporting: { cwd: message.reportingCwd as string } }
+              : {}),
+            ...(message.nextRepository === undefined
+              ? {}
+              : { nextRepository: message.nextRepository }),
+            progress: continuation,
+            // The lease's fencing epoch, and the parent heartbeat behind the fence's writable
+            // hook: together they stop a stale worker from committing, whether the new holder
+            // bumps the epoch or is an old release that never does.
+            epoch: message.epoch,
+            assertWritable: () => base.assertHeartbeatFresh(),
           },
-        },
-      );
-      // The pass built on this progress object and mutated it in place; the
-      // returned one is what the next pass threads in, exactly as Kimchi's
-      // supervisor kept ContinuationProgress on itself between scans.
-      continuation = run.progress;
-    } catch (error) {
-      passError = error;
+          guardHostReads(base, passAgentDir),
+          {
+            signal: state.controller.signal,
+            assertLease: () => {
+              if (!state.leaseValid) throw new Error("the reconciliation lease was lost");
+              state.controller.signal.throwIfAborted();
+            },
+          },
+        );
+        // The pass built on this progress object and mutated it in place; the
+        // returned one is what the next pass threads in, exactly as Kimchi's
+        // supervisor kept ContinuationProgress on itself between scans.
+        continuation = run.progress;
+      } catch (error) {
+        passError = error;
+      }
     }
     transport.deadlineAt = 0;
     clearTimeout(deadline);

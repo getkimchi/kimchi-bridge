@@ -29,12 +29,14 @@ import type { HostPorts } from "../reconcile/host.js";
 import { DEFAULT_WORKER_USER_AGENT, makeWorkerFetch } from "./fetch.js";
 import {
   encodeWorkerMessage,
+  HEARTBEAT_TIMEOUT_MS,
   parseConsentReply,
   parseGitTokenReply,
   parseHostCredentials,
   parseHostEndpoints,
   parseParentLine,
   parsePolicyReply,
+  parseReportingConsentReply,
   redactTokens,
   resourceEnabledFromPolicy,
   type HostRequestKind,
@@ -45,12 +47,16 @@ import {
 /** The parent must answer a host request within this window. */
 export const REQUEST_TIMEOUT_MS = 10_000;
 
-/** SharedArrayBuffer header (int32 slots) followed by the reply line's bytes. */
+/** SharedArrayBuffer header (int32 control and heartbeat-arrival slots) followed by the
+ *  reply line's bytes. */
 /** Slot 0 holds the state in its low bits and the owning request's rid above. */
 const COMBINED = 0;
 const LENGTH = 1;
 const ACTIVE_PASS = 3;
-const HEADER_BYTES = 16;
+/** Int32 slot 4 (byte 16): the heartbeat arrival counter. The helper increments it once per
+ *  heartbeat line it reads; the main thread uses changes to bound the newest arrival in time. */
+const HEARTBEAT_SEQ = 4;
+const HEADER_BYTES = 32;
 /** The longest reply line (a credentials or policy answer is a few hundred bytes). */
 const REPLY_BYTES = 64 * 1024;
 
@@ -65,6 +71,8 @@ const STATE_MASK = 0b111;
 const RID_SHIFT = 3;
 /** The rid's bits of the combined word; the mask keeps the word a positive int32. */
 const RID_MASK = 0x0fffffff;
+/** How often the main thread bounds newly observed arrivals on its own monotonic clock. */
+const ANCHOR_PERIOD_MS = 50;
 
 /** Packs a slot owner into one word: state in the low bits, rid above. */
 /** The next request id: cycles through 1..RID_MASK, never the zero the wire forbids. */
@@ -74,6 +82,40 @@ export function nextRequestId(current: number): number {
 
 function combined(rid: number, state: number): number {
   return (rid << RID_SHIFT) | state;
+}
+
+/** The worker refuses ledger writes when no heartbeat arrived for this long. The value is the
+ *  protocol module's: it must stay inside proper-lockfile's 5 s stale-lock window (Decision 7).
+ *  Re-exported so the parent and the worker share one constant through the package. */
+export { HEARTBEAT_TIMEOUT_MS };
+
+/** The heartbeat window, overridable through the environment (the tests use a shorter or longer
+ *  one); the parent that spawns the worker controls its environment, like the idle exit. Values
+ *  above the protocol's timeout are clamped to it: an override that reached or passed the
+ *  proper-lockfile stale window would defeat the old-release fence the timeout exists for
+ *  (Decision 7). Shorter values stay as given, so tests can tighten the window. */
+export function heartbeatTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.KIMCHI_WORKER_HEARTBEAT_TIMEOUT_MS;
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = Number(raw.trim());
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.min(parsed, HEARTBEAT_TIMEOUT_MS);
+  }
+  return HEARTBEAT_TIMEOUT_MS;
+}
+
+/** The parent's lease heartbeat went silent: the worker refuses every ledger write through the
+ *  pass's write fence. Thrown by the fence's assertWritable hook, so it fails the pass's writes
+ *  the same way a lost epoch does; the channel reports it and nothing is committed. */
+export class LeaseHeartbeatLost extends Error {
+  /** How stale the freshest heartbeat was, in milliseconds. */
+  readonly ageMs: number;
+  constructor(ageMs: number) {
+    super(
+      `the parent lease heartbeat was last seen ${Math.round(ageMs)} ms ago; refusing ledger writes`,
+    );
+    this.name = "LeaseHeartbeatLost";
+    this.ageMs = ageMs;
+  }
 }
 
 /** What failed when a host request cannot be answered. */
@@ -96,7 +138,9 @@ export class HostRequestError extends Error {
   }
 }
 
-/** One note from the helper thread: a forwarded line, or a stdin condition. */
+/** One note from the helper thread: a forwarded line, or a stdin condition. Its wall timestamp
+ *  is for pass deadlines; heartbeat freshness instead uses the shared arrival counter, so a
+ *  note drained late cannot re-date an arrival on the main thread's monotonic clock. */
 interface HelperNote {
   line?: string;
   /** When the helper read the line (ms since epoch): the true receipt time. */
@@ -126,18 +170,35 @@ const HELPER_SOURCE = `
 const { parentPort, workerData } = require("node:worker_threads");
 const { readSync } = require("node:fs");
 const ia = new Int32Array(workerData);
+const seq = new Int32Array(workerData, ${HEARTBEAT_SEQ * 4}, 1);
 const payload = new Uint8Array(workerData, ${HEADER_BYTES});
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const MAX_LINE_BYTES = 1048576;
 const chunk = Buffer.alloc(65536);
 let pending = "";
+// This thread owns stdin through a BLOCKING readSync loop (below): it never takes an
+// event-loop turn between reads, so it cannot answer postMessages — the heartbeat fence
+// therefore never asks it anything. On each heartbeat it increments the shared arrival
+// counter; the main thread bounds those changes on its own monotonic clock.
+// Test-only hook: a delay inserted before this thread's first action, so a test can
+// reproduce a helper whose actual start is delayed past the fence window (scheduler
+// starvation) without touching the main thread. Zero (unset) keeps it dormant.
+const TEST_HELPER_START_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_HELPER_START_DELAY_MS || 0);
+if (TEST_HELPER_START_DELAY_MS > 0) {
+  const until = performance.now() + TEST_HELPER_START_DELAY_MS;
+  while (performance.now() < until) {
+    /* A real block: no first action, no store, no wake until it ends. */
+  }
+}
 // Test-only hook: a delay inserted between the reply checks and the
 // publication, so a test can hold a checked reply across a request's
 // timeout and the next request's start. Zero (unset) keeps it dormant.
 const TEST_REPLY_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_REPLY_DELAY_MS || 0);
 const TEST_SLEEP = new Int32Array(new SharedArrayBuffer(4));
-function forward(line) { parentPort.postMessage({ line: line, at: Date.now() }); }
+function forward(line) {
+  parentPort.postMessage({ line: line, at: Date.now() });
+}
 function reply(line, parsed) {
   const word = Atomics.load(ia, ${COMBINED});
   if ((word & ${STATE_MASK}) !== ${STATE_WAITING}) return false; // nobody is waiting
@@ -167,6 +228,12 @@ function cancel(parsed) {
   Atomics.store(ia, ${COMBINED}, ${STATE_CANCELLED});
   Atomics.notify(ia, ${COMBINED});
 }
+function heartbeat(parsed) {
+  // A malformed stamp cannot refresh liveness; a valid stamp's value is not read by the fence.
+  if (parsed.type !== "heartbeat" || typeof parsed.at !== "number") return;
+  Atomics.add(seq, 0, 1);
+  Atomics.notify(seq, 0);
+}
 function gone() {
   Atomics.store(ia, ${COMBINED}, ${STATE_PARENT_GONE});
   Atomics.notify(ia, ${COMBINED});
@@ -178,6 +245,7 @@ function onLine(line) {
   if (parsed === null || typeof parsed !== "object") return forward(line);
   if (parsed.type === "reply" && typeof parsed.rid === "number" && reply(line, parsed)) return;
   if (parsed.type === "cancel" && typeof parsed.id === "number") cancel(parsed);
+  heartbeat(parsed);
   forward(line);
 }
 for (;;) {
@@ -233,12 +301,41 @@ export class StdioTransport {
   private rid = 0;
   private closed = false;
   private readonly secrets = new Set<string>();
+  /** The main thread's monotonic clock; injectable for deterministic elapsed-time tests. */
+  readonly #mono: () => number;
+  /** The actual preceding observation fire, not a delayed current fire mislabeled as it. */
+  #previousFireAt: number;
+  /** The arrival count observed at a fire or fence check on the main thread. */
+  #previousObservedSeq: number;
+  /** A time at or before the newest observed arrival; age from it is an upper bound. */
+  #arrivalLowerBound: number;
+  /** The arrival anchor timer; stopped by close(). */
+  #anchorTimer: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly emit: (event: TransportEvent) => void,
-    options?: { ridSeed?: number },
+    options?: { ridSeed?: number; mono?: () => number },
   ) {
     this.rid = options?.ridSeed ?? 0;
+    this.#mono = options?.mono ?? (() => performance.now());
+    // A parent that never heartbeats ages out from construction. Every value is read by this
+    // main thread: no wall clock and no cross-thread clock conversion participates in the fence.
+    const startedAt = this.#mono();
+    this.#previousFireAt = startedAt;
+    this.#arrivalLowerBound = startedAt;
+    this.#previousObservedSeq = Atomics.load(this.slots, HEARTBEAT_SEQ) >>> 0;
+    // Test-only hook: a delay inserted between the startup stamp above and the helper
+    // thread's start, so a test can reproduce a Worker construction stretched past the fence
+    // window (scheduler pressure, a paused process). The startup stamp covers the whole
+    // stretch — ages only read older through it, never fresher. Zero (unset) keeps it
+    // dormant.
+    const TEST_CONSTRUCT_DELAY_MS = Number(process.env.KIMCHI_WORKER_TEST_CONSTRUCT_DELAY_MS || 0);
+    if (TEST_CONSTRUCT_DELAY_MS > 0) {
+      const until = performance.now() + TEST_CONSTRUCT_DELAY_MS;
+      while (performance.now() < until) {
+        /* A real block: the helper thread cannot start until it ends. */
+      }
+    }
     this.helper = new Worker(HELPER_SOURCE, { eval: true, workerData: this.shared });
     this.helper.on("message", (note: HelperNote) => this.onHelperNote(note));
     this.helper.on("error", (error) => {
@@ -248,6 +345,38 @@ export class StdioTransport {
       if (!this.closed)
         this.transportError(`the stdin reader thread exited unexpectedly (${code})`);
     });
+    this.#anchorTimer = setInterval(() => this.#observeArrivalAnchors(), ANCHOR_PERIOD_MS);
+  }
+
+  /** Bound changed arrivals at the actual preceding fire P, not this possibly delayed fire D.
+   *  Any newly observed arrival lies in [P, D], so P is always a conservative lower bound. */
+  #observeArrivalAnchors(): void {
+    const fireAt = this.#mono();
+    const observedSeq = Atomics.load(this.slots, HEARTBEAT_SEQ) >>> 0;
+    if (observedSeq !== this.#previousObservedSeq) this.#arrivalLowerBound = this.#previousFireAt;
+    this.#previousObservedSeq = observedSeq;
+    this.#previousFireAt = fireAt;
+  }
+
+  /** An upper bound on silence. A check also observes arrivals, but leaves previousFireAt alone:
+   *  a changed sequence can only be newer than the preceding fire, never newer than this check. */
+  heartbeatAgeMs(): number {
+    const observedSeq = Atomics.load(this.slots, HEARTBEAT_SEQ) >>> 0;
+    if (observedSeq !== this.#previousObservedSeq) {
+      this.#arrivalLowerBound = this.#previousFireAt;
+      this.#previousObservedSeq = observedSeq;
+    }
+    return Math.max(0, this.#mono() - this.#arrivalLowerBound);
+  }
+
+  /** Throws LeaseHeartbeatLost when the newest heartbeat's conservative silence bound exceeds
+   *  the window. Delayed helper/pipe/main-thread observation and wall-clock steps cannot lower
+   *  this bound. A long main-thread hold may overstate it; later punctual observations recover.
+   *  On platforms whose monotonic clock pauses during OS suspend, suspended time is outside
+   *  this arrival bound; the host lease and post-resume heartbeat cadence remain the backstop. */
+  assertHeartbeatFresh(timeoutMs: number = heartbeatTimeoutMs()): void {
+    const age = this.heartbeatAgeMs();
+    if (age > timeoutMs) throw new LeaseHeartbeatLost(age);
   }
 
   private transportError(reason: string): void {
@@ -436,9 +565,10 @@ export class StdioTransport {
     return parsed.value.result;
   }
 
-  /** Stops the reader thread; the process is exiting anyway. */
+  /** Stops the arrival anchor timer and the reader thread; the process is exiting anyway. */
   close(): void {
     this.closed = true;
+    clearInterval(this.#anchorTimer);
     this.helper.terminate();
   }
 }
@@ -541,8 +671,29 @@ export class StdioHostClient implements HostPorts {
     return parsed.value.consent;
   }
 
+  /** The user's PR-reporting consent, exactly like telemetryConsent: a live blocking request
+   *  per call — never cached, so a mid-pass choice change is honored — with a timeout that
+   *  fails the channel through a typed error rather than ever guessing a value. */
+  reportingConsent(): "on" | "off" | "follow-telemetry" | undefined {
+    const parsed = parseReportingConsentReply(this.transport.request("reportingConsent"));
+    if (!parsed.ok)
+      throw new HostRequestError(
+        `the parent's reportingConsent reply was invalid: ${parsed.error}`,
+        "reportingConsent",
+        "invalid-reply",
+      );
+    return parsed.value.reportingConsent;
+  }
+
   metric(metric: Parameters<HostPorts["metric"]>[0]): void {
     this.transport.send({ type: "metric", metric });
+  }
+
+  /** The write fence's heartbeat hook: throws LeaseHeartbeatLost once the parent's lease
+   *  heartbeat has been silent past the window. Delegates to the transport, whose reader
+   *  thread owns the heartbeat slot. */
+  assertHeartbeatFresh(): void {
+    this.transport.assertHeartbeatFresh();
   }
 
   /** The parent's user agent, or the worker's own identity when it sent none. */

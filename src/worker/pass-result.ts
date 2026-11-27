@@ -15,7 +15,8 @@
  */
 import type { PassRun } from "../reconcile/pass.js";
 import type { ReconcileChannel } from "../reconcile/pass.js";
-import type { PassMessage, PassResult } from "./protocol.js";
+import type { TxDurations as LedgerTxDurations } from "../ledger/store.js";
+import type { PassMessage, PassResult, TxDurations } from "./protocol.js";
 
 /** Why the pass in flight was aborted. */
 export type AbortCause = "cancel" | "deadline" | "parent-gone";
@@ -35,6 +36,35 @@ export interface PassRunForWire {
   nextRepository?: string;
   /** Every pass channel's outcome, as the pass reported it. */
   channels: PassRun["channels"];
+  /** The pass's measured write-transaction durations, when the backend measures them. */
+  txDurations?: LedgerTxDurations;
+}
+
+/** Maps the ledger's bucketed histogram onto the wire's cumulative buckets. */
+export function wireTxDurations(measured: LedgerTxDurations): TxDurations {
+  // The ledger's buckets sit under TX_DURATION_EDGES = [1, 2, 5, 10, 25, 50, 100, 250, ...];
+  // the wire reports the plan's checkpoints cumulatively, counting every transaction at or
+  // under each ceiling, and everything past 250 ms as the hard-maximum overflow.
+  const buckets = measured.buckets;
+  const upTo = (edgeIndex: number): number => {
+    let total = 0;
+    for (let index = 0; index <= edgeIndex && index < buckets.length; index++)
+      total += buckets[index];
+    return total;
+  };
+  const upTo25Ms = upTo(4);
+  const upTo50Ms = upTo(5);
+  const upTo100Ms = upTo(6);
+  const upTo250Ms = upTo(7);
+  return {
+    count: measured.count,
+    maxMs: measured.maxMs,
+    upTo25Ms,
+    upTo50Ms,
+    upTo100Ms,
+    upTo250Ms,
+    over250Ms: Math.max(0, measured.count - upTo250Ms),
+  };
 }
 
 /**
@@ -119,6 +149,6 @@ export function passResultFromRun(
     outcome,
     channels,
     ...(run?.nextRepository === undefined ? {} : { nextRepository: run.nextRepository }),
-    // txDurations is filled by chunk B4's transaction budget.
+    ...(run?.txDurations === undefined ? {} : { txDurations: wireTxDurations(run.txDurations) }),
   };
 }

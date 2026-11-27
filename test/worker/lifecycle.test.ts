@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
@@ -6,14 +7,24 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { backendFor, closeBackends } from "../../src/ledger/records.js";
+import {
+  backendFor,
+  capture,
+  closeBackends,
+  readRecords,
+  spoolFilePath,
+} from "../../src/ledger/records.js";
+import { acquireWriterEpoch, openStore } from "../../src/ledger/store.js";
 import {
   PROTOCOL_VERSION,
   type DoneMessage,
@@ -33,6 +44,7 @@ import {
 
 const ROOT = join(import.meta.dir, "../..");
 const WORKER = join(ROOT, "src/worker/main.ts");
+const LEDGER_DRIVER = join(ROOT, "test/ledger/ledger-driver.ts");
 /** The dev build falls back to the checkout's commit; the bundle embeds its own. */
 const BUILD = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT }).toString().trim();
 const FAKE_TOKEN = "kchi_lifecycle_fake_token_0123456789";
@@ -68,6 +80,8 @@ const REPLIES: Record<HostRequestKind, unknown> = {
   },
   policy: { resources: { "extensions.cost-per-pr": true } },
   consent: { consent: false },
+  // No host-governed PR-reporting choice: the queue keeps its legacy state.json semantics.
+  reportingConsent: {},
 };
 
 interface WorkerHandle {
@@ -119,6 +133,13 @@ function spawnWorker(dir: string, extraEnv: Record<string, string> = {}): Worker
     for await (const chunk of proc.stderr)
       stderr += decoder.decode(chunk as Uint8Array, { stream: true });
   })();
+  // The fake parent heartbeats its lease like the real one (K2): every 500 ms while the
+  // worker lives, so the write fence stays open for the passes this suite drives.
+  const heartbeats = setInterval(() => {
+    if (proc.exitCode !== null) return;
+    proc.stdin.write(`{"type":"heartbeat","at":${Date.now()}}\n`);
+    proc.stdin.flush();
+  }, 500);
   const handle: WorkerHandle = {
     send(message) {
       proc.stdin.write(`${JSON.stringify(message)}\n`);
@@ -147,11 +168,13 @@ function spawnWorker(dir: string, extraEnv: Record<string, string> = {}): Worker
       return proc.exitCode ?? 0;
     },
     kill() {
+      clearInterval(heartbeats);
       proc.kill();
     },
     stderrText: () => stderr,
     lines: () => lines,
   };
+  void proc.exited.then(() => clearInterval(heartbeats));
   children.push(handle);
   return handle;
 }
@@ -244,6 +267,31 @@ function seedRecord(dir: string): void {
   closeBackends();
 }
 
+test("a pass for a different agent directory fails without creating that directory", async () => {
+  const trusted = agentDir();
+  const other = agentDir();
+  const worker = spawnWorker(trusted);
+  await handshake(worker, trusted);
+  worker.send({
+    type: "pass",
+    id: 99,
+    channels: { files: true, pullRequests: true, costs: true, reporting: true },
+    reportingCwd: "/project",
+    deadlineMs: 5_000,
+    epoch: 0,
+    agentDir: other,
+  });
+  const done = await answerRequestsUntilDone(worker, 99);
+  expect(done.result?.outcome).toBe("failed");
+  expect(done.result?.channels.files?.outcome).toBe("failed");
+  expect(done.result?.channels.pullRequests?.outcome).toBe("failed");
+  expect(done.result?.channels.reporting?.outcome).toBe("failed");
+  expect(done.result?.channels.files?.error).toContain("agent_directory_mismatch");
+  expect(existsSync(join(other, "work-attribution"))).toBe(false);
+  worker.end();
+  await worker.exited();
+});
+
 test("hello is answered with ready, and idle stdin EOF exits within 2 s", async () => {
   const dir = agentDir();
   const worker = spawnWorker(dir);
@@ -267,7 +315,7 @@ test("one pass against a temp ledger: progress, metric, done; EOF exits cleanly"
     channels: { files: true, reporting: true },
     reportingCwd: "/project",
     deadlineMs: 30000,
-    epoch: 3,
+    epoch: 0,
   });
   const seen: string[] = [];
   let done: DoneMessage | undefined;
@@ -291,7 +339,10 @@ test("one pass against a temp ledger: progress, metric, done; EOF exits cleanly"
   expect(done?.result.outcome).toBe("ok");
   expect(done?.result.channels.files?.outcome).toBe("ok");
   expect(done?.result.channels.reporting?.outcome).toBe("ok");
-  expect(done?.result.txDurations).toBeUndefined();
+  // The pass's measured write transactions ride along (B4): even a read-mostly pass's
+  // histogram is present, with nothing slow in it.
+  expect(done?.result.txDurations?.count).toBeGreaterThanOrEqual(0);
+  expect(done?.result.txDurations?.over250Ms).toBe(0);
   // A read-only files-and-reporting pass must not have rewritten the ledger.
   expect(ledgerDigest(dir)).toBe(digest);
   worker.end();
@@ -356,7 +407,7 @@ test("a host request the parent never answers fails the channel within its timeo
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch: 0,
   });
   const started = Date.now();
   let sawRequest = false;
@@ -397,7 +448,7 @@ test("a cancel mid-pass returns a canceled done promptly and writes nothing", as
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch: 0,
   });
   // Answer consent so the pass reaches a credentials request, then stall on it:
   // the worker is blocked in the pipe RPC when the cancel arrives.
@@ -405,6 +456,10 @@ test("a cancel mid-pass returns a canceled done promptly and writes nothing", as
   const canceling = (async () => {
     for (;;) {
       const message = await worker.next();
+      if (message.type === "request" && message.kind === "reportingConsent") {
+        worker.send({ type: "reply", rid: message.rid, result: {} });
+        continue;
+      }
       if (message.type === "request" && message.kind === "consent") {
         worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
         continue;
@@ -440,7 +495,7 @@ test("stdin EOF while a pass is running still exits the worker within 2 s", asyn
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch: 0,
   });
   // Let the pass start and block on its first host request, then cut the pipe.
   const first = await worker.next();
@@ -483,7 +538,7 @@ test("the parent's credential token never appears in any message the worker emit
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 30000,
-    epoch: 2,
+    epoch: 0,
   });
   // Consent true, so delivery resolves credentials and re-checks them mid-pass;
   // the fake token is answered, and every fetch dies on the closed local port.
@@ -501,6 +556,10 @@ async function answerRequestsUntilConsent(worker: WorkerHandle, consent: boolean
   for (;;) {
     const message = await worker.next();
     if (message.type !== "request") continue;
+    if (message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent } });
       return;
@@ -522,11 +581,15 @@ test("a cancel for a pass queued behind a blocked one drops it before it starts"
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 3000,
-    epoch: 1,
+    epoch: 0,
   });
   let blocked = false;
   for (;;) {
     const message = await worker.next();
+    if (message.type === "request" && message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.type === "request" && message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
       continue;
@@ -545,7 +608,7 @@ test("a cancel for a pass queued behind a blocked one drops it before it starts"
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch: 0,
   });
   const canceled = Date.now();
   worker.send({ type: "cancel", id: 11 });
@@ -586,11 +649,15 @@ test("a pass queued behind a blocked one is reported expired when its budget ran
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch: 0,
   });
   let blocked = false;
   for (;;) {
     const message = await worker.next();
+    if (message.type === "request" && message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.type === "request" && message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
       continue;
@@ -608,7 +675,7 @@ test("a pass queued behind a blocked one is reported expired when its budget ran
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 400,
-    epoch: 1,
+    epoch: 0,
   });
   await Bun.sleep(1200);
   // Unblock pass 1: it fails fast on the closed local port, and pass 2 must
@@ -651,7 +718,7 @@ test("no token, short, long, or whitespace-only, reaches any worker output or th
       channels: { reporting: true },
       reportingCwd: "/project",
       deadlineMs: 30000,
-      epoch: 1,
+      epoch: 0,
     });
     for (;;) {
       const message = await worker.next();
@@ -676,7 +743,7 @@ test("no token, short, long, or whitespace-only, reaches any worker output or th
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 30000,
-    epoch: 1,
+    epoch: 0,
   });
   for (;;) {
     const message = await worker.next();
@@ -754,7 +821,7 @@ test("a parent that closes the worker's stdout read end gets a clean exit within
       channels: { reporting: true },
       reportingCwd: "/project",
       deadlineMs: 60000,
-      epoch: 1,
+      epoch: 0,
     });
     // The worker's first write after the cut fails: it must treat that as
     // parent death and leave on its own, not block or wait out a timeout.
@@ -783,12 +850,16 @@ test("a late reply after a request's timeout never satisfies a later request", a
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch: 0,
   });
   let stalled: number | undefined;
   for (;;) {
     const message = await worker.next();
     if (message.type !== "request") continue;
+    if (message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
       continue;
@@ -799,6 +870,10 @@ test("a late reply after a request's timeout never satisfies a later request", a
   expect(stalled).toBeDefined();
   const done1 = await drain(worker, 50);
   expect(done1.result.outcome).toBe("failed");
+  // The expired host request held the main thread for 10 s. Even though the helper kept
+  // receiving, that hold's conservative refusal ends only after later punctual anchors.
+  // Let two parent cadences and their anchors pass so recovery holds without weak timing margins.
+  await new Promise((resolve) => setTimeout(resolve, 1200));
   // Pass 2 asks again with consent granted, so its credentials request
   // really happens; only after seeing the new request does the parent
   // deliver the stale reply belonging to pass 1's timed-out request — with
@@ -809,7 +884,7 @@ test("a late reply after a request's timeout never satisfies a later request", a
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch: 0,
   });
   let done2: DoneMessage | undefined;
   let staleSent = false;
@@ -820,6 +895,10 @@ test("a late reply after a request's timeout never satisfies a later request", a
       break;
     }
     if (message.type !== "request") continue;
+    if (message.kind === "reportingConsent") {
+      worker.send({ type: "reply", rid: message.rid, result: {} });
+      continue;
+    }
     if (message.kind === "consent") {
       worker.send({ type: "reply", rid: message.rid, result: { consent: true } });
       continue;
@@ -853,6 +932,17 @@ test("a late reply after a request's timeout never satisfies a later request", a
 test("a delayed reply publication never fails the next host request", async () => {
   const dir = agentDir();
   seedRecord(dir);
+  // The fake parent grants the pass's fencing epoch like a real lease holder:
+  // it bumps meta.writer_epoch first (B4), so the worker's writes pass the
+  // fence while the delayed publications are probed. A granted epoch the
+  // ledger never received would fence every write instead.
+  const leaseStore = openStore(dir);
+  let epoch: number;
+  try {
+    epoch = acquireWriterEpoch(leaseStore);
+  } finally {
+    leaseStore.close();
+  }
   // The reader thread's test-only delay holds every checked reply between
   // its state/rid checks and its publication — the preemption window the
   // reviewer probed. A reply for a request that has since timed out must
@@ -868,7 +958,7 @@ test("a delayed reply publication never fails the next host request", async () =
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 100,
-    epoch: 1,
+    epoch,
   });
   // Pass 2 is queued while pass 1 is still in flight: its consent request
   // must already be waiting when the reader thread wakes to publish pass 1's
@@ -882,7 +972,7 @@ test("a delayed reply publication never fails the next host request", async () =
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch,
   });
   let answeredForPass1 = false;
   let done80: DoneMessage | undefined;
@@ -926,7 +1016,7 @@ test("several messages in one chunk and a line split across chunks both parse", 
     id: 60,
     channels: { files: true },
     deadlineMs: 30000,
-    epoch: 1,
+    epoch: 0,
   });
   worker.sendRaw(`${hello}\n${pass}\n`);
   const first = await worker.next();
@@ -936,7 +1026,7 @@ test("several messages in one chunk and a line split across chunks both parse", 
     id: 61,
     channels: { files: true },
     deadlineMs: 30000,
-    epoch: 1,
+    epoch: 0,
   });
   worker.sendRaw(split.slice(0, Math.floor(split.length / 2)));
   await Bun.sleep(150);
@@ -960,7 +1050,7 @@ test("a reply larger than the pipe buffer fails the request instead of truncatin
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 60000,
-    epoch: 1,
+    epoch: 0,
   });
   // A consent answer padded past the 64 KiB shared reply slot: the worker
   // must fail the request with the typed oversized error, never use a cut of
@@ -1009,7 +1099,7 @@ test("an idle worker exits after its idle lifetime, and a pass rearms it", async
     id: 80,
     channels: { files: true },
     deadlineMs: 30000,
-    epoch: 1,
+    epoch: 0,
   });
   const done = await answerRequestsUntilDone(worker, 80);
   expect(done.result.outcome).toBe("ok");
@@ -1068,7 +1158,7 @@ test("the saved git host token is answered over the pipe and never reported", as
     id: 16,
     channels: { pullRequests: true },
     deadlineMs: 30000,
-    epoch: 1,
+    epoch: 0,
   });
   const SAVED = "ghp_lifecycle_saved_git_token_0123456";
   const hosts: string[] = [];
@@ -1120,7 +1210,7 @@ test("the worker carries the pass's continuation progress into the next pass", a
   );
   const worker = spawnWorker(dir);
   await handshake(worker, dir);
-  worker.send({ type: "pass", id: 17, channels: { files: true }, deadlineMs: 30000, epoch: 1 });
+  worker.send({ type: "pass", id: 17, channels: { files: true }, deadlineMs: 30000, epoch: 0 });
   const done1 = await drain(worker, 17);
   expect(done1.result.outcome).toBe("ok");
   expect(done1.result.channels.files?.outcome).toBe("ok");
@@ -1129,7 +1219,7 @@ test("the worker carries the pass's continuation progress into the next pass", a
   // refuse to treat the journal as complete; the quiet fast path — which only
   // the progress carried from pass 1 can take — absorbs it.
   appendFileSync(journal, "this line is not json\n");
-  worker.send({ type: "pass", id: 18, channels: { files: true }, deadlineMs: 30000, epoch: 1 });
+  worker.send({ type: "pass", id: 18, channels: { files: true }, deadlineMs: 30000, epoch: 0 });
   const done2 = await drain(worker, 18);
   expect(done2.result.outcome).toBe("ok");
   expect(done2.result.channels.files?.outcome).toBe("ok");
@@ -1141,7 +1231,7 @@ test("the worker carries the pass's continuation progress into the next pass", a
   // the supervisor's ContinuationProgress, kept on the worker between passes.
   const fresh = spawnWorker(dir);
   await handshake(fresh, dir);
-  fresh.send({ type: "pass", id: 19, channels: { files: true }, deadlineMs: 30000, epoch: 1 });
+  fresh.send({ type: "pass", id: 19, channels: { files: true }, deadlineMs: 30000, epoch: 0 });
   const done3 = await drain(fresh, 19);
   expect(done3.result.outcome).toBe("failed");
   expect(done3.result.channels.files?.outcome).toBe("failed");
@@ -1158,7 +1248,7 @@ test("a pass that fails before any channel reports the channels as failed, not o
   writeFileSync(join(dir, "work-attribution"), "not a directory");
   const worker = spawnWorker(dir);
   await handshake(worker, dir);
-  worker.send({ type: "pass", id: 15, channels: { files: true }, deadlineMs: 30000, epoch: 1 });
+  worker.send({ type: "pass", id: 15, channels: { files: true }, deadlineMs: 30000, epoch: 0 });
   const done = await answerRequestsUntilDone(worker, 15);
   expect(done.result.outcome).toBe("failed");
   expect(done.result.channels.files?.outcome).toBe("failed");
@@ -1179,7 +1269,7 @@ test("the pass deadline wakes a host request the parent stalls on", async () => 
     channels: { reporting: true },
     reportingCwd: "/project",
     deadlineMs: 500,
-    epoch: 1,
+    epoch: 0,
   });
   const started = Date.now();
   let done: DoneMessage | undefined;
@@ -1203,4 +1293,119 @@ test("the pass deadline wakes a host request the parent stalls on", async () => 
     expect(done.result.channels.reporting.error).toContain("deadline");
   worker.end();
   expect(await worker.exited()).toBe(0);
+}, 20000);
+
+test("capture under a 6 s writer spools, and the next worker pass imports it exactly once", async () => {
+  const dir = agentDir();
+  const workId = "22222222-2222-4222-8222-222222222222";
+  const rec = {
+    version: 1,
+    type: "request",
+    workId,
+    sessionId: "session",
+    requestId: "33333333-3333-4333-8333-333333333333",
+    scope: null,
+    recordedAt: "2026-10-01T00:00:00.000Z",
+  };
+  // The session process (this test) opened its backend before the contention began.
+  expect(readRecords(dir)).toHaveLength(0);
+  // A 6 s writer held in another process: capture must park the record in the spool and
+  // return, never block the session out past the busy window.
+  const holder = spawn(process.execPath, [LEDGER_DRIVER, "hold-writer", dir, "6000"], {
+    cwd: ROOT,
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  try {
+    const held = await (async () => {
+      const lines = createInterface({ input: holder.stdout! });
+      const messages = lines[Symbol.asyncIterator]();
+      const first = await messages.next();
+      return !first.done && (JSON.parse(first.value) as { held?: boolean }).held === true;
+    })();
+    expect(held).toBe(true);
+    const start = Date.now();
+    capture(dir, rec as never, "summary-native");
+    expect(Date.now() - start).toBeLessThan(260);
+    expect(existsSync(spoolFilePath(dir, "session"))).toBe(true);
+    expect(readRecords(dir)).toHaveLength(0);
+  } finally {
+    await new Promise((resolve) => holder.once("exit", resolve));
+  }
+
+  // The next pass through the real worker imports the spooled record exactly once, and the
+  // spool retires; a second pass and a re-capture of the same line change nothing.
+  const worker = spawnWorker(dir);
+  try {
+    await handshake(worker, dir);
+    worker.send({ type: "pass", id: 41, channels: { files: true }, deadlineMs: 30000, epoch: 0 });
+    const done = await answerRequestsUntilDone(worker, 41);
+    expect(done.result.outcome).toBe("ok");
+    expect(done.result.channels.files?.outcome).toBe("ok");
+    expect(readRecords(dir)).toHaveLength(1);
+    expect(existsSync(spoolFilePath(dir, "session"))).toBe(false);
+    worker.send({ type: "pass", id: 42, channels: { files: true }, deadlineMs: 30000, epoch: 0 });
+    expect((await answerRequestsUntilDone(worker, 42)).result.outcome).toBe("ok");
+    capture(dir, rec as never, "summary-native");
+    expect(readRecords(dir)).toHaveLength(1);
+  } finally {
+    worker.kill();
+    await worker.exited();
+  }
+}, 30000);
+
+test("a pass must name the inherited agent directory across a link move", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kimchi-worker-pin-"));
+  dirs.push(root);
+  const original = join(root, "original-agent");
+  const replacement = join(root, "replacement-agent");
+  const link = join(root, "agent-link");
+  mkdirSync(original, { recursive: true, mode: 0o700 });
+  mkdirSync(replacement, { recursive: true, mode: 0o700 });
+  symlinkSync(original, link);
+  // A directory pinned before the link moves is a different tree from the inherited link's
+  // current target. It must be rejected before writing, while a pass naming the current target
+  // is valid and runs on that target, never on the pre-move directory.
+  const pinned = realpathSync(link);
+  unlinkSync(link);
+  symlinkSync(replacement, link);
+  const worker = spawnWorker(link);
+  try {
+    await handshake(worker, link);
+    worker.send({
+      type: "pass",
+      id: 70,
+      channels: { files: true },
+      deadlineMs: 30000,
+      epoch: 0,
+      agentDir: pinned,
+    });
+    const invalid = await answerRequestsUntilDone(worker, 70);
+    expect(invalid.result.outcome).toBe("failed");
+    expect(invalid.result.channels.files?.error).toContain("agent_directory_mismatch");
+    expect(existsSync(join(pinned, "work-attribution"))).toBe(false);
+    expect(existsSync(join(pinned, "pr-cost-reporting"))).toBe(false);
+    expect(existsSync(join(replacement, "work-attribution"))).toBe(false);
+    expect(existsSync(join(replacement, "pr-cost-reporting"))).toBe(false);
+    const currentPinned = realpathSync(link);
+    worker.send({
+      type: "pass",
+      id: 71,
+      channels: { files: true },
+      deadlineMs: 30000,
+      epoch: 0,
+      agentDir: currentPinned,
+    });
+    const valid = await answerRequestsUntilDone(worker, 71);
+    expect(valid.result.outcome).toBe("ok");
+    expect(valid.result.channels.files?.outcome).toBe("ok");
+    worker.end();
+    expect(await worker.exited()).toBe(0);
+    expect(existsSync(join(currentPinned, "work-attribution"))).toBe(true);
+    expect(existsSync(join(currentPinned, "pr-cost-reporting"))).toBe(true);
+    expect(existsSync(join(pinned, "work-attribution"))).toBe(false);
+    expect(existsSync(join(pinned, "pr-cost-reporting"))).toBe(false);
+  } finally {
+    worker.kill();
+    await worker.exited();
+  }
 }, 20000);

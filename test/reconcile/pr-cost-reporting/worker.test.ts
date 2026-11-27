@@ -185,7 +185,7 @@ const {
   TranslationPreludeTimeoutError,
 } = await import("../../../src/reconcile/pr-cost-reporting/worker.js");
 import type { Batch } from "../../../src/ledger/protocol.js";
-import { pinAgentDir } from "../../../src/ledger/store.js";
+import { pinAgentDir, useTxClock } from "../../../src/ledger/store.js";
 import { TX_TARGET_MS } from "../../../src/ledger/tx-budget.js";
 
 /** Bun's it.each types reject the vitest-style tables below (plain and object rows). */
@@ -333,6 +333,7 @@ beforeEach(async () => {
 afterEach(async () => {
   // Restores the spyOn'd globals (Date.now, Math.random, node:fs) like vi.restoreAllMocks.
   mock.restore();
+  useTxClock(null);
   // bun test keeps mock.module registrations for the rest of the run, so the file loaded
   // next sees whatever implementations this suite last installed. buildEvents and
   // observeEvents end on their no-op stand-ins after the final test, which would silently
@@ -914,6 +915,9 @@ describe("account-fenced reporting delivery", () => {
   it("retains pending events and backoff when a later batch is rate limited", async () => {
     const storedKey = accountKey(content.account);
     await seedCoverageEvents(storedKey, 500);
+    // This case verifies accounting and retention under 429, not adaptive batch sizing.
+    // Use the test clock so slow host I/O cannot change the 100-record fixture batches.
+    useTxClock(() => 0);
     acceptEventBatches((attempt) =>
       attempt === 4
         ? new Response("rate-limited", { status: 429, headers: { "Retry-After": "120" } })

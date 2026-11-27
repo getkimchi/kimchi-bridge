@@ -9,6 +9,7 @@ import {
   parseHostEndpoints,
   parseParentLine,
   parsePolicyReply,
+  parseReportingConsentReply,
   parseWorkerLine,
   PROTOCOL_VERSION,
   redactTokens,
@@ -47,6 +48,8 @@ const PASS: PassMessage = {
 
 const CANCEL: ParentMessage = { type: "cancel", id: 7 };
 
+const HEARTBEAT: ParentMessage = { type: "heartbeat", at: 1795296329743 };
+
 const READY: ReadyMessage = { type: "ready", v: PROTOCOL_VERSION, build: "b3-test-build" };
 
 const DONE: DoneMessage = {
@@ -68,6 +71,7 @@ function parentMessages(): ParentMessage[] {
     reportingCwd: "/project",
     deadlineMs: 3000,
     epoch: 0,
+    agentDir: "/tmp/agent",
   };
   return [
     HELLO,
@@ -80,6 +84,7 @@ function parentMessages(): ParentMessage[] {
       result: { token: "secret-token-value", apiUrl: "https://api.example" },
     },
     { type: "hello", v: PROTOCOL_VERSION, build: "b", agentDir: "/a" },
+    HEARTBEAT,
   ];
 }
 
@@ -90,6 +95,7 @@ function workerMessages(): WorkerMessage[] {
     { type: "request", rid: 1, kind: "credentials", cwd: "/project" },
     { type: "request", rid: 2, kind: "policy" },
     { type: "request", rid: 3, kind: "consent" },
+    { type: "request", rid: 6, kind: "reportingConsent" },
     { type: "request", rid: 4, kind: "endpoints", cwd: "/project" },
     { type: "request", rid: 5, kind: "gitToken", host: "github.com" },
     { type: "metric", metric: { kind: "reconciliation" } },
@@ -182,6 +188,9 @@ describe("strict line rejection", () => {
       '{"type":"pass","id":1,"channels":{"nonsense":true},"deadlineMs":10,"epoch":0}',
       '{"type":"cancel"}',
       '{"type":"cancel","id":-2}',
+      '{"type":"heartbeat"}',
+      '{"type":"heartbeat","at":"soon"}',
+      '{"type":"heartbeat","at":1795296329743,"extra":true}',
       '{"type":"reply"}',
       '{"type":"request","rid":1,"kind":"gitToken","host":5}',
       '{"type":"request","rid":1,"kind":"nonsense"}',
@@ -262,6 +271,17 @@ describe("reply payload validation", () => {
     expect(parseConsentReply({ consent: false }).ok).toBe(true);
     expect(parseConsentReply({ consent: "no" }).ok).toBe(false);
     expect(parseConsentReply({}).ok).toBe(false);
+    // The PR-reporting consent reply round-trips like the consent reply: an explicit choice
+    // (on/off/follow-telemetry) or an empty object when the host does not govern the choice.
+    expect(parseReportingConsentReply({ reportingConsent: "off" })).toEqual({
+      ok: true,
+      value: { reportingConsent: "off" },
+    });
+    expect(parseReportingConsentReply({ reportingConsent: "follow-telemetry" }).ok).toBe(true);
+    expect(parseReportingConsentReply({}).ok).toBe(true);
+    expect(parseReportingConsentReply({ reportingConsent: "maybe" }).ok).toBe(false);
+    expect(parseReportingConsentReply({ reportingConsent: 1 }).ok).toBe(false);
+    expect(parseReportingConsentReply({ consent: true }).ok).toBe(false);
     // The saved git host token, or no token at all when none is saved.
     expect(parseGitTokenReply({ token: "ghp_saved" })).toEqual({
       ok: true,

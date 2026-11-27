@@ -24,8 +24,21 @@ import type { HostCredentials, HostEndpoints, HostMetric } from "../reconcile/ho
 /** Bumped only on a breaking protocol change; the worker refuses any other version. */
 export const PROTOCOL_VERSION = 1;
 
+/** How long the worker tolerates silence between the parent's lease heartbeats before it
+ *  refuses every ledger write. The value must stay inside proper-lockfile's 5 s stale-lock
+ *  window (plan Decision 7), so an old release's lease handover can never leave a stale worker
+ *  writable longer than the lease itself could. Exported here because the parent (K2) shares
+ *  this contract with the worker through ./worker-protocol. */
+export const HEARTBEAT_TIMEOUT_MS = 2000;
+
 /** The host services the worker cannot resolve itself and must ask the parent for. */
-export type HostRequestKind = "credentials" | "endpoints" | "policy" | "consent" | "gitToken";
+export type HostRequestKind =
+  | "credentials"
+  | "endpoints"
+  | "policy"
+  | "consent"
+  | "reportingConsent"
+  | "gitToken";
 
 /** The channels one pass runs; the supervisor's channel set, on the wire. */
 export interface PassChannels {
@@ -113,12 +126,33 @@ export interface PassMessage {
   deadlineMs: number;
   /** The lease fencing epoch; chunk B4 checks it inside every write transaction. */
   epoch: number;
+  /** The agent directory the parent already resolved (pinned to its real path) before sending
+   *  the pass. The worker requires this to resolve to the hello's real agent directory,
+   *  so an alias cannot redirect writes into a different tree. Optional: a parent that
+   *  does not send it keeps the hello's agent directory. */
+  agentDir?: string;
 }
 
 /** Cancels a running pass; the parent sends this on lease loss or shutdown. */
 export interface CancelMessage {
   type: "cancel";
   id: number;
+}
+
+/** The lease holder's heartbeat: the parent is alive and still holds the lease. The reader
+ *  increments a shared arrival counter; the worker bounds changes on its own monotonic clock,
+ *  so wall-clock corrections and delayed observation cannot make a silent parent fresh.
+ *
+ *  Required parent send cadence: at a fixed interval of at most 1 s (proper-lockfile's own
+ *  lease-update interval; K2's supervisor sends every 500 ms while the worker lives), starting
+ *  immediately after `ready`. A parent that only heartbeats around passes will find its worker
+ *  refusing writes mid-pass once the window elapses. */
+export interface HeartbeatMessage {
+  type: "heartbeat";
+  /** When the parent sent it: its own Date.now() at send, retained for wire diagnostics and
+   *  compatibility. Freshness never reads its value; numeric presence remains required so
+   *  malformed heartbeats cannot refresh liveness. */
+  at: number;
 }
 
 /** The parent's answer to a `request`; the only message allowed to carry tokens. */
@@ -128,7 +162,12 @@ export interface ReplyMessage {
   result: unknown;
 }
 
-export type ParentMessage = HelloMessage | PassMessage | CancelMessage | ReplyMessage;
+export type ParentMessage =
+  | HelloMessage
+  | PassMessage
+  | CancelMessage
+  | HeartbeatMessage
+  | ReplyMessage;
 
 // ---------------------------------------------------------------------------
 // Worker → parent
@@ -434,7 +473,7 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       const shape = exactKeys(
         object.value,
         ["type", "id", "channels", "deadlineMs", "epoch"],
-        ["nextRepository", "reportingCwd"],
+        ["nextRepository", "reportingCwd", "agentDir"],
       );
       if (!shape.ok) return shape;
       const id = fieldInteger(object.value, "id", 1);
@@ -449,6 +488,8 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       if (!nextRepository.ok) return nextRepository;
       const reportingCwd = optionalFieldString(object.value, "reportingCwd");
       if (!reportingCwd.ok) return reportingCwd;
+      const agentDir = optionalFieldString(object.value, "agentDir");
+      if (!agentDir.ok) return agentDir;
       return accept({
         type: "pass",
         id: id.value,
@@ -457,6 +498,7 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
         epoch: epoch.value,
         ...(nextRepository.value === undefined ? {} : { nextRepository: nextRepository.value }),
         ...(reportingCwd.value === undefined ? {} : { reportingCwd: reportingCwd.value }),
+        ...(agentDir.value === undefined ? {} : { agentDir: agentDir.value }),
       });
     }
     case "cancel": {
@@ -465,6 +507,13 @@ function parseParentValue(value: unknown): Parsed<ParentMessage> {
       const id = fieldInteger(object.value, "id", 1);
       if (!id.ok) return id;
       return accept({ type: "cancel", id: id.value });
+    }
+    case "heartbeat": {
+      const shape = exactKeys(object.value, ["type", "at"], []);
+      if (!shape.ok) return shape;
+      const at = fieldNumber(object.value, "at");
+      if (!at.ok) return at;
+      return accept({ type: "heartbeat", at: at.value });
     }
     case "reply": {
       const shape = exactKeys(object.value, ["type", "rid", "result"], []);
@@ -508,6 +557,7 @@ function parseWorkerValue(value: unknown): Parsed<WorkerMessage> {
               "endpoints",
               "policy",
               "consent",
+              "reportingConsent",
               "gitToken",
             ] as const)
           : undefined;
@@ -713,6 +763,29 @@ export function parseConsentReply(value: unknown): Parsed<ConsentReply> {
   const consent = fieldBoolean(object.value, "consent");
   if (!consent.ok) return consent;
   return accept({ consent: consent.value });
+}
+
+/** The PR-reporting consent reply: the host's explicit choice for the reporting queue, or
+ *  nothing at all when the host leaves the choice to the queue's legacy state.json semantics
+ *  (an older embedding release, or a user choice the host does not govern). Like the consent
+ *  reply, this is read live at every consent site — never cached — and an answer this reader
+ *  cannot validate is an error, never a guessed value. */
+export interface ReportingConsentReply {
+  reportingConsent?: "on" | "off" | "follow-telemetry";
+}
+
+export function parseReportingConsentReply(value: unknown): Parsed<ReportingConsentReply> {
+  const object = asObject(value, "reportingConsent reply");
+  if (!object.ok) return object;
+  const shape = exactKeys(object.value, [], ["reportingConsent"]);
+  if (!shape.ok) return shape;
+  const consent = optionalFieldString(object.value, "reportingConsent");
+  if (!consent.ok) return consent;
+  if (consent.value === undefined) return accept({});
+  const choice = oneOf(consent.value, ["on", "off", "follow-telemetry"] as const);
+  if (choice === undefined)
+    return reject("reportingConsent reply is not one of on|off|follow-telemetry");
+  return accept({ reportingConsent: choice });
 }
 
 /** The gitToken reply: the saved Git host token, or no token at all when none is saved. */
