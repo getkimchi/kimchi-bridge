@@ -359,7 +359,7 @@ it("a helper whose first action is delayed past the window keeps accepting live 
     expect(sample.refused).toBe(false);
     expect(sample.ageMs).toBeLessThan(500);
   }
-  expect(samples.length - lastRefused - 1).toBeGreaterThanOrEqual(10);
+  expect(samples.length - lastRefused - 1).toBeGreaterThanOrEqual(Math.ceil(samples.length / 4));
 }, 20_000);
 
 it("a heartbeat arriving during a bounded main-thread hold still ages from its arrival", async () => {
